@@ -36,7 +36,7 @@
 
 | 对标功能 | 决策 | 说明与处理方式 |
 | :--- | :---: | :--- |
-| 三段式分类分组（应用 / 后台进程 / Windows 进程）与子进程展开 | **P0 (`0.0.3`)** | 通过非阻塞 `InternalGetWindowText` 与 DWM Cloaked 状态分类，首列提供折叠箭头；Windows 分组视图中 `explorer.exe` 不吞并独立应用或后台进程，多进程应用的无窗口子进程归属并聚合到所属应用行 |
+| 三段式分类分组（应用 / 后台进程 / Windows 进程）与子进程展开 | **P0 (`0.0.3`)** | 通过非阻塞 `InternalGetWindowText` 与 DWM Cloaked 状态分类，首列提供折叠箭头；Windows 分组视图按应用身份（MSIX/UWP 包家族名或可执行文件身份）将同应用多进程聚合至顶层应用行并展示组内总进程数，不同映像的后台子进程留在后台进程，且 `explorer.exe` 不吞并独立应用或后台进程 |
 | 父子进程树视图一键切换（`Process Tree`） | **P0 (`0.0.3`)** | 校验 `parent.create_time <= child.create_time` 防止 PID 复用造成误挂载 |
 | 进程状态列（效能模式绿叶标识、已挂起、未响应） | **P0 (`0.0.3`)** | 基于内核线程挂起态与非阻塞 `IsHungAppWindow` 判定 |
 | 资源占用热力图列（CPU、内存、磁盘、网络、GPU） | **P0 (`0.0.3`)** | 在 `TableDelegate::render_td` 中按占用分档映射单元格背景透明度 |

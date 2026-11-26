@@ -28,8 +28,8 @@ use windows_sys::Wdk::System::Threading::{
     NtQueryInformationProcess, ProcessCommandLineInformation,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, S_FALSE, S_OK, STATUS_BUFFER_TOO_SMALL,
-    STATUS_INFO_LENGTH_MISMATCH, STATUS_SUCCESS, UNICODE_STRING,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GetLastError, HANDLE, S_FALSE, S_OK,
+    STATUS_BUFFER_TOO_SMALL, STATUS_INFO_LENGTH_MISMATCH, STATUS_SUCCESS, UNICODE_STRING,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
@@ -44,6 +44,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, GetDriveTypeW, GetFileVersionInfoSizeW, GetFileVersionInfoW,
     VerQueryValueW,
 };
+use windows_sys::Win32::Storage::Packaging::Appx::GetPackageFamilyName;
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
 };
@@ -289,6 +290,7 @@ impl SlowMetadataProber for WindowsSlowProber {
         let command_line = query_process_command_line(handle.as_raw()).map(Arc::<str>::from);
         let arch = query_process_arch(handle.as_raw());
         let efficiency_mode = query_efficiency_mode(handle.as_raw());
+        let app_group_id = query_process_package_family_name(handle.as_raw()).map(Arc::<str>::from);
         let (user_name, uac_virtualization, is_elevated) =
             query_token_metadata(handle.as_raw(), self);
 
@@ -301,6 +303,7 @@ impl SlowMetadataProber for WindowsSlowProber {
             uac_virtualization,
             efficiency_mode,
             is_elevated,
+            app_group_id,
             asset: None,
         })
     }
@@ -541,6 +544,37 @@ fn query_efficiency_mode(handle: HANDLE) -> bool {
         )
     };
     ok != 0 && (state.ControlMask & state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
+}
+
+/// Queries the MSIX/UWP Package Family Name for packaged Windows apps via `GetPackageFamilyName`.
+///
+/// Returns `None` for non-packaged Win32 desktop processes (`APPMODEL_ERROR_NO_PACKAGE`).
+fn query_process_package_family_name(handle: HANDLE) -> Option<String> {
+    let mut stack_buf = [0u16; 128];
+    let mut len = stack_buf.len() as u32;
+
+    // SAFETY: `handle` has `PROCESS_QUERY_LIMITED_INFORMATION`; `stack_buf` is writable for `len` u16s.
+    let rc = unsafe { GetPackageFamilyName(handle, &mut len, stack_buf.as_mut_ptr()) };
+    if rc == ERROR_SUCCESS {
+        let char_len = (len as usize).saturating_sub(1).min(stack_buf.len());
+        let name = String::from_utf16_lossy(&stack_buf[..char_len]);
+        let trimmed = name.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_owned());
+    }
+
+    if rc == ERROR_INSUFFICIENT_BUFFER && len > 1 && len <= 1024 {
+        let mut heap_buf = vec![0u16; len as usize];
+        // SAFETY: `heap_buf` is sized to the exact length returned by `GetPackageFamilyName`.
+        let rc2 = unsafe { GetPackageFamilyName(handle, &mut len, heap_buf.as_mut_ptr()) };
+        if rc2 == ERROR_SUCCESS {
+            let char_len = (len as usize).saturating_sub(1).min(heap_buf.len());
+            let name = String::from_utf16_lossy(&heap_buf[..char_len]);
+            let trimmed = name.trim();
+            return (!trimmed.is_empty()).then(|| trimmed.to_owned());
+        }
+    }
+
+    None
 }
 
 /// Queries process token owner account name, UAC virtualization state, and elevation status.
