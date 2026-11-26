@@ -13,7 +13,8 @@ mod store;
 
 pub use error::ConfigError;
 pub use schema::{
-    AppSettings, CURRENT_SCHEMA_VERSION, MAX_RUN_TASK_HISTORY, WindowGeometry, migrate_toml_value,
+    AppSettings, CURRENT_SCHEMA_VERSION, MAX_RUN_TASK_HISTORY, TableColumnSetting, WindowGeometry,
+    migrate_toml_value,
 };
 pub use store::{CONFIG_FILE_NAME, ConfigStore, default_config_path};
 
@@ -52,6 +53,35 @@ mod tests {
                 maximized: false,
             }),
             run_task_history: Vec::new(),
+            processes_columns: vec![
+                TableColumnSetting {
+                    id: "name".to_owned(),
+                    width: 260,
+                    visible: true,
+                },
+                TableColumnSetting {
+                    id: "pid".to_owned(),
+                    width: 76,
+                    visible: true,
+                },
+                TableColumnSetting {
+                    id: "publisher".to_owned(),
+                    width: 176,
+                    visible: false,
+                },
+            ],
+            details_columns: vec![
+                TableColumnSetting {
+                    id: "name".to_owned(),
+                    width: 240,
+                    visible: true,
+                },
+                TableColumnSetting {
+                    id: "threads".to_owned(),
+                    width: 72,
+                    visible: true,
+                },
+            ],
         };
         for i in 0..MAX_RUN_TASK_HISTORY {
             settings.push_run_task_history(format!(r"C:\Windows\System32\tool_{i}.exe --flag"));

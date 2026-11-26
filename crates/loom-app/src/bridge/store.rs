@@ -1,13 +1,12 @@
 //! Reactive GPUI [`UiStore`] entity bridging lock-free [`AppSnapshot`] slices and events.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use gpui_kit::{Context, EventEmitter, Task};
-use loom_config::{AppSettings, ConfigError, ConfigStore};
+use loom_config::{AppSettings, ConfigError, ConfigStore, TableColumnSetting};
 use loom_engine::{
     CommandEvent, CommandKind, EngineCommand, EngineCommandError, EngineCoordinator,
 };
@@ -51,7 +50,6 @@ pub(crate) struct UiStore {
     event_rx: Receiver<CommandEvent>,
     dormant: bool,
     poll_task: Option<Task<()>>,
-    table_columns: HashMap<&'static str, Vec<(&'static str, f32)>>,
 }
 
 impl EventEmitter<UiStoreEvent> for UiStore {}
@@ -77,7 +75,6 @@ impl UiStore {
             event_rx,
             dormant: false,
             poll_task: None,
-            table_columns: HashMap::new(),
         };
         store.start_polling(cx);
         store
@@ -122,19 +119,16 @@ impl UiStore {
         self.config_store.path()
     }
 
-    /// Returns the session-saved column order and pixel widths for `table_id`, if any.
+    /// Returns the persisted column layout (order, width, visibility) for the Processes table.
     #[inline]
-    pub(crate) fn table_column_layout(&self, table_id: &str) -> Option<&[(&'static str, f32)]> {
-        self.table_columns.get(table_id).map(Vec::as_slice)
+    pub(crate) fn processes_columns(&self) -> &[TableColumnSetting] {
+        &self.settings.processes_columns
     }
 
-    /// Saves the active column order and pixel widths for `table_id` across route switches.
-    pub(crate) fn set_table_column_layout(
-        &mut self,
-        table_id: &'static str,
-        layout: Vec<(&'static str, f32)>,
-    ) {
-        self.table_columns.insert(table_id, layout);
+    /// Returns the persisted column layout (order, width, visibility) for the Details table.
+    #[inline]
+    pub(crate) fn details_columns(&self) -> &[TableColumnSetting] {
+        &self.settings.details_columns
     }
 
     /// Acquires an RAII [`ScopedMonitorLease`] for an on-demand domain.

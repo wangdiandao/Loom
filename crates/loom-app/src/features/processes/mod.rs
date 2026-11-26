@@ -16,6 +16,7 @@ use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
     v_flex,
@@ -37,8 +38,9 @@ use loom_ui_kit::{
 
 use crate::bridge::{UiCommands, UiStore, UiStoreEvent};
 use crate::features::table_columns::{
-    ColumnKey, ColumnSpec, HeaderColumnDescriptor, TableColumnLayout,
-    attach_header_reorder_handlers, attach_table_column_drag_handlers,
+    ColumnKey, ColumnSpec, ColumnToggleItem, HeaderColumnDescriptor, HeaderMenuAction,
+    TableColumnLayout, attach_header_reorder_handlers, attach_table_column_drag_handlers,
+    build_column_header_menu, open_select_columns_dialog, render_header_trailing_spacer,
     render_interactive_header_cell,
 };
 use crate::i18n;
@@ -52,12 +54,14 @@ use self::state::{
 
 const PROCESS_ROW_HEIGHT: f32 = 32.0;
 const TABLE_HORIZONTAL_PADDING: f32 = 16.0;
-const PROCESSES_TABLE_ID: &str = "processes";
 
-/// Logical columns rendered by [`ProcessesView`].
+/// Logical columns supported by [`ProcessesView`] (distinct from [`crate::features::details`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessColumn {
     Name,
+    Category,
+    Pid,
+    ProcessName,
     Status,
     Cpu,
     Memory,
@@ -65,12 +69,16 @@ enum ProcessColumn {
     Network,
     Gpu,
     Publisher,
+    CommandLine,
 }
 
 impl ColumnKey for ProcessColumn {
     fn slug(self) -> &'static str {
         match self {
             Self::Name => "name",
+            Self::Category => "type",
+            Self::Pid => "pid",
+            Self::ProcessName => "process_name",
             Self::Status => "status",
             Self::Cpu => "cpu",
             Self::Memory => "memory",
@@ -78,14 +86,33 @@ impl ColumnKey for ProcessColumn {
             Self::Network => "network",
             Self::Gpu => "gpu",
             Self::Publisher => "publisher",
+            Self::CommandLine => "command_line",
         }
     }
 }
 
 impl ProcessColumn {
+    /// Canonical toggleable column order presented in the **Select columns** dialog.
+    const SELECTABLE_ORDER: [Self; 11] = [
+        Self::Category,
+        Self::Pid,
+        Self::ProcessName,
+        Self::Status,
+        Self::Publisher,
+        Self::Cpu,
+        Self::Memory,
+        Self::Disk,
+        Self::Network,
+        Self::Gpu,
+        Self::CommandLine,
+    ];
+
     fn default_specs() -> Vec<ColumnSpec<Self>> {
         vec![
-            ColumnSpec::new(Self::Name, 260.0, 140.0, 720.0),
+            ColumnSpec::pinned(Self::Name, 260.0, 140.0, 720.0),
+            ColumnSpec::hidden(Self::Category, 112.0, 72.0, 240.0),
+            ColumnSpec::hidden(Self::Pid, 76.0, 56.0, 160.0),
+            ColumnSpec::hidden(Self::ProcessName, 168.0, 96.0, 360.0),
             ColumnSpec::new(Self::Status, 80.0, 56.0, 200.0),
             ColumnSpec::new(Self::Cpu, 82.0, 60.0, 180.0),
             ColumnSpec::new(Self::Memory, 96.0, 68.0, 220.0),
@@ -93,12 +120,16 @@ impl ProcessColumn {
             ColumnSpec::new(Self::Network, 92.0, 68.0, 220.0),
             ColumnSpec::new(Self::Gpu, 78.0, 60.0, 180.0),
             ColumnSpec::new(Self::Publisher, 176.0, 88.0, 480.0),
+            ColumnSpec::hidden(Self::CommandLine, 320.0, 140.0, 1200.0),
         ]
     }
 
     fn label(self) -> String {
         match self {
             Self::Name => i18n::tr("processes.col_name"),
+            Self::Category => i18n::tr("processes.col_type"),
+            Self::Pid => i18n::tr("processes.col_pid"),
+            Self::ProcessName => i18n::tr("processes.col_process_name"),
             Self::Status => i18n::tr("processes.col_status"),
             Self::Cpu => i18n::tr("processes.col_cpu"),
             Self::Memory => i18n::tr("processes.col_memory"),
@@ -106,26 +137,31 @@ impl ProcessColumn {
             Self::Network => i18n::tr("processes.col_network"),
             Self::Gpu => i18n::tr("processes.col_gpu"),
             Self::Publisher => i18n::tr("processes.col_publisher"),
+            Self::CommandLine => i18n::tr("processes.col_command_line"),
         }
     }
 
     const fn sort_column(self) -> Option<ProcessSortColumn> {
         match self {
             Self::Name => Some(ProcessSortColumn::Name),
+            Self::Category => Some(ProcessSortColumn::Category),
+            Self::Pid => Some(ProcessSortColumn::Pid),
+            Self::ProcessName => Some(ProcessSortColumn::ProcessName),
             Self::Status => Some(ProcessSortColumn::Status),
             Self::Cpu => Some(ProcessSortColumn::Cpu),
             Self::Memory => Some(ProcessSortColumn::Memory),
             Self::Disk => Some(ProcessSortColumn::Disk),
             Self::Network => Some(ProcessSortColumn::Network),
             Self::Gpu => Some(ProcessSortColumn::Gpu),
-            Self::Publisher => None,
+            Self::Publisher => Some(ProcessSortColumn::Publisher),
+            Self::CommandLine => Some(ProcessSortColumn::CommandLine),
         }
     }
 
     const fn right_aligned(self) -> bool {
         matches!(
             self,
-            Self::Cpu | Self::Memory | Self::Disk | Self::Network | Self::Gpu
+            Self::Pid | Self::Cpu | Self::Memory | Self::Disk | Self::Network | Self::Gpu
         )
     }
 }
@@ -155,8 +191,9 @@ impl ProcessesView {
     pub(crate) fn new(store: Entity<UiStore>, shell: ShellHandle, cx: &mut Context<Self>) -> Self {
         let initial_rev = store.read(cx).snapshot().revisions.processes;
         let mut column_layout = TableColumnLayout::new(ProcessColumn::default_specs());
-        if let Some(saved) = store.read(cx).table_column_layout(PROCESSES_TABLE_ID) {
-            column_layout.apply_saved(saved);
+        let saved_cols = store.read(cx).processes_columns().to_vec();
+        if !saved_cols.is_empty() {
+            column_layout.apply_saved(&saved_cols);
         }
         let sub = cx.subscribe(&store, |this, _store, event, cx| match event {
             UiStoreEvent::SnapshotUpdated(revs) => {
@@ -185,9 +222,96 @@ impl ProcessesView {
 
     fn persist_column_layout(&self, cx: &mut Context<Self>) {
         let snapshot = self.column_layout.snapshot();
-        self.store.update(cx, |store, _| {
-            store.set_table_column_layout(PROCESSES_TABLE_ID, snapshot);
-        });
+        UiCommands::set_processes_columns(&self.store, snapshot, cx);
+    }
+
+    fn hide_column(&mut self, col: ProcessColumn, cx: &mut Context<Self>) {
+        if self.column_layout.hide_column(col) {
+            self.persist_column_layout(cx);
+            cx.notify();
+        }
+    }
+
+    fn reset_columns_to_default(&mut self, cx: &mut Context<Self>) {
+        self.column_layout.reset(ProcessColumn::default_specs());
+        UiCommands::set_processes_columns(&self.store, Vec::new(), cx);
+        cx.notify();
+    }
+
+    fn open_select_columns_modal(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let items = ProcessColumn::SELECTABLE_ORDER
+            .iter()
+            .map(|&col| ColumnToggleItem {
+                slug: col.slug(),
+                label: col.label(),
+                visible: self.column_layout.is_visible(col),
+            })
+            .collect();
+        let view_weak = cx.entity().downgrade();
+        open_select_columns_dialog(
+            items,
+            Rc::new(move |selected_slugs, cx| {
+                let _ = view_weak.update(cx, |this, cx| {
+                    if this.column_layout.apply_visible_slugs(&selected_slugs) {
+                        this.persist_column_layout(cx);
+                        cx.notify();
+                    }
+                });
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn build_header_context_menu(
+        menu: PopupMenu,
+        store: Entity<UiStore>,
+        clicked_col: Option<ProcessColumn>,
+        view_weak: gpui_kit::WeakEntity<Self>,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let hide_action: Option<HeaderMenuAction> = clicked_col
+            .filter(|&col| col != ProcessColumn::Name)
+            .map(|col| {
+                let view_hide = view_weak.clone();
+                Rc::new(move |_window: &mut Window, cx: &mut App| {
+                    let _ = view_hide.update(cx, |this, cx| this.hide_column(col, cx));
+                }) as HeaderMenuAction
+            });
+
+        let view_select = view_weak.clone();
+        let on_select_columns: HeaderMenuAction =
+            Rc::new(move |window: &mut Window, cx: &mut App| {
+                let _ = view_select.update(cx, |this, cx| {
+                    this.open_select_columns_modal(window, cx);
+                });
+            });
+
+        let view_reset = view_weak;
+        let on_reset_defaults: HeaderMenuAction =
+            Rc::new(move |_window: &mut Window, cx: &mut App| {
+                let _ = view_reset.update(cx, |this, cx| this.reset_columns_to_default(cx));
+            });
+
+        build_column_header_menu(
+            menu,
+            hide_action,
+            on_select_columns,
+            move |sub, window, cx| {
+                sub.separator().submenu(
+                    i18n::tr("processes.menu_resource_values"),
+                    window,
+                    cx,
+                    move |nested, window, cx| {
+                        build_resource_values_submenu(nested, store.clone(), window, cx)
+                    },
+                )
+            },
+            on_reset_defaults,
+            window,
+            cx,
+        )
     }
 
     fn select_process(&mut self, key: ProcessKey, window: &mut Window, cx: &mut Context<Self>) {
@@ -487,6 +611,7 @@ impl Render for ProcessesView {
         let secondary_bg = theme.secondary;
         let primary = theme.primary;
         let radius = theme.radius;
+        let mono_font = theme.mono_font_family.clone();
         let semantic = LoomSemanticColors::from_theme(theme);
 
         let store_grouped = self.store.clone();
@@ -608,10 +733,11 @@ impl Render for ProcessesView {
                     ),
             );
 
-        let columns: Vec<ColumnSpec<ProcessColumn>> = self.column_layout.columns().to_vec();
+        let columns: Vec<ColumnSpec<ProcessColumn>> = self.column_layout.visible_columns();
         let total_cols = columns.len();
         let table_width = self.column_layout.total_width(TABLE_HORIZONTAL_PADDING);
         let column_layout_snapshot = self.column_layout.clone();
+        let header_view_weak = cx.entity().downgrade();
 
         let header_cells = columns.iter().enumerate().map(|(col_ix, spec)| {
             let col = spec.id;
@@ -621,6 +747,8 @@ impl Render for ProcessesView {
                 .map(|target| next_sort_direction(sort_col, sort_dir, target))
                 .unwrap_or(SortDirection::Descending);
             let store_for_sort = self.store.clone();
+            let store_for_menu = self.store.clone();
+            let menu_view = header_view_weak.clone();
 
             render_interactive_header_cell(
                 col_ix,
@@ -643,9 +771,35 @@ impl Render for ProcessesView {
                     }
                 },
                 |view: &mut Self, cx| view.persist_column_layout(cx),
+                move |menu, window, cx| {
+                    Self::build_header_context_menu(
+                        menu,
+                        store_for_menu.clone(),
+                        Some(col),
+                        menu_view.clone(),
+                        window,
+                        cx,
+                    )
+                },
             )
             .into_any_element()
         });
+
+        let spacer_menu_view = header_view_weak.clone();
+        let spacer_store = self.store.clone();
+        let header_trailing = render_header_trailing_spacer(
+            "processes-column-header-spacer",
+            move |menu, window, cx| {
+                Self::build_header_context_menu(
+                    menu,
+                    spacer_store.clone(),
+                    None,
+                    spacer_menu_view.clone(),
+                    window,
+                    cx,
+                )
+            },
+        );
 
         let column_header = attach_header_reorder_handlers(
             h_flex()
@@ -661,7 +815,8 @@ impl Render for ProcessesView {
                 .text_xs()
                 .font_medium()
                 .text_color(muted_fg)
-                .children(header_cells),
+                .children(header_cells)
+                .child(header_trailing),
             cx,
             |view: &mut Self| &mut view.column_layout,
             |view: &mut Self, cx| view.persist_column_layout(cx),
@@ -809,6 +964,26 @@ impl Render for ProcessesView {
                                                                         .unwrap_or("")
                                                                         .to_owned()
                                                                         .into();
+                                                                let category_text: SharedString =
+                                                                    i18n::process_category_label(
+                                                                        row.category,
+                                                                        platform,
+                                                                    )
+                                                                    .into();
+                                                                let process_name_text: SharedString =
+                                                                    row.name.to_string().into();
+                                                                let cmdline_text: SharedString =
+                                                                    row.command_line
+                                                                        .as_deref()
+                                                                        .filter(|s| !s.is_empty())
+                                                                        .unwrap_or("—")
+                                                                        .to_owned()
+                                                                        .into();
+                                                                let cmdline_tooltip = row
+                                                                    .command_line
+                                                                    .as_deref()
+                                                                    .filter(|s| !s.is_empty())
+                                                                    .map(str::to_owned);
 
                                                                 let cpu_text = format_permille(
                                                                     row.cpu_permille,
@@ -944,6 +1119,52 @@ impl Render for ProcessesView {
                                                                                 )
                                                                                 .into_any_element()
                                                                         }
+                                                                        ProcessColumn::Category => {
+                                                                            h_flex()
+                                                                                .w(w)
+                                                                                .h_full()
+                                                                                .flex_shrink_0()
+                                                                                .items_center()
+                                                                                .px_2()
+                                                                                .overflow_hidden()
+                                                                                .child(
+                                                                                    div()
+                                                                                        .min_w_0()
+                                                                                        .truncate()
+                                                                                        .text_color(muted_fg)
+                                                                                        .child(category_text.clone()),
+                                                                                )
+                                                                                .into_any_element()
+                                                                        }
+                                                                        ProcessColumn::Pid => h_flex()
+                                                                            .w(w)
+                                                                            .h_full()
+                                                                            .flex_shrink_0()
+                                                                            .items_center()
+                                                                            .justify_end()
+                                                                            .px_2()
+                                                                            .font_family(mono_font.clone())
+                                                                            .text_color(muted_fg)
+                                                                            .child(key.pid.to_string())
+                                                                            .into_any_element(),
+                                                                        ProcessColumn::ProcessName => {
+                                                                            h_flex()
+                                                                                .w(w)
+                                                                                .h_full()
+                                                                                .flex_shrink_0()
+                                                                                .items_center()
+                                                                                .px_2()
+                                                                                .overflow_hidden()
+                                                                                .child(
+                                                                                    div()
+                                                                                        .min_w_0()
+                                                                                        .truncate()
+                                                                                        .font_family(mono_font.clone())
+                                                                                        .text_color(muted_fg)
+                                                                                        .child(process_name_text.clone()),
+                                                                                )
+                                                                                .into_any_element()
+                                                                        }
                                                                         ProcessColumn::Status => {
                                                                             h_flex()
                                                                                 .w(w)
@@ -1049,6 +1270,38 @@ impl Render for ProcessesView {
                                                                                         .truncate()
                                                                                         .text_color(muted_fg)
                                                                                         .child(publisher_text.clone()),
+                                                                                )
+                                                                                .into_any_element()
+                                                                        }
+                                                                        ProcessColumn::CommandLine => {
+                                                                            h_flex()
+                                                                                .id(("proc-cmd", row_id))
+                                                                                .w(w)
+                                                                                .h_full()
+                                                                                .flex_shrink_0()
+                                                                                .items_center()
+                                                                                .px_2()
+                                                                                .overflow_hidden()
+                                                                                .font_family(mono_font.clone())
+                                                                                .text_color(muted_fg)
+                                                                                .when_some(
+                                                                                    cmdline_tooltip.clone(),
+                                                                                    |el, full_cmd| {
+                                                                                        el.tooltip(
+                                                                                            move |window, cx| {
+                                                                                                Tooltip::new(
+                                                                                                    full_cmd.clone(),
+                                                                                                )
+                                                                                                .build(window, cx)
+                                                                                            },
+                                                                                        )
+                                                                                    },
+                                                                                )
+                                                                                .child(
+                                                                                    div()
+                                                                                        .min_w_0()
+                                                                                        .truncate()
+                                                                                        .child(cmdline_text.clone()),
                                                                                 )
                                                                                 .into_any_element()
                                                                         }

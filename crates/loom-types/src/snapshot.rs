@@ -112,6 +112,8 @@ pub struct ProcessRowProjection {
     pub publisher: Option<Arc<str>>,
     /// Full executable image path, if resolved on the slow lane.
     pub exe_path: Option<Arc<str>>,
+    /// Full process command line, if resolved on the slow lane.
+    pub command_line: Option<Arc<str>>,
     /// Optional downsampled `20x20` RGBA icon.
     pub icon: Option<ExeIconRgba>,
     /// Grouping category of this process.

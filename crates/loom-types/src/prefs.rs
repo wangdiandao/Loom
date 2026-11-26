@@ -27,6 +27,12 @@ pub enum DetailsViewMode {
 pub enum ProcessSortColumn {
     /// Process / application display name.
     Name,
+    /// Process grouping category (`App` / `Background` / `System`).
+    Category,
+    /// Numeric process identifier.
+    Pid,
+    /// Raw executable/process image name.
+    ProcessName,
     /// Process status flags.
     Status,
     /// CPU utilization.
@@ -40,6 +46,10 @@ pub enum ProcessSortColumn {
     Network,
     /// GPU utilization / memory.
     Gpu,
+    /// Binary publisher / company name.
+    Publisher,
+    /// Full process command line string.
+    CommandLine,
 }
 
 /// Sortable columns in the Details table.
@@ -54,16 +64,38 @@ pub enum DetailsSortColumn {
     Status,
     /// Owning user account name.
     UserName,
+    /// OS login session identifier.
+    SessionId,
     /// CPU utilization.
     Cpu,
-    /// Memory working set.
+    /// Cumulative CPU time (kernel + user).
+    CpuTime,
+    /// Private working set memory.
     Memory,
+    /// Total resident working set memory.
+    WorkingSet,
+    /// Private committed virtual memory.
+    CommitSize,
+    /// Scheduling priority class.
+    Priority,
+    /// Open kernel handle / file descriptor count.
+    Handles,
+    /// Active OS thread count.
+    Threads,
     /// Process CPU architecture.
     Arch,
     /// UAC virtualization state.
     UacVirtualization,
+    /// Process token elevation status.
+    Elevated,
     /// Dedicated GPU memory.
     GpuMemory,
+    /// Binary publisher / company name.
+    Publisher,
+    /// Binary file description.
+    Description,
+    /// Full executable image path.
+    ExePath,
     /// Full command line string.
     CommandLine,
 }
