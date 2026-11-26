@@ -346,6 +346,7 @@ mod tests {
 
         let status_labels = StatusLabels::new("Efficiency mode", "Suspended", "Not responding");
         let _badges = status_badges(
+            42,
             ProcessStatusFlags::EFFICIENCY_MODE
                 | ProcessStatusFlags::SUSPENDED
                 | ProcessStatusFlags::NOT_RESPONDING,

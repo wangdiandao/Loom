@@ -4,6 +4,12 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ## Unreleased
 
+### UI & UX
+
+- Simplified **Processes** status badges to compact icon-only indicators with hover tooltips and streamlined the **Processes** toolbar by removing the summary metric pills, **Efficiency mode** button, and **Refresh** button (retaining Efficiency mode in the context menu).
+- Streamlined the **Details** toolbar by removing the on-demand lease badge, row count pill, **End process tree** toolbar button, and **Refresh** button (retaining **End process tree** in the context menu); simplified **Details** status cells to plain text (`Running` / `Suspended`), stripped machine/domain prefixes from displayed usernames, and renamed the memory column label to **工作集增量（内存）** (`Working set delta (memory)`).
+- Removed explanatory subtitle and per-row description texts from the **Settings** page for a cleaner, more compact layout.
+
 ## 0.0.3 - 2026-11-26
 
 ### Engine & PAL

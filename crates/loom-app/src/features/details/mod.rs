@@ -34,8 +34,8 @@ use loom_types::{
     ProcessKey, ProcessPriority, ProcessStatusFlags, SortDirection,
 };
 use loom_ui_kit::{
-    HeatmapLevel, LoomSemanticColors, StatusLabels, format_bytes, format_permille, heatmap_cell,
-    rgba_icon_to_render_image, status_badges,
+    HeatmapLevel, LoomSemanticColors, format_bytes, format_permille, heatmap_cell,
+    rgba_icon_to_render_image,
 };
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
@@ -47,10 +47,10 @@ const ICON_CACHE_MAX_ENTRIES: usize = 512;
 // Column widths (px) kept wide enough so horizontal scrolling prevents cramping.
 const COL_NAME_W: f32 = 240.0;
 const COL_PID_W: f32 = 72.0;
-const COL_STATUS_W: f32 = 156.0;
-const COL_USER_W: f32 = 152.0;
+const COL_STATUS_W: f32 = 96.0;
+const COL_USER_W: f32 = 140.0;
 const COL_CPU_W: f32 = 78.0;
-const COL_MEM_W: f32 = 136.0;
+const COL_MEM_W: f32 = 168.0;
 const COL_PRIORITY_W: f32 = 112.0;
 const COL_PLATFORM_W: f32 = 82.0;
 const COL_UAC_W: f32 = 132.0;
@@ -200,6 +200,18 @@ pub(super) fn next_sort_direction(
         active_direction.toggle()
     } else {
         default_sort_direction(clicked)
+    }
+}
+
+/// Strips a leading Windows computer/domain prefix (`HOST\User` -> `User`) for compact display.
+#[inline]
+pub(super) fn display_user_name(raw: Option<&str>) -> &str {
+    let Some(name) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return "—";
+    };
+    match name.rsplit_once('\\') {
+        Some((_, account)) if !account.is_empty() => account,
+        _ => name,
     }
 }
 
@@ -641,7 +653,6 @@ impl Render for DetailsView {
         let muted_bg = theme.muted;
         let secondary_bg = theme.secondary;
         let primary = theme.primary;
-        let success = theme.success;
         let accent = theme.accent;
         let radius = theme.radius;
         let mono_font = theme.mono_font_family.clone();
@@ -650,11 +661,8 @@ impl Render for DetailsView {
         let store_flat = self.store.clone();
         let store_tree = self.store.clone();
         let store_run_task = self.store.clone();
-        let store_refresh = self.store.clone();
         let store_end_task = self.store.clone();
-        let store_end_tree = self.store.clone();
         let end_task_target = selected_target.clone();
-        let end_tree_target = selected_target.clone();
         let has_selection = selected_target.is_some();
 
         let toolbar = h_flex()
@@ -724,40 +732,6 @@ impl Render for DetailsView {
                                         );
                                     }),
                             ),
-                    )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1p5()
-                            .px_2p5()
-                            .py_1()
-                            .rounded(radius)
-                            .bg(success.opacity(0.14))
-                            .text_xs()
-                            .text_color(success)
-                            .child(Icon::new(IconName::CircleCheck).xsmall())
-                            .child(i18n::tr("details.lease_active")),
-                    )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1p5()
-                            .px_2p5()
-                            .py_1()
-                            .rounded(radius)
-                            .bg(muted_bg.opacity(0.65))
-                            .text_xs()
-                            .child(
-                                div()
-                                    .text_color(muted_fg)
-                                    .child(i18n::tr("details.rows_label")),
-                            )
-                            .child(
-                                div()
-                                    .font_semibold()
-                                    .text_color(fg)
-                                    .child(row_count.to_string()),
-                            ),
                     ),
             )
             .child(
@@ -792,35 +766,6 @@ impl Render for DetailsView {
                                 if let Some(ref target) = end_task_target {
                                     request_end_task(&store_end_task, target, window, cx);
                                 }
-                            }),
-                    )
-                    .child(
-                        Button::new("details-end-process-tree")
-                            .small()
-                            .danger()
-                            .outline()
-                            .icon(IconName::Ban)
-                            .label(i18n::tr("details.end_process_tree"))
-                            .disabled(!has_selection)
-                            .on_click(move |_, window, cx| {
-                                if let Some(ref target) = end_tree_target {
-                                    open_end_process_tree_dialog(
-                                        &store_end_tree,
-                                        target,
-                                        window,
-                                        cx,
-                                    );
-                                }
-                            }),
-                    )
-                    .child(
-                        Button::new("details-refresh")
-                            .small()
-                            .ghost()
-                            .icon(IconName::RefreshCw)
-                            .label(i18n::tr("processes.refresh"))
-                            .on_click(move |_, _, cx| {
-                                UiCommands::force_refresh(&store_refresh, cx);
                             }),
                     ),
             );
@@ -1082,12 +1027,8 @@ impl Render for DetailsView {
             let view_weak = cx.entity().downgrade();
             let icon_cache = Rc::clone(&self.icon_cache);
             let is_tree_mode = view_mode == DetailsViewMode::Tree;
-            let status_labels = StatusLabels::new(
-                i18n::tr("processes.status_efficiency"),
-                i18n::tr("processes.status_suspended"),
-                i18n::tr("processes.status_not_responding"),
-            );
-            let running_label = i18n::tr("details.status_running");
+            let running_label: SharedString = i18n::tr("details.status_running").into();
+            let suspended_label: SharedString = i18n::tr("details.status_suspended").into();
 
             div()
                 .flex_1()
@@ -1141,16 +1082,18 @@ impl Render for DetailsView {
                                                             is_tree_mode && row.has_children;
                                                         let is_expanded = row.is_expanded;
 
-                                                        let has_badge_flags = row.status.intersects(
-                                                            ProcessStatusFlags::NOT_RESPONDING
-                                                                | ProcessStatusFlags::SUSPENDED
-                                                                | ProcessStatusFlags::EFFICIENCY_MODE,
-                                                        );
-                                                        let user_text = row
-                                                            .user_name
-                                                            .as_deref()
-                                                            .unwrap_or("—")
-                                                            .to_owned();
+                                                        let status_text = if row
+                                                            .status
+                                                            .contains(ProcessStatusFlags::SUSPENDED)
+                                                        {
+                                                            suspended_label.clone()
+                                                        } else {
+                                                            running_label.clone()
+                                                        };
+                                                        let user_text = display_user_name(
+                                                            row.user_name.as_deref(),
+                                                        )
+                                                        .to_owned();
                                                         let publisher_text = row
                                                             .publisher
                                                             .as_deref()
@@ -1309,24 +1252,9 @@ impl Render for DetailsView {
                                                                 div()
                                                                     .w(px(COL_STATUS_W))
                                                                     .flex_shrink_0()
-                                                                    .overflow_hidden()
-                                                                    .child(if has_badge_flags {
-                                                                        status_badges(
-                                                                            row.status,
-                                                                            &status_labels,
-                                                                            &semantic,
-                                                                        )
-                                                                        .into_any_element()
-                                                                    } else {
-                                                                        div()
-                                                                            .truncate()
-                                                                            .text_color(muted_fg)
-                                                                            .child(
-                                                                                running_label
-                                                                                    .clone(),
-                                                                            )
-                                                                            .into_any_element()
-                                                                    }),
+                                                                    .truncate()
+                                                                    .text_color(muted_fg)
+                                                                    .child(status_text),
                                                             )
                                                             .child(
                                                                 div()
@@ -1942,5 +1870,16 @@ mod tests {
             ),
             SortDirection::Ascending
         );
+    }
+
+    #[test]
+    fn display_user_name_strips_computer_and_domain_prefix() {
+        assert_eq!(display_user_name(Some(r"LAPTOP-M850NT2C\Lenovo")), "Lenovo");
+        assert_eq!(display_user_name(Some(r"NT AUTHORITY\SYSTEM")), "SYSTEM");
+        assert_eq!(display_user_name(Some("Lenovo")), "Lenovo");
+        assert_eq!(display_user_name(Some("")), "—");
+        assert_eq!(display_user_name(Some("   ")), "—");
+        assert_eq!(display_user_name(None), "—");
+        assert_eq!(display_user_name(Some(r"DOMAIN\")), r"DOMAIN\");
     }
 }

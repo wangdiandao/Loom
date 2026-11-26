@@ -307,21 +307,11 @@ impl Render for SettingsView {
                     .gap_5()
                     .p_6()
                     .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_semibold()
-                                    .text_color(fg)
-                                    .child(i18n::tr("settings.title")),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(muted_fg)
-                                    .child(i18n::tr("settings.subtitle")),
-                            ),
+                        div()
+                            .text_xl()
+                            .font_semibold()
+                            .text_color(fg)
+                            .child(i18n::tr("settings.title")),
                     )
                     // 1. General
                     .child(
@@ -335,9 +325,7 @@ impl Render for SettingsView {
                         )
                         .child(setting_row(
                             startup_label.clone(),
-                            i18n::tr("settings.startup_page_desc"),
                             fg,
-                            muted_fg,
                             border,
                             false,
                             div().w(px(220.)).child(
@@ -348,9 +336,7 @@ impl Render for SettingsView {
                         ))
                         .child(setting_row(
                             speed_label.clone(),
-                            i18n::tr("settings.refresh_speed_desc"),
                             fg,
-                            muted_fg,
                             border,
                             true,
                             div().w(px(220.)).child(
@@ -373,9 +359,7 @@ impl Render for SettingsView {
                         .when(supports_always_on_top, |section| {
                             section.child(setting_row(
                                 always_on_top_label.clone(),
-                                i18n::tr("settings.always_on_top_desc"),
                                 fg,
-                                muted_fg,
                                 border,
                                 false,
                                 Switch::new("setting-always-on-top")
@@ -388,9 +372,7 @@ impl Render for SettingsView {
                         })
                         .child(setting_row(
                             min_tray_label.clone(),
-                            i18n::tr("settings.minimize_to_tray_desc"),
                             fg,
-                            muted_fg,
                             border,
                             supports_always_on_top,
                             Switch::new("setting-minimize-to-tray")
@@ -402,9 +384,7 @@ impl Render for SettingsView {
                         ))
                         .child(setting_row(
                             close_tray_label.clone(),
-                            i18n::tr("settings.close_to_tray_desc"),
                             fg,
-                            muted_fg,
                             border,
                             true,
                             Switch::new("setting-close-to-tray")
@@ -427,9 +407,7 @@ impl Render for SettingsView {
                         )
                         .child(setting_row(
                             theme_label.clone(),
-                            i18n::tr("settings.theme_desc"),
                             fg,
-                            muted_fg,
                             border,
                             false,
                             div().w(px(220.)).child(
@@ -440,9 +418,7 @@ impl Render for SettingsView {
                         ))
                         .child(setting_row(
                             language_label.clone(),
-                            i18n::tr("settings.language_desc"),
                             fg,
-                            muted_fg,
                             border,
                             true,
                             div().w(px(220.)).child(
@@ -464,9 +440,7 @@ impl Render for SettingsView {
                         )
                         .child(setting_row(
                             i18n::tr("settings.privilege_label"),
-                            i18n::tr("settings.privilege_desc"),
                             fg,
-                            muted_fg,
                             border,
                             false,
                             h_flex()
@@ -505,9 +479,7 @@ impl Render for SettingsView {
                         ))
                         .child(setting_row(
                             i18n::tr("settings.config_path_label"),
-                            i18n::tr("settings.config_path_desc"),
                             fg,
-                            muted_fg,
                             border,
                             true,
                             div()
@@ -557,9 +529,7 @@ fn settings_section(
 
 fn setting_row(
     title: String,
-    description: String,
     fg: gpui_kit::Hsla,
-    muted_fg: gpui_kit::Hsla,
     border: gpui_kit::Hsla,
     top_divider: bool,
     control: impl IntoElement,
@@ -570,15 +540,16 @@ fn setting_row(
         .justify_between()
         .gap_4()
         .px_4()
-        .py_3p5()
+        .py_3()
         .when(top_divider, |this| this.border_t_1().border_color(border))
         .child(
-            v_flex()
+            div()
                 .flex_1()
                 .min_w_0()
-                .gap_0p5()
-                .child(div().text_sm().font_medium().text_color(fg).child(title))
-                .child(div().text_xs().text_color(muted_fg).child(description)),
+                .text_sm()
+                .font_medium()
+                .text_color(fg)
+                .child(title),
         )
         .child(div().flex_shrink_0().child(control))
 }

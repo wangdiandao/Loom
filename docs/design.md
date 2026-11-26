@@ -113,8 +113,8 @@ flowchart LR
 ### 3. Key view specifications
 
 1. **Processes**:
-   - Header bar includes a compact `Grouped` ↔ `Process Tree` view switcher on the left and `Run new task`, `End task`, and `Efficiency mode` actions on the right.
-   - Column 0 renders cached `20×20` icons, display names, and tree expanders; status badges mark `Efficiency mode`, `Suspended`, and `Not responding`; resource columns display subtle heatmap shading.
+   - Header bar includes a compact `Grouped` ↔ `Process Tree` view switcher on the left and `Run new task` and `End task` actions on the right (`Efficiency mode` is toggled via the row context menu).
+   - Column 0 renders cached `20×20` icons, display names, and tree expanders; the status column renders compact icon-only badges with hover tooltips for `Efficiency mode`, `Suspended`, and `Not responding`; resource columns display subtle heatmap shading.
 2. **Performance**:
    - Resizable split layout (`h_resizable`): left rail lists hardware devices with 60s sparklines; right pane displays device header and hardware model string, interactive `AreaChart`/`LineChart` plots (supporting overall/logical-core and kernel-time toggles on CPU, plus `2×2` multi-engine / single-engine views on GPU), and a two-column metric grid below.
 3. **Cross-view navigation**:
