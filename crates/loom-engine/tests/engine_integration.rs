@@ -74,6 +74,8 @@ struct MockState {
     slow_probe_sleep: Duration,
     slow_probe_release: Option<Receiver<()>>,
     recorded_tree_kills: Mutex<Vec<Vec<ProcessKey>>>,
+    priorities: Mutex<HashMap<ProcessKey, ProcessPriority>>,
+    browse_result: Mutex<Option<PathBuf>>,
     terminate_error_elevation: AtomicBool,
     is_elevated: AtomicBool,
 }
@@ -94,6 +96,8 @@ impl MockState {
             slow_probe_sleep: Duration::ZERO,
             slow_probe_release: None,
             recorded_tree_kills: Mutex::new(Vec::new()),
+            priorities: Mutex::new(HashMap::new()),
+            browse_result: Mutex::new(None),
             terminate_error_elevation: AtomicBool::new(false),
             is_elevated: AtomicBool::new(false),
         })
@@ -157,6 +161,13 @@ impl FastSystemSampler for MockFastSampler {
             let (window_title_offset, window_title_len) = scratch.push_str(&spec.window_title);
             let cpu = spec.cpu_time_100ns + tick * spec.cpu_delta_per_tick;
             let disk = spec.disk_bytes + tick * spec.disk_delta_per_tick;
+            let priority = self
+                .state
+                .priorities
+                .lock()
+                .get(&spec.key)
+                .copied()
+                .unwrap_or(ProcessPriority::Normal);
             scratch.samples.push(ProcessHotSample {
                 key: spec.key,
                 parent_pid: spec.parent_pid,
@@ -170,7 +181,7 @@ impl FastSystemSampler for MockFastSampler {
                 commit_bytes: spec.private_mem_bytes,
                 disk_read_bytes: disk,
                 category: spec.category,
-                priority: ProcessPriority::Normal,
+                priority,
                 status: ProcessStatusFlags::empty(),
                 name_offset,
                 name_len,
@@ -235,6 +246,8 @@ impl SlowMetadataProber for MockSlowProber {
             user_name: Some(Arc::from("TEST\\User")),
             arch: ProcessArch::X64,
             uac_virtualization: UacVirtualization::NotAllowed,
+            efficiency_mode: false,
+            is_elevated: self.state.is_elevated.load(Ordering::Acquire),
             asset: None,
         })
     }
@@ -338,7 +351,8 @@ impl SystemOperator for MockOperator {
     fn set_efficiency_mode(&self, _key: ProcessKey, _enabled: bool) -> Result<(), PalError> {
         Ok(())
     }
-    fn set_priority(&self, _key: ProcessKey, _priority: ProcessPriority) -> Result<(), PalError> {
+    fn set_priority(&self, key: ProcessKey, priority: ProcessPriority) -> Result<(), PalError> {
+        self.state.priorities.lock().insert(key, priority);
         Ok(())
     }
     fn get_affinity(&self, _key: ProcessKey) -> Result<CpuAffinityMask, PalError> {
@@ -374,7 +388,7 @@ impl SystemOperator for MockOperator {
         Ok(())
     }
     fn browse_executable(&self) -> Result<Option<PathBuf>, PalError> {
-        Ok(None)
+        Ok(self.state.browse_result.lock().clone())
     }
     fn is_elevated(&self) -> bool {
         self.state.is_elevated.load(Ordering::Acquire)
@@ -695,6 +709,8 @@ fn slow_disk_5s_fault_injection_never_blocks_fast_lane_or_shutdown() {
         slow_probe_sleep: Duration::from_secs(5),
         slow_probe_release: Some(release_rx),
         recorded_tree_kills: Mutex::new(Vec::new()),
+        priorities: Mutex::new(HashMap::new()),
+        browse_result: Mutex::new(None),
         terminate_error_elevation: AtomicBool::new(false),
         is_elevated: AtomicBool::new(false),
     });
@@ -954,4 +970,177 @@ fn slow_lane_deduplicates_exe_asset_across_30_chrome_instances() {
             count: 30
         })
     ));
+}
+
+#[test]
+fn efficiency_mode_priority_affinity_browse_and_cold_projection_fields() {
+    let mut app = MockProcSpec::new(2001, 50_000, 0, "editor.exe");
+    app.category = ProcessCategory::App;
+    app.exe_path = Some(r"C:\Apps\Editor\editor.exe".to_owned());
+    app.disk_delta_per_tick = 750_000;
+
+    let mut helper = MockProcSpec::new(2002, 50_010, 0, "helper.exe");
+    helper.category = ProcessCategory::Background;
+    helper.disk_delta_per_tick = 250_000;
+
+    let app_key = app.key;
+    let state = MockState::new(vec![app, helper]);
+    state.is_elevated.store(true, Ordering::Release);
+    *state.browse_result.lock() = Some(PathBuf::from(r"C:\Windows\System32\notepad.exe"));
+
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let coord = EngineCoordinator::new(backend, settings).unwrap();
+    let _details_lease = coord.acquire_lease(MonitorDomain::Details);
+
+    // Wait for slow-lane ColdMeta & ExeStaticAsset to populate both Processes and Details projections.
+    assert!(wait_until(Duration::from_secs(2), || {
+        let snap = coord.snapshot();
+        let proc_ready = snap.processes.rows.iter().any(|r| {
+            r.key == app_key
+                && r.exe_path.as_deref() == Some(r"C:\Apps\Editor\editor.exe")
+                && r.status.contains(ProcessStatusFlags::ELEVATED)
+        });
+        let details_ready = snap.details.rows.iter().any(|r| {
+            r.key == app_key
+                && r.publisher.as_deref() == Some("Mock Publisher")
+                && r.status.contains(ProcessStatusFlags::ELEVATED)
+        });
+        proc_ready && details_ready
+    }));
+
+    // 1. Trigger a ForceRefresh tick so disk throughput deltas & disk_permille are computed (75% vs 25%).
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let snap_disk = coord.snapshot();
+    let app_row = snap_disk
+        .processes
+        .rows
+        .iter()
+        .find(|r| r.key == app_key)
+        .expect("app row present");
+    assert_eq!(app_row.disk_permille, 750);
+    assert_eq!(app_row.net_permille, 0);
+
+    // 2. SetEfficiencyMode(true) IMMEDIATELY sets EFFICIENCY_MODE in both Processes and Details
+    //    without waiting for a slow-lane re-probe, and SetEfficiencyMode(false) clears it.
+    let eco_on = coord
+        .send_command_with_reply(EngineCommand::SetEfficiencyMode {
+            key: app_key,
+            enabled: true,
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(eco_on.kind, CommandKind::SetEfficiencyMode);
+    assert!(eco_on.is_ok());
+
+    let snap_on = coord.snapshot();
+    assert!(
+        snap_on
+            .processes
+            .rows
+            .iter()
+            .find(|r| r.key == app_key)
+            .unwrap()
+            .status
+            .contains(ProcessStatusFlags::EFFICIENCY_MODE)
+    );
+    assert!(
+        snap_on
+            .details
+            .rows
+            .iter()
+            .find(|r| r.key == app_key)
+            .unwrap()
+            .status
+            .contains(ProcessStatusFlags::EFFICIENCY_MODE)
+    );
+
+    let eco_off = coord
+        .send_command_with_reply(EngineCommand::SetEfficiencyMode {
+            key: app_key,
+            enabled: false,
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(eco_off.is_ok());
+    let snap_off = coord.snapshot();
+    assert!(
+        !snap_off
+            .processes
+            .rows
+            .iter()
+            .find(|r| r.key == app_key)
+            .unwrap()
+            .status
+            .contains(ProcessStatusFlags::EFFICIENCY_MODE)
+    );
+    assert!(
+        !snap_off
+            .details
+            .rows
+            .iter()
+            .find(|r| r.key == app_key)
+            .unwrap()
+            .status
+            .contains(ProcessStatusFlags::EFFICIENCY_MODE)
+    );
+
+    // 3. SetPriority immediately triggers a fast refresh so Details reflects the updated priority.
+    let prio_ev = coord
+        .send_command_with_reply(EngineCommand::SetPriority {
+            key: app_key,
+            priority: ProcessPriority::High,
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(prio_ev.kind, CommandKind::SetPriority);
+    assert!(prio_ev.is_ok());
+    assert_eq!(
+        coord
+            .snapshot()
+            .details
+            .rows
+            .iter()
+            .find(|r| r.key == app_key)
+            .unwrap()
+            .priority,
+        ProcessPriority::High
+    );
+
+    // 4. GetAffinity returns CommandSuccess::Affinity matching host logical_cpus.
+    let aff_ev = coord
+        .send_command_with_reply(EngineCommand::GetAffinity(app_key))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(aff_ev.kind, CommandKind::GetAffinity);
+    assert_eq!(aff_ev.target, Some(app_key));
+    assert_eq!(
+        aff_ev.outcome.as_ok(),
+        Some(&CommandSuccess::Affinity(CpuAffinityMask::all(4)))
+    );
+
+    // 5. BrowseExecutable runs on the slow lane and returns CommandSuccess::FilePicked.
+    let browse_ev = coord
+        .send_command_with_reply(EngineCommand::BrowseExecutable)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(browse_ev.kind, CommandKind::BrowseExecutable);
+    assert_eq!(
+        browse_ev.outcome.as_ok(),
+        Some(&CommandSuccess::FilePicked(Some(PathBuf::from(
+            r"C:\Windows\System32\notepad.exe"
+        ))))
+    );
 }

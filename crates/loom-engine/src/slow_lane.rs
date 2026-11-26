@@ -166,6 +166,7 @@ pub fn normalize_exe_path_key(path: &str) -> Arc<str> {
 pub struct ColdMetaCache {
     proc_meta: HashMap<ProcessKey, Arc<ProcessColdMeta>>,
     exe_assets: HashMap<Arc<str>, Arc<ExeStaticAsset>>,
+    eco_overrides: HashMap<ProcessKey, bool>,
 }
 
 impl ColdMetaCache {
@@ -181,6 +182,41 @@ impl ColdMetaCache {
             return None;
         }
         self.proc_meta.get(&key)
+    }
+
+    /// Returns whether Efficiency Mode (`EcoQoS`) is known to be enabled for `key`.
+    #[inline]
+    pub fn efficiency_mode(&self, key: ProcessKey) -> bool {
+        if let Some(meta) = self.proc_meta.get(&key) {
+            return meta.efficiency_mode;
+        }
+        self.eco_overrides.get(&key).copied().unwrap_or(false)
+    }
+
+    /// Returns whether `key` is known to be running with an elevated token.
+    #[inline]
+    pub fn is_elevated(&self, key: ProcessKey) -> bool {
+        self.proc_meta
+            .get(&key)
+            .is_some_and(|meta| meta.is_elevated)
+    }
+
+    /// Immediately updates the cached Efficiency Mode (`EcoQoS`) flag for `key`.
+    ///
+    /// If `key` is already in the Level-1 cache, its `ProcessColdMeta` is updated
+    /// immediately; otherwise, the state is staged in `eco_overrides` until the slow-lane
+    /// probe populates the entry (preventing stale in-flight probes from clobbering the toggle).
+    pub fn set_efficiency_mode(&mut self, key: ProcessKey, enabled: bool) {
+        if let Some(meta_arc) = self.proc_meta.get_mut(&key) {
+            if meta_arc.efficiency_mode != enabled {
+                let mut cloned = (**meta_arc).clone();
+                cloned.efficiency_mode = enabled;
+                *meta_arc = Arc::new(cloned);
+            }
+            self.eco_overrides.remove(&key);
+        } else {
+            self.eco_overrides.insert(key, enabled);
+        }
     }
 
     /// Looks up a cached path-deduplicated executable asset by normalized key.
@@ -228,6 +264,9 @@ impl ColdMetaCache {
         }
 
         let proc_key = meta.key;
+        if let Some(overridden_eco) = self.eco_overrides.remove(&proc_key) {
+            meta.efficiency_mode = overridden_eco;
+        }
         self.proc_meta.insert(proc_key, Arc::new(meta));
         needs_asset_probe
     }
@@ -263,6 +302,7 @@ impl ColdMetaCache {
     /// Evicts exited processes from Level 1 while preserving Level-2 executable assets.
     pub fn retain_live_processes(&mut self, live: &HashSet<ProcessKey>) {
         self.proc_meta.retain(|k, _| live.contains(k));
+        self.eco_overrides.retain(|k, _| live.contains(k));
     }
 
     fn insert_asset_arc(
@@ -284,6 +324,7 @@ impl ColdMetaCache {
 #[derive(Debug)]
 pub(crate) enum SlowShellOp {
     RunNewTask(RunTaskRequest),
+    BrowseExecutable,
     OpenFileLocation(PathBuf),
     ShowFileProperties(PathBuf),
     SearchOnline(String),
@@ -521,6 +562,18 @@ fn execute_priority_job<B: PlatformBackend>(
                         CommandEvent::new(CommandKind::RunNewTask, None, CommandOutcome::err(err))
                     }
                 },
+                SlowShellOp::BrowseExecutable => match operator.browse_executable() {
+                    Ok(path) => CommandEvent::new(
+                        CommandKind::BrowseExecutable,
+                        None,
+                        CommandOutcome::Ok(CommandSuccess::FilePicked(path)),
+                    ),
+                    Err(err) => CommandEvent::new(
+                        CommandKind::BrowseExecutable,
+                        None,
+                        CommandOutcome::err(err),
+                    ),
+                },
                 SlowShellOp::OpenFileLocation(path) => match operator.open_file_location(&path) {
                     Ok(()) => CommandEvent::new(
                         CommandKind::OpenFileLocation,
@@ -678,6 +731,8 @@ mod tests {
             user_name: Some(Arc::from("User")),
             arch: ProcessArch::X64,
             uac_virtualization: UacVirtualization::NotAllowed,
+            efficiency_mode: false,
+            is_elevated: false,
             asset: None,
         };
         let needs = cache.insert_process(meta1);
@@ -700,6 +755,8 @@ mod tests {
             user_name: Some(Arc::from("User")),
             arch: ProcessArch::X64,
             uac_virtualization: UacVirtualization::NotAllowed,
+            efficiency_mode: true,
+            is_elevated: true,
             asset: None,
         };
         assert!(
@@ -710,11 +767,21 @@ mod tests {
         let a1 = cache.get_process(p1).unwrap().asset.as_ref().unwrap();
         let a2 = cache.get_process(p2).unwrap().asset.as_ref().unwrap();
         assert!(Arc::ptr_eq(a1, a2));
+        assert!(cache.efficiency_mode(p2));
+        assert!(cache.is_elevated(p2));
+
+        // Immediate EcoQoS toggle updates cached state both for cached and pre-probe processes.
+        cache.set_efficiency_mode(p2, false);
+        assert!(!cache.efficiency_mode(p2));
+        let p3 = ProcessKey::new(30, 300);
+        cache.set_efficiency_mode(p3, true);
+        assert!(cache.efficiency_mode(p3));
 
         // Evicting p1 removes Level-1 entry but preserves Level-2 asset
         let live: HashSet<ProcessKey> = [p2].into_iter().collect();
         cache.retain_live_processes(&live);
         assert_eq!(cache.proc_cache_len(), 1);
         assert_eq!(cache.asset_cache_len(), 1);
+        assert!(!cache.efficiency_mode(p3));
     }
 }

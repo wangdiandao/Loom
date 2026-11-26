@@ -16,18 +16,23 @@ use loom_types::{
     CpuAffinityMask, ProcessKey, ProcessPriority, RunTaskRequest, TreeKillItem, TreeKillReport,
     WaitChainNode,
 };
-use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
+use windows_sys::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, GetLastError, HANDLE,
+};
 use windows_sys::Win32::Security::{
     GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
 };
+use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
 use windows_sys::Win32::System::Threading::{
-    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess,
-    GetProcessAffinityMask, GetProcessId, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS,
-    NORMAL_PRIORITY_CLASS, OpenProcessToken, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_TERMINATE,
-    ProcessPowerThrottling, QueryFullProcessImageNameW, REALTIME_PRIORITY_CLASS, SetPriorityClass,
-    SetProcessAffinityMask, SetProcessInformation, TerminateProcess,
+    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, GetActiveProcessorCount,
+    GetActiveProcessorGroupCount, GetCurrentProcess, GetProcessAffinityMask,
+    GetProcessDefaultCpuSetMasks, GetProcessGroupAffinity, GetProcessId, HIGH_PRIORITY_CLASS,
+    IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenProcessToken,
+    PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+    PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
+    PROCESS_TERMINATE, ProcessPowerThrottling, QueryFullProcessImageNameW, REALTIME_PRIORITY_CLASS,
+    SetPriorityClass, SetProcessAffinityMask, SetProcessDefaultCpuSetMasks, SetProcessInformation,
+    TerminateProcess,
 };
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
@@ -157,6 +162,14 @@ impl SystemOperator for WindowsSystemOperator {
     }
 
     fn set_efficiency_mode(&self, key: ProcessKey, enabled: bool) -> Result<(), PalError> {
+        // System Idle (PID 0) and System (PID 4) are kernel pseudo-processes that must never
+        // be throttled even when Loom runs elevated.
+        if key.pid == 0 || key.pid == 4 {
+            return Err(PalError::Unsupported(
+                "efficiency mode is not supported for Windows kernel system processes",
+            ));
+        }
+
         let handle = open_verified_process(key, PROCESS_SET_INFORMATION)?;
 
         let throttling = PROCESS_POWER_THROTTLING_STATE {
@@ -181,6 +194,11 @@ impl SystemOperator for WindowsSystemOperator {
         if ok == 0 {
             // SAFETY: Reads last Win32 error set by `SetProcessInformation`.
             let err = unsafe { GetLastError() };
+            if err == ERROR_NOT_SUPPORTED || err == ERROR_INVALID_FUNCTION {
+                return Err(PalError::Unsupported(
+                    "ProcessPowerThrottling is not supported for this process",
+                ));
+            }
             return Err(map_win32_error(
                 err,
                 Some(key),
@@ -230,25 +248,57 @@ impl SystemOperator for WindowsSystemOperator {
         let handle = open_verified_process(key, PROCESS_QUERY_LIMITED_INFORMATION)?;
         let logical_cpus = self.logical_cpu_count();
 
-        let mut proc_mask: usize = 0;
-        let mut sys_mask: usize = 0;
-        // SAFETY: `handle` has `PROCESS_QUERY_LIMITED_INFORMATION` and out pointers are stack locals.
-        let ok = unsafe { GetProcessAffinityMask(handle.as_raw(), &mut proc_mask, &mut sys_mask) };
-        if ok == 0 {
-            // SAFETY: Reads last Win32 error set by `GetProcessAffinityMask`.
-            let err = unsafe { GetLastError() };
-            return Err(map_win32_error(err, Some(key), "GetProcessAffinityMask"));
+        if logical_cpus <= 64 {
+            let mut proc_mask: usize = 0;
+            let mut sys_mask: usize = 0;
+            // SAFETY: `handle` has `PROCESS_QUERY_LIMITED_INFORMATION` and out pointers are stack locals.
+            let ok =
+                unsafe { GetProcessAffinityMask(handle.as_raw(), &mut proc_mask, &mut sys_mask) };
+            if ok == 0 {
+                // SAFETY: Reads last Win32 error set by `GetProcessAffinityMask`.
+                let err = unsafe { GetLastError() };
+                return Err(map_win32_error(err, Some(key), "GetProcessAffinityMask"));
+            }
+
+            let mut mask = CpuAffinityMask::empty(logical_cpus);
+            if let Some(first) = mask.groups.first_mut() {
+                *first = proc_mask as u64;
+            }
+            return Ok(mask);
         }
 
-        let mut mask = CpuAffinityMask::empty(logical_cpus);
-        if proc_mask == 0 && logical_cpus > 64 {
-            // Multi-group process on >64 CPU hardware: default to reporting all active CPUs.
-            return Ok(CpuAffinityMask::all(logical_cpus));
-        }
-        if let Some(first) = mask.groups.first_mut() {
-            *first = proc_mask as u64;
-        }
-        Ok(mask)
+        // Multi-group (>64 logical CPUs) path via `GetProcessGroupAffinity`.
+        let group_counts = query_processor_group_counts();
+        let active_groups = query_process_group_affinity(handle.as_raw(), key)?;
+
+        let single_group_proc_mask = if active_groups.len() == 1 {
+            let mut proc_mask: usize = 0;
+            let mut sys_mask: usize = 0;
+            // SAFETY: `handle` has `PROCESS_QUERY_LIMITED_INFORMATION` and out pointers are stack locals.
+            let ok =
+                unsafe { GetProcessAffinityMask(handle.as_raw(), &mut proc_mask, &mut sys_mask) };
+            if ok != 0 && proc_mask != 0 {
+                Some(proc_mask as u64)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let cpu_set_masks = if active_groups.len() > 1 {
+            query_process_default_cpu_set_masks(handle.as_raw())
+        } else {
+            Vec::new()
+        };
+
+        Ok(build_affinity_mask_from_groups(
+            logical_cpus,
+            &group_counts,
+            &active_groups,
+            single_group_proc_mask,
+            &cpu_set_masks,
+        ))
     }
 
     fn set_affinity(&self, key: ProcessKey, mask: &CpuAffinityMask) -> Result<(), PalError> {
@@ -258,20 +308,68 @@ impl SystemOperator for WindowsSystemOperator {
             ));
         }
 
-        let group0 = mask.groups.first().copied().unwrap_or(0) as usize;
-        if group0 == 0 {
+        let logical_cpus = self.logical_cpu_count();
+        if logical_cpus <= 64 {
+            let group0 = mask.groups.first().copied().unwrap_or(0) as usize;
+            if group0 == 0 {
+                return Err(PalError::InvalidArgument(
+                    "primary processor group affinity mask cannot be empty".into(),
+                ));
+            }
+
+            let handle = open_verified_process(key, PROCESS_SET_INFORMATION)?;
+            // SAFETY: `handle` is validated and opened with `PROCESS_SET_INFORMATION`.
+            let ok = unsafe { SetProcessAffinityMask(handle.as_raw(), group0) };
+            if ok == 0 {
+                // SAFETY: Reads last Win32 error set by `SetProcessAffinityMask`.
+                let err = unsafe { GetLastError() };
+                return Err(map_win32_error(err, Some(key), "SetProcessAffinityMask"));
+            }
+
+            return Ok(());
+        }
+
+        // Multi-group (>64 logical CPUs) path.
+        let group_counts = query_processor_group_counts();
+        let group_affinities = affinity_mask_to_group_affinities(mask, &group_counts);
+        if group_affinities.is_empty() {
             return Err(PalError::InvalidArgument(
-                "primary processor group affinity mask cannot be empty".into(),
+                "CPU affinity mask enables no active processors".into(),
             ));
         }
 
         let handle = open_verified_process(key, PROCESS_SET_INFORMATION)?;
-        // SAFETY: `handle` is validated and opened with `PROCESS_SET_INFORMATION`.
-        let ok = unsafe { SetProcessAffinityMask(handle.as_raw(), group0) };
+
+        // When targeting a single processor group that the process already belongs to exclusively,
+        // `SetProcessAffinityMask` enforces hard per-CPU affinity directly.
+        if group_affinities.len() == 1
+            && let Ok(current_groups) = query_process_group_affinity(handle.as_raw(), key)
+            && current_groups.as_slice() == [group_affinities[0].Group]
+        {
+            // SAFETY: `handle` is validated and opened with `PROCESS_SET_INFORMATION`.
+            let ok = unsafe { SetProcessAffinityMask(handle.as_raw(), group_affinities[0].Mask) };
+            if ok != 0 {
+                return Ok(());
+            }
+        }
+
+        // Cross-group / multi-group affinity via `SetProcessDefaultCpuSetMasks`.
+        // SAFETY: `group_affinities` is a valid contiguous slice of `GROUP_AFFINITY`.
+        let ok = unsafe {
+            SetProcessDefaultCpuSetMasks(
+                handle.as_raw(),
+                group_affinities.as_ptr(),
+                group_affinities.len() as u16,
+            )
+        };
         if ok == 0 {
-            // SAFETY: Reads last Win32 error set by `SetProcessAffinityMask`.
+            // SAFETY: Reads last Win32 error set by `SetProcessDefaultCpuSetMasks`.
             let err = unsafe { GetLastError() };
-            return Err(map_win32_error(err, Some(key), "SetProcessAffinityMask"));
+            return Err(map_win32_error(
+                err,
+                Some(key),
+                "SetProcessDefaultCpuSetMasks",
+            ));
         }
 
         Ok(())
@@ -422,16 +520,16 @@ impl SystemOperator for WindowsSystemOperator {
     }
 
     fn browse_executable(&self) -> Result<Option<PathBuf>, PalError> {
-        let filter: Vec<u16> =
-            "Programs (*.exe;*.bat;*.cmd;*.msc)\0*.exe;*.bat;*.cmd;*.msc\0All Files (*.*)\0*.*\0\0"
-                .encode_utf16()
-                .collect();
+        ensure_com_initialized();
+
+        let filter: Vec<u16> = BROWSE_EXECUTABLE_FILTER.encode_utf16().collect();
         let mut file_buf = vec![0u16; 32_768];
 
         // SAFETY: `OPENFILENAMEW` is POD.
         let mut ofn: OPENFILENAMEW = unsafe { zeroed() };
         ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
         ofn.lpstrFilter = filter.as_ptr();
+        ofn.nFilterIndex = 1;
         ofn.lpstrFile = file_buf.as_mut_ptr();
         ofn.nMaxFile = file_buf.len() as u32;
         ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
@@ -484,6 +582,182 @@ impl SystemOperator for WindowsSystemOperator {
     fn logical_cpu_count(&self) -> u32 {
         query_logical_cpu_count()
     }
+}
+
+/// Double-null-terminated Win32 `OPENFILENAMEW` filter for executable file selection.
+const BROWSE_EXECUTABLE_FILTER: &str = "Executables (*.exe;*.bat;*.cmd;*.msc;*.com)\0*.exe;*.bat;*.cmd;*.msc;*.com\0All Files (*.*)\0*.*\0\0";
+
+/// Queries the active logical processor count for each Windows processor group `0..group_count`.
+fn query_processor_group_counts() -> Vec<u32> {
+    // SAFETY: `GetActiveProcessorGroupCount` takes no pointers and is always safe to call.
+    let group_count = unsafe { GetActiveProcessorGroupCount() };
+    let mut counts = Vec::with_capacity(usize::from(group_count));
+    for g in 0..group_count {
+        // SAFETY: `g` is within `0..group_count`.
+        let count = unsafe { GetActiveProcessorCount(g) };
+        counts.push(count);
+    }
+    counts
+}
+
+/// Queries the Windows processor groups currently associated with `handle` via
+/// `GetProcessGroupAffinity`.
+fn query_process_group_affinity(handle: HANDLE, key: ProcessKey) -> Result<Vec<u16>, PalError> {
+    let mut groups = vec![0u16; 16];
+    for _ in 0..3 {
+        let mut count = groups.len() as u16;
+        // SAFETY: `handle` has `PROCESS_QUERY_LIMITED_INFORMATION` and `groups` has length `count`.
+        let ok = unsafe { GetProcessGroupAffinity(handle, &mut count, groups.as_mut_ptr()) };
+        if ok != 0 {
+            groups.truncate(usize::from(count));
+            return Ok(groups);
+        }
+        // SAFETY: Reads last Win32 error set by `GetProcessGroupAffinity`.
+        let err = unsafe { GetLastError() };
+        if err == ERROR_INSUFFICIENT_BUFFER && count > 0 {
+            groups.resize(usize::from(count), 0);
+            continue;
+        }
+        return Err(map_win32_error(err, Some(key), "GetProcessGroupAffinity"));
+    }
+    Err(PalError::OsError {
+        code: ERROR_INSUFFICIENT_BUFFER as i32,
+        message: "GetProcessGroupAffinity exceeded retry budget".into(),
+    })
+}
+
+/// Queries custom per-group CPU set masks assigned to `handle` via
+/// `GetProcessDefaultCpuSetMasks`, returning an empty `Vec` if no explicit set is configured.
+fn query_process_default_cpu_set_masks(handle: HANDLE) -> Vec<GROUP_AFFINITY> {
+    let mut required: u16 = 0;
+    // SAFETY: Size discovery call with null buffer.
+    unsafe {
+        GetProcessDefaultCpuSetMasks(handle, ptr::null_mut(), 0, &mut required);
+    }
+    if required == 0 {
+        return Vec::new();
+    }
+    let mut masks = vec![
+        GROUP_AFFINITY {
+            Mask: 0,
+            Group: 0,
+            Reserved: [0; 3],
+        };
+        usize::from(required)
+    ];
+    let mut actual: u16 = 0;
+    // SAFETY: `masks` is sized to `required` entries.
+    let ok =
+        unsafe { GetProcessDefaultCpuSetMasks(handle, masks.as_mut_ptr(), required, &mut actual) };
+    if ok == 0 {
+        return Vec::new();
+    }
+    masks.truncate(usize::from(actual).min(masks.len()));
+    masks
+}
+
+/// Maps Windows processor-group affinity results into a flat [`CpuAffinityMask`].
+fn build_affinity_mask_from_groups(
+    logical_cpus: u32,
+    group_counts: &[u32],
+    active_groups: &[u16],
+    single_group_proc_mask: Option<u64>,
+    cpu_set_masks: &[GROUP_AFFINITY],
+) -> CpuAffinityMask {
+    let mut mask = CpuAffinityMask::empty(logical_cpus);
+
+    // Precompute flat starting CPU index for each Windows processor group.
+    let mut group_bases = Vec::with_capacity(group_counts.len());
+    let mut base: u32 = 0;
+    for &count in group_counts {
+        group_bases.push(base);
+        base = base.saturating_add(count);
+    }
+
+    // Prefer explicit CPU set masks when present on multi-group processes.
+    if !cpu_set_masks.is_empty() {
+        for ga in cpu_set_masks {
+            let g_idx = usize::from(ga.Group);
+            let Some(&g_base) = group_bases.get(g_idx) else {
+                continue;
+            };
+            let g_count = group_counts[g_idx].min(usize::BITS);
+            for bit in 0..g_count {
+                if (ga.Mask & (1usize << bit)) != 0 {
+                    mask.set(g_base + bit, true);
+                }
+            }
+        }
+        if !mask.is_empty() {
+            return mask;
+        }
+    }
+
+    if active_groups.len() == 1
+        && let Some(proc_mask) = single_group_proc_mask
+    {
+        let g_idx = usize::from(active_groups[0]);
+        if let Some(&g_base) = group_bases.get(g_idx) {
+            let g_count = group_counts[g_idx].min(64);
+            for bit in 0..g_count {
+                if (proc_mask & (1u64 << bit)) != 0 {
+                    mask.set(g_base + bit, true);
+                }
+            }
+            if !mask.is_empty() {
+                return mask;
+            }
+        }
+    }
+
+    for &group in active_groups {
+        let g_idx = usize::from(group);
+        let Some(&g_base) = group_bases.get(g_idx) else {
+            continue;
+        };
+        let g_count = group_counts[g_idx];
+        for bit in 0..g_count {
+            mask.set(g_base + bit, true);
+        }
+    }
+
+    if mask.is_empty() {
+        CpuAffinityMask::all(logical_cpus)
+    } else {
+        mask
+    }
+}
+
+/// Converts a flat [`CpuAffinityMask`] into non-empty Windows [`GROUP_AFFINITY`] entries
+/// according to `group_counts`.
+fn affinity_mask_to_group_affinities(
+    mask: &CpuAffinityMask,
+    group_counts: &[u32],
+) -> Vec<GROUP_AFFINITY> {
+    let mut out = Vec::with_capacity(group_counts.len());
+    let mut base: u32 = 0;
+
+    for (g_idx, &count) in group_counts.iter().enumerate() {
+        let clamped_count = count.min(usize::BITS);
+        let mut group_mask: usize = 0;
+        for bit in 0..clamped_count {
+            if mask.is_enabled(base + bit) {
+                group_mask |= 1usize << bit;
+            }
+        }
+        if group_mask != 0
+            && let Ok(group) = u16::try_from(g_idx)
+        {
+            out.push(GROUP_AFFINITY {
+                Mask: group_mask,
+                Group: group,
+                Reserved: [0; 3],
+            });
+        }
+        base = base.saturating_add(count);
+    }
+
+    out
 }
 
 /// Splits a "Run new task" command line into `(executable_or_target, arguments)`.
@@ -571,5 +845,47 @@ mod tests {
             "svchost.exe+high+cpu"
         );
         assert_eq!(percent_encode_query("a&b=c"), "a%26b%3Dc");
+    }
+
+    #[test]
+    fn multi_group_affinity_helpers_map_96_and_128_cpu_topologies() {
+        // 96 logical CPUs split as two 48-CPU processor groups ([48, 48]).
+        let groups_96 = [48u32, 48u32];
+        let mut mask = CpuAffinityMask::empty(96);
+        mask.set(0, true);
+        mask.set(47, true);
+        mask.set(48, true); // Group 1, bit 0
+        mask.set(95, true); // Group 1, bit 47
+
+        let ga = affinity_mask_to_group_affinities(&mask, &groups_96);
+        assert_eq!(ga.len(), 2);
+        assert_eq!(ga[0].Group, 0);
+        assert_eq!(ga[0].Mask, (1usize << 0) | (1usize << 47));
+        assert_eq!(ga[1].Group, 1);
+        assert_eq!(ga[1].Mask, (1usize << 0) | (1usize << 47));
+
+        let roundtrip = build_affinity_mask_from_groups(96, &groups_96, &[0, 1], None, &ga);
+        assert_eq!(roundtrip, mask);
+
+        // Single-group process pinned to group 1 on a 128-CPU ([64, 64]) system.
+        let groups_128 = [64u32, 64u32];
+        let single_g1 = build_affinity_mask_from_groups(128, &groups_128, &[1], Some(0b1011), &[]);
+        assert_eq!(single_g1.enabled_count(), 3);
+        assert!(!single_g1.is_enabled(0));
+        assert!(single_g1.is_enabled(64));
+        assert!(single_g1.is_enabled(65));
+        assert!(!single_g1.is_enabled(66));
+        assert!(single_g1.is_enabled(67));
+
+        // Multi-group default process with no custom CPU set masks enables all CPUs in its groups.
+        let all_groups = build_affinity_mask_from_groups(128, &groups_128, &[0, 1], None, &[]);
+        assert_eq!(all_groups, CpuAffinityMask::all(128));
+    }
+
+    #[test]
+    fn browse_executable_filter_includes_expected_extensions_and_double_null() {
+        assert!(BROWSE_EXECUTABLE_FILTER.ends_with("\0\0"));
+        assert!(BROWSE_EXECUTABLE_FILTER.contains("*.exe;*.bat;*.cmd;*.msc;*.com"));
+        assert!(BROWSE_EXECUTABLE_FILTER.contains("All Files (*.*)\0*.*\0\0"));
     }
 }

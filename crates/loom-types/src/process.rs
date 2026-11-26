@@ -332,6 +332,10 @@ pub struct ProcessColdMeta {
     pub arch: ProcessArch,
     /// UAC virtualization state.
     pub uac_virtualization: UacVirtualization,
+    /// Whether the process is running in Efficiency Mode (`EcoQoS`).
+    pub efficiency_mode: bool,
+    /// Whether the process token is elevated (Administrator / root).
+    pub is_elevated: bool,
     /// Shared path-level static executable asset.
     pub asset: Option<Arc<ExeStaticAsset>>,
 }
