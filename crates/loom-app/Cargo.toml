@@ -7,10 +7,24 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+crossbeam-channel.workspace = true
+gpui-kit.workspace = true
 loom-config.workspace = true
 loom-engine.workspace = true
 loom-pal.workspace = true
 loom-types.workspace = true
 loom-ui-kit.workspace = true
+parking_lot.workspace = true
+rust-i18n.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tray-icon.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
