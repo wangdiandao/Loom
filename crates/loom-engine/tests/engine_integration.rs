@@ -830,11 +830,20 @@ fn monitor_lease_raii_gates_details_and_performance_domains() {
     assert_eq!(after_drop_snap.revisions.details, frozen_rev);
     assert!(Arc::ptr_eq(&frozen_snap.details, &after_drop_snap.details));
 
-    // Acquiring Performance + PerCoreCpu lease triggers sample_performance and populates per-core history.
+    // Acquiring Performance first (and waiting for its wakeup sample to land) and then
+    // acquiring PerCoreCpu on the same paused tick must still sample and publish per-core data.
     let _perf_lease = coord.acquire_lease(MonitorDomain::Performance);
-    let _core_lease = coord.acquire_lease(MonitorDomain::PerCoreCpu);
     assert!(wait_until(Duration::from_millis(300), || {
         state.sample_perf_calls.load(Ordering::Acquire) >= 1
+    }));
+    assert!(
+        coord.snapshot().performance.per_core_permille.is_empty(),
+        "per-core data must stay empty while only Performance lease is held"
+    );
+
+    let _core_lease = coord.acquire_lease(MonitorDomain::PerCoreCpu);
+    assert!(wait_until(Duration::from_millis(300), || {
+        state.sample_perf_calls.load(Ordering::Acquire) >= 2
             && coord.snapshot().performance.per_core_permille.len() == 4
     }));
 }
