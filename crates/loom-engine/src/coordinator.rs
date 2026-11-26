@@ -182,7 +182,7 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
                     ),
                     config,
                     view_config,
-                    projection: ProjectionEngine::new(),
+                    projection: ProjectionEngine::with_platform(B::PLATFORM),
                     cold_cache: ColdMetaCache::new(),
                     pending_procs: HashSet::with_capacity(256),
                     pending_paths: HashSet::with_capacity(64),

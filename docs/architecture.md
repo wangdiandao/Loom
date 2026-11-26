@@ -221,7 +221,7 @@ Feature-specific dialogs (such as `Set affinity` and `Analyze wait chain` inside
 
 `AppSnapshot` partitions state into independent `Arc` slices pre-sorted, pre-filtered, and tree-flattened off the UI thread inside `loom-engine`:
 
-- `processes: Arc<ProcessTableSlice>` (flattened `Vec<ProcessRowProjection>`; selection and right-click actions anchor to `ProcessKey` rather than row index so dynamic resorts do not target the wrong process)
+- `processes: Arc<ProcessTableSlice>` (flattened `Vec<ProcessRowProjection>`; selection and right-click actions anchor to `ProcessKey` rather than row index so dynamic resorts do not target the wrong process; `ProjectionEngine` is parameterized by `PlatformBackend::PLATFORM` so Windows Task Manager-aligned shell un-nesting and multi-process app aggregation apply strictly to `PlatformKind::Windows` without altering Linux/macOS grouping or true OS `Process Tree` views)
 - `details: Arc<DetailsTableSlice>` (projected only while `Details` holds an active `MonitorLease`)
 - `performance: Arc<PerformanceSlice>` (device summaries, 60-point quantized history rings, and static hardware metadata)
 - `services: Arc<ServicesSlice>` / `startup: Arc<StartupSlice>` / `users: Arc<UsersSlice>` / `app_history: Arc<AppHistorySlice>` (gated by `MonitorLease`; no polling overhead while unmounted)

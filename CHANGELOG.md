@@ -4,6 +4,10 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ## Unreleased
 
+### Engine & PAL
+
+- Aligned the Windows **Processes** `Grouped` view (`PlatformKind::Windows` only) with Windows Task Manager: stopped nesting independent desktop apps or background daemons under `explorer.exe`, grouped windowless multi-process helper/renderer descendants (and same-image orphaned helpers) under their owning top-level `App` row with aggregated CPU/Memory/Disk/Network/GPU metrics and rolled-up EcoQoS/`Not responding` status flags, and auto-expanded owning `App` groups when searching for child processes—while keeping `Process Tree` and non-Windows (`Linux` / `macOS`) grouping unchanged.
+
 ### UI & UX
 
 - Simplified **Processes** status badges to compact icon-only indicators with hover tooltips and streamlined the **Processes** toolbar by removing the summary metric pills, **Efficiency mode** button, and **Refresh** button (retaining Efficiency mode in the context menu).

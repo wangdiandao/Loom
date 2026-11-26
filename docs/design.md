@@ -38,7 +38,7 @@ Priority tiers:
 
 | Audited Feature | Tier | Rationale & Handling |
 | --- | :---: | --- |
-| Three-tier grouping (`Apps` / `Background processes` / `Windows processes`) + child expansion | **P0 (`0.0.3`)** | Classified via non-blocking `InternalGetWindowText` and DWM cloaked checks. |
+| Three-tier grouping (`Apps` / `Background processes` / `Windows processes`) + child expansion | **P0 (`0.0.3`)** | Classified via non-blocking `InternalGetWindowText` and DWM cloaked checks; on Windows, `explorer.exe` does not nest independent apps or background processes, and windowless helper processes of multi-process apps group and aggregate under their owning top-level App row. |
 | One-click toggle to parent-child `Process Tree` view | **P0 (`0.0.3`)** | Enforces `parent.create_time <= child.create_time` to avoid PID-reuse mismatches. |
 | Process status indicators (`Efficiency mode` leaf, `Suspended`, `Not responding`) | **P0 (`0.0.3`)** | Derived from kernel thread states and non-blocking `IsHungAppWindow`. |
 | Resource heatmap columns (`CPU`, `Memory`, `Disk`, `Network`, `GPU`) | **P0 (`0.0.3`)** | Quantized theme background opacity inside `TableDelegate::render_td`. |

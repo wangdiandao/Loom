@@ -829,6 +829,7 @@ fn is_windows_system_process(pid: u32, session_id: u32, image_name: &str) -> boo
 
     // Well-known interactive-session Windows shell and subsystem processes.
     const WINDOWS_IMAGES: &[&str] = &[
+        "explorer.exe",
         "csrss.exe",
         "dwm.exe",
         "sihost.exe",
