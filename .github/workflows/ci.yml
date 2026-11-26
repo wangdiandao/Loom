@@ -42,3 +42,27 @@ jobs:
 
       - name: Run workspace tests (including headless Windows E2E)
         run: cargo test --locked --workspace
+
+  linux-headless:
+    name: Linux headless (check / clippy / test)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Configure Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check headless crates on Linux
+        run: cargo check --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal -p loom-engine
+
+      - name: Run Clippy on headless crates (Linux)
+        run: cargo clippy --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal -p loom-engine --all-targets -- -D warnings
+
+      - name: Run headless tests on Linux
+        run: cargo test --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal -p loom-engine

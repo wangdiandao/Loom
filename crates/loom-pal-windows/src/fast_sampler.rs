@@ -416,7 +416,14 @@ impl FastSystemSampler for WindowsFastSampler {
 
             let mut status = ProcessStatusFlags::empty();
             if pid == 0 {
-                status |= ProcessStatusFlags::SYSTEM_IDLE;
+                status |= ProcessStatusFlags::SYSTEM_IDLE
+                    | ProcessStatusFlags::KERNEL
+                    | ProcessStatusFlags::PROTECTED
+                    | ProcessStatusFlags::CRITICAL;
+            } else if pid == 4 {
+                status |= ProcessStatusFlags::KERNEL
+                    | ProcessStatusFlags::PROTECTED
+                    | ProcessStatusFlags::CRITICAL;
             }
 
             // Push UTF-16 image name directly into `scratch.string_buf` without intermediate allocation.
@@ -480,7 +487,7 @@ impl FastSystemSampler for WindowsFastSampler {
                 } else {
                     let image_name = scratch.str_slice(name_offset, name_len);
                     let cat = if is_windows_system_process(pid, entry.session_id, image_name) {
-                        ProcessCategory::Windows
+                        ProcessCategory::System
                     } else {
                         ProcessCategory::Background
                     };

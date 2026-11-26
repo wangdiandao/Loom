@@ -18,6 +18,7 @@ pub mod fast_sampler;
 pub(crate) mod handle;
 pub mod operator;
 pub mod slow_prober;
+pub mod window;
 
 pub use circuit_breaker::CircuitBreaker;
 pub use fast_sampler::WindowsFastSampler;
@@ -28,7 +29,8 @@ use loom_pal_api::{
     AppHistoryReader, PalError, PlatformBackend, ServiceManager, SessionManager, StartupManager,
 };
 use loom_types::{
-    AppHistoryRecord, CapabilityFlags, ServiceRecord, StartupEntry, UserSessionRecord,
+    AppHistoryRecord, CapabilityFlags, PlatformProfile, ServiceRecord, StartupEntry,
+    UserSessionRecord,
 };
 
 /// Windows native PAL backend combining dual-lane sampling with core process control.
@@ -67,13 +69,29 @@ impl PlatformBackend for WindowsBackend {
     type HistoryReader = WindowsAppHistoryReader;
     type Operator = WindowsSystemOperator;
 
+    const PLATFORM: PlatformProfile = PlatformProfile::WINDOWS;
+
     const CAPABILITIES: CapabilityFlags = CapabilityFlags::ECO_MODE
         .union(CapabilityFlags::CPU_AFFINITY)
         .union(CapabilityFlags::PROCESS_PRIORITY)
-        .union(CapabilityFlags::ELEVATION_RELAUNCH);
+        .union(CapabilityFlags::UAC_VIRTUALIZATION)
+        .union(CapabilityFlags::ELEVATION_RELAUNCH)
+        .union(CapabilityFlags::ALWAYS_ON_TOP);
 
     fn boost_self_priority() {
         fast_sampler::boost_self_priority();
+    }
+
+    fn set_main_window_always_on_top(enabled: bool) {
+        window::set_main_window_always_on_top(enabled);
+    }
+
+    fn is_main_window_minimized() -> bool {
+        window::is_main_window_minimized()
+    }
+
+    fn restore_and_focus_main_window() {
+        window::restore_and_focus_main_window();
     }
 
     fn initialize() -> Result<Self, PalError> {
@@ -609,5 +627,49 @@ mod tests {
             .expect("wait on terminated child");
         guard.0 = None;
         assert!(!status.success(), "terminated child should exit non-zero");
+    }
+
+    #[test]
+    fn windows_backend_advertises_platform_capabilities_and_kernel_process_flags() {
+        use loom_types::{ProcessCategory, ProcessStatusFlags};
+
+        assert_eq!(WindowsBackend::PLATFORM, PlatformProfile::WINDOWS);
+        assert!(WindowsBackend::CAPABILITIES.contains(
+            CapabilityFlags::ECO_MODE
+                | CapabilityFlags::CPU_AFFINITY
+                | CapabilityFlags::PROCESS_PRIORITY
+                | CapabilityFlags::UAC_VIRTUALIZATION
+                | CapabilityFlags::ELEVATION_RELAUNCH
+                | CapabilityFlags::ALWAYS_ON_TOP
+        ));
+
+        // Own-process window host helpers must safely no-op in a headless test binary.
+        assert!(!WindowsBackend::is_main_window_minimized());
+        WindowsBackend::set_main_window_always_on_top(false);
+        WindowsBackend::restore_and_focus_main_window();
+
+        let mut fast = WindowsFastSampler::new();
+        let mut scratch = ProcessSampleScratch::<()>::with_capacity(512, 32 * 1024);
+        fast.sample_processes(&mut scratch)
+            .expect("sample_processes");
+
+        if let Some(idle) = scratch.samples.iter().find(|s| s.key.pid == 0) {
+            assert_eq!(idle.category, ProcessCategory::System);
+            assert!(idle.status.contains(
+                ProcessStatusFlags::SYSTEM_IDLE
+                    | ProcessStatusFlags::KERNEL
+                    | ProcessStatusFlags::PROTECTED
+                    | ProcessStatusFlags::CRITICAL
+            ));
+        }
+        if let Some(sys) = scratch.samples.iter().find(|s| s.key.pid == 4) {
+            assert_eq!(sys.category, ProcessCategory::System);
+            assert!(sys.status.contains(
+                ProcessStatusFlags::KERNEL
+                    | ProcessStatusFlags::PROTECTED
+                    | ProcessStatusFlags::CRITICAL
+            ));
+            assert!(!sys.status.contains(ProcessStatusFlags::SYSTEM_IDLE));
+        }
     }
 }

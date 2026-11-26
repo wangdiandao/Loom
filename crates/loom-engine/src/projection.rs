@@ -649,7 +649,7 @@ impl ProjectionEngine {
         let categories = [
             ProcessCategory::App,
             ProcessCategory::Background,
-            ProcessCategory::Windows,
+            ProcessCategory::System,
         ];
         let mut rows = Vec::with_capacity(n + 3);
         let mut visited = vec![false; n];
@@ -1092,7 +1092,7 @@ fn category_index(category: ProcessCategory) -> usize {
     match category {
         ProcessCategory::App => 0,
         ProcessCategory::Background => 1,
-        ProcessCategory::Windows => 2,
+        ProcessCategory::System => 2,
     }
 }
 
@@ -1101,7 +1101,7 @@ const fn category_label(category: ProcessCategory) -> &'static str {
     match category {
         ProcessCategory::App => "Apps",
         ProcessCategory::Background => "Background",
-        ProcessCategory::Windows => "Windows",
+        ProcessCategory::System => "System",
     }
 }
 
@@ -1361,7 +1361,7 @@ mod tests {
             10,
             0,
             "root.exe",
-            ProcessCategory::Windows,
+            ProcessCategory::System,
             0,
             0,
         );

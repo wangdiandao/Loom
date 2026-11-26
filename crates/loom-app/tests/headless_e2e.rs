@@ -60,6 +60,7 @@ fn headless_windows_e2e_lifecycle() {
     );
 
     let snap0 = coordinator.snapshot();
+    assert_eq!(snap0.platform, NativeBackend::PLATFORM);
     assert_eq!(snap0.capabilities, NativeBackend::CAPABILITIES);
     assert!(
         snap0.processes.total_process_count > 10,

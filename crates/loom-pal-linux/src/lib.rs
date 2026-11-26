@@ -13,9 +13,9 @@ use loom_pal_api::{
     SystemOperator,
 };
 use loom_types::{
-    AppHistoryRecord, CapabilityFlags, CpuAffinityMask, ExeStaticAsset, ProcessColdMeta,
-    ProcessKey, ProcessPriority, RunTaskRequest, ServiceRecord, StartupEntry, Timestamp100Ns,
-    TreeKillReport, UserSessionRecord, WaitChainNode,
+    AppHistoryRecord, CapabilityFlags, CpuAffinityMask, ExeStaticAsset, PlatformProfile,
+    ProcessColdMeta, ProcessKey, ProcessPriority, RunTaskRequest, ServiceRecord, StartupEntry,
+    Timestamp100Ns, TreeKillReport, UserSessionRecord, WaitChainNode,
 };
 
 /// Compile-time placeholder backend for Linux (`0.2.0`).
@@ -41,6 +41,8 @@ impl PlatformBackend for LinuxBackend {
     type SessionMgr = LinuxStub;
     type HistoryReader = LinuxStub;
     type Operator = LinuxStub;
+
+    const PLATFORM: PlatformProfile = PlatformProfile::LINUX;
 
     const CAPABILITIES: CapabilityFlags = CapabilityFlags::empty();
 
@@ -235,5 +237,22 @@ impl SystemOperator for LinuxStub {
         std::thread::available_parallelism()
             .map(|n| n.get() as u32)
             .unwrap_or(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_backend_advertises_platform_profile_and_noop_window_helpers() {
+        assert_eq!(LinuxBackend::PLATFORM, PlatformProfile::LINUX);
+        assert_eq!(LinuxBackend::CAPABILITIES, CapabilityFlags::empty());
+        assert!(!LinuxBackend::is_main_window_minimized());
+        LinuxBackend::set_main_window_always_on_top(true);
+        LinuxBackend::restore_and_focus_main_window();
+
+        let backend = LinuxBackend::initialize().expect("LinuxBackend::initialize");
+        assert!(backend.operator().logical_cpu_count() >= 1);
     }
 }

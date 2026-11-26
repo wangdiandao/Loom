@@ -21,6 +21,32 @@ pub type NativeBackend = loom_pal_macos::MacosBackend;
 #[cfg(target_os = "linux")]
 pub type NativeBackend = loom_pal_linux::LinuxBackend;
 
+/// Cross-platform static facade for host application window operations.
+///
+/// Delegates directly to [`NativeBackend`] without introducing `#[cfg(target_os)]`
+/// branches or dynamic dispatch.
+pub mod window {
+    use crate::{NativeBackend, PlatformBackend};
+
+    /// Toggles native always-on-top z-order for Loom's primary application window.
+    #[inline]
+    pub fn set_main_window_always_on_top(enabled: bool) {
+        NativeBackend::set_main_window_always_on_top(enabled);
+    }
+
+    /// Returns `true` when Loom's primary native window is currently minimized.
+    #[inline]
+    pub fn is_main_window_minimized() -> bool {
+        NativeBackend::is_main_window_minimized()
+    }
+
+    /// Restores Loom's primary native window (if minimized) and brings it to foreground focus.
+    #[inline]
+    pub fn restore_and_focus_main_window() {
+        NativeBackend::restore_and_focus_main_window();
+    }
+}
+
 /// Cross-platform single-instance application lock guard.
 ///
 /// Wraps OS-native named mutex / domain-socket / flock primitives via `single-instance`
@@ -91,5 +117,16 @@ mod tests {
     fn single_instance_guard_rejects_empty_id() {
         let err = SingleInstanceGuard::acquire("   ").expect_err("empty app_id must error");
         assert!(matches!(err, PalError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn native_backend_exposes_platform_profile_and_window_helpers() {
+        assert_ne!(NativeBackend::PLATFORM, Default::default());
+        assert!(!NativeBackend::PLATFORM.os_name.is_empty());
+
+        // Window host helpers must be safe to call in headless test processes without a main window.
+        assert!(!window::is_main_window_minimized());
+        window::set_main_window_always_on_top(false);
+        window::restore_and_focus_main_window();
     }
 }

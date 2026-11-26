@@ -36,6 +36,8 @@ bitflags! {
         const APP_HISTORY = 1 << 9;
         /// Supports relaunching Loom elevated via OS privilege prompt.
         const ELEVATION_RELAUNCH = 1 << 10;
+        /// Supports toggling host window always-on-top z-order.
+        const ALWAYS_ON_TOP = 1 << 11;
     }
 }
 

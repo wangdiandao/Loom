@@ -13,9 +13,9 @@ use loom_pal_api::{
     SystemOperator,
 };
 use loom_types::{
-    AppHistoryRecord, CapabilityFlags, CpuAffinityMask, ExeStaticAsset, ProcessColdMeta,
-    ProcessKey, ProcessPriority, RunTaskRequest, ServiceRecord, StartupEntry, Timestamp100Ns,
-    TreeKillReport, UserSessionRecord, WaitChainNode,
+    AppHistoryRecord, CapabilityFlags, CpuAffinityMask, ExeStaticAsset, PlatformProfile,
+    ProcessColdMeta, ProcessKey, ProcessPriority, RunTaskRequest, ServiceRecord, StartupEntry,
+    Timestamp100Ns, TreeKillReport, UserSessionRecord, WaitChainNode,
 };
 
 /// Compile-time placeholder backend for macOS (`0.3.0`).
@@ -41,6 +41,8 @@ impl PlatformBackend for MacosBackend {
     type SessionMgr = MacosStub;
     type HistoryReader = MacosStub;
     type Operator = MacosStub;
+
+    const PLATFORM: PlatformProfile = PlatformProfile::MACOS;
 
     const CAPABILITIES: CapabilityFlags = CapabilityFlags::empty();
 
@@ -235,5 +237,22 @@ impl SystemOperator for MacosStub {
         std::thread::available_parallelism()
             .map(|n| n.get() as u32)
             .unwrap_or(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_backend_advertises_platform_profile_and_noop_window_helpers() {
+        assert_eq!(MacosBackend::PLATFORM, PlatformProfile::MACOS);
+        assert_eq!(MacosBackend::CAPABILITIES, CapabilityFlags::empty());
+        assert!(!MacosBackend::is_main_window_minimized());
+        MacosBackend::set_main_window_always_on_top(true);
+        MacosBackend::restore_and_focus_main_window();
+
+        let backend = MacosBackend::initialize().expect("MacosBackend::initialize");
+        assert!(backend.operator().logical_cpu_count() >= 1);
     }
 }

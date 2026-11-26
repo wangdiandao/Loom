@@ -294,11 +294,19 @@ pub trait PlatformBackend: Send + 'static {
     type HistoryReader: AppHistoryReader;
     type Operator: SystemOperator;
 
+    /// Static platform identity profile (`Windows` / `Linux` / `macOS`)
+    const PLATFORM: PlatformProfile;
+
     /// Compile-time capability flags enabling dead-code elimination of unsupported branches
     const CAPABILITIES: CapabilityFlags;
 
     /// Startup priority boost on process entry
     fn boost_self_priority();
+
+    /// Host main window z-order & restore hooks (default no-op for headless/unsupported platforms)
+    fn set_main_window_always_on_top(_enabled: bool) {}
+    fn is_main_window_minimized() -> bool { false }
+    fn restore_and_focus_main_window() {}
 
     fn initialize() -> Result<Self, PalError>
     where

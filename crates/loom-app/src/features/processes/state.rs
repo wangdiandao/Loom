@@ -182,7 +182,7 @@ pub(crate) fn can_terminate_process(row: &ProcessRowProjection) -> bool {
 /// explicit confirmation before issuing `TerminateProcess`.
 #[inline]
 pub(crate) fn requires_end_task_confirmation(row: &ProcessRowProjection) -> bool {
-    row.category == ProcessCategory::Windows
+    row.category == ProcessCategory::System
         || row
             .status
             .intersects(ProcessStatusFlags::CRITICAL | ProcessStatusFlags::PROTECTED)
@@ -366,7 +366,7 @@ mod tests {
             0,
             "System Idle Process",
             "System Idle Process",
-            ProcessCategory::Windows,
+            ProcessCategory::System,
             ProcessStatusFlags::SYSTEM_IDLE,
         );
         let kernel = sample_process_row(
@@ -374,7 +374,7 @@ mod tests {
             1,
             "System",
             "System",
-            ProcessCategory::Windows,
+            ProcessCategory::System,
             ProcessStatusFlags::empty(),
         );
         let protected = sample_process_row(
@@ -382,7 +382,7 @@ mod tests {
             500,
             "csrss.exe",
             "Client Server Runtime Process",
-            ProcessCategory::Windows,
+            ProcessCategory::System,
             ProcessStatusFlags::PROTECTED | ProcessStatusFlags::CRITICAL,
         );
         let system_idle_flagged = sample_process_row(
@@ -390,7 +390,7 @@ mod tests {
             500,
             "idle_stub",
             "Idle Stub",
-            ProcessCategory::Windows,
+            ProcessCategory::System,
             ProcessStatusFlags::SYSTEM_IDLE,
         );
         let normal_app = sample_process_row(
