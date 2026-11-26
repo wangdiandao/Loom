@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
@@ -31,7 +32,7 @@ use gpui_kit::{
 };
 use loom_types::{
     CapabilityFlags, DetailsRowProjection, DetailsSortColumn, DetailsViewMode, MonitorDomain,
-    ProcessKey, ProcessPriority, ProcessStatusFlags, SortDirection,
+    PlatformProfile, ProcessKey, ProcessPriority, ProcessStatusFlags, SortDirection,
 };
 use loom_ui_kit::{
     HeatmapLevel, LoomSemanticColors, format_bytes, format_permille, heatmap_cell,
@@ -39,44 +40,139 @@ use loom_ui_kit::{
 };
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
+use crate::features::table_columns::{
+    ColumnKey, ColumnSpec, HeaderColumnDescriptor, TableColumnLayout,
+    attach_header_reorder_handlers, attach_table_column_drag_handlers,
+    render_interactive_header_cell,
+};
 use crate::i18n;
 
 const DETAILS_ROW_HEIGHT: f32 = 30.0;
 const ICON_CACHE_MAX_ENTRIES: usize = 512;
+const TABLE_HORIZONTAL_PADDING: f32 = 16.0;
+const DETAILS_TABLE_ID: &str = "details";
 
-// Column widths (px) kept wide enough so horizontal scrolling prevents cramping.
+// Default column widths (px) kept wide enough so horizontal scrolling prevents cramping.
 const COL_NAME_W: f32 = 240.0;
-const COL_PID_W: f32 = 72.0;
+const COL_PID_W: f32 = 76.0;
 const COL_STATUS_W: f32 = 96.0;
 const COL_USER_W: f32 = 140.0;
-const COL_CPU_W: f32 = 78.0;
+const COL_CPU_W: f32 = 82.0;
 const COL_MEM_W: f32 = 168.0;
 const COL_PRIORITY_W: f32 = 112.0;
-const COL_PLATFORM_W: f32 = 82.0;
+const COL_PLATFORM_W: f32 = 86.0;
 const COL_UAC_W: f32 = 132.0;
 const COL_GPU_MEM_W: f32 = 144.0;
 const COL_PUBLISHER_W: f32 = 164.0;
-const COL_CMDLINE_MIN_W: f32 = 360.0;
-/// Total minimum width of the Details table, adapting to advertised [`CapabilityFlags`].
-pub(super) const fn table_min_width(capabilities: CapabilityFlags) -> f32 {
-    let base = COL_NAME_W
-        + COL_PID_W
-        + COL_STATUS_W
-        + COL_USER_W
-        + COL_CPU_W
-        + COL_MEM_W
-        + COL_PRIORITY_W
-        + COL_PLATFORM_W
-        + COL_GPU_MEM_W
-        + COL_PUBLISHER_W
-        + COL_CMDLINE_MIN_W
-        + 10.0 * 8.0
-        + 32.0;
-    if capabilities.contains(CapabilityFlags::UAC_VIRTUALIZATION) {
-        base + COL_UAC_W + 8.0
-    } else {
-        base
+const COL_CMDLINE_W: f32 = 360.0;
+
+/// Logical columns rendered by [`DetailsView`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailsColumn {
+    Name,
+    Pid,
+    Status,
+    UserName,
+    Cpu,
+    Memory,
+    Priority,
+    Platform,
+    UacVirtualization,
+    GpuMemory,
+    Publisher,
+    CommandLine,
+}
+
+impl ColumnKey for DetailsColumn {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Pid => "pid",
+            Self::Status => "status",
+            Self::UserName => "user",
+            Self::Cpu => "cpu",
+            Self::Memory => "memory",
+            Self::Priority => "priority",
+            Self::Platform => "platform",
+            Self::UacVirtualization => "uac",
+            Self::GpuMemory => "gpu_memory",
+            Self::Publisher => "publisher",
+            Self::CommandLine => "command_line",
+        }
     }
+}
+
+impl DetailsColumn {
+    fn default_specs(capabilities: CapabilityFlags) -> Vec<ColumnSpec<Self>> {
+        let mut cols = vec![
+            ColumnSpec::new(Self::Name, COL_NAME_W, 140.0, 640.0),
+            ColumnSpec::new(Self::Pid, COL_PID_W, 56.0, 160.0),
+            ColumnSpec::new(Self::Status, COL_STATUS_W, 68.0, 200.0),
+            ColumnSpec::new(Self::UserName, COL_USER_W, 80.0, 360.0),
+            ColumnSpec::new(Self::Cpu, COL_CPU_W, 60.0, 180.0),
+            ColumnSpec::new(Self::Memory, COL_MEM_W, 96.0, 320.0),
+            ColumnSpec::new(Self::Priority, COL_PRIORITY_W, 72.0, 240.0),
+            ColumnSpec::new(Self::Platform, COL_PLATFORM_W, 64.0, 180.0),
+        ];
+        if capabilities.contains(CapabilityFlags::UAC_VIRTUALIZATION) {
+            cols.push(ColumnSpec::new(
+                Self::UacVirtualization,
+                COL_UAC_W,
+                84.0,
+                260.0,
+            ));
+        }
+        cols.extend([
+            ColumnSpec::new(Self::GpuMemory, COL_GPU_MEM_W, 88.0, 280.0),
+            ColumnSpec::new(Self::Publisher, COL_PUBLISHER_W, 88.0, 420.0),
+            ColumnSpec::new(Self::CommandLine, COL_CMDLINE_W, 140.0, 1200.0),
+        ]);
+        cols
+    }
+
+    fn label(self, platform: PlatformProfile) -> String {
+        match self {
+            Self::Name => i18n::tr("details.col_name"),
+            Self::Pid => i18n::tr("details.col_pid"),
+            Self::Status => i18n::tr("details.col_status"),
+            Self::UserName => i18n::tr("details.col_user"),
+            Self::Cpu => i18n::tr("details.col_cpu"),
+            Self::Memory => i18n::tr("details.col_memory"),
+            Self::Priority => i18n::tr("details.col_priority"),
+            Self::Platform => i18n::tr("details.col_platform"),
+            Self::UacVirtualization => i18n::virtualization_column_label(platform),
+            Self::GpuMemory => i18n::tr("details.col_gpu_memory"),
+            Self::Publisher => i18n::tr("details.col_publisher"),
+            Self::CommandLine => i18n::tr("details.col_command_line"),
+        }
+    }
+
+    const fn sort_column(self) -> Option<DetailsSortColumn> {
+        match self {
+            Self::Name => Some(DetailsSortColumn::Name),
+            Self::Pid => Some(DetailsSortColumn::Pid),
+            Self::Status => Some(DetailsSortColumn::Status),
+            Self::UserName => Some(DetailsSortColumn::UserName),
+            Self::Cpu => Some(DetailsSortColumn::Cpu),
+            Self::Memory => Some(DetailsSortColumn::Memory),
+            Self::Priority | Self::Publisher => None,
+            Self::Platform => Some(DetailsSortColumn::Arch),
+            Self::UacVirtualization => Some(DetailsSortColumn::UacVirtualization),
+            Self::GpuMemory => Some(DetailsSortColumn::GpuMemory),
+            Self::CommandLine => Some(DetailsSortColumn::CommandLine),
+        }
+    }
+
+    const fn right_aligned(self) -> bool {
+        matches!(self, Self::Pid | Self::Cpu | Self::Memory | Self::GpuMemory)
+    }
+}
+
+/// Total minimum default width of the Details table, adapting to advertised [`CapabilityFlags`].
+#[cfg(test)]
+pub(super) fn table_min_width(capabilities: CapabilityFlags) -> f32 {
+    TableColumnLayout::new(DetailsColumn::default_specs(capabilities))
+        .total_width(TABLE_HORIZONTAL_PADDING)
 }
 
 /// Scheduling priority classes displayed in the `Set priority >` submenu (highest to lowest).
@@ -436,6 +532,7 @@ pub(crate) struct DetailsView {
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
     h_scroll_handle: ScrollHandle,
+    column_layout: TableColumnLayout<DetailsColumn>,
     icon_cache: IconCache,
     _subscriptions: Vec<Subscription>,
 }
@@ -448,7 +545,14 @@ impl DetailsView {
         cx: &mut Context<Self>,
     ) -> Self {
         let lease = store.read(cx).acquire_lease(MonitorDomain::Details);
-        let initial_rev = store.read(cx).snapshot().revisions.details;
+        let (initial_rev, capabilities) = {
+            let snap = store.read(cx).snapshot();
+            (snap.revisions.details, snap.capabilities)
+        };
+        let mut column_layout = TableColumnLayout::new(DetailsColumn::default_specs(capabilities));
+        if let Some(saved) = store.read(cx).table_column_layout(DETAILS_TABLE_ID) {
+            column_layout.apply_saved(saved);
+        }
         let sub = cx.subscribe(&store, |this, _store, event, cx| match event {
             UiStoreEvent::SnapshotUpdated(revs) => {
                 if revs.details != this.last_details_rev {
@@ -471,11 +575,19 @@ impl DetailsView {
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
             h_scroll_handle: ScrollHandle::new(),
+            column_layout,
             icon_cache: Rc::new(RefCell::new(HashMap::new())),
             _subscriptions: vec![sub],
         };
         view.try_scroll_to_pending(cx);
         view
+    }
+
+    fn persist_column_layout(&self, cx: &mut Context<Self>) {
+        let snapshot = self.column_layout.snapshot();
+        self.store.update(cx, |store, _| {
+            store.set_table_column_layout(DETAILS_TABLE_ID, snapshot);
+        });
     }
 
     /// Updates the highlighted target [`ProcessKey`] (e.g., from `NavigationIntent::JumpToDetails`).
@@ -578,52 +690,6 @@ impl DetailsView {
     }
 }
 
-/// Renders a clickable sortable column header button with active sort chevron indicator.
-#[allow(clippy::too_many_arguments)]
-fn sortable_header(
-    id: &'static str,
-    label: String,
-    column: DetailsSortColumn,
-    active_column: DetailsSortColumn,
-    active_direction: SortDirection,
-    width: f32,
-    flex_grow: bool,
-    align_right: bool,
-    store: Entity<UiStore>,
-    fg: gpui_kit::Hsla,
-    muted_fg: gpui_kit::Hsla,
-    hover_bg: gpui_kit::Hsla,
-) -> impl IntoElement {
-    let is_active = active_column == column;
-    let next_dir = next_sort_direction(active_column, active_direction, column);
-    let text_color = if is_active { fg } else { muted_fg };
-
-    h_flex()
-        .id(id)
-        .h_full()
-        .items_center()
-        .gap_1()
-        .px_1()
-        .rounded_sm()
-        .cursor_pointer()
-        .text_color(text_color)
-        .hover(move |s| s.bg(hover_bg).text_color(fg))
-        .when(flex_grow, |el| el.flex_1().min_w(px(width)))
-        .when(!flex_grow, |el| el.w(px(width)).flex_shrink_0())
-        .when(align_right, |el| el.justify_end())
-        .on_click(move |_, _, cx| {
-            UiCommands::set_details_sort(&store, column, next_dir, cx);
-        })
-        .child(div().truncate().child(label))
-        .when(is_active, |el| {
-            let chevron = match active_direction {
-                SortDirection::Ascending => IconName::ChevronUp,
-                SortDirection::Descending => IconName::ChevronDown,
-            };
-            el.child(Icon::new(chevron).xsmall().text_color(fg))
-        })
-}
-
 impl Render for DetailsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         debug_assert_eq!(self._details_lease.domain(), MonitorDomain::Details);
@@ -632,7 +698,6 @@ impl Render for DetailsView {
         let details = snapshot.details.clone();
         let capabilities = snapshot.capabilities;
         let platform = snapshot.platform;
-        let show_uac_col = capabilities.contains(CapabilityFlags::UAC_VIRTUALIZATION);
         let total_ram_bytes = snapshot.performance.latest.mem_total_bytes;
         let view_mode = details.view_mode;
         let sort_column = details.sort_column;
@@ -653,7 +718,6 @@ impl Render for DetailsView {
         let muted_bg = theme.muted;
         let secondary_bg = theme.secondary;
         let primary = theme.primary;
-        let accent = theme.accent;
         let radius = theme.radius;
         let mono_font = theme.mono_font_family.clone();
         let semantic = LoomSemanticColors::from_theme(theme);
@@ -664,6 +728,9 @@ impl Render for DetailsView {
         let store_end_task = self.store.clone();
         let end_task_target = selected_target.clone();
         let has_selection = selected_target.is_some();
+
+        let flat_label = i18n::tr("details.view_flat");
+        let tree_label = i18n::tr("details.view_tree");
 
         let toolbar = h_flex()
             .w_full()
@@ -697,7 +764,9 @@ impl Render for DetailsView {
                             .child(
                                 Button::new("details-mode-flat")
                                     .xsmall()
-                                    .label(i18n::tr("details.view_flat"))
+                                    .icon(Icon::new(AssetIconName::List))
+                                    .tooltip(flat_label.clone())
+                                    .accessibility_label(flat_label)
                                     .map(|btn| {
                                         if view_mode == DetailsViewMode::Flat {
                                             btn.primary()
@@ -716,7 +785,9 @@ impl Render for DetailsView {
                             .child(
                                 Button::new("details-mode-tree")
                                     .xsmall()
-                                    .label(i18n::tr("details.view_tree"))
+                                    .icon(Icon::new(AssetIconName::ListTree))
+                                    .tooltip(tree_label.clone())
+                                    .accessibility_label(tree_label)
                                     .map(|btn| {
                                         if view_mode == DetailsViewMode::Tree {
                                             btn.primary()
@@ -805,178 +876,64 @@ impl Render for DetailsView {
                 )
         });
 
-        let header_hover = accent.opacity(0.5);
-        let column_header = h_flex()
-            .w_full()
-            .h(px(32.))
-            .flex_shrink_0()
-            .items_center()
-            .px_4()
-            .gap_2()
-            .bg(secondary_bg.opacity(0.45))
-            .border_b_1()
-            .border_color(border)
-            .text_xs()
-            .font_medium()
-            .text_color(muted_fg)
-            .child(sortable_header(
-                "details-sort-name",
-                i18n::tr("details.col_name"),
-                DetailsSortColumn::Name,
-                sort_column,
-                sort_direction,
-                COL_NAME_W,
-                false,
-                false,
-                self.store.clone(),
-                fg,
-                muted_fg,
-                header_hover,
-            ))
-            .child(sortable_header(
-                "details-sort-pid",
-                i18n::tr("details.col_pid"),
-                DetailsSortColumn::Pid,
-                sort_column,
-                sort_direction,
-                COL_PID_W,
-                false,
-                true,
-                self.store.clone(),
-                fg,
-                muted_fg,
-                header_hover,
-            ))
-            .child(sortable_header(
-                "details-sort-status",
-                i18n::tr("details.col_status"),
-                DetailsSortColumn::Status,
-                sort_column,
-                sort_direction,
-                COL_STATUS_W,
-                false,
-                false,
-                self.store.clone(),
-                fg,
-                muted_fg,
-                header_hover,
-            ))
-            .child(sortable_header(
-                "details-sort-user",
-                i18n::tr("details.col_user"),
-                DetailsSortColumn::UserName,
-                sort_column,
-                sort_direction,
-                COL_USER_W,
-                false,
-                false,
-                self.store.clone(),
-                fg,
-                muted_fg,
-                header_hover,
-            ))
-            .child(sortable_header(
-                "details-sort-cpu",
-                i18n::tr("details.col_cpu"),
-                DetailsSortColumn::Cpu,
-                sort_column,
-                sort_direction,
-                COL_CPU_W,
-                false,
-                true,
-                self.store.clone(),
-                fg,
-                muted_fg,
-                header_hover,
-            ))
-            .child(sortable_header(
-                "details-sort-memory",
-                i18n::tr("details.col_memory"),
-                DetailsSortColumn::Memory,
-                sort_column,
-                sort_direction,
-                COL_MEM_W,
-                false,
-                true,
-                self.store.clone(),
-                fg,
-                muted_fg,
-                header_hover,
-            ))
-            .child(
-                div()
-                    .w(px(COL_PRIORITY_W))
-                    .flex_shrink_0()
-                    .px_1()
-                    .truncate()
-                    .child(i18n::tr("details.col_priority")),
-            )
-            .child(sortable_header(
-                "details-sort-arch",
-                i18n::tr("details.col_platform"),
-                DetailsSortColumn::Arch,
-                sort_column,
-                sort_direction,
-                COL_PLATFORM_W,
-                false,
-                false,
-                self.store.clone(),
-                fg,
-                muted_fg,
-                header_hover,
-            ))
-            .when(show_uac_col, |el| {
-                el.child(sortable_header(
-                    "details-sort-uac",
-                    i18n::virtualization_column_label(platform),
-                    DetailsSortColumn::UacVirtualization,
-                    sort_column,
+        let columns: Vec<ColumnSpec<DetailsColumn>> = self.column_layout.columns().to_vec();
+        let total_cols = columns.len();
+        let table_width = self.column_layout.total_width(TABLE_HORIZONTAL_PADDING);
+        let column_layout_snapshot = self.column_layout.clone();
+
+        let header_cells = columns.iter().enumerate().map(|(col_ix, spec)| {
+            let col = spec.id;
+            let sort_target = col.sort_column();
+            let is_active_sort = sort_target == Some(sort_column);
+            let next_dir = sort_target
+                .map(|target| next_sort_direction(sort_column, sort_direction, target))
+                .unwrap_or(SortDirection::Descending);
+            let store_for_sort = self.store.clone();
+
+            render_interactive_header_cell(
+                col_ix,
+                total_cols,
+                HeaderColumnDescriptor {
+                    id: format!("details-col-{}", col.slug()).into(),
+                    label: col.label(platform).into(),
+                    width: spec.width,
+                    right_aligned: col.right_aligned(),
+                    sortable: sort_target.is_some(),
+                    is_active_sort,
                     sort_direction,
-                    COL_UAC_W,
-                    false,
-                    false,
-                    self.store.clone(),
-                    fg,
-                    muted_fg,
-                    header_hover,
-                ))
-            })
-            .child(sortable_header(
-                "details-sort-gpu-mem",
-                i18n::tr("details.col_gpu_memory"),
-                DetailsSortColumn::GpuMemory,
-                sort_column,
-                sort_direction,
-                COL_GPU_MEM_W,
-                false,
-                true,
-                self.store.clone(),
-                fg,
-                muted_fg,
-                header_hover,
-            ))
-            .child(
-                div()
-                    .w(px(COL_PUBLISHER_W))
-                    .flex_shrink_0()
-                    .px_1()
-                    .truncate()
-                    .child(i18n::tr("details.col_publisher")),
+                },
+                &column_layout_snapshot,
+                cx,
+                |view: &mut Self| &mut view.column_layout,
+                move |_view, _window, cx| {
+                    if let Some(target) = sort_target {
+                        UiCommands::set_details_sort(&store_for_sort, target, next_dir, cx);
+                    }
+                },
+                |view: &mut Self, cx| view.persist_column_layout(cx),
             )
-            .child(sortable_header(
-                "details-sort-cmdline",
-                i18n::tr("details.col_command_line"),
-                DetailsSortColumn::CommandLine,
-                sort_column,
-                sort_direction,
-                COL_CMDLINE_MIN_W,
-                true,
-                false,
-                self.store.clone(),
-                fg,
-                muted_fg,
-                header_hover,
-            ));
+            .into_any_element()
+        });
+
+        let column_header = attach_header_reorder_handlers(
+            h_flex()
+                .id("details-column-header")
+                .w_full()
+                .h(px(32.))
+                .flex_shrink_0()
+                .items_center()
+                .px_2()
+                .bg(secondary_bg.opacity(0.45))
+                .border_b_1()
+                .border_color(border)
+                .text_xs()
+                .font_medium()
+                .text_color(muted_fg)
+                .children(header_cells),
+            cx,
+            |view: &mut Self| &mut view.column_layout,
+            |view: &mut Self, cx| view.persist_column_layout(cx),
+        );
 
         let table_area = if details.revision == 0 {
             v_flex()
@@ -1043,7 +1000,7 @@ impl Render for DetailsView {
                         .track_scroll(&self.h_scroll_handle)
                         .child(
                             v_flex()
-                                .min_w(px(table_min_width(capabilities)))
+                                .min_w(px(table_width))
                                 .w_full()
                                 .h_full()
                                 .child(column_header)
@@ -1121,6 +1078,286 @@ impl Render for DetailsView {
                                                         let row_a11y_label: SharedString =
                                                             format!("{} (PID {})", row.name, key.pid)
                                                                 .into();
+
+                                                        let cells = columns.iter().map(|spec| {
+                                                            let w = px(spec.width);
+                                                            match spec.id {
+                                                                DetailsColumn::Name => {
+                                                                    let toggle_store = toggle_store.clone();
+                                                                    h_flex()
+                                                                        .w(w)
+                                                                        .h_full()
+                                                                        .flex_shrink_0()
+                                                                        .items_center()
+                                                                        .gap_1p5()
+                                                                        .px_2()
+                                                                        .pl(px(8.0 + indent))
+                                                                        .overflow_hidden()
+                                                                        .when(is_tree_mode, |el| {
+                                                                            el.child(if has_children {
+                                                                                Button::new((
+                                                                                    "details-expand",
+                                                                                    row_id,
+                                                                                ))
+                                                                                .xsmall()
+                                                                                .ghost()
+                                                                                .icon(if is_expanded {
+                                                                                    IconName::ChevronDown
+                                                                                } else {
+                                                                                    IconName::ChevronRight
+                                                                                })
+                                                                                .on_click(move |_, _, cx| {
+                                                                                    UiCommands::toggle_details_expanded(
+                                                                                        &toggle_store,
+                                                                                        key,
+                                                                                        cx,
+                                                                                    );
+                                                                                })
+                                                                                .into_any_element()
+                                                                            } else {
+                                                                                div()
+                                                                                    .w(px(18.))
+                                                                                    .flex_shrink_0()
+                                                                                    .into_any_element()
+                                                                            })
+                                                                        })
+                                                                        .child(if let Some(image) =
+                                                                            icon_image.clone()
+                                                                        {
+                                                                            img(image)
+                                                                                .size(px(20.))
+                                                                                .flex_shrink_0()
+                                                                                .into_any_element()
+                                                                        } else {
+                                                                            h_flex()
+                                                                                .size(px(20.))
+                                                                                .flex_shrink_0()
+                                                                                .items_center()
+                                                                                .justify_center()
+                                                                                .child(
+                                                                                    Icon::new(
+                                                                                        IconName::File,
+                                                                                    )
+                                                                                    .small()
+                                                                                    .text_color(
+                                                                                        muted_fg,
+                                                                                    ),
+                                                                                )
+                                                                                .into_any_element()
+                                                                        })
+                                                                        .child(
+                                                                            div()
+                                                                                .flex_1()
+                                                                                .min_w_0()
+                                                                                .truncate()
+                                                                                .child(
+                                                                                    row.name
+                                                                                        .to_string(),
+                                                                                ),
+                                                                        )
+                                                                        .into_any_element()
+                                                                }
+                                                                DetailsColumn::Pid => h_flex()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .items_center()
+                                                                    .justify_end()
+                                                                    .px_2()
+                                                                    .font_family(mono_font.clone())
+                                                                    .text_color(muted_fg)
+                                                                    .child(key.pid.to_string())
+                                                                    .into_any_element(),
+                                                                DetailsColumn::Status => h_flex()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .items_center()
+                                                                    .px_2()
+                                                                    .overflow_hidden()
+                                                                    .child(
+                                                                        div()
+                                                                            .min_w_0()
+                                                                            .truncate()
+                                                                            .text_color(muted_fg)
+                                                                            .child(status_text.clone()),
+                                                                    )
+                                                                    .into_any_element(),
+                                                                DetailsColumn::UserName => h_flex()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .items_center()
+                                                                    .px_2()
+                                                                    .overflow_hidden()
+                                                                    .child(
+                                                                        div()
+                                                                            .min_w_0()
+                                                                            .truncate()
+                                                                            .text_color(muted_fg)
+                                                                            .child(user_text.clone()),
+                                                                    )
+                                                                    .into_any_element(),
+                                                                DetailsColumn::Cpu => div()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .px_1()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .child(heatmap_cell(
+                                                                        format_permille(
+                                                                            row.cpu_permille,
+                                                                        ),
+                                                                        HeatmapLevel::from_permille(
+                                                                            row.cpu_permille,
+                                                                        ),
+                                                                        &semantic,
+                                                                    ))
+                                                                    .into_any_element(),
+                                                                DetailsColumn::Memory => div()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .px_1()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .child(heatmap_cell(
+                                                                        format_bytes(
+                                                                            row.private_working_set_bytes,
+                                                                        ),
+                                                                        memory_heatmap_level(
+                                                                            row.private_working_set_bytes,
+                                                                            total_ram_bytes,
+                                                                        ),
+                                                                        &semantic,
+                                                                    ))
+                                                                    .into_any_element(),
+                                                                DetailsColumn::Priority => h_flex()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .items_center()
+                                                                    .px_2()
+                                                                    .overflow_hidden()
+                                                                    .child(
+                                                                        div()
+                                                                            .min_w_0()
+                                                                            .truncate()
+                                                                            .text_color(muted_fg)
+                                                                            .child(
+                                                                                i18n::process_priority_label(
+                                                                                    row.priority,
+                                                                                ),
+                                                                            ),
+                                                                    )
+                                                                    .into_any_element(),
+                                                                DetailsColumn::Platform => h_flex()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .items_center()
+                                                                    .px_2()
+                                                                    .overflow_hidden()
+                                                                    .child(
+                                                                        div()
+                                                                            .min_w_0()
+                                                                            .truncate()
+                                                                            .text_color(muted_fg)
+                                                                            .child(
+                                                                                i18n::process_arch_label(
+                                                                                    row.arch,
+                                                                                ),
+                                                                            ),
+                                                                    )
+                                                                    .into_any_element(),
+                                                                DetailsColumn::UacVirtualization => {
+                                                                    h_flex()
+                                                                        .w(w)
+                                                                        .h_full()
+                                                                        .flex_shrink_0()
+                                                                        .items_center()
+                                                                        .px_2()
+                                                                        .overflow_hidden()
+                                                                        .child(
+                                                                            div()
+                                                                                .min_w_0()
+                                                                                .truncate()
+                                                                                .text_color(muted_fg)
+                                                                                .child(
+                                                                                    i18n::uac_virtualization_label(
+                                                                                        row.uac_virtualization,
+                                                                                    ),
+                                                                                ),
+                                                                        )
+                                                                        .into_any_element()
+                                                                }
+                                                                DetailsColumn::GpuMemory => h_flex()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .items_center()
+                                                                    .justify_end()
+                                                                    .px_2()
+                                                                    .font_family(mono_font.clone())
+                                                                    .text_color(muted_fg)
+                                                                    .child(format_bytes(
+                                                                        row.gpu_dedicated_bytes,
+                                                                    ))
+                                                                    .into_any_element(),
+                                                                DetailsColumn::Publisher => h_flex()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .items_center()
+                                                                    .px_2()
+                                                                    .overflow_hidden()
+                                                                    .child(
+                                                                        div()
+                                                                            .min_w_0()
+                                                                            .truncate()
+                                                                            .text_color(muted_fg)
+                                                                            .child(publisher_text.clone()),
+                                                                    )
+                                                                    .into_any_element(),
+                                                                DetailsColumn::CommandLine => {
+                                                                    h_flex()
+                                                                        .id(("details-cmd", row_id))
+                                                                        .w(w)
+                                                                        .h_full()
+                                                                        .flex_shrink_0()
+                                                                        .items_center()
+                                                                        .px_2()
+                                                                        .overflow_hidden()
+                                                                        .font_family(mono_font.clone())
+                                                                        .text_color(muted_fg)
+                                                                        .when_some(
+                                                                            cmdline_tooltip.clone(),
+                                                                            |el, full_cmd| {
+                                                                                el.tooltip(
+                                                                                    move |window, cx| {
+                                                                                        Tooltip::new(
+                                                                                            full_cmd
+                                                                                                .clone(),
+                                                                                        )
+                                                                                        .build(
+                                                                                            window, cx,
+                                                                                        )
+                                                                                    },
+                                                                                )
+                                                                            },
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .min_w_0()
+                                                                                .truncate()
+                                                                                .child(cmdline_text.clone()),
+                                                                        )
+                                                                        .into_any_element()
+                                                                }
+                                                            }
+                                                        });
+
                                                         let row_element = h_flex()
                                                             .id(("details-row", row_id))
                                                             .role(gpui_kit::Role::ListItem)
@@ -1129,8 +1366,7 @@ impl Render for DetailsView {
                                                             .w_full()
                                                             .h(px(DETAILS_ROW_HEIGHT))
                                                             .items_center()
-                                                            .px_4()
-                                                            .gap_2()
+                                                            .px_2()
                                                             .border_b_1()
                                                             .border_color(row_border)
                                                             .text_xs()
@@ -1168,214 +1404,7 @@ impl Render for DetailsView {
                                                                     );
                                                                 },
                                                             )
-                                                            .child(
-                                                                h_flex()
-                                                                    .w(px(COL_NAME_W))
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .gap_1p5()
-                                                                    .pl(px(indent))
-                                                                    .overflow_hidden()
-                                                                    .when(is_tree_mode, |el| {
-                                                                        el.child(if has_children {
-                                                                            Button::new((
-                                                                                "details-expand",
-                                                                                row_id,
-                                                                            ))
-                                                                            .xsmall()
-                                                                            .ghost()
-                                                                            .icon(if is_expanded {
-                                                                                IconName::ChevronDown
-                                                                            } else {
-                                                                                IconName::ChevronRight
-                                                                            })
-                                                                            .on_click(move |_, _, cx| {
-                                                                                UiCommands::toggle_details_expanded(
-                                                                                    &toggle_store,
-                                                                                    key,
-                                                                                    cx,
-                                                                                );
-                                                                            })
-                                                                            .into_any_element()
-                                                                        } else {
-                                                                            div()
-                                                                                .w(px(18.))
-                                                                                .flex_shrink_0()
-                                                                                .into_any_element()
-                                                                        })
-                                                                    })
-                                                                    .child(if let Some(image) =
-                                                                        icon_image
-                                                                    {
-                                                                        img(image)
-                                                                            .size(px(20.))
-                                                                            .flex_shrink_0()
-                                                                            .into_any_element()
-                                                                    } else {
-                                                                        h_flex()
-                                                                            .size(px(20.))
-                                                                            .flex_shrink_0()
-                                                                            .items_center()
-                                                                            .justify_center()
-                                                                            .child(
-                                                                                Icon::new(
-                                                                                    IconName::File,
-                                                                                )
-                                                                                .small()
-                                                                                .text_color(
-                                                                                    muted_fg,
-                                                                                ),
-                                                                            )
-                                                                            .into_any_element()
-                                                                    })
-                                                                    .child(
-                                                                        div()
-                                                                            .flex_1()
-                                                                            .min_w_0()
-                                                                            .truncate()
-                                                                            .child(
-                                                                                row.name
-                                                                                    .to_string(),
-                                                                            ),
-                                                                    ),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .w(px(COL_PID_W))
-                                                                    .flex_shrink_0()
-                                                                    .text_right()
-                                                                    .font_family(mono_font.clone())
-                                                                    .text_color(muted_fg)
-                                                                    .child(key.pid.to_string()),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .w(px(COL_STATUS_W))
-                                                                    .flex_shrink_0()
-                                                                    .truncate()
-                                                                    .text_color(muted_fg)
-                                                                    .child(status_text),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .w(px(COL_USER_W))
-                                                                    .flex_shrink_0()
-                                                                    .truncate()
-                                                                    .text_color(muted_fg)
-                                                                    .child(user_text),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .w(px(COL_CPU_W))
-                                                                    .flex_shrink_0()
-                                                                    .child(heatmap_cell(
-                                                                        format_permille(
-                                                                            row.cpu_permille,
-                                                                        ),
-                                                                        HeatmapLevel::from_permille(
-                                                                            row.cpu_permille,
-                                                                        ),
-                                                                        &semantic,
-                                                                    )),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .w(px(COL_MEM_W))
-                                                                    .flex_shrink_0()
-                                                                    .child(heatmap_cell(
-                                                                        format_bytes(
-                                                                            row.private_working_set_bytes,
-                                                                        ),
-                                                                        memory_heatmap_level(
-                                                                            row.private_working_set_bytes,
-                                                                            total_ram_bytes,
-                                                                        ),
-                                                                        &semantic,
-                                                                    )),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .w(px(COL_PRIORITY_W))
-                                                                    .flex_shrink_0()
-                                                                    .truncate()
-                                                                    .text_color(muted_fg)
-                                                                    .child(
-                                                                        i18n::process_priority_label(
-                                                                            row.priority,
-                                                                        ),
-                                                                    ),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .w(px(COL_PLATFORM_W))
-                                                                    .flex_shrink_0()
-                                                                    .truncate()
-                                                                    .text_color(muted_fg)
-                                                                    .child(
-                                                                        i18n::process_arch_label(
-                                                                            row.arch,
-                                                                        ),
-                                                                    ),
-                                                            )
-                                                            .when(show_uac_col, |el| {
-                                                                el.child(
-                                                                    div()
-                                                                        .w(px(COL_UAC_W))
-                                                                        .flex_shrink_0()
-                                                                        .truncate()
-                                                                        .text_color(muted_fg)
-                                                                        .child(
-                                                                            i18n::uac_virtualization_label(
-                                                                                row.uac_virtualization,
-                                                                            ),
-                                                                        ),
-                                                                )
-                                                            })
-                                                            .child(
-                                                                div()
-                                                                    .w(px(COL_GPU_MEM_W))
-                                                                    .flex_shrink_0()
-                                                                    .text_right()
-                                                                    .font_family(mono_font.clone())
-                                                                    .text_color(muted_fg)
-                                                                    .child(format_bytes(
-                                                                        row.gpu_dedicated_bytes,
-                                                                    )),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .w(px(COL_PUBLISHER_W))
-                                                                    .flex_shrink_0()
-                                                                    .truncate()
-                                                                    .text_color(muted_fg)
-                                                                    .child(publisher_text),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .id(("details-cmd", row_id))
-                                                                    .flex_1()
-                                                                    .min_w(px(COL_CMDLINE_MIN_W))
-                                                                    .truncate()
-                                                                    .font_family(mono_font.clone())
-                                                                    .text_color(muted_fg)
-                                                                    .when_some(
-                                                                        cmdline_tooltip,
-                                                                        |el, full_cmd| {
-                                                                            el.tooltip(
-                                                                                move |window, cx| {
-                                                                                    Tooltip::new(
-                                                                                        full_cmd
-                                                                                            .clone(),
-                                                                                    )
-                                                                                    .build(
-                                                                                        window, cx,
-                                                                                    )
-                                                                                },
-                                                                            )
-                                                                        },
-                                                                    )
-                                                                    .child(cmdline_text),
-                                                            );
+                                                            .children(cells);
 
                                                         Some(
                                                             row_element
@@ -1408,15 +1437,20 @@ impl Render for DetailsView {
                 .into_any_element()
         };
 
-        v_flex()
-            .id("details-view-root")
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(Self::handle_key_down))
-            .size_full()
-            .min_h_0()
-            .child(toolbar)
-            .when_some(highlight_banner, |this, banner| this.child(banner))
-            .child(table_area)
+        attach_table_column_drag_handlers(
+            v_flex()
+                .id("details-view-root")
+                .track_focus(&self.focus_handle)
+                .on_key_down(cx.listener(Self::handle_key_down))
+                .size_full()
+                .min_h_0()
+                .child(toolbar)
+                .when_some(highlight_banner, |this, banner| this.child(banner))
+                .child(table_area),
+            cx,
+            |view: &mut Self| &mut view.column_layout,
+            |view: &mut Self, cx| view.persist_column_layout(cx),
+        )
     }
 }
 
@@ -1837,9 +1871,9 @@ mod tests {
         let without_uac = table_min_width(CapabilityFlags::empty());
         let with_uac = table_min_width(CapabilityFlags::UAC_VIRTUALIZATION);
         assert!(
-            (with_uac - without_uac - (COL_UAC_W + 8.0)).abs() < f32::EPSILON,
-            "expected UAC column width + gap ({}) delta, got {}",
-            COL_UAC_W + 8.0,
+            (with_uac - without_uac - COL_UAC_W).abs() < f32::EPSILON,
+            "expected UAC column width ({}) delta, got {}",
+            COL_UAC_W,
             with_uac - without_uac
         );
     }

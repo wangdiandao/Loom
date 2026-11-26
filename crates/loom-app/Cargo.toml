@@ -21,4 +21,5 @@ tracing-subscriber.workspace = true
 tray-icon.workspace = true
 
 [dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
@@ -21,7 +22,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, Context, Entity, FocusHandle, Focusable, InteractiveElement as _, IntoElement,
-    KeyDownEvent, MouseButton, ParentElement as _, Render, SharedString,
+    KeyDownEvent, MouseButton, ParentElement as _, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, UniformListScrollHandle, Window,
     div, img, prelude::FluentBuilder as _, px, uniform_list,
 };
@@ -35,6 +36,11 @@ use loom_ui_kit::{
 };
 
 use crate::bridge::{UiCommands, UiStore, UiStoreEvent};
+use crate::features::table_columns::{
+    ColumnKey, ColumnSpec, HeaderColumnDescriptor, TableColumnLayout,
+    attach_header_reorder_handlers, attach_table_column_drag_handlers,
+    render_interactive_header_cell,
+};
 use crate::i18n;
 use crate::shell::{ShellHandle, dialogs};
 
@@ -45,14 +51,84 @@ use self::state::{
 };
 
 const PROCESS_ROW_HEIGHT: f32 = 32.0;
+const TABLE_HORIZONTAL_PADDING: f32 = 16.0;
+const PROCESSES_TABLE_ID: &str = "processes";
 
-const COL_STATUS_W: f32 = 76.0;
-const COL_CPU_W: f32 = 74.0;
-const COL_MEMORY_W: f32 = 88.0;
-const COL_DISK_W: f32 = 82.0;
-const COL_NETWORK_W: f32 = 84.0;
-const COL_GPU_W: f32 = 68.0;
-const COL_PUBLISHER_W: f32 = 148.0;
+/// Logical columns rendered by [`ProcessesView`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessColumn {
+    Name,
+    Status,
+    Cpu,
+    Memory,
+    Disk,
+    Network,
+    Gpu,
+    Publisher,
+}
+
+impl ColumnKey for ProcessColumn {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Status => "status",
+            Self::Cpu => "cpu",
+            Self::Memory => "memory",
+            Self::Disk => "disk",
+            Self::Network => "network",
+            Self::Gpu => "gpu",
+            Self::Publisher => "publisher",
+        }
+    }
+}
+
+impl ProcessColumn {
+    fn default_specs() -> Vec<ColumnSpec<Self>> {
+        vec![
+            ColumnSpec::new(Self::Name, 260.0, 140.0, 720.0),
+            ColumnSpec::new(Self::Status, 80.0, 56.0, 200.0),
+            ColumnSpec::new(Self::Cpu, 82.0, 60.0, 180.0),
+            ColumnSpec::new(Self::Memory, 96.0, 68.0, 220.0),
+            ColumnSpec::new(Self::Disk, 90.0, 68.0, 220.0),
+            ColumnSpec::new(Self::Network, 92.0, 68.0, 220.0),
+            ColumnSpec::new(Self::Gpu, 78.0, 60.0, 180.0),
+            ColumnSpec::new(Self::Publisher, 176.0, 88.0, 480.0),
+        ]
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Name => i18n::tr("processes.col_name"),
+            Self::Status => i18n::tr("processes.col_status"),
+            Self::Cpu => i18n::tr("processes.col_cpu"),
+            Self::Memory => i18n::tr("processes.col_memory"),
+            Self::Disk => i18n::tr("processes.col_disk"),
+            Self::Network => i18n::tr("processes.col_network"),
+            Self::Gpu => i18n::tr("processes.col_gpu"),
+            Self::Publisher => i18n::tr("processes.col_publisher"),
+        }
+    }
+
+    const fn sort_column(self) -> Option<ProcessSortColumn> {
+        match self {
+            Self::Name => Some(ProcessSortColumn::Name),
+            Self::Status => Some(ProcessSortColumn::Status),
+            Self::Cpu => Some(ProcessSortColumn::Cpu),
+            Self::Memory => Some(ProcessSortColumn::Memory),
+            Self::Disk => Some(ProcessSortColumn::Disk),
+            Self::Network => Some(ProcessSortColumn::Network),
+            Self::Gpu => Some(ProcessSortColumn::Gpu),
+            Self::Publisher => None,
+        }
+    }
+
+    const fn right_aligned(self) -> bool {
+        matches!(
+            self,
+            Self::Cpu | Self::Memory | Self::Disk | Self::Network | Self::Gpu
+        )
+    }
+}
 
 /// Live Processes overview view.
 pub(crate) struct ProcessesView {
@@ -62,6 +138,8 @@ pub(crate) struct ProcessesView {
     selected_key: Option<ProcessKey>,
     last_processes_rev: u64,
     scroll_handle: UniformListScrollHandle,
+    h_scroll_handle: ScrollHandle,
+    column_layout: TableColumnLayout<ProcessColumn>,
     icon_cache: Rc<RefCell<IconRenderCache>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -76,6 +154,10 @@ impl ProcessesView {
     /// Creates a new [`ProcessesView`] subscribed to [`UiStore`] snapshot changes.
     pub(crate) fn new(store: Entity<UiStore>, shell: ShellHandle, cx: &mut Context<Self>) -> Self {
         let initial_rev = store.read(cx).snapshot().revisions.processes;
+        let mut column_layout = TableColumnLayout::new(ProcessColumn::default_specs());
+        if let Some(saved) = store.read(cx).table_column_layout(PROCESSES_TABLE_ID) {
+            column_layout.apply_saved(saved);
+        }
         let sub = cx.subscribe(&store, |this, _store, event, cx| match event {
             UiStoreEvent::SnapshotUpdated(revs) => {
                 if revs.processes != this.last_processes_rev {
@@ -94,9 +176,18 @@ impl ProcessesView {
             selected_key: None,
             last_processes_rev: initial_rev,
             scroll_handle: UniformListScrollHandle::new(),
+            h_scroll_handle: ScrollHandle::new(),
+            column_layout,
             icon_cache: Rc::new(RefCell::new(IconRenderCache::new())),
             _subscriptions: vec![sub],
         }
+    }
+
+    fn persist_column_layout(&self, cx: &mut Context<Self>) {
+        let snapshot = self.column_layout.snapshot();
+        self.store.update(cx, |store, _| {
+            store.set_table_column_layout(PROCESSES_TABLE_ID, snapshot);
+        });
     }
 
     fn select_process(&mut self, key: ProcessKey, window: &mut Window, cx: &mut Context<Self>) {
@@ -402,6 +493,9 @@ impl Render for ProcessesView {
         let store_tree = self.store.clone();
         let store_run_task = self.store.clone();
 
+        let grouped_label = i18n::tr("processes.view_grouped");
+        let tree_label = i18n::tr("processes.view_tree");
+
         let toolbar = h_flex()
             .w_full()
             .flex_wrap()
@@ -435,7 +529,9 @@ impl Render for ProcessesView {
                             .child(
                                 Button::new("processes-mode-grouped")
                                     .xsmall()
-                                    .label(i18n::tr("processes.view_grouped"))
+                                    .icon(Icon::new(AssetIconName::LayoutList))
+                                    .tooltip(grouped_label.clone())
+                                    .accessibility_label(grouped_label)
                                     .map(|btn| {
                                         if view_mode == ProcessViewMode::Grouped {
                                             btn.primary()
@@ -454,7 +550,9 @@ impl Render for ProcessesView {
                             .child(
                                 Button::new("processes-mode-tree")
                                     .xsmall()
-                                    .label(i18n::tr("processes.view_tree"))
+                                    .icon(Icon::new(AssetIconName::ListTree))
+                                    .tooltip(tree_label.clone())
+                                    .accessibility_label(tree_label)
                                     .map(|btn| {
                                         if view_mode == ProcessViewMode::Tree {
                                             btn.primary()
@@ -510,158 +608,89 @@ impl Render for ProcessesView {
                     ),
             );
 
-        let column_header = h_flex()
-            .w_full()
-            .h(px(32.))
-            .flex_shrink_0()
-            .items_center()
-            .px_4()
-            .gap_2()
-            .bg(secondary_bg.opacity(0.45))
-            .border_b_1()
-            .border_color(border)
-            .text_xs()
-            .font_medium()
-            .text_color(muted_fg)
-            .child(div().flex_1().min_w(px(180.)).child(sortable_column_header(
-                "proc-col-name",
-                i18n::tr("processes.col_name"),
-                ProcessSortColumn::Name,
-                sort_col,
-                sort_dir,
-                false,
-                fg,
-                muted_fg,
-                primary,
-                self.store.clone(),
-            )))
-            .child(
-                div()
-                    .w(px(COL_STATUS_W))
-                    .flex_shrink_0()
-                    .child(sortable_column_header(
-                        "proc-col-status",
-                        i18n::tr("processes.col_status"),
-                        ProcessSortColumn::Status,
-                        sort_col,
-                        sort_dir,
-                        false,
-                        fg,
-                        muted_fg,
-                        primary,
-                        self.store.clone(),
-                    )),
-            )
-            .child(
-                div()
-                    .w(px(COL_CPU_W))
-                    .flex_shrink_0()
-                    .child(sortable_column_header(
-                        "proc-col-cpu",
-                        i18n::tr("processes.col_cpu"),
-                        ProcessSortColumn::Cpu,
-                        sort_col,
-                        sort_dir,
-                        true,
-                        fg,
-                        muted_fg,
-                        primary,
-                        self.store.clone(),
-                    )),
-            )
-            .child(
-                div()
-                    .w(px(COL_MEMORY_W))
-                    .flex_shrink_0()
-                    .child(sortable_column_header(
-                        "proc-col-memory",
-                        i18n::tr("processes.col_memory"),
-                        ProcessSortColumn::Memory,
-                        sort_col,
-                        sort_dir,
-                        true,
-                        fg,
-                        muted_fg,
-                        primary,
-                        self.store.clone(),
-                    )),
-            )
-            .child(
-                div()
-                    .w(px(COL_DISK_W))
-                    .flex_shrink_0()
-                    .child(sortable_column_header(
-                        "proc-col-disk",
-                        i18n::tr("processes.col_disk"),
-                        ProcessSortColumn::Disk,
-                        sort_col,
-                        sort_dir,
-                        true,
-                        fg,
-                        muted_fg,
-                        primary,
-                        self.store.clone(),
-                    )),
-            )
-            .child(
-                div()
-                    .w(px(COL_NETWORK_W))
-                    .flex_shrink_0()
-                    .child(sortable_column_header(
-                        "proc-col-network",
-                        i18n::tr("processes.col_network"),
-                        ProcessSortColumn::Network,
-                        sort_col,
-                        sort_dir,
-                        true,
-                        fg,
-                        muted_fg,
-                        primary,
-                        self.store.clone(),
-                    )),
-            )
-            .child(
-                div()
-                    .w(px(COL_GPU_W))
-                    .flex_shrink_0()
-                    .child(sortable_column_header(
-                        "proc-col-gpu",
-                        i18n::tr("processes.col_gpu"),
-                        ProcessSortColumn::Gpu,
-                        sort_col,
-                        sort_dir,
-                        true,
-                        fg,
-                        muted_fg,
-                        primary,
-                        self.store.clone(),
-                    )),
-            )
-            .child(
-                div()
-                    .w(px(COL_PUBLISHER_W))
-                    .flex_shrink_0()
-                    .truncate()
-                    .child(i18n::tr("processes.col_publisher")),
-            );
+        let columns: Vec<ColumnSpec<ProcessColumn>> = self.column_layout.columns().to_vec();
+        let total_cols = columns.len();
+        let table_width = self.column_layout.total_width(TABLE_HORIZONTAL_PADDING);
+        let column_layout_snapshot = self.column_layout.clone();
 
-        let body = if row_count == 0 {
+        let header_cells = columns.iter().enumerate().map(|(col_ix, spec)| {
+            let col = spec.id;
+            let sort_target = col.sort_column();
+            let is_active_sort = sort_target == Some(sort_col);
+            let next_dir = sort_target
+                .map(|target| next_sort_direction(sort_col, sort_dir, target))
+                .unwrap_or(SortDirection::Descending);
+            let store_for_sort = self.store.clone();
+
+            render_interactive_header_cell(
+                col_ix,
+                total_cols,
+                HeaderColumnDescriptor {
+                    id: format!("proc-col-{}", col.slug()).into(),
+                    label: col.label().into(),
+                    width: spec.width,
+                    right_aligned: col.right_aligned(),
+                    sortable: sort_target.is_some(),
+                    is_active_sort,
+                    sort_direction: sort_dir,
+                },
+                &column_layout_snapshot,
+                cx,
+                |view: &mut Self| &mut view.column_layout,
+                move |_view, _window, cx| {
+                    if let Some(target) = sort_target {
+                        UiCommands::set_process_sort(&store_for_sort, target, next_dir, cx);
+                    }
+                },
+                |view: &mut Self, cx| view.persist_column_layout(cx),
+            )
+            .into_any_element()
+        });
+
+        let column_header = attach_header_reorder_handlers(
+            h_flex()
+                .id("processes-column-header")
+                .w_full()
+                .h(px(32.))
+                .flex_shrink_0()
+                .items_center()
+                .px_2()
+                .bg(secondary_bg.opacity(0.45))
+                .border_b_1()
+                .border_color(border)
+                .text_xs()
+                .font_medium()
+                .text_color(muted_fg)
+                .children(header_cells),
+            cx,
+            |view: &mut Self| &mut view.column_layout,
+            |view: &mut Self, cx| view.persist_column_layout(cx),
+        );
+
+        let table_area = if row_count == 0 {
             v_flex()
                 .flex_1()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .p_8()
+                .min_h_0()
+                .w_full()
+                .child(column_header)
                 .child(
-                    Icon::new(IconName::Search)
-                        .size(px(24.))
-                        .text_color(muted_fg),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(muted_fg)
-                        .child(i18n::tr("processes.empty_search")),
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .p_8()
+                        .child(
+                            Icon::new(IconName::Search)
+                                .size(px(24.))
+                                .text_color(muted_fg),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(muted_fg)
+                                .child(i18n::tr("processes.empty_search")),
+                        ),
                 )
                 .into_any_element()
         } else {
@@ -682,378 +711,453 @@ impl Render for ProcessesView {
             div()
                 .flex_1()
                 .min_h_0()
+                .w_full()
                 .relative()
                 .child(
-                    uniform_list(
-                        "processes-virtual-list",
-                        row_count,
-                        move |range, _window, cx| {
-                            let theme = cx.theme();
-                            let row_border = theme.border.opacity(0.45);
-                            let row_hover = theme.accent.opacity(0.45);
-                            let row_selected = theme.primary.opacity(0.14);
-                            let section_bg = theme.muted.opacity(0.6);
+                    div()
+                        .id("processes-table-hscroll")
+                        .size_full()
+                        .overflow_x_scroll()
+                        .track_scroll(&self.h_scroll_handle)
+                        .child(
+                            v_flex()
+                                .min_w(px(table_width))
+                                .w_full()
+                                .h_full()
+                                .child(column_header)
+                                .child(
+                                    div().flex_1().min_h_0().w_full().child(
+                                        uniform_list(
+                                            "processes-virtual-list",
+                                            row_count,
+                                            move |range, _window, cx| {
+                                                let theme = cx.theme();
+                                                let row_border = theme.border.opacity(0.45);
+                                                let row_hover = theme.accent.opacity(0.45);
+                                                let row_selected = theme.primary.opacity(0.14);
+                                                let section_bg = theme.muted.opacity(0.6);
 
-                            range
-                                .filter_map(|ix| {
-                                    let row = slice.rows.get(ix)?;
-                                    match row.kind {
-                                        ProcessRowKind::SectionHeader { category, count } => {
-                                            let label = format!(
-                                                "{} ({count})",
-                                                i18n::process_category_label(category, platform)
-                                            );
-                                            Some(
-                                                h_flex()
-                                                    .id(("proc-section", ix))
-                                                    .w_full()
-                                                    .h(px(PROCESS_ROW_HEIGHT))
-                                                    .items_center()
-                                                    .px_4()
-                                                    .bg(section_bg)
-                                                    .border_b_1()
-                                                    .border_color(row_border)
-                                                    .text_xs()
-                                                    .font_semibold()
-                                                    .text_color(primary)
-                                                    .child(label)
-                                                    .into_any_element(),
-                                            )
-                                        }
-                                        ProcessRowKind::Process => {
-                                            let key = row.key;
-                                            let row_id = stable_row_id(key);
-                                            let is_selected = selected_key == Some(key);
-                                            let indent = f32::from(row.depth.min(8)) * 16.0;
-                                            let has_children = row.has_children;
-                                            let is_expanded = row.is_expanded;
+                                                range
+                                                    .filter_map(|ix| {
+                                                        let row = slice.rows.get(ix)?;
+                                                        match row.kind {
+                                                            ProcessRowKind::SectionHeader {
+                                                                category,
+                                                                count,
+                                                            } => {
+                                                                let label = format!(
+                                                                    "{} ({count})",
+                                                                    i18n::process_category_label(
+                                                                        category, platform
+                                                                    )
+                                                                );
+                                                                Some(
+                                                                    h_flex()
+                                                                        .id(("proc-section", ix))
+                                                                        .w_full()
+                                                                        .h(px(PROCESS_ROW_HEIGHT))
+                                                                        .items_center()
+                                                                        .px_4()
+                                                                        .bg(section_bg)
+                                                                        .border_b_1()
+                                                                        .border_color(row_border)
+                                                                        .text_xs()
+                                                                        .font_semibold()
+                                                                        .text_color(primary)
+                                                                        .child(label)
+                                                                        .into_any_element(),
+                                                                )
+                                                            }
+                                                            ProcessRowKind::Process => {
+                                                                let key = row.key;
+                                                                let row_id = stable_row_id(key);
+                                                                let is_selected =
+                                                                    selected_key == Some(key);
+                                                                let indent = f32::from(
+                                                                    row.depth.min(8),
+                                                                ) * 16.0;
+                                                                let has_children = row.has_children;
+                                                                let is_expanded = row.is_expanded;
 
-                                            let rendered_icon = row.icon.as_ref().and_then(|icon| {
-                                                icon_cache.borrow_mut().get_or_insert(icon)
-                                            });
+                                                                let rendered_icon =
+                                                                    row.icon.as_ref().and_then(
+                                                                        |icon| {
+                                                                            icon_cache
+                                                                                .borrow_mut()
+                                                                                .get_or_insert(icon)
+                                                                        },
+                                                                    );
 
-                                            let display_name: SharedString =
-                                                row.display_name.to_string().into();
-                                            let child_badge: Option<SharedString> =
-                                                (row.child_count > 0)
-                                                    .then(|| format!("({})", row.child_count).into());
-                                            let publisher_text: SharedString =
-                                                row.publisher.as_deref().unwrap_or("").to_owned().into();
+                                                                let display_name: SharedString =
+                                                                    row.display_name
+                                                                        .to_string()
+                                                                        .into();
+                                                                let child_badge: Option<
+                                                                    SharedString,
+                                                                > = (row.child_count > 0).then(
+                                                                    || {
+                                                                        format!(
+                                                                            "({})",
+                                                                            row.child_count
+                                                                        )
+                                                                        .into()
+                                                                    },
+                                                                );
+                                                                let publisher_text: SharedString =
+                                                                    row.publisher
+                                                                        .as_deref()
+                                                                        .unwrap_or("")
+                                                                        .to_owned()
+                                                                        .into();
 
-                                            let cpu_text = format_permille(row.cpu_permille);
-                                            let mem_text = format_memory_cell(
-                                                row.memory_bytes,
-                                                row.memory_permille,
-                                                mem_mode,
-                                            );
-                                            let disk_text = format_disk_cell(
-                                                row.disk_bytes_per_sec,
-                                                row.disk_permille,
-                                                disk_mode,
-                                            );
-                                            let net_text = format_network_cell(
-                                                row.net_bytes_per_sec,
-                                                row.net_permille,
-                                                net_mode,
-                                            );
-                                            let gpu_text = format_permille(row.gpu_util_permille);
+                                                                let cpu_text = format_permille(
+                                                                    row.cpu_permille,
+                                                                );
+                                                                let mem_text = format_memory_cell(
+                                                                    row.memory_bytes,
+                                                                    row.memory_permille,
+                                                                    mem_mode,
+                                                                );
+                                                                let disk_text = format_disk_cell(
+                                                                    row.disk_bytes_per_sec,
+                                                                    row.disk_permille,
+                                                                    disk_mode,
+                                                                );
+                                                                let net_text = format_network_cell(
+                                                                    row.net_bytes_per_sec,
+                                                                    row.net_permille,
+                                                                    net_mode,
+                                                                );
+                                                                let gpu_text = format_permille(
+                                                                    row.gpu_util_permille,
+                                                                );
 
-                                            let toggle_store = store_for_rows.clone();
-                                            let select_left = view_weak.clone();
-                                            let select_right = view_weak.clone();
-                                            let menu_store = store_for_rows.clone();
-                                            let menu_shell = shell_for_rows.clone();
-                                            let menu_row = row.clone();
+                                                                let toggle_store =
+                                                                    store_for_rows.clone();
+                                                                let select_left = view_weak.clone();
+                                                                let select_right =
+                                                                    view_weak.clone();
+                                                                let menu_store =
+                                                                    store_for_rows.clone();
+                                                                let menu_shell =
+                                                                    shell_for_rows.clone();
+                                                                let menu_row = row.clone();
 
-                                            let icon_el = if let Some(render_img) = rendered_icon {
-                                                img(render_img)
-                                                    .size(px(16.0))
-                                                    .flex_shrink_0()
-                                                    .into_any_element()
-                                            } else {
-                                                Icon::new(IconName::Frame)
-                                                    .size(px(15.0))
-                                                    .text_color(muted_fg.opacity(0.6))
-                                                    .into_any_element()
-                                            };
+                                                                let row_a11y_label: SharedString =
+                                                                    format!(
+                                                                        "{} (PID {})",
+                                                                        row.display_name, key.pid
+                                                                    )
+                                                                    .into();
 
-                                            let row_a11y_label: SharedString =
-                                                format!("{} (PID {})", row.display_name, key.pid)
-                                                    .into();
-                                            Some(
-                                                h_flex()
-                                                    .id(("proc-row", row_id))
-                                                    .role(gpui_kit::Role::ListItem)
-                                                    .aria_label(row_a11y_label)
-                                                    .aria_selected(is_selected)
-                                                    .w_full()
-                                                    .h(px(PROCESS_ROW_HEIGHT))
-                                                    .items_center()
-                                                    .px_4()
-                                                    .gap_2()
-                                                    .border_b_1()
-                                                    .border_color(row_border)
-                                                    .text_xs()
-                                                    .text_color(fg)
-                                                    .when(is_selected, |s| s.bg(row_selected))
-                                                    .hover(move |s| {
-                                                        if is_selected {
-                                                            s.bg(row_selected)
-                                                        } else {
-                                                            s.bg(row_hover)
+                                                                let cells = columns.iter().map(|spec| {
+                                                                    let w = px(spec.width);
+                                                                    match spec.id {
+                                                                        ProcessColumn::Name => {
+                                                                            let icon_el = if let Some(
+                                                                                render_img,
+                                                                            ) =
+                                                                                rendered_icon.clone()
+                                                                            {
+                                                                                img(render_img)
+                                                                                    .size(px(16.0))
+                                                                                    .flex_shrink_0()
+                                                                                    .into_any_element()
+                                                                            } else {
+                                                                                Icon::new(
+                                                                                    IconName::Frame,
+                                                                                )
+                                                                                .size(px(15.0))
+                                                                                .text_color(
+                                                                                    muted_fg
+                                                                                        .opacity(0.6),
+                                                                                )
+                                                                                .into_any_element()
+                                                                            };
+                                                                            let toggle_store =
+                                                                                toggle_store.clone();
+                                                                            h_flex()
+                                                                                .w(w)
+                                                                                .h_full()
+                                                                                .flex_shrink_0()
+                                                                                .items_center()
+                                                                                .gap_1p5()
+                                                                                .px_2()
+                                                                                .pl(px(8.0 + indent))
+                                                                                .overflow_hidden()
+                                                                                .child(if has_children {
+                                                                                    Button::new((
+                                                                                        "proc-expand",
+                                                                                        row_id,
+                                                                                    ))
+                                                                                    .xsmall()
+                                                                                    .ghost()
+                                                                                    .icon(if is_expanded {
+                                                                                        IconName::ChevronDown
+                                                                                    } else {
+                                                                                        IconName::ChevronRight
+                                                                                    })
+                                                                                    .on_click(move |_, _, cx| {
+                                                                                        UiCommands::toggle_process_expanded(
+                                                                                            &toggle_store,
+                                                                                            key,
+                                                                                            cx,
+                                                                                        );
+                                                                                    })
+                                                                                    .into_any_element()
+                                                                                } else {
+                                                                                    div()
+                                                                                        .w(px(20.))
+                                                                                        .flex_shrink_0()
+                                                                                        .into_any_element()
+                                                                                })
+                                                                                .child(icon_el)
+                                                                                .child(
+                                                                                    h_flex()
+                                                                                        .flex_1()
+                                                                                        .min_w_0()
+                                                                                        .items_center()
+                                                                                        .gap_1p5()
+                                                                                        .overflow_hidden()
+                                                                                        .child(
+                                                                                            div()
+                                                                                                .min_w_0()
+                                                                                                .truncate()
+                                                                                                .when(
+                                                                                                    is_selected
+                                                                                                        || has_children,
+                                                                                                    |d| d.font_medium(),
+                                                                                                )
+                                                                                                .child(display_name.clone()),
+                                                                                        )
+                                                                                        .when_some(
+                                                                                            child_badge.clone(),
+                                                                                            |this, badge| {
+                                                                                                this.child(
+                                                                                                    div()
+                                                                                                        .flex_shrink_0()
+                                                                                                        .text_color(muted_fg)
+                                                                                                        .child(badge),
+                                                                                                )
+                                                                                            },
+                                                                                        ),
+                                                                                )
+                                                                                .into_any_element()
+                                                                        }
+                                                                        ProcessColumn::Status => {
+                                                                            h_flex()
+                                                                                .w(w)
+                                                                                .h_full()
+                                                                                .flex_shrink_0()
+                                                                                .items_center()
+                                                                                .px_2()
+                                                                                .overflow_hidden()
+                                                                                .child(status_badges(
+                                                                                    row_id,
+                                                                                    row.status,
+                                                                                    &status_labels,
+                                                                                    &semantic,
+                                                                                ))
+                                                                                .into_any_element()
+                                                                        }
+                                                                        ProcessColumn::Cpu => div()
+                                                                            .w(w)
+                                                                            .h_full()
+                                                                            .flex_shrink_0()
+                                                                            .px_1()
+                                                                            .flex()
+                                                                            .items_center()
+                                                                            .child(heatmap_cell(
+                                                                                cpu_text.clone(),
+                                                                                HeatmapLevel::from_permille(
+                                                                                    row.cpu_permille,
+                                                                                ),
+                                                                                &semantic,
+                                                                            ))
+                                                                            .into_any_element(),
+                                                                        ProcessColumn::Memory => div()
+                                                                            .w(w)
+                                                                            .h_full()
+                                                                            .flex_shrink_0()
+                                                                            .px_1()
+                                                                            .flex()
+                                                                            .items_center()
+                                                                            .child(heatmap_cell(
+                                                                                mem_text.clone(),
+                                                                                HeatmapLevel::from_permille(
+                                                                                    row.memory_permille,
+                                                                                ),
+                                                                                &semantic,
+                                                                            ))
+                                                                            .into_any_element(),
+                                                                        ProcessColumn::Disk => div()
+                                                                            .w(w)
+                                                                            .h_full()
+                                                                            .flex_shrink_0()
+                                                                            .px_1()
+                                                                            .flex()
+                                                                            .items_center()
+                                                                            .child(heatmap_cell(
+                                                                                disk_text.clone(),
+                                                                                HeatmapLevel::from_bytes_per_sec(
+                                                                                    row.disk_bytes_per_sec,
+                                                                                ),
+                                                                                &semantic,
+                                                                            ))
+                                                                            .into_any_element(),
+                                                                        ProcessColumn::Network => div()
+                                                                            .w(w)
+                                                                            .h_full()
+                                                                            .flex_shrink_0()
+                                                                            .px_1()
+                                                                            .flex()
+                                                                            .items_center()
+                                                                            .child(heatmap_cell(
+                                                                                net_text.clone(),
+                                                                                HeatmapLevel::from_bytes_per_sec(
+                                                                                    row.net_bytes_per_sec,
+                                                                                ),
+                                                                                &semantic,
+                                                                            ))
+                                                                            .into_any_element(),
+                                                                        ProcessColumn::Gpu => div()
+                                                                            .w(w)
+                                                                            .h_full()
+                                                                            .flex_shrink_0()
+                                                                            .px_1()
+                                                                            .flex()
+                                                                            .items_center()
+                                                                            .child(heatmap_cell(
+                                                                                gpu_text.clone(),
+                                                                                HeatmapLevel::from_permille(
+                                                                                    row.gpu_util_permille,
+                                                                                ),
+                                                                                &semantic,
+                                                                            ))
+                                                                            .into_any_element(),
+                                                                        ProcessColumn::Publisher => {
+                                                                            h_flex()
+                                                                                .w(w)
+                                                                                .h_full()
+                                                                                .flex_shrink_0()
+                                                                                .items_center()
+                                                                                .px_2()
+                                                                                .overflow_hidden()
+                                                                                .child(
+                                                                                    div()
+                                                                                        .min_w_0()
+                                                                                        .truncate()
+                                                                                        .text_color(muted_fg)
+                                                                                        .child(publisher_text.clone()),
+                                                                                )
+                                                                                .into_any_element()
+                                                                        }
+                                                                    }
+                                                                });
+
+                                                                Some(
+                                                                    h_flex()
+                                                                        .id(("proc-row", row_id))
+                                                                        .role(gpui_kit::Role::ListItem)
+                                                                        .aria_label(row_a11y_label)
+                                                                        .aria_selected(is_selected)
+                                                                        .w_full()
+                                                                        .h(px(PROCESS_ROW_HEIGHT))
+                                                                        .items_center()
+                                                                        .px_2()
+                                                                        .border_b_1()
+                                                                        .border_color(row_border)
+                                                                        .text_xs()
+                                                                        .text_color(fg)
+                                                                        .when(is_selected, |s| {
+                                                                            s.bg(row_selected)
+                                                                        })
+                                                                        .hover(move |s| {
+                                                                            if is_selected {
+                                                                                s.bg(row_selected)
+                                                                            } else {
+                                                                                s.bg(row_hover)
+                                                                            }
+                                                                        })
+                                                                        .on_click(move |_, window, cx| {
+                                                                            let _ = select_left.update(
+                                                                                cx,
+                                                                                |view, cx| {
+                                                                                    view.select_process(
+                                                                                        key, window, cx,
+                                                                                    );
+                                                                                },
+                                                                            );
+                                                                        })
+                                                                        .on_mouse_down(
+                                                                            MouseButton::Right,
+                                                                            move |_, window, cx| {
+                                                                                let _ = select_right.update(
+                                                                                    cx,
+                                                                                    |view, cx| {
+                                                                                        view.select_process(
+                                                                                            key, window, cx,
+                                                                                        );
+                                                                                    },
+                                                                                );
+                                                                            },
+                                                                        )
+                                                                        .children(cells)
+                                                                        .context_menu(
+                                                                            move |menu, window, cx| {
+                                                                                build_row_context_menu(
+                                                                                    menu,
+                                                                                    menu_store.clone(),
+                                                                                    menu_shell.clone(),
+                                                                                    menu_row.clone(),
+                                                                                    window,
+                                                                                    cx,
+                                                                                )
+                                                                            },
+                                                                        )
+                                                                        .into_any_element(),
+                                                                )
+                                                            }
                                                         }
                                                     })
-                                                    .on_click(move |_, window, cx| {
-                                                        let _ = select_left.update(
-                                                            cx,
-                                                            |view, cx| {
-                                                                view.select_process(
-                                                                    key, window, cx,
-                                                                );
-                                                            },
-                                                        );
-                                                    })
-                                                    .on_mouse_down(
-                                                        MouseButton::Right,
-                                                        move |_, window, cx| {
-                                                            let _ = select_right.update(
-                                                                cx,
-                                                                |view, cx| {
-                                                                    view.select_process(
-                                                                        key, window, cx,
-                                                                    );
-                                                                },
-                                                            );
-                                                        },
-                                                    )
-                                                    .child(
-                                                        h_flex()
-                                                            .flex_1()
-                                                            .min_w(px(180.))
-                                                            .items_center()
-                                                            .gap_1p5()
-                                                            .pl(px(indent))
-                                                            .overflow_hidden()
-                                                            .child(if has_children {
-                                                                Button::new((
-                                                                    "proc-expand",
-                                                                    row_id,
-                                                                ))
-                                                                .xsmall()
-                                                                .ghost()
-                                                                .icon(if is_expanded {
-                                                                    IconName::ChevronDown
-                                                                } else {
-                                                                    IconName::ChevronRight
-                                                                })
-                                                                .on_click(move |_, _, cx| {
-                                                                    UiCommands::toggle_process_expanded(
-                                                                        &toggle_store,
-                                                                        key,
-                                                                        cx,
-                                                                    );
-                                                                })
-                                                                .into_any_element()
-                                                            } else {
-                                                                div()
-                                                                    .w(px(20.))
-                                                                    .flex_shrink_0()
-                                                                    .into_any_element()
-                                                            })
-                                                            .child(icon_el)
-                                                            .child(
-                                                                h_flex()
-                                                                    .flex_1()
-                                                                    .min_w_0()
-                                                                    .items_center()
-                                                                    .gap_1p5()
-                                                                    .overflow_hidden()
-                                                                    .child(
-                                                                        div()
-                                                                            .min_w_0()
-                                                                            .truncate()
-                                                                            .when(
-                                                                                is_selected
-                                                                                    || has_children,
-                                                                                |d| d.font_medium(),
-                                                                            )
-                                                                            .child(display_name),
-                                                                    )
-                                                                    .when_some(
-                                                                        child_badge,
-                                                                        |this, badge| {
-                                                                            this.child(
-                                                                                div()
-                                                                                    .flex_shrink_0()
-                                                                                    .text_color(
-                                                                                        muted_fg,
-                                                                                    )
-                                                                                    .child(badge),
-                                                                            )
-                                                                        },
-                                                                    ),
-                                                            ),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .w(px(COL_STATUS_W))
-                                                            .flex_shrink_0()
-                                                            .overflow_hidden()
-                                                            .child(status_badges(
-                                                                row_id,
-                                                                row.status,
-                                                                &status_labels,
-                                                                &semantic,
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        div().w(px(COL_CPU_W)).flex_shrink_0().child(
-                                                            heatmap_cell(
-                                                                cpu_text,
-                                                                HeatmapLevel::from_permille(
-                                                                    row.cpu_permille,
-                                                                ),
-                                                                &semantic,
-                                                            ),
-                                                        ),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .w(px(COL_MEMORY_W))
-                                                            .flex_shrink_0()
-                                                            .child(heatmap_cell(
-                                                                mem_text,
-                                                                HeatmapLevel::from_permille(
-                                                                    row.memory_permille,
-                                                                ),
-                                                                &semantic,
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .w(px(COL_DISK_W))
-                                                            .flex_shrink_0()
-                                                            .child(heatmap_cell(
-                                                                disk_text,
-                                                                HeatmapLevel::from_bytes_per_sec(
-                                                                    row.disk_bytes_per_sec,
-                                                                ),
-                                                                &semantic,
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .w(px(COL_NETWORK_W))
-                                                            .flex_shrink_0()
-                                                            .child(heatmap_cell(
-                                                                net_text,
-                                                                HeatmapLevel::from_bytes_per_sec(
-                                                                    row.net_bytes_per_sec,
-                                                                ),
-                                                                &semantic,
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        div().w(px(COL_GPU_W)).flex_shrink_0().child(
-                                                            heatmap_cell(
-                                                                gpu_text,
-                                                                HeatmapLevel::from_permille(
-                                                                    row.gpu_util_permille,
-                                                                ),
-                                                                &semantic,
-                                                            ),
-                                                        ),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .w(px(COL_PUBLISHER_W))
-                                                            .flex_shrink_0()
-                                                            .truncate()
-                                                            .text_color(muted_fg)
-                                                            .child(publisher_text),
-                                                    )
-                                                    .context_menu(move |menu, window, cx| {
-                                                        build_row_context_menu(
-                                                            menu,
-                                                            menu_store.clone(),
-                                                            menu_shell.clone(),
-                                                            menu_row.clone(),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                    })
-                                                    .into_any_element(),
-                                            )
-                                        }
-                                    }
-                                })
-                                .collect()
-                        },
-                    )
-                    .size_full()
-                    .track_scroll(&self.scroll_handle),
+                                                    .collect()
+                                            },
+                                        )
+                                        .size_full()
+                                        .track_scroll(&self.scroll_handle),
+                                    ),
+                                ),
+                        ),
                 )
                 .vertical_scrollbar(&self.scroll_handle)
+                .horizontal_scrollbar(&self.h_scroll_handle)
                 .into_any_element()
         };
 
-        v_flex()
-            .id("processes-view-root")
-            .track_focus(&self.focus_handle)
-            .size_full()
-            .min_h_0()
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                let no_modifiers = !event.keystroke.modifiers.control
-                    && !event.keystroke.modifiers.alt
-                    && !event.keystroke.modifiers.platform
-                    && !event.keystroke.modifiers.shift;
-                if no_modifiers && event.keystroke.key == "delete" && this.selected_key.is_some() {
-                    this.trigger_end_task_for_selected(window, cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .child(toolbar)
-            .child(column_header)
-            .child(body)
+        attach_table_column_drag_handlers(
+            v_flex()
+                .id("processes-view-root")
+                .track_focus(&self.focus_handle)
+                .size_full()
+                .min_h_0()
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    let no_modifiers = !event.keystroke.modifiers.control
+                        && !event.keystroke.modifiers.alt
+                        && !event.keystroke.modifiers.platform
+                        && !event.keystroke.modifiers.shift;
+                    if no_modifiers
+                        && event.keystroke.key == "delete"
+                        && this.selected_key.is_some()
+                    {
+                        this.trigger_end_task_for_selected(window, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .child(toolbar)
+                .child(table_area),
+            cx,
+            |view: &mut Self| &mut view.column_layout,
+            |view: &mut Self, cx| view.persist_column_layout(cx),
+        )
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn sortable_column_header(
-    id: &'static str,
-    label: String,
-    column: ProcessSortColumn,
-    active_column: ProcessSortColumn,
-    active_direction: SortDirection,
-    right_aligned: bool,
-    active_fg: gpui_kit::Hsla,
-    muted_fg: gpui_kit::Hsla,
-    primary: gpui_kit::Hsla,
-    store: Entity<UiStore>,
-) -> impl IntoElement {
-    let is_active = active_column == column;
-    let next_dir = next_sort_direction(active_column, active_direction, column);
-    let chevron = match active_direction {
-        SortDirection::Ascending => IconName::ChevronUp,
-        SortDirection::Descending => IconName::ChevronDown,
-    };
-
-    h_flex()
-        .id(id)
-        .w_full()
-        .h_full()
-        .items_center()
-        .gap_1()
-        .cursor_pointer()
-        .when(right_aligned, |this| this.justify_end())
-        .text_color(if is_active { active_fg } else { muted_fg })
-        .when(is_active, |this| this.font_semibold())
-        .hover(move |s| s.text_color(active_fg))
-        .on_click(move |_, _, cx| {
-            UiCommands::set_process_sort(&store, column, next_dir, cx);
-        })
-        .child(div().truncate().child(label))
-        .when(is_active, |this| {
-            this.child(Icon::new(chevron).xsmall().text_color(primary))
-        })
 }
