@@ -1,16 +1,28 @@
-//! Reusable interactive table column layout (drag-to-resize and drag-to-reorder)
-//! shared by the Processes and Details feature views.
+//! Reusable interactive table column layout (visibility, header context menu,
+//! "Select columns" dialog, drag-to-resize, and drag-to-reorder) shared by the
+//! Processes and Details feature views.
 
+use std::rc::Rc;
+
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::dialog::DialogFooter;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
-    ActiveTheme as _, ElementExt as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
+    ActiveTheme as _, ElementExt as _, Icon, IconName, Sizable as _, StyledExt as _,
+    WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
-    AppContext as _, Bounds, Context, DragMoveEvent, Empty, EntityId, InteractiveElement as _,
+    App, AppContext as _, Bounds, Context, DragMoveEvent, Empty, EntityId, InteractiveElement as _,
     IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels, Render, Role,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window, div,
     prelude::FluentBuilder as _, px,
 };
+use loom_config::TableColumnSetting;
 use loom_types::SortDirection;
+
+use crate::i18n;
 
 /// Width in logical pixels on each side of a column divider that acts as a resize grab zone.
 const RESIZE_HANDLE_HALF_WIDTH: f32 = 4.0;
@@ -21,11 +33,11 @@ const HEADER_DRAG_VERTICAL_SLACK: f32 = 36.0;
 
 /// Identifier trait for columns managed by [`TableColumnLayout`].
 pub(crate) trait ColumnKey: Copy + Eq + 'static {
-    /// Stable lowercase key used to persist session column order and widths in `UiStore`.
+    /// Stable lowercase key used to persist column order, widths, and visibility in `settings.toml`.
     fn slug(self) -> &'static str;
 }
 
-/// Static + runtime geometry specification for a single table column.
+/// Static + runtime geometry and visibility specification for a single table column.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ColumnSpec<C: ColumnKey> {
     /// Logical column identifier.
@@ -36,10 +48,14 @@ pub(crate) struct ColumnSpec<C: ColumnKey> {
     pub(crate) min_width: f32,
     /// Maximum allowed width in logical pixels during resize.
     pub(crate) max_width: f32,
+    /// Whether this column is currently visible in the table.
+    pub(crate) visible: bool,
+    /// Whether this column is pinned and cannot be hidden (e.g., primary Name column).
+    pub(crate) locked: bool,
 }
 
 impl<C: ColumnKey> ColumnSpec<C> {
-    /// Creates a new [`ColumnSpec`] with the given initial width and `[min_width, max_width]` bounds.
+    /// Creates a visible, hideable [`ColumnSpec`] with the given width and bounds.
     #[inline]
     pub(crate) const fn new(id: C, width: f32, min_width: f32, max_width: f32) -> Self {
         Self {
@@ -47,6 +63,34 @@ impl<C: ColumnKey> ColumnSpec<C> {
             width,
             min_width,
             max_width,
+            visible: true,
+            locked: false,
+        }
+    }
+
+    /// Creates a visible, locked [`ColumnSpec`] that cannot be hidden.
+    #[inline]
+    pub(crate) const fn pinned(id: C, width: f32, min_width: f32, max_width: f32) -> Self {
+        Self {
+            id,
+            width,
+            min_width,
+            max_width,
+            visible: true,
+            locked: true,
+        }
+    }
+
+    /// Creates a hidden-by-default, toggleable [`ColumnSpec`] with the given width and bounds.
+    #[inline]
+    pub(crate) const fn hidden(id: C, width: f32, min_width: f32, max_width: f32) -> Self {
+        Self {
+            id,
+            width,
+            min_width,
+            max_width,
+            visible: false,
+            locked: false,
         }
     }
 }
@@ -58,7 +102,11 @@ struct ResizeDragOrigin {
     origin_width: f32,
 }
 
-/// Pure column order, width, bounds, resize, and drag-reorder state for a virtualized table.
+/// Pure column order, visibility, width, bounds, resize, and drag-reorder state for a virtualized table.
+///
+/// All `col_ix` indices passed to resize, bounds, and drag-reorder methods operate in
+/// **visible-column** coordinates (`0..visible_count()`), while hidden columns retain their
+/// relative order and last saved widths inside `columns`.
 #[derive(Debug, Clone)]
 pub(crate) struct TableColumnLayout<C: ColumnKey> {
     columns: Vec<ColumnSpec<C>>,
@@ -70,103 +118,193 @@ pub(crate) struct TableColumnLayout<C: ColumnKey> {
 
 impl<C: ColumnKey> TableColumnLayout<C> {
     /// Constructs a layout initialized from default ordered [`ColumnSpec`] definitions.
-    pub(crate) fn new(columns: Vec<ColumnSpec<C>>) -> Self {
-        let len = columns.len();
+    pub(crate) fn new(mut columns: Vec<ColumnSpec<C>>) -> Self {
+        ensure_at_least_one_visible(&mut columns);
+        let vis_len = columns.iter().filter(|c| c.visible).count();
         Self {
             columns,
-            bounds: vec![Bounds::default(); len],
+            bounds: vec![Bounds::default(); vis_len],
             resize_origin: None,
             resizing_col: None,
             drag_gap: None,
         }
     }
 
-    /// Applies previously saved `(slug, width)` entries, preserving order and clamped widths
-    /// while keeping any new columns appended at their default positions.
-    pub(crate) fn apply_saved(&mut self, saved: &[(&'static str, f32)]) {
+    /// Applies previously persisted [`TableColumnSetting`] entries, preserving order, clamped
+    /// widths, and visibility while appending any newly added columns at their default positions.
+    pub(crate) fn apply_saved(&mut self, saved: &[TableColumnSetting]) {
         if saved.is_empty() {
             return;
         }
         let mut remaining = self.columns.clone();
         let mut reordered = Vec::with_capacity(remaining.len());
 
-        for &(slug, width) in saved {
-            if let Some(pos) = remaining.iter().position(|spec| spec.id.slug() == slug) {
+        for entry in saved {
+            if let Some(pos) = remaining
+                .iter()
+                .position(|spec| spec.id.slug() == entry.id.as_str())
+            {
                 let mut spec = remaining.remove(pos);
-                spec.width = width.clamp(spec.min_width, spec.max_width);
+                spec.width = (entry.width as f32).clamp(spec.min_width, spec.max_width);
+                spec.visible = if spec.locked { true } else { entry.visible };
                 reordered.push(spec);
             }
         }
         reordered.extend(remaining);
+        ensure_at_least_one_visible(&mut reordered);
 
-        let len = reordered.len();
         self.columns = reordered;
-        self.bounds = vec![Bounds::default(); len];
-        self.resize_origin = None;
-        self.resizing_col = None;
-        self.drag_gap = None;
+        self.reset_interaction_state();
     }
 
-    /// Exports the current column order and widths as `(slug, width)` pairs for session storage.
-    pub(crate) fn snapshot(&self) -> Vec<(&'static str, f32)> {
+    /// Exports the current column order, widths, and visibility for persistence in `settings.toml`.
+    pub(crate) fn snapshot(&self) -> Vec<TableColumnSetting> {
         self.columns
             .iter()
-            .map(|spec| (spec.id.slug(), spec.width))
+            .map(|spec| TableColumnSetting {
+                id: spec.id.slug().to_owned(),
+                width: spec.width.round().max(1.0) as u32,
+                visible: spec.visible,
+            })
             .collect()
     }
 
-    /// Returns the ordered slice of active columns.
+    /// Resets the layout to fresh default specifications.
+    pub(crate) fn reset(&mut self, mut defaults: Vec<ColumnSpec<C>>) {
+        ensure_at_least_one_visible(&mut defaults);
+        self.columns = defaults;
+        self.reset_interaction_state();
+    }
+
+    /// Returns all columns (both visible and hidden) in their stored order.
+    #[cfg(test)]
     #[inline]
-    pub(crate) fn columns(&self) -> &[ColumnSpec<C>] {
+    pub(crate) fn all_columns(&self) -> &[ColumnSpec<C>] {
         &self.columns
     }
 
-    /// Returns total table width across all columns plus `horizontal_padding` (left + right).
+    /// Returns the ordered list of currently visible columns.
+    pub(crate) fn visible_columns(&self) -> Vec<ColumnSpec<C>> {
+        self.columns
+            .iter()
+            .copied()
+            .filter(|spec| spec.visible)
+            .collect()
+    }
+
+    /// Returns the number of currently visible columns.
+    #[inline]
+    pub(crate) fn visible_count(&self) -> usize {
+        self.columns.iter().filter(|spec| spec.visible).count()
+    }
+
+    /// Returns `true` if column `id` is currently visible.
+    #[inline]
+    pub(crate) fn is_visible(&self, id: C) -> bool {
+        self.columns
+            .iter()
+            .find(|spec| spec.id == id)
+            .is_some_and(|spec| spec.visible)
+    }
+
+    /// Hides column `id` if it is visible, unlocked, and not the last visible column.
+    ///
+    /// Returns `true` if visibility changed.
+    pub(crate) fn hide_column(&mut self, id: C) -> bool {
+        let visible_total = self.visible_count();
+        if visible_total <= 1 {
+            return false;
+        }
+        let Some(spec) = self.columns.iter_mut().find(|spec| spec.id == id) else {
+            return false;
+        };
+        if spec.locked || !spec.visible {
+            return false;
+        }
+        spec.visible = false;
+        self.reset_interaction_state();
+        true
+    }
+
+    /// Updates visibility for all unlocked columns based on the selected `visible_slugs`.
+    ///
+    /// Locked columns always remain visible, and at least one column is guaranteed to stay visible.
+    /// Returns `true` if any column's visibility changed.
+    pub(crate) fn apply_visible_slugs(&mut self, visible_slugs: &[&'static str]) -> bool {
+        let mut changed = false;
+        for spec in &mut self.columns {
+            let next_visible = if spec.locked {
+                true
+            } else {
+                visible_slugs.contains(&spec.id.slug())
+            };
+            if spec.visible != next_visible {
+                spec.visible = next_visible;
+                changed = true;
+            }
+        }
+        if ensure_at_least_one_visible(&mut self.columns) {
+            changed = true;
+        }
+        if changed {
+            self.reset_interaction_state();
+        }
+        changed
+    }
+
+    /// Returns total table width across all visible columns plus `horizontal_padding` (left + right).
     #[inline]
     pub(crate) fn total_width(&self, horizontal_padding: f32) -> f32 {
-        let cols_sum: f32 = self.columns.iter().map(|c| c.width).sum();
+        let cols_sum: f32 = self
+            .columns
+            .iter()
+            .filter(|c| c.visible)
+            .map(|c| c.width)
+            .sum();
         cols_sum + horizontal_padding
     }
 
-    /// Records the rendered window-space bounds of column header `col_ix`.
+    /// Records the rendered window-space bounds of visible column header `vis_ix`.
     #[inline]
-    pub(crate) fn set_bounds(&mut self, col_ix: usize, bounds: Bounds<Pixels>) {
-        if let Some(slot) = self.bounds.get_mut(col_ix) {
+    pub(crate) fn set_bounds(&mut self, vis_ix: usize, bounds: Bounds<Pixels>) {
+        if let Some(slot) = self.bounds.get_mut(vis_ix) {
             *slot = bounds;
         }
     }
 
-    /// Starts a column-resize interaction at pointer x-coordinate `pointer_x`.
-    pub(crate) fn begin_resize(&mut self, col_ix: usize, pointer_x: Pixels) {
-        if let Some(spec) = self.columns.get(col_ix) {
+    /// Starts a column-resize interaction for visible column `vis_ix` at pointer `pointer_x`.
+    pub(crate) fn begin_resize(&mut self, vis_ix: usize, pointer_x: Pixels) {
+        if let Some(all_ix) = self.visible_to_all_index(vis_ix) {
+            let width = self.columns[all_ix].width;
             self.resize_origin = Some(ResizeDragOrigin {
-                col_ix,
+                col_ix: vis_ix,
                 origin_x: pointer_x,
-                origin_width: spec.width,
+                origin_width: width,
             });
-            self.resizing_col = Some(col_ix);
+            self.resizing_col = Some(vis_ix);
         }
     }
 
-    /// Updates column `col_ix` width from a drag-move at `pointer_x`. Returns `true` if changed.
-    pub(crate) fn update_resize(&mut self, col_ix: usize, pointer_x: Pixels) -> bool {
+    /// Updates visible column `vis_ix` width from a drag-move at `pointer_x`. Returns `true` if changed.
+    pub(crate) fn update_resize(&mut self, vis_ix: usize, pointer_x: Pixels) -> bool {
         let origin = match self.resize_origin {
-            Some(origin) if origin.col_ix == col_ix => origin,
+            Some(origin) if origin.col_ix == vis_ix => origin,
             _ => {
-                self.begin_resize(col_ix, pointer_x);
+                self.begin_resize(vis_ix, pointer_x);
                 return false;
             }
         };
-        self.resizing_col = Some(col_ix);
+        self.resizing_col = Some(vis_ix);
         let delta = f32::from(pointer_x - origin.origin_x);
-        self.resize_column(col_ix, origin.origin_width + delta)
+        self.resize_column(vis_ix, origin.origin_width + delta)
     }
 
-    /// Sets column `col_ix` width clamped to `[min_width, max_width]`. Returns `true` if changed.
-    pub(crate) fn resize_column(&mut self, col_ix: usize, new_width: f32) -> bool {
-        let Some(spec) = self.columns.get_mut(col_ix) else {
+    /// Sets visible column `vis_ix` width clamped to `[min_width, max_width]`. Returns `true` if changed.
+    pub(crate) fn resize_column(&mut self, vis_ix: usize, new_width: f32) -> bool {
+        let Some(all_ix) = self.visible_to_all_index(vis_ix) else {
             return false;
         };
+        let spec = &mut self.columns[all_ix];
         let clamped = new_width.clamp(spec.min_width, spec.max_width).round();
         if (spec.width - clamped).abs() < 0.5 {
             return false;
@@ -183,13 +321,13 @@ impl<C: ColumnKey> TableColumnLayout<C> {
         was_active
     }
 
-    /// Returns `true` while column `col_ix` is actively being resized.
+    /// Returns `true` while visible column `vis_ix` is actively being resized.
     #[inline]
-    pub(crate) fn is_resizing(&self, col_ix: usize) -> bool {
-        self.resizing_col == Some(col_ix)
+    pub(crate) fn is_resizing(&self, vis_ix: usize) -> bool {
+        self.resizing_col == Some(vis_ix)
     }
 
-    /// Returns the currently highlighted drop insertion gap (`0..=columns.len()`).
+    /// Returns the currently highlighted drop insertion gap (`0..=visible_count()`).
     #[inline]
     pub(crate) fn drag_gap(&self) -> Option<usize> {
         self.drag_gap
@@ -206,11 +344,12 @@ impl<C: ColumnKey> TableColumnLayout<C> {
         }
     }
 
-    /// Computes the drop insertion gap (`0..=columns.len()`) for a column header dragged to `x`.
+    /// Computes the drop insertion gap (`0..=visible_count()`) for a visible column header dragged to `x`.
     ///
-    /// Returns `None` when dropping at `x` would leave `drag_col_ix` in its current position.
-    pub(crate) fn drag_gap_at(&self, x: Pixels, drag_col_ix: usize) -> Option<usize> {
-        if drag_col_ix >= self.columns.len() || self.bounds.len() != self.columns.len() {
+    /// Returns `None` when dropping at `x` would leave `drag_vis_ix` in its current position.
+    pub(crate) fn drag_gap_at(&self, x: Pixels, drag_vis_ix: usize) -> Option<usize> {
+        let vis_len = self.visible_count();
+        if drag_vis_ix >= vis_len || self.bounds.len() != vis_len {
             return None;
         }
 
@@ -222,38 +361,74 @@ impl<C: ColumnKey> TableColumnLayout<C> {
             gap = ix + 1;
         }
 
-        if gap == drag_col_ix || gap == drag_col_ix + 1 {
+        if gap == drag_vis_ix || gap == drag_vis_ix + 1 {
             None
         } else {
             Some(gap)
         }
     }
 
-    /// Commits a column reorder by moving `from_ix` into the active `drag_gap`.
+    /// Commits a column reorder by moving visible column `from_vis_ix` into the active `drag_gap`.
     ///
     /// Returns `true` if the column order changed.
-    pub(crate) fn commit_drag_drop(&mut self, from_ix: usize) -> bool {
+    pub(crate) fn commit_drag_drop(&mut self, from_vis_ix: usize) -> bool {
         let Some(gap) = self.drag_gap.take() else {
             return false;
         };
-        let to_ix = if from_ix < gap { gap - 1 } else { gap };
-        self.move_column(from_ix, to_ix)
+        let to_vis_ix = if from_vis_ix < gap { gap - 1 } else { gap };
+        self.move_visible_column(from_vis_ix, to_vis_ix)
     }
 
-    /// Moves the column at `from_ix` to `to_ix`, keeping bounds synchronized.
-    pub(crate) fn move_column(&mut self, from_ix: usize, to_ix: usize) -> bool {
-        let len = self.columns.len();
-        if from_ix >= len || to_ix >= len || from_ix == to_ix {
+    /// Moves the visible column at `from_vis_ix` to visible slot `to_vis_ix`, keeping bounds synchronized.
+    pub(crate) fn move_visible_column(&mut self, from_vis_ix: usize, to_vis_ix: usize) -> bool {
+        let vis_len = self.visible_count();
+        if from_vis_ix >= vis_len || to_vis_ix >= vis_len || from_vis_ix == to_vis_ix {
             return false;
         }
-        let col = self.columns.remove(from_ix);
-        self.columns.insert(to_ix, col);
-        if self.bounds.len() == len {
-            let b = self.bounds.remove(from_ix);
-            self.bounds.insert(to_ix, b);
+        let Some(from_all_ix) = self.visible_to_all_index(from_vis_ix) else {
+            return false;
+        };
+        let Some(target_all_ix) = self.visible_to_all_index(to_vis_ix) else {
+            return false;
+        };
+
+        let col = self.columns.remove(from_all_ix);
+        self.columns.insert(target_all_ix, col);
+        if self.bounds.len() == vis_len {
+            let b = self.bounds.remove(from_vis_ix);
+            self.bounds.insert(to_vis_ix, b);
         }
         true
     }
+
+    fn visible_to_all_index(&self, vis_ix: usize) -> Option<usize> {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter(|(_, spec)| spec.visible)
+            .nth(vis_ix)
+            .map(|(all_ix, _)| all_ix)
+    }
+
+    fn reset_interaction_state(&mut self) {
+        let vis_len = self.visible_count();
+        self.bounds = vec![Bounds::default(); vis_len];
+        self.resize_origin = None;
+        self.resizing_col = None;
+        self.drag_gap = None;
+    }
+}
+
+fn ensure_at_least_one_visible<C: ColumnKey>(columns: &mut [ColumnSpec<C>]) -> bool {
+    if columns.is_empty() || columns.iter().any(|c| c.visible) {
+        return false;
+    }
+    if let Some(locked) = columns.iter_mut().find(|c| c.locked) {
+        locked.visible = true;
+    } else {
+        columns[0].visible = true;
+    }
+    true
 }
 
 /// Floating ghost preview payload used while dragging a column header to reorder it.
@@ -310,13 +485,62 @@ pub(crate) struct HeaderColumnDescriptor {
     pub(crate) sort_direction: SortDirection,
 }
 
+/// Callback executed by a table column header context menu item.
+pub(crate) type HeaderMenuAction = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// Builds the standard table column header right-click [`PopupMenu`].
+///
+/// Includes `Hide column` (disabled when `hide_action` is `None`, e.g., on the pinned Name
+/// column or empty header space), `Select columns...`, optional view-specific `extra_items`,
+/// and `Reset default columns`.
+pub(crate) fn build_column_header_menu<FExtra>(
+    mut menu: PopupMenu,
+    hide_action: Option<HeaderMenuAction>,
+    on_select_columns: HeaderMenuAction,
+    extra_items: FExtra,
+    on_reset_defaults: HeaderMenuAction,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu
+where
+    FExtra: FnOnce(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu,
+{
+    let can_hide = hide_action.is_some();
+    menu = menu
+        .item(
+            PopupMenuItem::new(i18n::tr("table.menu_hide_column"))
+                .disabled(!can_hide)
+                .on_click(move |_, window, cx| {
+                    if let Some(ref action) = hide_action {
+                        action(window, cx);
+                    }
+                }),
+        )
+        .item(
+            PopupMenuItem::new(i18n::tr("table.menu_select_columns"))
+                .icon(IconName::Settings2)
+                .on_click(move |_, window, cx| {
+                    on_select_columns(window, cx);
+                }),
+        );
+
+    menu = extra_items(menu, window, cx);
+
+    menu.separator().item(
+        PopupMenuItem::new(i18n::tr("table.menu_reset_columns")).on_click(move |_, window, cx| {
+            on_reset_defaults(window, cx);
+        }),
+    )
+}
+
 /// Renders one interactive column header cell with:
 /// - Click-to-sort (when `desc.sortable`)
+/// - Right-click header context menu (`on_context_menu`)
 /// - Drag-to-reorder (`DragColumnHeader`) + vertical drop insertion bar
 /// - Symmetric leading & trailing `cursor_col_resize` handles (`ResizeColumnDrag`)
 /// - Prepaint bounds capture for accurate live drop-gap hit testing
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn render_interactive_header_cell<V, C, FLayout, FSort, FChanged>(
+pub(crate) fn render_interactive_header_cell<V, C, FLayout, FSort, FChanged, FMenu>(
     col_ix: usize,
     total_cols: usize,
     desc: HeaderColumnDescriptor,
@@ -325,6 +549,7 @@ pub(crate) fn render_interactive_header_cell<V, C, FLayout, FSort, FChanged>(
     layout_mut: FLayout,
     on_sort: FSort,
     on_layout_committed: FChanged,
+    on_context_menu: FMenu,
 ) -> impl IntoElement
 where
     V: 'static,
@@ -332,6 +557,7 @@ where
     FLayout: Fn(&mut V) -> &mut TableColumnLayout<C> + Copy + 'static,
     FSort: Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
     FChanged: Fn(&mut V, &mut Context<V>) + Copy + 'static,
+    FMenu: Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
 {
     let table_id = cx.entity_id();
     let theme = cx.theme();
@@ -342,6 +568,7 @@ where
     let hover_bg = theme.accent.opacity(0.4);
 
     let width_px = px(desc.width);
+    let wrapper_id: SharedString = format!("{}-cell", desc.id).into();
     let label_for_drag = desc.label.clone();
     let label_for_a11y = desc.label.clone();
     let is_resizing = layout.is_resizing(col_ix);
@@ -440,6 +667,7 @@ where
     });
 
     h_flex()
+        .id(wrapper_id)
         .relative()
         .w(width_px)
         .h_full()
@@ -477,6 +705,24 @@ where
                 });
             }
         })
+        .context_menu(move |menu, window, cx| on_context_menu(menu, window, cx))
+}
+
+/// Renders an invisible flex-1 trailing spacer inside the column header row so right-clicking
+/// blank header space to the right of the last visible column still opens the header menu.
+pub(crate) fn render_header_trailing_spacer<FMenu>(
+    id: &'static str,
+    on_context_menu: FMenu,
+) -> impl IntoElement
+where
+    FMenu: Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
+{
+    div()
+        .id(id)
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .context_menu(move |menu, window, cx| on_context_menu(menu, window, cx))
 }
 
 fn make_resize_handle<V, C, FLayout, FChanged>(
@@ -639,6 +885,158 @@ where
         }))
 }
 
+/// Single checkbox entry displayed inside the **Select columns** dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ColumnToggleItem {
+    /// Stable column slug matching [`ColumnKey::slug`].
+    pub(crate) slug: &'static str,
+    /// Localized display label shown next to the checkbox.
+    pub(crate) label: String,
+    /// Current visibility toggle state.
+    pub(crate) visible: bool,
+}
+
+/// Pure draft state for the **Select columns** checklist dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SelectColumnsDraft {
+    items: Vec<ColumnToggleItem>,
+}
+
+impl SelectColumnsDraft {
+    /// Creates a new draft from ordered [`ColumnToggleItem`] entries.
+    pub(crate) fn new(items: Vec<ColumnToggleItem>) -> Self {
+        Self { items }
+    }
+
+    /// Returns the ordered checklist items.
+    #[inline]
+    pub(crate) fn items(&self) -> &[ColumnToggleItem] {
+        &self.items
+    }
+
+    /// Updates the checked state of item `index`.
+    pub(crate) fn set_checked(&mut self, index: usize, checked: bool) {
+        if let Some(item) = self.items.get_mut(index) {
+            item.visible = checked;
+        }
+    }
+
+    /// Returns the slugs of all currently checked items.
+    pub(crate) fn selected_slugs(&self) -> Vec<&'static str> {
+        self.items
+            .iter()
+            .filter(|item| item.visible)
+            .map(|item| item.slug)
+            .collect()
+    }
+}
+
+type ConfirmColumnsCallback = Rc<dyn Fn(Vec<&'static str>, &mut App)>;
+
+struct SelectColumnsDialogView {
+    draft: SelectColumnsDraft,
+    on_confirm: ConfirmColumnsCallback,
+}
+
+impl SelectColumnsDialogView {
+    fn new(items: Vec<ColumnToggleItem>, on_confirm: ConfirmColumnsCallback) -> Self {
+        Self {
+            draft: SelectColumnsDraft::new(items),
+            on_confirm,
+        }
+    }
+}
+
+impl Render for SelectColumnsDialogView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let muted_fg = theme.muted_foreground;
+        let border = theme.border;
+
+        let checkboxes = self
+            .draft
+            .items()
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| {
+                let label = item.label.clone();
+                let checked = item.visible;
+                div().w_full().py_0p5().child(
+                    Checkbox::new(("select-column-checkbox", idx))
+                        .label(label)
+                        .checked(checked)
+                        .on_change(cx.listener(move |this, next: &bool, _, cx| {
+                            this.draft.set_checked(idx, *next);
+                            cx.notify();
+                        })),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        v_flex()
+            .w_full()
+            .gap_3()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child(i18n::tr("table.select_columns_subtitle")),
+            )
+            .child(
+                v_flex()
+                    .id("select-columns-scroll")
+                    .w_full()
+                    .max_h(px(340.))
+                    .overflow_y_scrollbar()
+                    .gap_2()
+                    .py_1()
+                    .pr_2()
+                    .border_t_1()
+                    .border_b_1()
+                    .border_color(border.opacity(0.6))
+                    .children(checkboxes),
+            )
+            .child(
+                DialogFooter::new()
+                    .pt_1()
+                    .child(
+                        Button::new("select-columns-ok")
+                            .primary()
+                            .label(i18n::tr("common.ok"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let selected = this.draft.selected_slugs();
+                                (this.on_confirm)(selected, cx);
+                                window.close_dialog(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("select-columns-cancel")
+                            .outline()
+                            .label(i18n::tr("common.cancel"))
+                            .on_click(|_, window, cx| {
+                                window.close_dialog(cx);
+                            }),
+                    ),
+            )
+    }
+}
+
+/// Opens the reusable **Select columns** modal dialog inside `gpui-kit`'s `Root` dialog layer.
+pub(crate) fn open_select_columns_dialog(
+    items: Vec<ColumnToggleItem>,
+    on_confirm: ConfirmColumnsCallback,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let dialog_view = cx.new(|_| SelectColumnsDialogView::new(items, on_confirm));
+    window.open_dialog(cx, move |dialog, _window, _cx| {
+        dialog
+            .w(px(360.))
+            .title(i18n::tr("table.select_columns_title"))
+            .child(dialog_view.clone())
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use gpui_kit::{point, size};
@@ -648,6 +1046,7 @@ mod tests {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum TestCol {
         Name,
+        Pid,
         Cpu,
         Memory,
         Publisher,
@@ -657,6 +1056,7 @@ mod tests {
         fn slug(self) -> &'static str {
             match self {
                 Self::Name => "name",
+                Self::Pid => "pid",
                 Self::Cpu => "cpu",
                 Self::Memory => "memory",
                 Self::Publisher => "publisher",
@@ -664,41 +1064,47 @@ mod tests {
         }
     }
 
-    fn sample_layout() -> TableColumnLayout<TestCol> {
-        let mut layout = TableColumnLayout::new(vec![
-            ColumnSpec::new(TestCol::Name, 200.0, 100.0, 400.0),
-            ColumnSpec::new(TestCol::Cpu, 80.0, 50.0, 200.0),
-            ColumnSpec::new(TestCol::Memory, 100.0, 60.0, 240.0),
-            ColumnSpec::new(TestCol::Publisher, 140.0, 80.0, 320.0),
-        ]);
-        // Assign contiguous horizontal bounds [0..200], [200..280], [280..380], [380..520].
+    fn assign_contiguous_bounds(layout: &mut TableColumnLayout<TestCol>) {
         let mut x = 0.0;
-        for (ix, spec) in layout.columns().to_vec().into_iter().enumerate() {
+        for (ix, spec) in layout.visible_columns().into_iter().enumerate() {
             layout.set_bounds(
                 ix,
                 Bounds::new(point(px(x), px(0.)), size(px(spec.width), px(32.))),
             );
             x += spec.width;
         }
+    }
+
+    fn sample_layout() -> TableColumnLayout<TestCol> {
+        let mut layout = TableColumnLayout::new(vec![
+            ColumnSpec::pinned(TestCol::Name, 200.0, 100.0, 400.0),
+            ColumnSpec::hidden(TestCol::Pid, 76.0, 56.0, 160.0),
+            ColumnSpec::new(TestCol::Cpu, 80.0, 50.0, 200.0),
+            ColumnSpec::new(TestCol::Memory, 100.0, 60.0, 240.0),
+            ColumnSpec::new(TestCol::Publisher, 140.0, 80.0, 320.0),
+        ]);
+        // Visible columns: Name[0..200], Cpu[200..280], Memory[280..380], Publisher[380..520].
+        assign_contiguous_bounds(&mut layout);
         layout
     }
 
     #[test]
-    fn resize_clamps_to_min_and_max_bounds() {
+    fn resize_clamps_to_min_and_max_bounds_on_visible_columns() {
         let mut layout = sample_layout();
 
         layout.begin_resize(1, px(280.));
         assert!(layout.is_resizing(1));
         assert!(layout.update_resize(1, px(320.)));
-        assert_eq!(layout.columns()[1].width, 120.0);
+        assert_eq!(layout.visible_columns()[1].id, TestCol::Cpu);
+        assert_eq!(layout.visible_columns()[1].width, 120.0);
 
         // Shrink below min_width (50.0) clamps to 50.0.
         assert!(layout.update_resize(1, px(100.)));
-        assert_eq!(layout.columns()[1].width, 50.0);
+        assert_eq!(layout.visible_columns()[1].width, 50.0);
 
         // Expand past max_width (200.0) clamps to 200.0.
         assert!(layout.update_resize(1, px(900.)));
-        assert_eq!(layout.columns()[1].width, 200.0);
+        assert_eq!(layout.visible_columns()[1].width, 200.0);
 
         assert!(layout.end_resize());
         assert!(!layout.is_resizing(1));
@@ -706,19 +1112,23 @@ mod tests {
     }
 
     #[test]
-    fn drag_gap_and_commit_reorder_forward_and_backward() {
+    fn drag_gap_and_commit_reorder_preserves_hidden_columns() {
         let mut layout = sample_layout();
 
-        // Dropping Cpu (ix=1) near its own edges is a no-op.
+        // Dropping Cpu (vis_ix=1) near its own edges is a no-op.
         assert_eq!(layout.drag_gap_at(px(210.), 1), None);
         assert_eq!(layout.drag_gap_at(px(270.), 1), None);
 
-        // Dragging Cpu (ix=1) to the left of Name's center (100) targets gap 0.
+        // Dragging Cpu (vis_ix=1) to the left of Name's center (100) targets gap 0.
         assert_eq!(layout.drag_gap_at(px(40.), 1), Some(0));
         assert!(layout.set_drag_gap(Some(0)));
         assert!(layout.commit_drag_drop(1));
         assert_eq!(
-            layout.columns().iter().map(|c| c.id).collect::<Vec<_>>(),
+            layout
+                .visible_columns()
+                .iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>(),
             vec![
                 TestCol::Cpu,
                 TestCol::Name,
@@ -726,21 +1136,21 @@ mod tests {
                 TestCol::Publisher
             ]
         );
+        // Hidden Pid column remains intact in all_columns().
+        assert!(!layout.is_visible(TestCol::Pid));
+        assert_eq!(layout.all_columns().len(), 5);
 
-        // Rebuild bounds for the new order and drag Cpu (now ix=0) past Publisher's center to gap 4.
-        let mut x = 0.0;
-        for (ix, spec) in layout.columns().to_vec().into_iter().enumerate() {
-            layout.set_bounds(
-                ix,
-                Bounds::new(point(px(x), px(0.)), size(px(spec.width), px(32.))),
-            );
-            x += spec.width;
-        }
+        // Rebuild bounds for the new order and drag Cpu (now vis_ix=0) past Publisher's center to gap 4.
+        assign_contiguous_bounds(&mut layout);
         assert_eq!(layout.drag_gap_at(px(500.), 0), Some(4));
         assert!(layout.set_drag_gap(Some(4)));
         assert!(layout.commit_drag_drop(0));
         assert_eq!(
-            layout.columns().iter().map(|c| c.id).collect::<Vec<_>>(),
+            layout
+                .visible_columns()
+                .iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>(),
             vec![
                 TestCol::Name,
                 TestCol::Memory,
@@ -751,46 +1161,118 @@ mod tests {
     }
 
     #[test]
-    fn saved_snapshot_roundtrip_handles_missing_and_extra_columns() {
+    fn visibility_hiding_locked_guard_and_select_columns_apply() {
+        let mut layout = sample_layout();
+        assert_eq!(
+            layout.total_width(16.0),
+            200.0 + 80.0 + 100.0 + 140.0 + 16.0
+        );
+
+        // Pinned Name column cannot be hidden.
+        assert!(!layout.hide_column(TestCol::Name));
+        assert!(layout.is_visible(TestCol::Name));
+
+        // Hide Publisher; width drops by 140px.
+        assert!(layout.hide_column(TestCol::Publisher));
+        assert!(!layout.is_visible(TestCol::Publisher));
+        assert_eq!(layout.total_width(16.0), 200.0 + 80.0 + 100.0 + 16.0);
+
+        // Re-applying visibility with Pid enabled and Cpu disabled keeps Name visible.
+        assert!(layout.apply_visible_slugs(&["pid", "memory"]));
+        assert_eq!(
+            layout
+                .visible_columns()
+                .iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>(),
+            vec![TestCol::Name, TestCol::Pid, TestCol::Memory]
+        );
+
+        // Empty selection still preserves the pinned Name column.
+        assert!(layout.apply_visible_slugs(&[]));
+        assert_eq!(
+            layout
+                .visible_columns()
+                .iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>(),
+            vec![TestCol::Name]
+        );
+    }
+
+    #[test]
+    fn saved_snapshot_roundtrip_preserves_visibility_widths_and_guards_corrupt_data() {
         let mut layout = sample_layout();
         layout.resize_column(0, 260.0);
-        layout.move_column(3, 1);
-        let saved = layout.snapshot();
+        assert!(layout.apply_visible_slugs(&["pid", "cpu", "publisher"]));
+        assert!(layout.move_visible_column(3, 1)); // move Publisher after Name
+        let mut saved = layout.snapshot();
 
-        // Simulate restoring into a fresh layout (plus an unknown legacy slug and out-of-range width).
-        let mut extended_saved = saved;
-        extended_saved.push(("legacy_removed_col", 999.0));
-        extended_saved[0].1 = 9999.0; // should clamp to Name max_width (400.0)
+        // Add an unknown legacy slug, corrupt Name visibility to false, and out-of-range width.
+        saved.push(TableColumnSetting {
+            id: "legacy_removed_col".to_owned(),
+            width: 999,
+            visible: true,
+        });
+        saved[0].width = 9999; // Name clamps to max_width (400.0)
+        saved[0].visible = false; // Locked Name stays visible
 
         let mut restored = sample_layout();
-        restored.apply_saved(&extended_saved);
+        restored.apply_saved(&saved);
 
         assert_eq!(
-            restored.columns().iter().map(|c| c.id).collect::<Vec<_>>(),
+            restored
+                .visible_columns()
+                .iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>(),
             vec![
                 TestCol::Name,
                 TestCol::Publisher,
-                TestCol::Cpu,
-                TestCol::Memory
+                TestCol::Pid,
+                TestCol::Cpu
             ]
         );
-        assert_eq!(restored.columns()[0].width, 400.0);
+        assert_eq!(restored.visible_columns()[0].width, 400.0);
+        assert!(!restored.is_visible(TestCol::Memory));
+    }
+
+    #[test]
+    fn select_columns_draft_tracks_checkbox_toggles() {
+        let mut draft = SelectColumnsDraft::new(vec![
+            ColumnToggleItem {
+                slug: "pid",
+                label: "PID".to_owned(),
+                visible: false,
+            },
+            ColumnToggleItem {
+                slug: "cpu",
+                label: "CPU".to_owned(),
+                visible: true,
+            },
+        ]);
+        assert_eq!(draft.selected_slugs(), vec!["cpu"]);
+        draft.set_checked(0, true);
+        draft.set_checked(1, false);
+        assert_eq!(draft.selected_slugs(), vec!["pid"]);
     }
 
     struct InteractiveHeaderHarness {
         layout: TableColumnLayout<TestCol>,
         sorts: Vec<TestCol>,
+        context_menu_opens: Vec<TestCol>,
         commits: usize,
     }
 
     impl Render for InteractiveHeaderHarness {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let cols = self.layout.columns().to_vec();
+            let cols = self.layout.visible_columns();
             let total = cols.len();
             let snap = self.layout.clone();
 
             let header_cells = cols.iter().enumerate().map(|(ix, spec)| {
                 let col = spec.id;
+                let view_for_menu = cx.entity().downgrade();
                 render_interactive_header_cell(
                     ix,
                     total,
@@ -808,6 +1290,10 @@ mod tests {
                     |view: &mut Self| &mut view.layout,
                     move |view, _, _| view.sorts.push(col),
                     |view, _| view.commits += 1,
+                    move |menu, _window, cx| {
+                        let _ = view_for_menu.update(cx, |v, _| v.context_menu_opens.push(col));
+                        menu.item(PopupMenuItem::new("Hide column"))
+                    },
                 )
                 .into_any_element()
             });
@@ -834,7 +1320,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn interactive_header_supports_sort_click_column_resize_and_column_reorder(
+    fn interactive_header_supports_sort_click_resize_reorder_and_right_click_menu(
         cx: &mut gpui_kit::TestAppContext,
     ) {
         use gpui_kit::{Modifiers, VisualTestContext};
@@ -842,12 +1328,14 @@ mod tests {
         cx.update(gpui_kit::init);
         let view = cx.new(|_| InteractiveHeaderHarness {
             layout: TableColumnLayout::new(vec![
-                ColumnSpec::new(TestCol::Name, 200.0, 100.0, 400.0),
+                ColumnSpec::pinned(TestCol::Name, 200.0, 100.0, 400.0),
+                ColumnSpec::hidden(TestCol::Pid, 76.0, 56.0, 160.0),
                 ColumnSpec::new(TestCol::Cpu, 80.0, 50.0, 200.0),
                 ColumnSpec::new(TestCol::Memory, 100.0, 60.0, 240.0),
                 ColumnSpec::new(TestCol::Publisher, 140.0, 80.0, 320.0),
             ]),
             sorts: Vec::new(),
+            context_menu_opens: Vec::new(),
             commits: 0,
         });
 
@@ -869,7 +1357,11 @@ mod tests {
         view.read_with(&vcx, |h, _| {
             assert_eq!(h.sorts, vec![TestCol::Cpu]);
             assert_eq!(
-                h.layout.columns().iter().map(|c| c.id).collect::<Vec<_>>(),
+                h.layout
+                    .visible_columns()
+                    .iter()
+                    .map(|c| c.id)
+                    .collect::<Vec<_>>(),
                 vec![
                     TestCol::Name,
                     TestCol::Cpu,
@@ -879,7 +1371,24 @@ mod tests {
             );
         });
 
-        // 2. Drag the resize divider at Name's right border (x = 199, y = 16) +50px to x = 249.
+        // 2. Right-click on Cpu header opens the column header context menu for Cpu.
+        vcx.simulate_mouse_down(cpu_center, MouseButton::Right, Modifiers::default());
+        vcx.simulate_mouse_up(cpu_center, MouseButton::Right, Modifiers::default());
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        view.read_with(&vcx, |h, _| {
+            assert_eq!(
+                h.context_menu_opens,
+                vec![TestCol::Cpu],
+                "right-clicking Cpu header must open the header context menu for Cpu"
+            );
+        });
+
+        // Dismiss the open context menu before continuing drag tests.
+        vcx.simulate_keystrokes("escape");
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // 3. Drag the resize divider at Name's right border (x = 199, y = 16) +50px to x = 249.
         let divider_start = point(px(199.), px(16.));
         let divider_mid = point(px(225.), px(16.));
         let divider_end = point(px(249.), px(16.));
@@ -891,14 +1400,14 @@ mod tests {
 
         view.read_with(&vcx, |h, _| {
             assert_eq!(
-                h.layout.columns()[0].width,
+                h.layout.visible_columns()[0].width,
                 250.0,
                 "dragging Name divider +50px must resize Name from 200px to 250px"
             );
             assert!(h.commits >= 1, "resize completion must commit layout");
         });
 
-        // 3. Drag Cpu header (now at x = 250..330, center 290) past Memory (330..430) to x = 420.
+        // 4. Drag Cpu header (now at x = 250..330, center 290) past Memory (330..430) to x = 420.
         let drag_start = point(px(290.), px(16.));
         let drag_step = point(px(360.), px(16.));
         let drag_drop = point(px(420.), px(16.));
@@ -910,7 +1419,11 @@ mod tests {
 
         view.read_with(&vcx, |h, _| {
             assert_eq!(
-                h.layout.columns().iter().map(|c| c.id).collect::<Vec<_>>(),
+                h.layout
+                    .visible_columns()
+                    .iter()
+                    .map(|c| c.id)
+                    .collect::<Vec<_>>(),
                 vec![
                     TestCol::Name,
                     TestCol::Memory,

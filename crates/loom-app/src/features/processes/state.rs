@@ -148,7 +148,12 @@ pub(crate) fn next_sort_direction(
         active_direction.toggle()
     } else {
         match clicked_column {
-            ProcessSortColumn::Name => SortDirection::Ascending,
+            ProcessSortColumn::Name
+            | ProcessSortColumn::Category
+            | ProcessSortColumn::Pid
+            | ProcessSortColumn::ProcessName
+            | ProcessSortColumn::Publisher
+            | ProcessSortColumn::CommandLine => SortDirection::Ascending,
             ProcessSortColumn::Status
             | ProcessSortColumn::Cpu
             | ProcessSortColumn::Memory
@@ -261,6 +266,7 @@ mod tests {
             window_title: None,
             publisher: None,
             exe_path: None,
+            command_line: None,
             icon: None,
             category,
             status,

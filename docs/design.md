@@ -42,6 +42,7 @@ Priority tiers:
 | One-click toggle to parent-child `Process Tree` view | **P0 (`0.0.3`)** | Enforces `parent.create_time <= child.create_time` to avoid PID-reuse mismatches. |
 | Process status indicators (`Efficiency mode` leaf, `Suspended`, `Not responding`) | **P0 (`0.0.3`)** | Derived from kernel thread states and non-blocking `IsHungAppWindow`. |
 | Resource heatmap columns (`CPU`, `Memory`, `Disk`, `Network`, `GPU`) | **P0 (`0.0.3`)** | Quantized theme background opacity inside `TableDelegate::render_td`. |
+| Column header right-click menu & `Select columns` dialog (`Hide column` / column visibility / `Resource values` / `Reset defaults`) | **P0 (`0.0.3`)** | Independent column catalogs and default visible sets for Processes vs. Details; column order, widths, and visibility persist in `settings.toml`. |
 | Context menu `Resource values >` (`Values` vs. `Percents` for Memory/Disk/Network) | **P0 (`0.0.3`)** | Nested `PopupMenu` persisted in `settings.toml`. |
 | `End task` (toolbar button, `Delete` key, context menu) | **P0 (`0.0.3`)** | Selection anchored to `ProcessKey` so row resorts do not target the wrong process. |
 | `Efficiency mode` (`EcoQoS`) toggle & checkmark state | **P0 (`0.0.3`)** | `SetProcessInformation(ProcessPowerThrottling)`; disabled on unsupported system processes. |
@@ -114,12 +115,14 @@ flowchart LR
 
 1. **Processes**:
    - Header bar includes a compact icon-only `Grouped` ↔ `Process Tree` view switcher with hover tooltips on the left and `Run new task` and `End task` actions on the right (`Efficiency mode` is toggled via the row context menu).
-   - Table headers support drag-to-resize column borders and horizontal drag-to-reorder columns (preserved across route switches in the session); the Name column renders cached `20×20` icons, display names, and tree expanders; the status column renders compact icon-only badges with hover tooltips for `Efficiency mode`, `Suspended`, and `Not responding`; resource columns display subtle heatmap shading.
-2. **Performance**:
+   - Table headers support drag-to-resize column borders, horizontal drag-to-reorder columns, and a right-click context menu (`Hide column`, `Select columns...`, `Resource values >`, `Reset default columns`) to toggle Processes-specific columns (`Type`, `PID`, `Process name`, `Status`, `Publisher`, `CPU`, `Memory`, `Disk`, `Network`, `GPU`, `Command line`) persisted in `settings.toml`; the Name column renders cached `20×20` icons, display names, and tree expanders; the status column renders compact icon-only badges with hover tooltips for `Efficiency mode`, `Suspended`, and `Not responding`; resource columns display subtle heatmap shading.
+2. **Details**:
+   - Table headers support column resizing, drag-to-reorder, and a right-click context menu (`Hide column`, `Select columns...`, `Reset default columns`) managing Details-specific diagnostic columns (`PID`, `Status`, `User name`, `Session ID`, `CPU`, `CPU time`, `Working set delta (memory)`, `Working set (memory)`, `Commit size`, `Priority`, `Handles`, `Threads`, `Platform`, `UAC virtualization`, `Elevated`, `Dedicated GPU memory`, `Publisher`, `Description`, `Image path name`, `Command line`) persisted in `settings.toml`.
+3. **Performance**:
    - Resizable split layout (`h_resizable`): left rail lists hardware devices with 60s sparklines; right pane displays device header and hardware model string, interactive `AreaChart`/`LineChart` plots (supporting overall/logical-core and kernel-time toggles on CPU, plus `2×2` multi-engine / single-engine views on GPU), and a two-column metric grid below.
-3. **Cross-view navigation**:
+4. **Cross-view navigation**:
    - `Go to details` from `Processes` or `Services` activates `Details` and scrolls the target `ProcessKey` into view; `Go to service(s)` from `Details` activates `Services` filtered/highlighted to all services sharing that host `PID`.
-4. **Run new task & diagnostic dialogs**:
+5. **Run new task & diagnostic dialogs**:
    - `Run new task` supports Enter-to-run, recent command history, native `Browse...` file picker, and administrative elevation checkbox;
    - `Analyze wait chain` renders thread/process blocking chains inside a `Tree` with direct termination support for blocking targets.
 

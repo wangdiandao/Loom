@@ -30,6 +30,23 @@ pub struct WindowGeometry {
     pub maximized: bool,
 }
 
+#[inline]
+const fn default_true() -> bool {
+    true
+}
+
+/// Persisted order, width, and visibility configuration for a single table column.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableColumnSetting {
+    /// Stable lowercase column identifier (e.g., `"name"`, `"pid"`, `"cpu"`).
+    pub id: String,
+    /// Saved column width in rounded logical pixels.
+    pub width: u32,
+    /// Whether this column is currently visible in the table.
+    #[serde(default = "default_true")]
+    pub visible: bool,
+}
+
 /// Top-level persisted user settings (`settings.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -66,6 +83,12 @@ pub struct AppSettings {
     pub window_geometry: Option<WindowGeometry>,
     /// Most-recently-used commands launched via the "Run new task" dialog.
     pub run_task_history: Vec<String>,
+    /// Persisted column layout (order, width, visibility) for the Processes table.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processes_columns: Vec<TableColumnSetting>,
+    /// Persisted column layout (order, width, visibility) for the Details table.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details_columns: Vec<TableColumnSetting>,
 }
 
 impl Default for AppSettings {
@@ -87,6 +110,8 @@ impl Default for AppSettings {
             network_display_mode: ResourceDisplayMode::default(),
             window_geometry: None,
             run_task_history: Vec::new(),
+            processes_columns: Vec::new(),
+            details_columns: Vec::new(),
         }
     }
 }

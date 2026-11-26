@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crossbeam_channel::Receiver;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{App, Entity, Window};
+use loom_config::TableColumnSetting;
 use loom_engine::{CommandEvent, EngineCommand, EngineCommandError};
 use loom_types::{
     CpuAffinityMask, DetailsSortColumn, DetailsViewMode, LanguagePreference, ProcessKey,
@@ -298,6 +299,28 @@ impl UiCommands {
     pub(crate) fn record_run_task_history(store: &Entity<UiStore>, command: String, cx: &mut App) {
         store.update(cx, |store, cx| {
             let _ = store.update_settings(|s| s.push_run_task_history(command), cx);
+        });
+    }
+
+    /// Persists the Processes table column layout (order, widths, visibility) to `settings.toml`.
+    pub(crate) fn set_processes_columns(
+        store: &Entity<UiStore>,
+        columns: Vec<TableColumnSetting>,
+        cx: &mut App,
+    ) {
+        store.update(cx, |store, cx| {
+            let _ = store.update_settings(|s| s.processes_columns = columns, cx);
+        });
+    }
+
+    /// Persists the Details table column layout (order, widths, visibility) to `settings.toml`.
+    pub(crate) fn set_details_columns(
+        store: &Entity<UiStore>,
+        columns: Vec<TableColumnSetting>,
+        cx: &mut App,
+    ) {
+        store.update(cx, |store, cx| {
+            let _ = store.update_settings(|s| s.details_columns = columns, cx);
         });
     }
 }

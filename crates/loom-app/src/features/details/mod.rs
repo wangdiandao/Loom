@@ -17,7 +17,7 @@ use std::sync::Arc;
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
@@ -28,21 +28,23 @@ use gpui_kit::{
     App, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent,
     MouseButton, ParentElement as _, Render, RenderImage, ScrollHandle, ScrollStrategy,
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
-    UniformListScrollHandle, Window, div, img, prelude::FluentBuilder as _, px, uniform_list,
+    UniformListScrollHandle, WeakEntity, Window, div, img, prelude::FluentBuilder as _, px,
+    uniform_list,
 };
 use loom_types::{
     CapabilityFlags, DetailsRowProjection, DetailsSortColumn, DetailsViewMode, MonitorDomain,
     PlatformProfile, ProcessKey, ProcessPriority, ProcessStatusFlags, SortDirection,
 };
 use loom_ui_kit::{
-    HeatmapLevel, LoomSemanticColors, format_bytes, format_permille, heatmap_cell,
+    HeatmapLevel, LoomSemanticColors, format_bytes, format_cpu_time, format_permille, heatmap_cell,
     rgba_icon_to_render_image,
 };
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
 use crate::features::table_columns::{
-    ColumnKey, ColumnSpec, HeaderColumnDescriptor, TableColumnLayout,
-    attach_header_reorder_handlers, attach_table_column_drag_handlers,
+    ColumnKey, ColumnSpec, ColumnToggleItem, HeaderColumnDescriptor, HeaderMenuAction,
+    TableColumnLayout, attach_header_reorder_handlers, attach_table_column_drag_handlers,
+    build_column_header_menu, open_select_columns_dialog, render_header_trailing_spacer,
     render_interactive_header_cell,
 };
 use crate::i18n;
@@ -50,36 +52,53 @@ use crate::i18n;
 const DETAILS_ROW_HEIGHT: f32 = 30.0;
 const ICON_CACHE_MAX_ENTRIES: usize = 512;
 const TABLE_HORIZONTAL_PADDING: f32 = 16.0;
-const DETAILS_TABLE_ID: &str = "details";
 
 // Default column widths (px) kept wide enough so horizontal scrolling prevents cramping.
 const COL_NAME_W: f32 = 240.0;
 const COL_PID_W: f32 = 76.0;
 const COL_STATUS_W: f32 = 96.0;
 const COL_USER_W: f32 = 140.0;
+const COL_SESSION_W: f32 = 84.0;
 const COL_CPU_W: f32 = 82.0;
+const COL_CPU_TIME_W: f32 = 96.0;
 const COL_MEM_W: f32 = 168.0;
+const COL_WORKING_SET_W: f32 = 128.0;
+const COL_COMMIT_W: f32 = 112.0;
 const COL_PRIORITY_W: f32 = 112.0;
+const COL_HANDLES_W: f32 = 84.0;
+const COL_THREADS_W: f32 = 76.0;
 const COL_PLATFORM_W: f32 = 86.0;
 const COL_UAC_W: f32 = 132.0;
+const COL_ELEVATED_W: f32 = 76.0;
 const COL_GPU_MEM_W: f32 = 144.0;
 const COL_PUBLISHER_W: f32 = 164.0;
+const COL_DESCRIPTION_W: f32 = 200.0;
+const COL_EXE_PATH_W: f32 = 300.0;
 const COL_CMDLINE_W: f32 = 360.0;
 
-/// Logical columns rendered by [`DetailsView`].
+/// Logical columns supported by [`DetailsView`] (distinct diagnostic column set from Processes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetailsColumn {
     Name,
     Pid,
     Status,
     UserName,
+    SessionId,
     Cpu,
+    CpuTime,
     Memory,
+    WorkingSet,
+    CommitSize,
     Priority,
+    Handles,
+    Threads,
     Platform,
     UacVirtualization,
+    Elevated,
     GpuMemory,
     Publisher,
+    Description,
+    ExePath,
     CommandLine,
 }
 
@@ -90,13 +109,22 @@ impl ColumnKey for DetailsColumn {
             Self::Pid => "pid",
             Self::Status => "status",
             Self::UserName => "user",
+            Self::SessionId => "session_id",
             Self::Cpu => "cpu",
+            Self::CpuTime => "cpu_time",
             Self::Memory => "memory",
+            Self::WorkingSet => "working_set",
+            Self::CommitSize => "commit_size",
             Self::Priority => "priority",
+            Self::Handles => "handles",
+            Self::Threads => "threads",
             Self::Platform => "platform",
             Self::UacVirtualization => "uac",
+            Self::Elevated => "elevated",
             Self::GpuMemory => "gpu_memory",
             Self::Publisher => "publisher",
+            Self::Description => "description",
+            Self::ExePath => "exe_path",
             Self::CommandLine => "command_line",
         }
     }
@@ -105,13 +133,19 @@ impl ColumnKey for DetailsColumn {
 impl DetailsColumn {
     fn default_specs(capabilities: CapabilityFlags) -> Vec<ColumnSpec<Self>> {
         let mut cols = vec![
-            ColumnSpec::new(Self::Name, COL_NAME_W, 140.0, 640.0),
+            ColumnSpec::pinned(Self::Name, COL_NAME_W, 140.0, 640.0),
             ColumnSpec::new(Self::Pid, COL_PID_W, 56.0, 160.0),
             ColumnSpec::new(Self::Status, COL_STATUS_W, 68.0, 200.0),
             ColumnSpec::new(Self::UserName, COL_USER_W, 80.0, 360.0),
+            ColumnSpec::hidden(Self::SessionId, COL_SESSION_W, 64.0, 160.0),
             ColumnSpec::new(Self::Cpu, COL_CPU_W, 60.0, 180.0),
+            ColumnSpec::hidden(Self::CpuTime, COL_CPU_TIME_W, 76.0, 200.0),
             ColumnSpec::new(Self::Memory, COL_MEM_W, 96.0, 320.0),
+            ColumnSpec::hidden(Self::WorkingSet, COL_WORKING_SET_W, 88.0, 280.0),
+            ColumnSpec::hidden(Self::CommitSize, COL_COMMIT_W, 84.0, 260.0),
             ColumnSpec::new(Self::Priority, COL_PRIORITY_W, 72.0, 240.0),
+            ColumnSpec::hidden(Self::Handles, COL_HANDLES_W, 64.0, 180.0),
+            ColumnSpec::hidden(Self::Threads, COL_THREADS_W, 60.0, 160.0),
             ColumnSpec::new(Self::Platform, COL_PLATFORM_W, 64.0, 180.0),
         ];
         if capabilities.contains(CapabilityFlags::UAC_VIRTUALIZATION) {
@@ -123,11 +157,44 @@ impl DetailsColumn {
             ));
         }
         cols.extend([
+            ColumnSpec::hidden(Self::Elevated, COL_ELEVATED_W, 60.0, 160.0),
             ColumnSpec::new(Self::GpuMemory, COL_GPU_MEM_W, 88.0, 280.0),
             ColumnSpec::new(Self::Publisher, COL_PUBLISHER_W, 88.0, 420.0),
+            ColumnSpec::hidden(Self::Description, COL_DESCRIPTION_W, 100.0, 480.0),
+            ColumnSpec::hidden(Self::ExePath, COL_EXE_PATH_W, 120.0, 900.0),
             ColumnSpec::new(Self::CommandLine, COL_CMDLINE_W, 140.0, 1200.0),
         ]);
         cols
+    }
+
+    fn selectable_order(capabilities: CapabilityFlags) -> Vec<Self> {
+        let mut order = vec![
+            Self::Pid,
+            Self::Status,
+            Self::UserName,
+            Self::SessionId,
+            Self::Cpu,
+            Self::CpuTime,
+            Self::Memory,
+            Self::WorkingSet,
+            Self::CommitSize,
+            Self::Priority,
+            Self::Handles,
+            Self::Threads,
+            Self::Platform,
+        ];
+        if capabilities.contains(CapabilityFlags::UAC_VIRTUALIZATION) {
+            order.push(Self::UacVirtualization);
+        }
+        order.extend([
+            Self::Elevated,
+            Self::GpuMemory,
+            Self::Publisher,
+            Self::Description,
+            Self::ExePath,
+            Self::CommandLine,
+        ]);
+        order
     }
 
     fn label(self, platform: PlatformProfile) -> String {
@@ -136,13 +203,22 @@ impl DetailsColumn {
             Self::Pid => i18n::tr("details.col_pid"),
             Self::Status => i18n::tr("details.col_status"),
             Self::UserName => i18n::tr("details.col_user"),
+            Self::SessionId => i18n::tr("details.col_session_id"),
             Self::Cpu => i18n::tr("details.col_cpu"),
+            Self::CpuTime => i18n::tr("details.col_cpu_time"),
             Self::Memory => i18n::tr("details.col_memory"),
+            Self::WorkingSet => i18n::tr("details.col_working_set"),
+            Self::CommitSize => i18n::tr("details.col_commit"),
             Self::Priority => i18n::tr("details.col_priority"),
+            Self::Handles => i18n::tr("details.col_handles"),
+            Self::Threads => i18n::tr("details.col_threads"),
             Self::Platform => i18n::tr("details.col_platform"),
             Self::UacVirtualization => i18n::virtualization_column_label(platform),
+            Self::Elevated => i18n::tr("details.col_elevated"),
             Self::GpuMemory => i18n::tr("details.col_gpu_memory"),
             Self::Publisher => i18n::tr("details.col_publisher"),
+            Self::Description => i18n::tr("details.col_description"),
+            Self::ExePath => i18n::tr("details.col_exe_path"),
             Self::CommandLine => i18n::tr("details.col_command_line"),
         }
     }
@@ -153,18 +229,40 @@ impl DetailsColumn {
             Self::Pid => Some(DetailsSortColumn::Pid),
             Self::Status => Some(DetailsSortColumn::Status),
             Self::UserName => Some(DetailsSortColumn::UserName),
+            Self::SessionId => Some(DetailsSortColumn::SessionId),
             Self::Cpu => Some(DetailsSortColumn::Cpu),
+            Self::CpuTime => Some(DetailsSortColumn::CpuTime),
             Self::Memory => Some(DetailsSortColumn::Memory),
-            Self::Priority | Self::Publisher => None,
+            Self::WorkingSet => Some(DetailsSortColumn::WorkingSet),
+            Self::CommitSize => Some(DetailsSortColumn::CommitSize),
+            Self::Priority => Some(DetailsSortColumn::Priority),
+            Self::Handles => Some(DetailsSortColumn::Handles),
+            Self::Threads => Some(DetailsSortColumn::Threads),
             Self::Platform => Some(DetailsSortColumn::Arch),
             Self::UacVirtualization => Some(DetailsSortColumn::UacVirtualization),
+            Self::Elevated => Some(DetailsSortColumn::Elevated),
             Self::GpuMemory => Some(DetailsSortColumn::GpuMemory),
+            Self::Publisher => Some(DetailsSortColumn::Publisher),
+            Self::Description => Some(DetailsSortColumn::Description),
+            Self::ExePath => Some(DetailsSortColumn::ExePath),
             Self::CommandLine => Some(DetailsSortColumn::CommandLine),
         }
     }
 
     const fn right_aligned(self) -> bool {
-        matches!(self, Self::Pid | Self::Cpu | Self::Memory | Self::GpuMemory)
+        matches!(
+            self,
+            Self::Pid
+                | Self::SessionId
+                | Self::Cpu
+                | Self::CpuTime
+                | Self::Memory
+                | Self::WorkingSet
+                | Self::CommitSize
+                | Self::Handles
+                | Self::Threads
+                | Self::GpuMemory
+        )
     }
 }
 
@@ -273,14 +371,25 @@ pub(super) fn can_set_affinity(status: ProcessStatusFlags, capabilities: Capabil
 pub(super) const fn default_sort_direction(column: DetailsSortColumn) -> SortDirection {
     match column {
         DetailsSortColumn::Cpu
+        | DetailsSortColumn::CpuTime
         | DetailsSortColumn::Memory
+        | DetailsSortColumn::WorkingSet
+        | DetailsSortColumn::CommitSize
+        | DetailsSortColumn::Priority
+        | DetailsSortColumn::Handles
+        | DetailsSortColumn::Threads
+        | DetailsSortColumn::Elevated
         | DetailsSortColumn::GpuMemory
         | DetailsSortColumn::Status => SortDirection::Descending,
         DetailsSortColumn::Name
         | DetailsSortColumn::Pid
         | DetailsSortColumn::UserName
+        | DetailsSortColumn::SessionId
         | DetailsSortColumn::Arch
         | DetailsSortColumn::UacVirtualization
+        | DetailsSortColumn::Publisher
+        | DetailsSortColumn::Description
+        | DetailsSortColumn::ExePath
         | DetailsSortColumn::CommandLine => SortDirection::Ascending,
     }
 }
@@ -550,8 +659,9 @@ impl DetailsView {
             (snap.revisions.details, snap.capabilities)
         };
         let mut column_layout = TableColumnLayout::new(DetailsColumn::default_specs(capabilities));
-        if let Some(saved) = store.read(cx).table_column_layout(DETAILS_TABLE_ID) {
-            column_layout.apply_saved(saved);
+        let saved_cols = store.read(cx).details_columns().to_vec();
+        if !saved_cols.is_empty() {
+            column_layout.apply_saved(&saved_cols);
         }
         let sub = cx.subscribe(&store, |this, _store, event, cx| match event {
             UiStoreEvent::SnapshotUpdated(revs) => {
@@ -585,9 +695,92 @@ impl DetailsView {
 
     fn persist_column_layout(&self, cx: &mut Context<Self>) {
         let snapshot = self.column_layout.snapshot();
-        self.store.update(cx, |store, _| {
-            store.set_table_column_layout(DETAILS_TABLE_ID, snapshot);
-        });
+        UiCommands::set_details_columns(&self.store, snapshot, cx);
+    }
+
+    fn hide_column(&mut self, col: DetailsColumn, cx: &mut Context<Self>) {
+        if self.column_layout.hide_column(col) {
+            self.persist_column_layout(cx);
+            cx.notify();
+        }
+    }
+
+    fn reset_columns_to_default(&mut self, cx: &mut Context<Self>) {
+        let capabilities = self.store.read(cx).snapshot().capabilities;
+        self.column_layout
+            .reset(DetailsColumn::default_specs(capabilities));
+        UiCommands::set_details_columns(&self.store, Vec::new(), cx);
+        cx.notify();
+    }
+
+    fn open_select_columns_modal(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let (capabilities, platform) = {
+            let snap = self.store.read(cx).snapshot();
+            (snap.capabilities, snap.platform)
+        };
+        let items = DetailsColumn::selectable_order(capabilities)
+            .into_iter()
+            .map(|col| ColumnToggleItem {
+                slug: col.slug(),
+                label: col.label(platform),
+                visible: self.column_layout.is_visible(col),
+            })
+            .collect();
+        let view_weak = cx.entity().downgrade();
+        open_select_columns_dialog(
+            items,
+            Rc::new(move |selected_slugs, cx| {
+                let _ = view_weak.update(cx, |this, cx| {
+                    if this.column_layout.apply_visible_slugs(&selected_slugs) {
+                        this.persist_column_layout(cx);
+                        cx.notify();
+                    }
+                });
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn build_header_context_menu(
+        menu: PopupMenu,
+        clicked_col: Option<DetailsColumn>,
+        view_weak: WeakEntity<Self>,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let hide_action: Option<HeaderMenuAction> = clicked_col
+            .filter(|&col| col != DetailsColumn::Name)
+            .map(|col| {
+                let view_hide = view_weak.clone();
+                Rc::new(move |_window: &mut Window, cx: &mut App| {
+                    let _ = view_hide.update(cx, |this, cx| this.hide_column(col, cx));
+                }) as HeaderMenuAction
+            });
+
+        let view_select = view_weak.clone();
+        let on_select_columns: HeaderMenuAction =
+            Rc::new(move |window: &mut Window, cx: &mut App| {
+                let _ = view_select.update(cx, |this, cx| {
+                    this.open_select_columns_modal(window, cx);
+                });
+            });
+
+        let view_reset = view_weak;
+        let on_reset_defaults: HeaderMenuAction =
+            Rc::new(move |_window: &mut Window, cx: &mut App| {
+                let _ = view_reset.update(cx, |this, cx| this.reset_columns_to_default(cx));
+            });
+
+        build_column_header_menu(
+            menu,
+            hide_action,
+            on_select_columns,
+            |sub, _window, _cx| sub,
+            on_reset_defaults,
+            window,
+            cx,
+        )
     }
 
     /// Updates the highlighted target [`ProcessKey`] (e.g., from `NavigationIntent::JumpToDetails`).
@@ -876,10 +1069,11 @@ impl Render for DetailsView {
                 )
         });
 
-        let columns: Vec<ColumnSpec<DetailsColumn>> = self.column_layout.columns().to_vec();
+        let columns: Vec<ColumnSpec<DetailsColumn>> = self.column_layout.visible_columns();
         let total_cols = columns.len();
         let table_width = self.column_layout.total_width(TABLE_HORIZONTAL_PADDING);
         let column_layout_snapshot = self.column_layout.clone();
+        let header_view_weak = cx.entity().downgrade();
 
         let header_cells = columns.iter().enumerate().map(|(col_ix, spec)| {
             let col = spec.id;
@@ -889,6 +1083,7 @@ impl Render for DetailsView {
                 .map(|target| next_sort_direction(sort_column, sort_direction, target))
                 .unwrap_or(SortDirection::Descending);
             let store_for_sort = self.store.clone();
+            let menu_view = header_view_weak.clone();
 
             render_interactive_header_cell(
                 col_ix,
@@ -911,9 +1106,20 @@ impl Render for DetailsView {
                     }
                 },
                 |view: &mut Self, cx| view.persist_column_layout(cx),
+                move |menu, window, cx| {
+                    Self::build_header_context_menu(menu, Some(col), menu_view.clone(), window, cx)
+                },
             )
             .into_any_element()
         });
+
+        let spacer_menu_view = header_view_weak.clone();
+        let header_trailing = render_header_trailing_spacer(
+            "details-column-header-spacer",
+            move |menu, window, cx| {
+                Self::build_header_context_menu(menu, None, spacer_menu_view.clone(), window, cx)
+            },
+        );
 
         let column_header = attach_header_reorder_handlers(
             h_flex()
@@ -929,7 +1135,8 @@ impl Render for DetailsView {
                 .text_xs()
                 .font_medium()
                 .text_color(muted_fg)
-                .children(header_cells),
+                .children(header_cells)
+                .child(header_trailing),
             cx,
             |view: &mut Self| &mut view.column_layout,
             |view: &mut Self, cx| view.persist_column_layout(cx),
@@ -986,6 +1193,8 @@ impl Render for DetailsView {
             let is_tree_mode = view_mode == DetailsViewMode::Tree;
             let running_label: SharedString = i18n::tr("details.status_running").into();
             let suspended_label: SharedString = i18n::tr("details.status_suspended").into();
+            let elevated_yes_label: SharedString = i18n::tr("details.elevated_yes").into();
+            let elevated_no_label: SharedString = i18n::tr("details.elevated_no").into();
 
             div()
                 .flex_1()
@@ -1056,6 +1265,32 @@ impl Render for DetailsView {
                                                             .as_deref()
                                                             .unwrap_or("—")
                                                             .to_owned();
+                                                        let description_text = row
+                                                            .description
+                                                            .as_deref()
+                                                            .filter(|s| !s.is_empty())
+                                                            .unwrap_or("—")
+                                                            .to_owned();
+                                                        let exe_path_text: SharedString = row
+                                                            .exe_path
+                                                            .as_deref()
+                                                            .filter(|s| !s.is_empty())
+                                                            .unwrap_or("—")
+                                                            .to_owned()
+                                                            .into();
+                                                        let exe_path_tooltip = row
+                                                            .exe_path
+                                                            .as_deref()
+                                                            .filter(|s| !s.is_empty())
+                                                            .map(str::to_owned);
+                                                        let elevated_text = if row
+                                                            .status
+                                                            .contains(ProcessStatusFlags::ELEVATED)
+                                                        {
+                                                            elevated_yes_label.clone()
+                                                        } else {
+                                                            elevated_no_label.clone()
+                                                        };
                                                         let cmdline_text: SharedString = row
                                                             .command_line
                                                             .as_deref()
@@ -1198,6 +1433,17 @@ impl Render for DetailsView {
                                                                             .child(user_text.clone()),
                                                                     )
                                                                     .into_any_element(),
+                                                                DetailsColumn::SessionId => h_flex()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .items_center()
+                                                                    .justify_end()
+                                                                    .px_2()
+                                                                    .font_family(mono_font.clone())
+                                                                    .text_color(muted_fg)
+                                                                    .child(row.session_id.to_string())
+                                                                    .into_any_element(),
                                                                 DetailsColumn::Cpu => div()
                                                                     .w(w)
                                                                     .h_full()
@@ -1213,6 +1459,19 @@ impl Render for DetailsView {
                                                                             row.cpu_permille,
                                                                         ),
                                                                         &semantic,
+                                                                    ))
+                                                                    .into_any_element(),
+                                                                DetailsColumn::CpuTime => h_flex()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .items_center()
+                                                                    .justify_end()
+                                                                    .px_2()
+                                                                    .font_family(mono_font.clone())
+                                                                    .text_color(muted_fg)
+                                                                    .child(format_cpu_time(
+                                                                        row.cpu_time_100ns,
                                                                     ))
                                                                     .into_any_element(),
                                                                 DetailsColumn::Memory => div()
@@ -1233,6 +1492,32 @@ impl Render for DetailsView {
                                                                         &semantic,
                                                                     ))
                                                                     .into_any_element(),
+                                                                DetailsColumn::WorkingSet => h_flex()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .items_center()
+                                                                    .justify_end()
+                                                                    .px_2()
+                                                                    .font_family(mono_font.clone())
+                                                                    .text_color(muted_fg)
+                                                                    .child(format_bytes(
+                                                                        row.working_set_bytes,
+                                                                    ))
+                                                                    .into_any_element(),
+                                                                DetailsColumn::CommitSize => h_flex()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .items_center()
+                                                                    .justify_end()
+                                                                    .px_2()
+                                                                    .font_family(mono_font.clone())
+                                                                    .text_color(muted_fg)
+                                                                    .child(format_bytes(
+                                                                        row.commit_bytes,
+                                                                    ))
+                                                                    .into_any_element(),
                                                                 DetailsColumn::Priority => h_flex()
                                                                     .w(w)
                                                                     .h_full()
@@ -1250,6 +1535,32 @@ impl Render for DetailsView {
                                                                                     row.priority,
                                                                                 ),
                                                                             ),
+                                                                    )
+                                                                    .into_any_element(),
+                                                                DetailsColumn::Handles => h_flex()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .items_center()
+                                                                    .justify_end()
+                                                                    .px_2()
+                                                                    .font_family(mono_font.clone())
+                                                                    .text_color(muted_fg)
+                                                                    .child(
+                                                                        row.handle_count.to_string(),
+                                                                    )
+                                                                    .into_any_element(),
+                                                                DetailsColumn::Threads => h_flex()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .items_center()
+                                                                    .justify_end()
+                                                                    .px_2()
+                                                                    .font_family(mono_font.clone())
+                                                                    .text_color(muted_fg)
+                                                                    .child(
+                                                                        row.thread_count.to_string(),
                                                                     )
                                                                     .into_any_element(),
                                                                 DetailsColumn::Platform => h_flex()
@@ -1292,6 +1603,23 @@ impl Render for DetailsView {
                                                                         )
                                                                         .into_any_element()
                                                                 }
+                                                                DetailsColumn::Elevated => h_flex()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .items_center()
+                                                                    .px_2()
+                                                                    .overflow_hidden()
+                                                                    .child(
+                                                                        div()
+                                                                            .min_w_0()
+                                                                            .truncate()
+                                                                            .text_color(muted_fg)
+                                                                            .child(
+                                                                                elevated_text.clone(),
+                                                                            ),
+                                                                    )
+                                                                    .into_any_element(),
                                                                 DetailsColumn::GpuMemory => h_flex()
                                                                     .w(w)
                                                                     .h_full()
@@ -1320,6 +1648,61 @@ impl Render for DetailsView {
                                                                             .child(publisher_text.clone()),
                                                                     )
                                                                     .into_any_element(),
+                                                                DetailsColumn::Description => h_flex()
+                                                                    .w(w)
+                                                                    .h_full()
+                                                                    .flex_shrink_0()
+                                                                    .items_center()
+                                                                    .px_2()
+                                                                    .overflow_hidden()
+                                                                    .child(
+                                                                        div()
+                                                                            .min_w_0()
+                                                                            .truncate()
+                                                                            .text_color(muted_fg)
+                                                                            .child(
+                                                                                description_text.clone(),
+                                                                            ),
+                                                                    )
+                                                                    .into_any_element(),
+                                                                DetailsColumn::ExePath => {
+                                                                    h_flex()
+                                                                        .id(("details-exe", row_id))
+                                                                        .w(w)
+                                                                        .h_full()
+                                                                        .flex_shrink_0()
+                                                                        .items_center()
+                                                                        .px_2()
+                                                                        .overflow_hidden()
+                                                                        .font_family(mono_font.clone())
+                                                                        .text_color(muted_fg)
+                                                                        .when_some(
+                                                                            exe_path_tooltip.clone(),
+                                                                            |el, full_path| {
+                                                                                el.tooltip(
+                                                                                    move |window, cx| {
+                                                                                        Tooltip::new(
+                                                                                            full_path
+                                                                                                .clone(),
+                                                                                        )
+                                                                                        .build(
+                                                                                            window, cx,
+                                                                                        )
+                                                                                    },
+                                                                                )
+                                                                            },
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .min_w_0()
+                                                                                .truncate()
+                                                                                .child(
+                                                                                    exe_path_text
+                                                                                        .clone(),
+                                                                                ),
+                                                                        )
+                                                                        .into_any_element()
+                                                                }
                                                                 DetailsColumn::CommandLine => {
                                                                     h_flex()
                                                                         .id(("details-cmd", row_id))

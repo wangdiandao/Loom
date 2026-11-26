@@ -554,6 +554,7 @@ impl ProjectionEngine {
 
         let publisher = asset.and_then(|a| a.publisher.clone());
         let exe_path = cold.and_then(|meta| meta.exe_path.clone());
+        let command_line = cold.and_then(|meta| meta.command_line.clone());
         let icon = asset.and_then(|a| a.icon.clone());
         let display_name = asset
             .and_then(|a| a.file_description.as_ref())
@@ -579,6 +580,7 @@ impl ProjectionEngine {
             window_title: proc.window_title.clone(),
             publisher,
             exe_path,
+            command_line,
             icon,
             category: proc.category,
             status,
@@ -1027,24 +1029,8 @@ impl ProjectionEngine {
             visible_apps.sort_by(|(ia, agg_a, _), (ib, agg_b, _)| {
                 let a = &self.computed[*ia];
                 let b = &self.computed[*ib];
-                let ord = match sort_col {
-                    ProcessSortColumn::Name => {
-                        let da = process_display_name_ref(a, cold_cache);
-                        let db = process_display_name_ref(b, cold_cache);
-                        cmp_str_ascii_ci(da, db)
-                    }
-                    ProcessSortColumn::Status => agg_a.status.bits().cmp(&agg_b.status.bits()),
-                    ProcessSortColumn::Cpu => agg_a.cpu_permille.cmp(&agg_b.cpu_permille),
-                    ProcessSortColumn::Memory => agg_a.memory_bytes.cmp(&agg_b.memory_bytes),
-                    ProcessSortColumn::Disk => {
-                        agg_a.disk_bytes_per_sec.cmp(&agg_b.disk_bytes_per_sec)
-                    }
-                    ProcessSortColumn::Network => {
-                        agg_a.net_bytes_per_sec.cmp(&agg_b.net_bytes_per_sec)
-                    }
-                    ProcessSortColumn::Gpu => (agg_a.gpu_util_permille, agg_a.gpu_dedicated_bytes)
-                        .cmp(&(agg_b.gpu_util_permille, agg_b.gpu_dedicated_bytes)),
-                };
+                let ord =
+                    cmp_process_sort_column(a, b, Some(*agg_a), Some(*agg_b), cold_cache, sort_col);
                 let directed = match sort_dir {
                     SortDirection::Ascending => ord,
                     SortDirection::Descending => ord.reverse(),
@@ -1471,41 +1457,8 @@ impl ProjectionEngine {
         indices.sort_by(|&ia, &ib| {
             let a = &self.computed[ia];
             let b = &self.computed[ib];
-            let agg_a = group_agg[ia];
-            let agg_b = group_agg[ib];
-            let ord = match column {
-                ProcessSortColumn::Name => {
-                    let da = process_display_name_ref(a, cold_cache);
-                    let db = process_display_name_ref(b, cold_cache);
-                    cmp_str_ascii_ci(da, db)
-                }
-                ProcessSortColumn::Status => {
-                    let sa = agg_a.map_or_else(|| effective_status(a, cold_cache), |g| g.status);
-                    let sb = agg_b.map_or_else(|| effective_status(b, cold_cache), |g| g.status);
-                    sa.bits().cmp(&sb.bits())
-                }
-                ProcessSortColumn::Cpu => agg_a
-                    .map_or(a.cpu_permille, |g| g.cpu_permille)
-                    .cmp(&agg_b.map_or(b.cpu_permille, |g| g.cpu_permille)),
-                ProcessSortColumn::Memory => agg_a
-                    .map_or(a.private_working_set_bytes, |g| g.memory_bytes)
-                    .cmp(&agg_b.map_or(b.private_working_set_bytes, |g| g.memory_bytes)),
-                ProcessSortColumn::Disk => agg_a
-                    .map_or(a.disk_bytes_per_sec, |g| g.disk_bytes_per_sec)
-                    .cmp(&agg_b.map_or(b.disk_bytes_per_sec, |g| g.disk_bytes_per_sec)),
-                ProcessSortColumn::Network => agg_a
-                    .map_or(a.net_bytes_per_sec, |g| g.net_bytes_per_sec)
-                    .cmp(&agg_b.map_or(b.net_bytes_per_sec, |g| g.net_bytes_per_sec)),
-                ProcessSortColumn::Gpu => {
-                    let ga = agg_a.map_or((a.gpu_util_permille, a.gpu_dedicated_bytes), |g| {
-                        (g.gpu_util_permille, g.gpu_dedicated_bytes)
-                    });
-                    let gb = agg_b.map_or((b.gpu_util_permille, b.gpu_dedicated_bytes), |g| {
-                        (g.gpu_util_permille, g.gpu_dedicated_bytes)
-                    });
-                    ga.cmp(&gb)
-                }
-            };
+            let ord =
+                cmp_process_sort_column(a, b, group_agg[ia], group_agg[ib], cold_cache, column);
             let directed = match direction {
                 SortDirection::Ascending => ord,
                 SortDirection::Descending => ord.reverse(),
@@ -1526,24 +1479,7 @@ impl ProjectionEngine {
         indices.sort_by(|&ia, &ib| {
             let a = &self.computed[ia];
             let b = &self.computed[ib];
-            let ord = match column {
-                ProcessSortColumn::Name => {
-                    let da = process_display_name_ref(a, cold_cache);
-                    let db = process_display_name_ref(b, cold_cache);
-                    cmp_str_ascii_ci(da, db)
-                }
-                ProcessSortColumn::Status => effective_status(a, cold_cache)
-                    .bits()
-                    .cmp(&effective_status(b, cold_cache).bits()),
-                ProcessSortColumn::Cpu => a.cpu_permille.cmp(&b.cpu_permille),
-                ProcessSortColumn::Memory => a
-                    .private_working_set_bytes
-                    .cmp(&b.private_working_set_bytes),
-                ProcessSortColumn::Disk => a.disk_bytes_per_sec.cmp(&b.disk_bytes_per_sec),
-                ProcessSortColumn::Network => a.net_bytes_per_sec.cmp(&b.net_bytes_per_sec),
-                ProcessSortColumn::Gpu => (a.gpu_util_permille, a.gpu_dedicated_bytes)
-                    .cmp(&(b.gpu_util_permille, b.gpu_dedicated_bytes)),
-            };
+            let ord = cmp_process_sort_column(a, b, None, None, cold_cache, column);
             let directed = match direction {
                 SortDirection::Ascending => ord,
                 SortDirection::Descending => ord.reverse(),
@@ -1577,10 +1513,17 @@ impl ProjectionEngine {
                     let ub = display_user_for_sort(cb.and_then(|m| m.user_name.as_deref()));
                     cmp_str_ascii_ci(ua, ub)
                 }
+                DetailsSortColumn::SessionId => a.session_id.cmp(&b.session_id),
                 DetailsSortColumn::Cpu => a.cpu_permille.cmp(&b.cpu_permille),
+                DetailsSortColumn::CpuTime => a.cpu_time_100ns.cmp(&b.cpu_time_100ns),
                 DetailsSortColumn::Memory => a
                     .private_working_set_bytes
                     .cmp(&b.private_working_set_bytes),
+                DetailsSortColumn::WorkingSet => a.working_set_bytes.cmp(&b.working_set_bytes),
+                DetailsSortColumn::CommitSize => a.commit_bytes.cmp(&b.commit_bytes),
+                DetailsSortColumn::Priority => a.priority.cmp(&b.priority),
+                DetailsSortColumn::Handles => a.handle_count.cmp(&b.handle_count),
+                DetailsSortColumn::Threads => a.thread_count.cmp(&b.thread_count),
                 DetailsSortColumn::Arch => {
                     let aa = arch_rank(ca.map_or(ProcessArch::Unknown, |m| m.arch));
                     let ab = arch_rank(cb.map_or(ProcessArch::Unknown, |m| m.arch));
@@ -1593,7 +1536,37 @@ impl ProjectionEngine {
                         uac_rank(cb.map_or(UacVirtualization::Unknown, |m| m.uac_virtualization));
                     va.cmp(&vb)
                 }
+                DetailsSortColumn::Elevated => effective_status(a, cold_cache)
+                    .contains(ProcessStatusFlags::ELEVATED)
+                    .cmp(&effective_status(b, cold_cache).contains(ProcessStatusFlags::ELEVATED)),
                 DetailsSortColumn::GpuMemory => a.gpu_dedicated_bytes.cmp(&b.gpu_dedicated_bytes),
+                DetailsSortColumn::Publisher => {
+                    let pa = ca
+                        .and_then(|m| m.asset.as_ref())
+                        .and_then(|asset| asset.publisher.as_deref())
+                        .unwrap_or("");
+                    let pb = cb
+                        .and_then(|m| m.asset.as_ref())
+                        .and_then(|asset| asset.publisher.as_deref())
+                        .unwrap_or("");
+                    cmp_str_ascii_ci(pa, pb)
+                }
+                DetailsSortColumn::Description => {
+                    let da = ca
+                        .and_then(|m| m.asset.as_ref())
+                        .and_then(|asset| asset.file_description.as_deref())
+                        .unwrap_or("");
+                    let db = cb
+                        .and_then(|m| m.asset.as_ref())
+                        .and_then(|asset| asset.file_description.as_deref())
+                        .unwrap_or("");
+                    cmp_str_ascii_ci(da, db)
+                }
+                DetailsSortColumn::ExePath => {
+                    let ea = ca.and_then(|m| m.exe_path.as_deref()).unwrap_or("");
+                    let eb = cb.and_then(|m| m.exe_path.as_deref()).unwrap_or("");
+                    cmp_str_ascii_ci(ea, eb)
+                }
                 DetailsSortColumn::CommandLine => {
                     let cmd_a = ca.and_then(|m| m.command_line.as_deref()).unwrap_or("");
                     let cmd_b = cb.and_then(|m| m.command_line.as_deref()).unwrap_or("");
@@ -1608,6 +1581,77 @@ impl ProjectionEngine {
                 .then_with(|| cmp_str_ascii_ci(&a.name, &b.name))
                 .then_with(|| a.key.cmp(&b.key))
         });
+    }
+}
+
+#[inline]
+fn cmp_process_sort_column(
+    a: &ComputedProcess,
+    b: &ComputedProcess,
+    agg_a: Option<GroupAggregate>,
+    agg_b: Option<GroupAggregate>,
+    cold_cache: &ColdMetaCache,
+    column: ProcessSortColumn,
+) -> Ordering {
+    match column {
+        ProcessSortColumn::Name => {
+            let da = process_display_name_ref(a, cold_cache);
+            let db = process_display_name_ref(b, cold_cache);
+            cmp_str_ascii_ci(da, db)
+        }
+        ProcessSortColumn::Category => category_index(a.category).cmp(&category_index(b.category)),
+        ProcessSortColumn::Pid => a.key.pid.cmp(&b.key.pid),
+        ProcessSortColumn::ProcessName => cmp_str_ascii_ci(&a.name, &b.name),
+        ProcessSortColumn::Status => {
+            let sa = agg_a.map_or_else(|| effective_status(a, cold_cache), |g| g.status);
+            let sb = agg_b.map_or_else(|| effective_status(b, cold_cache), |g| g.status);
+            sa.bits().cmp(&sb.bits())
+        }
+        ProcessSortColumn::Cpu => agg_a
+            .map_or(a.cpu_permille, |g| g.cpu_permille)
+            .cmp(&agg_b.map_or(b.cpu_permille, |g| g.cpu_permille)),
+        ProcessSortColumn::Memory => agg_a
+            .map_or(a.private_working_set_bytes, |g| g.memory_bytes)
+            .cmp(&agg_b.map_or(b.private_working_set_bytes, |g| g.memory_bytes)),
+        ProcessSortColumn::Disk => agg_a
+            .map_or(a.disk_bytes_per_sec, |g| g.disk_bytes_per_sec)
+            .cmp(&agg_b.map_or(b.disk_bytes_per_sec, |g| g.disk_bytes_per_sec)),
+        ProcessSortColumn::Network => agg_a
+            .map_or(a.net_bytes_per_sec, |g| g.net_bytes_per_sec)
+            .cmp(&agg_b.map_or(b.net_bytes_per_sec, |g| g.net_bytes_per_sec)),
+        ProcessSortColumn::Gpu => {
+            let ga = agg_a.map_or((a.gpu_util_permille, a.gpu_dedicated_bytes), |g| {
+                (g.gpu_util_permille, g.gpu_dedicated_bytes)
+            });
+            let gb = agg_b.map_or((b.gpu_util_permille, b.gpu_dedicated_bytes), |g| {
+                (g.gpu_util_permille, g.gpu_dedicated_bytes)
+            });
+            ga.cmp(&gb)
+        }
+        ProcessSortColumn::Publisher => {
+            let pa = cold_cache
+                .get_process(a.key)
+                .and_then(|m| m.asset.as_ref())
+                .and_then(|asset| asset.publisher.as_deref())
+                .unwrap_or("");
+            let pb = cold_cache
+                .get_process(b.key)
+                .and_then(|m| m.asset.as_ref())
+                .and_then(|asset| asset.publisher.as_deref())
+                .unwrap_or("");
+            cmp_str_ascii_ci(pa, pb)
+        }
+        ProcessSortColumn::CommandLine => {
+            let ca = cold_cache
+                .get_process(a.key)
+                .and_then(|m| m.command_line.as_deref())
+                .unwrap_or("");
+            let cb = cold_cache
+                .get_process(b.key)
+                .and_then(|m| m.command_line.as_deref())
+                .unwrap_or("");
+            cmp_str_ascii_ci(ca, cb)
+        }
     }
 }
 
@@ -1756,6 +1800,7 @@ fn section_header_row(category: ProcessCategory, count: usize) -> ProcessRowProj
         window_title: None,
         publisher: None,
         exe_path: None,
+        command_line: None,
         icon: None,
         category,
         status: ProcessStatusFlags::empty(),
