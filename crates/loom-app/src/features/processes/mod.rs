@@ -119,13 +119,10 @@ impl ProcessesView {
 
     fn toggle_efficiency_mode_for_selected(&self, cx: &mut Context<Self>) {
         let snapshot = self.store.read(cx).snapshot().clone();
-        if !snapshot.capabilities.contains(CapabilityFlags::ECO_MODE) {
-            return;
-        }
         let Some(row) = find_selected_row(&snapshot.processes.rows, self.selected_key) else {
             return;
         };
-        if !is_efficiency_mode_eligible(row) {
+        if !is_efficiency_mode_eligible(row, snapshot.capabilities) {
             return;
         }
         let next_enabled = !row.status.contains(ProcessStatusFlags::EFFICIENCY_MODE);
@@ -133,7 +130,7 @@ impl ProcessesView {
     }
 }
 
-/// Triggers End Task on `row`, routing Windows/critical/protected processes through a confirmation dialog.
+/// Triggers End Task on `row`, routing system/critical/protected processes through a confirmation dialog.
 fn trigger_end_task_for_row(
     store: &Entity<UiStore>,
     row: &ProcessRowProjection,
@@ -287,7 +284,7 @@ fn build_row_context_menu(
     let has_children = row.has_children;
     let is_expanded = row.is_expanded;
     let can_end = can_terminate_process(&row);
-    let eco_eligible = eco_supported && is_efficiency_mode_eligible(&row);
+    let eco_eligible = is_efficiency_mode_eligible(&row, snapshot.capabilities);
     let eco_active = row.status.contains(ProcessStatusFlags::EFFICIENCY_MODE);
     let exe_path = row.exe_path.clone();
     let query = search_online_query(&row);
@@ -322,15 +319,17 @@ fn build_row_context_menu(
             }),
     );
 
-    let store_eco = store.clone();
-    menu = menu.item(
-        PopupMenuItem::new(i18n::tr("processes.menu_efficiency_mode"))
-            .checked(eco_active)
-            .disabled(!eco_eligible)
-            .on_click(move |_, _, cx| {
-                UiCommands::set_efficiency_mode(&store_eco, key, !eco_active, cx);
-            }),
-    );
+    if eco_supported {
+        let store_eco = store.clone();
+        menu = menu.item(
+            PopupMenuItem::new(i18n::tr("processes.menu_efficiency_mode"))
+                .checked(eco_active)
+                .disabled(!eco_eligible)
+                .on_click(move |_, _, cx| {
+                    UiCommands::set_efficiency_mode(&store_eco, key, !eco_active, cx);
+                }),
+        );
+    }
 
     let store_res = store.clone();
     menu = menu
@@ -397,6 +396,8 @@ impl Render for ProcessesView {
         let settings = store_ref.settings().clone();
         let slice = snapshot.processes.clone();
         let capabilities = snapshot.capabilities;
+        let platform = snapshot.platform;
+        let eco_supported = capabilities.contains(CapabilityFlags::ECO_MODE);
         let view_mode = slice.view_mode;
         let sort_col = slice.sort_column;
         let sort_dir = slice.sort_direction;
@@ -404,8 +405,8 @@ impl Render for ProcessesView {
 
         let selected_row = find_selected_row(&slice.rows, self.selected_key);
         let end_task_enabled = selected_row.is_some_and(can_terminate_process);
-        let eco_eligible = capabilities.contains(CapabilityFlags::ECO_MODE)
-            && selected_row.is_some_and(is_efficiency_mode_eligible);
+        let eco_eligible =
+            selected_row.is_some_and(|row| is_efficiency_mode_eligible(row, capabilities));
         let eco_active =
             selected_row.is_some_and(|r| r.status.contains(ProcessStatusFlags::EFFICIENCY_MODE));
 
@@ -554,18 +555,20 @@ impl Render for ProcessesView {
                                 this.trigger_end_task_for_selected(window, cx);
                             })),
                     )
-                    .child(
-                        Button::new("processes-efficiency-mode")
-                            .small()
-                            .outline()
-                            .selected(eco_active)
-                            .icon(Icon::default().data(ECO_LEAF_SVG))
-                            .label(i18n::tr("processes.efficiency_mode"))
-                            .disabled(!eco_eligible)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_efficiency_mode_for_selected(cx);
-                            })),
-                    )
+                    .when(eco_supported, |this| {
+                        this.child(
+                            Button::new("processes-efficiency-mode")
+                                .small()
+                                .outline()
+                                .selected(eco_active)
+                                .icon(Icon::default().data(ECO_LEAF_SVG))
+                                .label(i18n::tr("processes.efficiency_mode"))
+                                .disabled(!eco_eligible)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_efficiency_mode_for_selected(cx);
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("processes-refresh")
                             .small()
@@ -769,7 +772,7 @@ impl Render for ProcessesView {
                                         ProcessRowKind::SectionHeader { category, count } => {
                                             let label = format!(
                                                 "{} ({count})",
-                                                i18n::process_category_label(category)
+                                                i18n::process_category_label(category, platform)
                                             );
                                             Some(
                                                 h_flex()

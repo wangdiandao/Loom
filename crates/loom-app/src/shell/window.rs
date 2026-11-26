@@ -1,5 +1,5 @@
 //! Main desktop window shell (`AppShell`) with TitleBar search, collapsible Sidebar,
-//! route outlet, on-demand UAC notifications, and window visibility/close hooks.
+//! route outlet, on-demand elevation notifications, and window visibility/close hooks.
 
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use gpui_kit::{
     AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
     Subscription, Task, Window, WindowVisibility, div, prelude::FluentBuilder as _, px,
 };
-use loom_types::{LanguagePreference, ProcessKey, ThemePreference};
+use loom_types::{CapabilityFlags, LanguagePreference, ProcessKey, ThemePreference};
 
 use crate::bootstrap;
 use crate::bridge::{UiCommands, UiStore, UiStoreEvent, apply_theme};
@@ -28,8 +28,8 @@ use crate::shell::nav::{NavigationIntent, Route, ShellHandle};
 /// Debounce interval for typing in the global TitleBar search box.
 const SEARCH_DEBOUNCE_DURATION: Duration = Duration::from_millis(150);
 
-/// Unique notification type tag for deduplicating on-demand UAC elevation prompts.
-struct UacElevationNotice;
+/// Unique notification type tag for deduplicating on-demand elevation prompts.
+struct ElevationNotice;
 
 /// Mounted page entity owned by [`AppShell`].
 ///
@@ -98,14 +98,14 @@ impl AppShell {
             },
         ));
 
-        // Subscribe to UiStore domain events (UAC elevation notices, locale/settings changes).
+        // Subscribe to UiStore domain events (elevation notices, locale/settings changes).
         subscriptions.push(cx.subscribe_in(
             &store,
             window,
             |this, store, event: &UiStoreEvent, window, cx| match event {
                 UiStoreEvent::ElevationRequired { command } => {
-                    tracing::info!(?command, "surfacing on-demand UAC elevation notification");
-                    this.push_uac_notification(window, cx);
+                    tracing::info!(?command, "surfacing on-demand elevation notification");
+                    this.push_elevation_notification(window, cx);
                 }
                 UiStoreEvent::SettingsChanged => {
                     let next_locale = store.read(cx).settings().language;
@@ -174,7 +174,12 @@ impl AppShell {
         });
 
         // Apply initial Always-on-Top state once the native window is mapped.
-        let initial_topmost = initial_settings.always_on_top;
+        let initial_topmost = initial_settings.always_on_top
+            && store
+                .read(cx)
+                .snapshot()
+                .capabilities
+                .contains(CapabilityFlags::ALWAYS_ON_TOP);
         if initial_topmost {
             window.defer(cx, move |_window, _cx| {
                 bootstrap::apply_always_on_top(true);
@@ -282,28 +287,35 @@ impl AppShell {
         }
     }
 
-    fn push_uac_notification(&self, window: &mut Window, cx: &mut Context<Self>) {
+    fn push_elevation_notification(&self, window: &mut Window, cx: &mut Context<Self>) {
         let store = self.store.clone();
+        let supports_relaunch = store
+            .read(cx)
+            .snapshot()
+            .capabilities
+            .contains(CapabilityFlags::ELEVATION_RELAUNCH);
         let current_route = self.route.as_str();
         let action_label = i18n::tr("uac.action");
 
-        window.push_notification(
-            Notification::warning(i18n::tr("uac.message"))
-                .id::<UacElevationNotice>()
-                .title(i18n::tr("uac.title"))
-                .autohide(false)
-                .action(move |_, _, cx| {
-                    let store = store.clone();
-                    Button::new("uac-restart-as-admin")
-                        .primary()
-                        .label(action_label.clone())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            UiCommands::relaunch_elevated(&store, current_route, cx);
-                            this.dismiss(window, cx);
-                        }))
-                }),
-            cx,
-        );
+        let mut notice = Notification::warning(i18n::tr("uac.message"))
+            .id::<ElevationNotice>()
+            .title(i18n::tr("uac.title"))
+            .autohide(false);
+
+        if supports_relaunch {
+            notice = notice.action(move |_, _, cx| {
+                let store = store.clone();
+                Button::new("elevation-restart-as-admin")
+                    .primary()
+                    .label(action_label.clone())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        UiCommands::relaunch_elevated(&store, current_route, cx);
+                        this.dismiss(window, cx);
+                    }))
+            });
+        }
+
+        window.push_notification(notice, cx);
     }
 }
 

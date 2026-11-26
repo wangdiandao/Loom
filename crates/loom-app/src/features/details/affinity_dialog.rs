@@ -2,7 +2,7 @@
 //!
 //! Mounted via `gpui-kit`'s `Root` dialog layer (`WindowExt::open_dialog`) so it
 //! never bloats `shell/` with feature-specific dialog state. Supports multi-group
-//! processor affinity masks with `> 64` logical CPUs (Windows Processor Groups).
+//! processor affinity masks with `> 64` logical CPUs (OS processor groups).
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
@@ -18,7 +18,7 @@ use gpui_kit::{
     ParentElement as _, Render, Styled as _, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use loom_engine::CommandSuccess;
-use loom_types::{CpuAffinityMask, ProcessKey};
+use loom_types::{CapabilityFlags, CpuAffinityMask, ProcessKey};
 
 use crate::bridge::{UiCommands, UiStore};
 use crate::i18n;
@@ -259,6 +259,12 @@ impl Render for SetAffinityDialogView {
 
             AffinityLoadState::ElevationRequired => {
                 let store = self.store.clone();
+                let supports_relaunch = self
+                    .store
+                    .read(cx)
+                    .snapshot()
+                    .capabilities
+                    .contains(CapabilityFlags::ELEVATION_RELAUNCH);
                 v_flex()
                     .w_full()
                     .gap_4()
@@ -300,22 +306,24 @@ impl Render for SetAffinityDialogView {
                     .child(
                         DialogFooter::new()
                             .child(
-                                Button::new("affinity-uac-close")
+                                Button::new("affinity-elevation-close")
                                     .outline()
                                     .label(i18n::tr("common.close"))
                                     .on_click(|_, window, cx| {
                                         window.close_dialog(cx);
                                     }),
                             )
-                            .child(
-                                Button::new("affinity-uac-relaunch")
-                                    .primary()
-                                    .label(i18n::tr("uac.action"))
-                                    .on_click(move |_, window, cx| {
-                                        UiCommands::relaunch_elevated(&store, "details", cx);
-                                        window.close_dialog(cx);
-                                    }),
-                            ),
+                            .when(supports_relaunch, |footer| {
+                                footer.child(
+                                    Button::new("affinity-elevation-relaunch")
+                                        .primary()
+                                        .label(i18n::tr("uac.action"))
+                                        .on_click(move |_, window, cx| {
+                                            UiCommands::relaunch_elevated(&store, "details", cx);
+                                            window.close_dialog(cx);
+                                        }),
+                                )
+                            }),
                     )
                     .into_any_element()
             }

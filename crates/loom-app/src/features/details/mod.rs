@@ -57,21 +57,27 @@ const COL_UAC_W: f32 = 132.0;
 const COL_GPU_MEM_W: f32 = 144.0;
 const COL_PUBLISHER_W: f32 = 164.0;
 const COL_CMDLINE_MIN_W: f32 = 360.0;
-/// Total minimum width of the full-field Details table (columns + 11 gaps + horizontal padding).
-const TABLE_MIN_WIDTH: f32 = COL_NAME_W
-    + COL_PID_W
-    + COL_STATUS_W
-    + COL_USER_W
-    + COL_CPU_W
-    + COL_MEM_W
-    + COL_PRIORITY_W
-    + COL_PLATFORM_W
-    + COL_UAC_W
-    + COL_GPU_MEM_W
-    + COL_PUBLISHER_W
-    + COL_CMDLINE_MIN_W
-    + 11.0 * 8.0
-    + 32.0;
+/// Total minimum width of the Details table, adapting to advertised [`CapabilityFlags`].
+pub(super) const fn table_min_width(capabilities: CapabilityFlags) -> f32 {
+    let base = COL_NAME_W
+        + COL_PID_W
+        + COL_STATUS_W
+        + COL_USER_W
+        + COL_CPU_W
+        + COL_MEM_W
+        + COL_PRIORITY_W
+        + COL_PLATFORM_W
+        + COL_GPU_MEM_W
+        + COL_PUBLISHER_W
+        + COL_CMDLINE_MIN_W
+        + 10.0 * 8.0
+        + 32.0;
+    if capabilities.contains(CapabilityFlags::UAC_VIRTUALIZATION) {
+        base + COL_UAC_W + 8.0
+    } else {
+        base
+    }
+}
 
 /// Scheduling priority classes displayed in the `Set priority >` submenu (highest to lowest).
 pub(super) const PRIORITY_MENU_ORDER: [ProcessPriority; 6] = [
@@ -122,32 +128,48 @@ pub(super) fn find_row_index_by_key(
     rows.iter().position(|row| row.key == target)
 }
 
-/// Returns `true` when `key`/`status` represents a critical or OS-protected process
+/// Returns `true` when `status` represents a critical, kernel, idle, or OS-protected process
 /// that should show an explicit confirmation warning before termination.
 #[inline]
-pub(super) fn is_critical_or_system_process(key: ProcessKey, status: ProcessStatusFlags) -> bool {
-    key.pid <= 4
-        || status.contains(ProcessStatusFlags::CRITICAL)
-        || status.contains(ProcessStatusFlags::PROTECTED)
-        || status.contains(ProcessStatusFlags::SYSTEM_IDLE)
+pub(super) fn is_critical_or_system_process(status: ProcessStatusFlags) -> bool {
+    status.intersects(
+        ProcessStatusFlags::CRITICAL
+            | ProcessStatusFlags::PROTECTED
+            | ProcessStatusFlags::KERNEL
+            | ProcessStatusFlags::SYSTEM_IDLE,
+    )
 }
 
 /// Returns `true` if Efficiency Mode (`EcoQoS`) can be toggled for this process.
 ///
-/// Disabled for PID 0 (System Idle), PID 4 (System), protected/critical system processes,
-/// and backends that do not advertise [`CapabilityFlags::ECO_MODE`].
+/// Disabled for idle, kernel, protected, or critical processes, and for backends
+/// that do not advertise [`CapabilityFlags::ECO_MODE`].
 #[inline]
 pub(super) fn is_eco_mode_eligible(
-    key: ProcessKey,
     status: ProcessStatusFlags,
     capabilities: CapabilityFlags,
 ) -> bool {
     capabilities.contains(CapabilityFlags::ECO_MODE)
-        && key.pid != 0
-        && key.pid != 4
-        && !status.contains(ProcessStatusFlags::SYSTEM_IDLE)
-        && !status.contains(ProcessStatusFlags::PROTECTED)
-        && !status.contains(ProcessStatusFlags::CRITICAL)
+        && !status.intersects(
+            ProcessStatusFlags::SYSTEM_IDLE
+                | ProcessStatusFlags::KERNEL
+                | ProcessStatusFlags::PROTECTED
+                | ProcessStatusFlags::CRITICAL,
+        )
+}
+
+/// Returns `true` if scheduling priority can be changed for this process.
+#[inline]
+pub(super) fn can_set_priority(status: ProcessStatusFlags, capabilities: CapabilityFlags) -> bool {
+    capabilities.contains(CapabilityFlags::PROCESS_PRIORITY)
+        && !status.intersects(ProcessStatusFlags::SYSTEM_IDLE | ProcessStatusFlags::KERNEL)
+}
+
+/// Returns `true` if CPU affinity can be changed for this process.
+#[inline]
+pub(super) fn can_set_affinity(status: ProcessStatusFlags, capabilities: CapabilityFlags) -> bool {
+    capabilities.contains(CapabilityFlags::CPU_AFFINITY)
+        && !status.intersects(ProcessStatusFlags::SYSTEM_IDLE | ProcessStatusFlags::KERNEL)
 }
 
 /// Returns the default initial sort direction when switching to a different column.
@@ -230,7 +252,7 @@ fn request_end_task(
     window: &mut Window,
     cx: &mut App,
 ) {
-    if !is_critical_or_system_process(target.key, target.status) {
+    if !is_critical_or_system_process(target.status) {
         UiCommands::terminate_process(store, target.key, cx);
         return;
     }
@@ -318,7 +340,7 @@ fn open_end_process_tree_dialog(
     let store = store.clone();
     let key = target.key;
     let name = target.name.to_string();
-    let is_critical = is_critical_or_system_process(target.key, target.status);
+    let is_critical = is_critical_or_system_process(target.status);
 
     window.open_dialog(cx, move |dialog, _window, cx| {
         let store_confirm = store.clone();
@@ -597,6 +619,8 @@ impl Render for DetailsView {
         let snapshot = self.store.read(cx).snapshot().clone();
         let details = snapshot.details.clone();
         let capabilities = snapshot.capabilities;
+        let platform = snapshot.platform;
+        let show_uac_col = capabilities.contains(CapabilityFlags::UAC_VIRTUALIZATION);
         let total_ram_bytes = snapshot.performance.latest.mem_total_bytes;
         let view_mode = details.view_mode;
         let sort_column = details.sort_column;
@@ -956,20 +980,22 @@ impl Render for DetailsView {
                 muted_fg,
                 header_hover,
             ))
-            .child(sortable_header(
-                "details-sort-uac",
-                i18n::tr("details.col_uac"),
-                DetailsSortColumn::UacVirtualization,
-                sort_column,
-                sort_direction,
-                COL_UAC_W,
-                false,
-                false,
-                self.store.clone(),
-                fg,
-                muted_fg,
-                header_hover,
-            ))
+            .when(show_uac_col, |el| {
+                el.child(sortable_header(
+                    "details-sort-uac",
+                    i18n::virtualization_column_label(platform),
+                    DetailsSortColumn::UacVirtualization,
+                    sort_column,
+                    sort_direction,
+                    COL_UAC_W,
+                    false,
+                    false,
+                    self.store.clone(),
+                    fg,
+                    muted_fg,
+                    header_hover,
+                ))
+            })
             .child(sortable_header(
                 "details-sort-gpu-mem",
                 i18n::tr("details.col_gpu_memory"),
@@ -1076,7 +1102,7 @@ impl Render for DetailsView {
                         .track_scroll(&self.h_scroll_handle)
                         .child(
                             v_flex()
-                                .min_w(px(TABLE_MIN_WIDTH))
+                                .min_w(px(table_min_width(capabilities)))
                                 .w_full()
                                 .h_full()
                                 .child(column_header)
@@ -1363,18 +1389,20 @@ impl Render for DetailsView {
                                                                         ),
                                                                     ),
                                                             )
-                                                            .child(
-                                                                div()
-                                                                    .w(px(COL_UAC_W))
-                                                                    .flex_shrink_0()
-                                                                    .truncate()
-                                                                    .text_color(muted_fg)
-                                                                    .child(
-                                                                        i18n::uac_virtualization_label(
-                                                                            row.uac_virtualization,
+                                                            .when(show_uac_col, |el| {
+                                                                el.child(
+                                                                    div()
+                                                                        .w(px(COL_UAC_W))
+                                                                        .flex_shrink_0()
+                                                                        .truncate()
+                                                                        .text_color(muted_fg)
+                                                                        .child(
+                                                                            i18n::uac_virtualization_label(
+                                                                                row.uac_virtualization,
+                                                                            ),
                                                                         ),
-                                                                    ),
-                                                            )
+                                                                )
+                                                            })
                                                             .child(
                                                                 div()
                                                                     .w(px(COL_GPU_MEM_W))
@@ -1476,10 +1504,11 @@ fn build_row_context_menu(
 ) -> gpui_kit::component::menu::PopupMenu {
     let key = target.key;
     let current_priority = target.priority;
+    let eco_supported = capabilities.contains(CapabilityFlags::ECO_MODE);
     let eco_enabled = target.status.contains(ProcessStatusFlags::EFFICIENCY_MODE);
-    let eco_eligible = is_eco_mode_eligible(key, target.status, capabilities);
-    let can_set_priority = capabilities.contains(CapabilityFlags::PROCESS_PRIORITY) && key.pid != 0;
-    let can_set_affinity = capabilities.contains(CapabilityFlags::CPU_AFFINITY) && key.pid != 0;
+    let eco_eligible = is_eco_mode_eligible(target.status, capabilities);
+    let priority_allowed = can_set_priority(target.status, capabilities);
+    let affinity_allowed = can_set_affinity(target.status, capabilities);
     let has_exe_path = target.exe_path.is_some();
 
     let store_end = store.clone();
@@ -1504,99 +1533,104 @@ fn build_row_context_menu(
     let store_search = store.clone();
     let search_query = target.name.to_string();
 
-    menu.item(
-        PopupMenuItem::new(i18n::tr("details.menu_end_task"))
-            .icon(IconName::CircleX)
-            .on_click(move |_, window, cx| {
-                request_end_task(&store_end, &target_end, window, cx);
-            }),
-    )
-    .item(
-        PopupMenuItem::new(i18n::tr("details.menu_end_process_tree"))
-            .icon(IconName::Ban)
-            .on_click(move |_, window, cx| {
-                open_end_process_tree_dialog(&store_tree, &target_tree, window, cx);
-            }),
-    )
-    .separator()
-    .submenu_with_icon(
-        Some(Icon::new(IconName::ChevronsUpDown)),
-        i18n::tr("details.menu_set_priority"),
-        window,
-        cx,
-        move |mut submenu, _window, _cx| {
-            for level in PRIORITY_MENU_ORDER {
-                let store_level = store_priority.clone();
-                submenu = submenu.item(
-                    PopupMenuItem::new(i18n::process_priority_label(level))
-                        .checked(current_priority == level)
-                        .disabled(!can_set_priority)
-                        .on_click(move |_, _, cx| {
-                            UiCommands::set_priority(&store_level, key, level, cx);
-                        }),
-                );
-            }
-            submenu
-        },
-    )
-    .item(
-        PopupMenuItem::new(i18n::tr("details.menu_set_affinity"))
-            .icon(IconName::Cpu)
-            .disabled(!can_set_affinity)
-            .on_click(move |_, window, cx| {
-                affinity_dialog::open_set_affinity_dialog(
-                    store_affinity.clone(),
-                    key,
-                    affinity_name.clone(),
-                    window,
-                    cx,
-                );
-            }),
-    )
-    .item(
-        PopupMenuItem::new(i18n::tr("details.menu_efficiency_mode"))
-            .checked(eco_enabled)
-            .disabled(!eco_eligible)
-            .on_click(move |_, _, cx| {
-                UiCommands::set_efficiency_mode(&store_eco, key, !eco_enabled, cx);
-            }),
-    )
-    .separator()
-    .item(
-        PopupMenuItem::new(i18n::tr("details.menu_open_file_location"))
-            .icon(IconName::FolderOpen)
-            .disabled(!has_exe_path)
-            .on_click(move |_, _, cx| {
-                if let Some(ref path) = open_loc_path {
-                    UiCommands::open_file_location(
-                        &store_open_loc,
-                        PathBuf::from(path.as_ref()),
-                        cx,
+    let mut menu = menu
+        .item(
+            PopupMenuItem::new(i18n::tr("details.menu_end_task"))
+                .icon(IconName::CircleX)
+                .on_click(move |_, window, cx| {
+                    request_end_task(&store_end, &target_end, window, cx);
+                }),
+        )
+        .item(
+            PopupMenuItem::new(i18n::tr("details.menu_end_process_tree"))
+                .icon(IconName::Ban)
+                .on_click(move |_, window, cx| {
+                    open_end_process_tree_dialog(&store_tree, &target_tree, window, cx);
+                }),
+        )
+        .separator()
+        .submenu_with_icon(
+            Some(Icon::new(IconName::ChevronsUpDown)),
+            i18n::tr("details.menu_set_priority"),
+            window,
+            cx,
+            move |mut submenu, _window, _cx| {
+                for level in PRIORITY_MENU_ORDER {
+                    let store_level = store_priority.clone();
+                    submenu = submenu.item(
+                        PopupMenuItem::new(i18n::process_priority_label(level))
+                            .checked(current_priority == level)
+                            .disabled(!priority_allowed)
+                            .on_click(move |_, _, cx| {
+                                UiCommands::set_priority(&store_level, key, level, cx);
+                            }),
                     );
                 }
-            }),
-    )
-    .item(
-        PopupMenuItem::new(i18n::tr("details.menu_properties"))
-            .icon(IconName::Info)
-            .disabled(!has_exe_path)
-            .on_click(move |_, _, cx| {
-                if let Some(ref path) = props_path {
-                    UiCommands::show_file_properties(
-                        &store_props,
-                        PathBuf::from(path.as_ref()),
+                submenu
+            },
+        )
+        .item(
+            PopupMenuItem::new(i18n::tr("details.menu_set_affinity"))
+                .icon(IconName::Cpu)
+                .disabled(!affinity_allowed)
+                .on_click(move |_, window, cx| {
+                    affinity_dialog::open_set_affinity_dialog(
+                        store_affinity.clone(),
+                        key,
+                        affinity_name.clone(),
+                        window,
                         cx,
                     );
-                }
-            }),
-    )
-    .item(
-        PopupMenuItem::new(i18n::tr("details.menu_search_online"))
-            .icon(IconName::Globe)
-            .on_click(move |_, _, cx| {
-                UiCommands::search_online(&store_search, search_query.clone(), cx);
-            }),
-    )
+                }),
+        );
+
+    if eco_supported {
+        menu = menu.item(
+            PopupMenuItem::new(i18n::tr("details.menu_efficiency_mode"))
+                .checked(eco_enabled)
+                .disabled(!eco_eligible)
+                .on_click(move |_, _, cx| {
+                    UiCommands::set_efficiency_mode(&store_eco, key, !eco_enabled, cx);
+                }),
+        );
+    }
+
+    menu.separator()
+        .item(
+            PopupMenuItem::new(i18n::tr("details.menu_open_file_location"))
+                .icon(IconName::FolderOpen)
+                .disabled(!has_exe_path)
+                .on_click(move |_, _, cx| {
+                    if let Some(ref path) = open_loc_path {
+                        UiCommands::open_file_location(
+                            &store_open_loc,
+                            PathBuf::from(path.as_ref()),
+                            cx,
+                        );
+                    }
+                }),
+        )
+        .item(
+            PopupMenuItem::new(i18n::tr("details.menu_properties"))
+                .icon(IconName::Info)
+                .disabled(!has_exe_path)
+                .on_click(move |_, _, cx| {
+                    if let Some(ref path) = props_path {
+                        UiCommands::show_file_properties(
+                            &store_props,
+                            PathBuf::from(path.as_ref()),
+                            cx,
+                        );
+                    }
+                }),
+        )
+        .item(
+            PopupMenuItem::new(i18n::tr("details.menu_search_online"))
+                .icon(IconName::Globe)
+                .on_click(move |_, _, cx| {
+                    UiCommands::search_online(&store_search, search_query.clone(), cx);
+                }),
+        )
 }
 
 #[cfg(test)]
@@ -1820,63 +1854,66 @@ mod tests {
     fn eco_mode_eligibility_and_critical_process_guards() {
         let with_eco = CapabilityFlags::ECO_MODE;
         let without_eco = CapabilityFlags::empty();
+        let prio_and_affinity = CapabilityFlags::PROCESS_PRIORITY | CapabilityFlags::CPU_AFFINITY;
 
-        // Standard user process is eligible when capability is present.
-        let user_key = ProcessKey::new(1234, 500);
+        // Standard user process (including a non-kernel PID 4 on Linux/macOS) is eligible
+        // when the backend advertises the capability and no kernel/system flags are set.
+        assert!(is_eco_mode_eligible(ProcessStatusFlags::empty(), with_eco));
         assert!(is_eco_mode_eligible(
-            user_key,
-            ProcessStatusFlags::empty(),
-            with_eco
-        ));
-        assert!(is_eco_mode_eligible(
-            user_key,
             ProcessStatusFlags::EFFICIENCY_MODE,
             with_eco
         ));
         assert!(!is_eco_mode_eligible(
-            user_key,
             ProcessStatusFlags::empty(),
             without_eco
         ));
-        assert!(!is_critical_or_system_process(
-            user_key,
-            ProcessStatusFlags::empty()
-        ));
-
-        // PID 0, PID 4, protected, critical, and system-idle processes are ineligible.
-        assert!(!is_eco_mode_eligible(
-            ProcessKey::new(0, 0),
-            ProcessStatusFlags::SYSTEM_IDLE,
-            with_eco
-        ));
-        assert!(!is_eco_mode_eligible(
-            ProcessKey::new(4, 0),
+        assert!(!is_critical_or_system_process(ProcessStatusFlags::empty()));
+        assert!(can_set_priority(
             ProcessStatusFlags::empty(),
-            with_eco
+            prio_and_affinity
         ));
-        assert!(!is_eco_mode_eligible(
-            user_key,
-            ProcessStatusFlags::PROTECTED,
-            with_eco
+        assert!(can_set_affinity(
+            ProcessStatusFlags::empty(),
+            prio_and_affinity
         ));
-        assert!(!is_eco_mode_eligible(
-            user_key,
-            ProcessStatusFlags::CRITICAL,
-            with_eco
+        assert!(!can_set_priority(
+            ProcessStatusFlags::empty(),
+            CapabilityFlags::empty()
+        ));
+        assert!(!can_set_affinity(
+            ProcessStatusFlags::empty(),
+            CapabilityFlags::empty()
         ));
 
-        assert!(is_critical_or_system_process(
-            ProcessKey::new(4, 0),
-            ProcessStatusFlags::empty()
-        ));
-        assert!(is_critical_or_system_process(
-            user_key,
-            ProcessStatusFlags::CRITICAL
-        ));
-        assert!(is_critical_or_system_process(
-            user_key,
-            ProcessStatusFlags::PROTECTED
-        ));
+        // Semantic SYSTEM_IDLE, KERNEL, PROTECTED, and CRITICAL flags block EcoQoS & guard actions
+        // regardless of numeric PID (e.g. Linux PID 1/2 kernel/init or Windows PID 0/4).
+        for blocked in [
+            ProcessStatusFlags::SYSTEM_IDLE,
+            ProcessStatusFlags::KERNEL,
+            ProcessStatusFlags::PROTECTED,
+            ProcessStatusFlags::CRITICAL,
+        ] {
+            assert!(!is_eco_mode_eligible(blocked, with_eco));
+            assert!(is_critical_or_system_process(blocked));
+        }
+
+        // Priority and affinity changes are disabled for SYSTEM_IDLE and KERNEL processes.
+        for non_schedulable in [ProcessStatusFlags::SYSTEM_IDLE, ProcessStatusFlags::KERNEL] {
+            assert!(!can_set_priority(non_schedulable, prio_and_affinity));
+            assert!(!can_set_affinity(non_schedulable, prio_and_affinity));
+        }
+    }
+
+    #[test]
+    fn table_min_width_includes_virtualization_column_only_when_supported() {
+        let without_uac = table_min_width(CapabilityFlags::empty());
+        let with_uac = table_min_width(CapabilityFlags::UAC_VIRTUALIZATION);
+        assert!(
+            (with_uac - without_uac - (COL_UAC_W + 8.0)).abs() < f32::EPSILON,
+            "expected UAC column width + gap ({}) delta, got {}",
+            COL_UAC_W + 8.0,
+            with_uac - without_uac
+        );
     }
 
     #[test]

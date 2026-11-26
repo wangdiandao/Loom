@@ -5,8 +5,9 @@ use std::sync::{Arc, Weak};
 
 use gpui_kit::RenderImage;
 use loom_types::{
-    ExeIconRgba, ProcessCategory, ProcessKey, ProcessRowKind, ProcessRowProjection,
-    ProcessSortColumn, ProcessStatusFlags, ResourceDisplayMode, SortDirection,
+    CapabilityFlags, ExeIconRgba, ProcessCategory, ProcessKey, ProcessRowKind,
+    ProcessRowProjection, ProcessSortColumn, ProcessStatusFlags, ResourceDisplayMode,
+    SortDirection,
 };
 use loom_ui_kit::rgba_icon_to_render_image;
 
@@ -168,38 +169,47 @@ pub(crate) fn find_selected_row(
         .find(|row| row.kind == ProcessRowKind::Process && row.key == key)
 }
 
-/// Returns `true` when `row` can be targeted by End Task (excludes System Idle / PID 0).
+/// Returns `true` when `row` can be targeted by End Task (excludes idle and kernel processes).
 #[inline]
 pub(crate) fn can_terminate_process(row: &ProcessRowProjection) -> bool {
     row.kind == ProcessRowKind::Process
-        && row.key.pid != 0
-        && !row.status.contains(ProcessStatusFlags::SYSTEM_IDLE)
+        && !row
+            .status
+            .intersects(ProcessStatusFlags::SYSTEM_IDLE | ProcessStatusFlags::KERNEL)
 }
 
 /// Returns `true` when terminating `row` requires a confirmation modal dialog.
 ///
-/// Windows system processes, critical processes, and OS-protected processes require
-/// explicit confirmation before issuing `TerminateProcess`.
+/// System processes, critical processes, kernel processes, idle pseudo-processes,
+/// and OS-protected processes require explicit confirmation before termination.
 #[inline]
 pub(crate) fn requires_end_task_confirmation(row: &ProcessRowProjection) -> bool {
     row.category == ProcessCategory::System
-        || row
-            .status
-            .intersects(ProcessStatusFlags::CRITICAL | ProcessStatusFlags::PROTECTED)
+        || row.status.intersects(
+            ProcessStatusFlags::CRITICAL
+                | ProcessStatusFlags::PROTECTED
+                | ProcessStatusFlags::KERNEL
+                | ProcessStatusFlags::SYSTEM_IDLE,
+        )
 }
 
 /// Returns `true` when `row` is eligible for Efficiency Mode (`EcoQoS`) toggling.
 ///
-/// System Idle (PID 0), System kernel (PID 4), `SYSTEM_IDLE`, and `PROTECTED`
-/// processes do not allow EcoQoS toggling and must disable the control.
+/// Disabled when the active backend does not advertise [`CapabilityFlags::ECO_MODE`]
+/// or when `row` carries `SYSTEM_IDLE`, `KERNEL`, `PROTECTED`, or `CRITICAL` flags.
 #[inline]
-pub(crate) fn is_efficiency_mode_eligible(row: &ProcessRowProjection) -> bool {
-    row.kind == ProcessRowKind::Process
-        && row.key.pid != 0
-        && row.key.pid != 4
-        && !row
-            .status
-            .intersects(ProcessStatusFlags::SYSTEM_IDLE | ProcessStatusFlags::PROTECTED)
+pub(crate) fn is_efficiency_mode_eligible(
+    row: &ProcessRowProjection,
+    capabilities: CapabilityFlags,
+) -> bool {
+    capabilities.contains(CapabilityFlags::ECO_MODE)
+        && row.kind == ProcessRowKind::Process
+        && !row.status.intersects(
+            ProcessStatusFlags::SYSTEM_IDLE
+                | ProcessStatusFlags::KERNEL
+                | ProcessStatusFlags::PROTECTED
+                | ProcessStatusFlags::CRITICAL,
+        )
 }
 
 /// Returns a subtle secondary text label (image name or window title) when distinct from `display_name`.
@@ -360,22 +370,25 @@ mod tests {
     }
 
     #[test]
-    fn eco_mode_eligibility_blocks_system_idle_pid4_and_protected_processes() {
+    fn semantic_status_flags_govern_termination_and_eco_mode_without_hardcoded_pids() {
+        let with_eco = CapabilityFlags::ECO_MODE;
+        let without_eco = CapabilityFlags::empty();
+
         let idle = sample_process_row(
             0,
             0,
             "System Idle Process",
             "System Idle Process",
             ProcessCategory::System,
-            ProcessStatusFlags::SYSTEM_IDLE,
+            ProcessStatusFlags::SYSTEM_IDLE | ProcessStatusFlags::KERNEL,
         );
         let kernel = sample_process_row(
-            4,
+            2,
             1,
-            "System",
-            "System",
+            "kthreadd",
+            "kthreadd",
             ProcessCategory::System,
-            ProcessStatusFlags::empty(),
+            ProcessStatusFlags::KERNEL,
         );
         let protected = sample_process_row(
             812,
@@ -393,34 +406,52 @@ mod tests {
             ProcessCategory::System,
             ProcessStatusFlags::SYSTEM_IDLE,
         );
+        // Normal user process with PID 4 (e.g. on Linux/macOS without KERNEL/PROTECTED flags)
+        // must NOT be blocked by Windows-specific PID heuristics.
+        let non_kernel_pid4 = sample_process_row(
+            4,
+            10_000,
+            "my-worker",
+            "My Worker",
+            ProcessCategory::Background,
+            ProcessStatusFlags::empty(),
+        );
         let normal_app = sample_process_row(
             5120,
             80_000,
-            "notepad.exe",
-            "Notepad",
+            "editor",
+            "Editor",
             ProcessCategory::App,
             ProcessStatusFlags::empty(),
         );
         let already_eco_bg = sample_process_row(
             6120,
             90_000,
-            "worker.exe",
+            "worker",
             "Worker",
             ProcessCategory::Background,
             ProcessStatusFlags::EFFICIENCY_MODE,
         );
 
-        assert!(!is_efficiency_mode_eligible(&idle));
-        assert!(!is_efficiency_mode_eligible(&kernel));
-        assert!(!is_efficiency_mode_eligible(&protected));
-        assert!(!is_efficiency_mode_eligible(&system_idle_flagged));
-        assert!(is_efficiency_mode_eligible(&normal_app));
-        assert!(is_efficiency_mode_eligible(&already_eco_bg));
+        assert!(!is_efficiency_mode_eligible(&idle, with_eco));
+        assert!(!is_efficiency_mode_eligible(&kernel, with_eco));
+        assert!(!is_efficiency_mode_eligible(&protected, with_eco));
+        assert!(!is_efficiency_mode_eligible(&system_idle_flagged, with_eco));
+        assert!(is_efficiency_mode_eligible(&non_kernel_pid4, with_eco));
+        assert!(is_efficiency_mode_eligible(&normal_app, with_eco));
+        assert!(is_efficiency_mode_eligible(&already_eco_bg, with_eco));
+        assert!(!is_efficiency_mode_eligible(&normal_app, without_eco));
 
         assert!(!can_terminate_process(&idle));
+        assert!(!can_terminate_process(&kernel));
+        assert!(!can_terminate_process(&system_idle_flagged));
+        assert!(can_terminate_process(&non_kernel_pid4));
         assert!(can_terminate_process(&normal_app));
+
+        assert!(requires_end_task_confirmation(&idle));
         assert!(requires_end_task_confirmation(&kernel));
         assert!(requires_end_task_confirmation(&protected));
+        assert!(!requires_end_task_confirmation(&non_kernel_pid4));
         assert!(!requires_end_task_confirmation(&normal_app));
         assert!(!requires_end_task_confirmation(&already_eco_bg));
     }

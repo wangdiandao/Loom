@@ -14,7 +14,7 @@ use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
     Render, SharedString, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
-use loom_types::{LanguagePreference, RefreshSpeed, StartupPage, ThemePreference};
+use loom_types::{CapabilityFlags, LanguagePreference, RefreshSpeed, StartupPage, ThemePreference};
 
 use crate::bridge::{UiCommands, UiStore, UiStoreEvent};
 use crate::i18n;
@@ -256,7 +256,12 @@ impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store_ref = self.store.read(cx);
         let settings = store_ref.settings().clone();
-        let is_elevated = store_ref.snapshot().is_elevated;
+        let snapshot = store_ref.snapshot();
+        let is_elevated = snapshot.is_elevated;
+        let capabilities = snapshot.capabilities;
+        let supports_always_on_top = capabilities.contains(CapabilityFlags::ALWAYS_ON_TOP);
+        let supports_elevation_relaunch =
+            capabilities.contains(CapabilityFlags::ELEVATION_RELAUNCH);
         let config_path = store_ref.config_path().display().to_string();
 
         let theme = cx.theme();
@@ -365,27 +370,29 @@ impl Render for SettingsView {
                             fg,
                             radius_lg,
                         )
-                        .child(setting_row(
-                            always_on_top_label.clone(),
-                            i18n::tr("settings.always_on_top_desc"),
-                            fg,
-                            muted_fg,
-                            border,
-                            false,
-                            Switch::new("setting-always-on-top")
-                                .checked(settings.always_on_top)
-                                .accessibility_label(always_on_top_label)
-                                .on_change(move |checked, _, cx| {
-                                    UiCommands::set_always_on_top(&store_top, *checked, cx);
-                                }),
-                        ))
+                        .when(supports_always_on_top, |section| {
+                            section.child(setting_row(
+                                always_on_top_label.clone(),
+                                i18n::tr("settings.always_on_top_desc"),
+                                fg,
+                                muted_fg,
+                                border,
+                                false,
+                                Switch::new("setting-always-on-top")
+                                    .checked(settings.always_on_top)
+                                    .accessibility_label(always_on_top_label.clone())
+                                    .on_change(move |checked, _, cx| {
+                                        UiCommands::set_always_on_top(&store_top, *checked, cx);
+                                    }),
+                            ))
+                        })
                         .child(setting_row(
                             min_tray_label.clone(),
                             i18n::tr("settings.minimize_to_tray_desc"),
                             fg,
                             muted_fg,
                             border,
-                            true,
+                            supports_always_on_top,
                             Switch::new("setting-minimize-to-tray")
                                 .checked(settings.minimize_to_tray)
                                 .accessibility_label(min_tray_label)
@@ -480,7 +487,7 @@ impl Render for SettingsView {
                                             i18n::tr("settings.privilege_standard")
                                         }),
                                 )
-                                .when(!is_elevated, |this| {
+                                .when(!is_elevated && supports_elevation_relaunch, |this| {
                                     this.child(
                                         Button::new("settings-restart-as-admin")
                                             .small()
