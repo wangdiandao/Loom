@@ -221,7 +221,7 @@ crates/loom-app/src/
 
 `AppSnapshot` 拆分为独立的 `Arc` 子切片，并在 `loom-engine` 后台线程完成排序、搜索过滤与树展开扁平化：
 
-- `processes: Arc<ProcessTableSlice>`（已按当前排序列、搜索词与展开态扁平化的 `Vec<ProcessRowProjection>`，选中态与右键菜单锚定 `ProcessKey`，避免行重排导致误操作）
+- `processes: Arc<ProcessTableSlice>`（已按当前排序列、搜索词与展开态扁平化的 `Vec<ProcessRowProjection>`，选中态与右键菜单锚定 `ProcessKey`，避免行重排导致误操作；`ProjectionEngine` 绑定 `PlatformBackend::PLATFORM`，仅在 `PlatformKind::Windows` 分组视图下启用对齐任务管理器的壳层解嵌套与多进程应用聚合，不影响 Linux/macOS 分组与通用 `Process Tree`）
 - `details: Arc<DetailsTableSlice>`（仅在 `Details` 页激活持有租约时构建投影）
 - `performance: Arc<PerformanceSlice>`（五大类硬件摘要、60 点定长量化历史环与设备元数据）
 - `services: Arc<ServicesSlice>` / `startup: Arc<StartupSlice>` / `users: Arc<UsersSlice>` / `app_history: Arc<AppHistorySlice>`（均受 `MonitorLease` 门控，未查看时无后台轮询与投影开销）
