@@ -6,9 +6,12 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ### Engine & PAL
 
+- Refined Windows **Processes** `Grouped` view (`PlatformKind::Windows` only) to group multi-process apps strictly by app identity—MSIX/UWP Package Family Name (`ProcessColdMeta::app_group_id` via `GetPackageFamilyName`) or executable path / image name—rather than swallowing different-executable OS children (keeping `WeChatAppEx.exe`, `crashpad_handler.exe`, etc. in `Background`), displaying total group process counts (`(N)`), aggregating CPU/Memory/Disk/Network/GPU metrics, rolling up `EFFICIENCY_MODE`/`NOT_RESPONDING` (and `SUSPENDED` only when all group members are suspended), and keeping `Process Tree` and non-Windows (`Linux` / `macOS`) grouping unchanged.
 - Aligned the Windows **Processes** `Grouped` view (`PlatformKind::Windows` only) with Windows Task Manager: stopped nesting independent desktop apps or background daemons under `explorer.exe`, grouped windowless multi-process helper/renderer descendants (and same-image orphaned helpers) under their owning top-level `App` row with aggregated CPU/Memory/Disk/Network/GPU metrics and rolled-up EcoQoS/`Not responding` status flags, and auto-expanded owning `App` groups when searching for child processes—while keeping `Process Tree` and non-Windows (`Linux` / `macOS`) grouping unchanged.
 
 ### UI & UX
+
+- Removed the trailing grey `.exe` subtitle suffix from **Processes** rows so grouped app rows display clean names and counts (e.g., `QQ (5)`, `Weixin (5)`, `Loom 任务管理器`).
 
 - Simplified **Processes** status badges to compact icon-only indicators with hover tooltips and streamlined the **Processes** toolbar by removing the summary metric pills, **Efficiency mode** button, and **Refresh** button (retaining Efficiency mode in the context menu).
 - Streamlined the **Details** toolbar by removing the on-demand lease badge, row count pill, **End process tree** toolbar button, and **Refresh** button (retaining **End process tree** in the context menu); simplified **Details** status cells to plain text (`Running` / `Suspended`), stripped machine/domain prefixes from displayed usernames, and renamed the memory column label to **工作集增量（内存）** (`Working set delta (memory)`).

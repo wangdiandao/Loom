@@ -733,6 +733,7 @@ mod tests {
             uac_virtualization: UacVirtualization::NotAllowed,
             efficiency_mode: false,
             is_elevated: false,
+            app_group_id: None,
             asset: None,
         };
         let needs = cache.insert_process(meta1);
@@ -757,6 +758,7 @@ mod tests {
             uac_virtualization: UacVirtualization::NotAllowed,
             efficiency_mode: true,
             is_elevated: true,
+            app_group_id: None,
             asset: None,
         };
         assert!(

@@ -692,7 +692,8 @@ impl ProjectionEngine {
         let mut sum_net: u64 = root.net_bytes_per_sec;
         let mut sum_gpu_util: u32 = u32::from(root.gpu_util_permille);
         let mut sum_gpu_vram: u64 = root.gpu_dedicated_bytes;
-        let mut rolled_status = root_status;
+        let mut all_suspended = root_status.contains(ProcessStatusFlags::SUSPENDED);
+        let mut rolled_status = root_status - ProcessStatusFlags::SUSPENDED;
 
         for &c_idx in children {
             let child = &self.computed[c_idx];
@@ -704,8 +705,13 @@ impl ProjectionEngine {
             sum_net = sum_net.saturating_add(child.net_bytes_per_sec);
             sum_gpu_util = sum_gpu_util.saturating_add(u32::from(child.gpu_util_permille));
             sum_gpu_vram = sum_gpu_vram.saturating_add(child.gpu_dedicated_bytes);
+            all_suspended &= child_status.contains(ProcessStatusFlags::SUSPENDED);
             rolled_status |= child_status
                 & (ProcessStatusFlags::EFFICIENCY_MODE | ProcessStatusFlags::NOT_RESPONDING);
+        }
+
+        if all_suspended {
+            rolled_status |= ProcessStatusFlags::SUSPENDED;
         }
 
         let memory_permille = if self.latest_perf.mem_total_bytes > 0 {
@@ -845,13 +851,19 @@ impl ProjectionEngine {
 
     /// Windows Task Manager-aligned `Grouped` projection (`PlatformKind::Windows` only).
     ///
-    /// - Every visible-window `App` is a top-level item in `Apps` (never nested under
-    ///   `explorer.exe` or another independent `App`).
-    /// - `explorer.exe` is treated as a desktop shell launcher and never adopts child
-    ///   processes of different images.
-    /// - Windowless `Background` descendants of a non-shell `App` (plus same-image
-    ///   orphaned/shell-launched helpers in the same session) group under their owning
-    ///   `App` row with aggregated metrics and rolled-up status flags.
+    /// - Groups multi-process apps strictly by **app identity** (MSIX/UWP `app_group_id`
+    ///   when present, otherwise normalized `exe_path` case-insensitive, falling back to
+    ///   executable `name` case-insensitive before slow-lane paths arrive), scoped by
+    ///   `session_id`.
+    /// - Never pulls different-executable child processes (e.g. `crashpad_handler.exe`,
+    ///   `WeChatAppEx.exe`) into an `App` group; those remain in `Background`.
+    /// - Every unique `App` identity appears once at depth 0 in `Apps` (never nested
+    ///   under `explorer.exe` or another app) with a deterministic leader, total group
+    ///   count (`child_count = total_members` when `>= 2`), aggregated resource metrics,
+    ///   and rolled-up status flags (`EFFICIENCY_MODE` / `NOT_RESPONDING` on any member,
+    ///   `SUSPENDED` only when all members are suspended).
+    /// - `explorer.exe` is treated as a desktop shell launcher across all sections and
+    ///   never adopts different-image child processes.
     fn project_processes_grouped_windows(
         &self,
         config: &ViewProjectionConfig,
@@ -860,119 +872,77 @@ impl ProjectionEngine {
         has_query: bool,
     ) -> Vec<ProcessRowProjection> {
         let n = self.computed.len();
-        let mut app_roots: Vec<usize> = Vec::new();
-        let mut root_slot = vec![usize::MAX; n];
-        let mut app_by_image: HashMap<(u32, AsciiCiStr<'_>), usize, FastBuildHasher> =
+        let mut app_groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut pkg_to_group: HashMap<(u32, AsciiCiStr<'_>), usize, FastBuildHasher> =
+            HashMap::with_hasher(FastBuildHasher);
+        let mut exe_to_group: HashMap<(u32, AsciiCiStr<'_>), usize, FastBuildHasher> =
+            HashMap::with_hasher(FastBuildHasher);
+        let mut name_to_groups: HashMap<(u32, AsciiCiStr<'_>), Vec<usize>, FastBuildHasher> =
             HashMap::with_hasher(FastBuildHasher);
 
+        // Step 1: Build unique App-identity groups from all visible-window App processes.
         for (idx, proc) in self.computed.iter().enumerate() {
             if proc.category != ProcessCategory::App {
                 continue;
             }
-            let slot = app_roots.len();
-            app_roots.push(idx);
-            root_slot[idx] = slot;
+            let pkg = process_app_group_id(cold_cache, proc.key);
+            let exe = process_normalized_exe_slice(cold_cache, proc.key);
 
-            if !proc.name.is_empty() && !is_windows_shell_launcher(&proc.name) {
-                let image_key = (proc.session_id, AsciiCiStr(&proc.name));
-                app_by_image
-                    .entry(image_key)
-                    .and_modify(|existing_idx| {
-                        let existing = &self.computed[*existing_idx];
-                        if (proc.key.create_time_100ns, proc.key.pid)
-                            < (existing.key.create_time_100ns, existing.key.pid)
-                        {
-                            *existing_idx = idx;
-                        }
-                    })
-                    .or_insert(idx);
-            }
-        }
-
-        // Pass 1: Assign windowless Background descendants to their nearest non-shell App ancestor.
-        let mut app_owner: Vec<Option<usize>> = vec![None; n];
-        for (idx, proc) in self.computed.iter().enumerate() {
-            if proc.category != ProcessCategory::Background {
-                continue;
-            }
-            let mut curr = self.latest_tree.parent_index(idx);
-            let mut steps = 0usize;
-            while let Some(a_idx) = curr {
-                if steps >= n {
-                    break;
-                }
-                steps += 1;
-                let ancestor = &self.computed[a_idx];
-                match ancestor.category {
-                    ProcessCategory::App => {
-                        if !is_windows_shell_launcher(&ancestor.name)
-                            || ancestor.name.eq_ignore_ascii_case(&proc.name)
-                        {
-                            app_owner[idx] = Some(a_idx);
-                        }
-                        break;
+            let matched_group = pkg
+                .and_then(|p| pkg_to_group.get(&(proc.session_id, AsciiCiStr(p))).copied())
+                .or_else(|| {
+                    exe.and_then(|e| exe_to_group.get(&(proc.session_id, AsciiCiStr(e))).copied())
+                })
+                .or_else(|| {
+                    if proc.name.is_empty() {
+                        return None;
                     }
-                    ProcessCategory::System => break,
-                    ProcessCategory::Background => {
-                        curr = self.latest_tree.parent_index(a_idx);
-                    }
-                }
-            }
-        }
+                    name_to_groups
+                        .get(&(proc.session_id, AsciiCiStr(&proc.name)))
+                        .and_then(|candidates| {
+                            candidates.iter().copied().find(|&g_idx| {
+                                let leader_key = self.computed[app_groups[g_idx].0].key;
+                                exe_paths_compatible(cold_cache, leader_key, proc.key)
+                                    && app_group_ids_compatible(cold_cache, leader_key, proc.key)
+                            })
+                        })
+                });
 
-        // Pass 2a: Adopt orphaned or shell-launched same-image Background helpers under their
-        // matching non-shell App root in the same session (guarded by exe_path when available).
-        let mut adopted_any = false;
-        for (idx, proc) in self.computed.iter().enumerate() {
-            if proc.category != ProcessCategory::Background || app_owner[idx].is_some() {
-                continue;
-            }
-            if proc.name.is_empty() || is_windows_shell_launcher(&proc.name) {
-                continue;
-            }
-            let orphan_or_shell_parent = match self.latest_tree.parent_index(idx) {
-                None => true,
-                Some(p_idx) => is_windows_shell_launcher(&self.computed[p_idx].name),
+            let g_idx = if let Some(g_idx) = matched_group {
+                let (leader_idx, children) = &mut app_groups[g_idx];
+                if is_better_app_leader(proc, &self.computed[*leader_idx]) {
+                    let prev_leader = *leader_idx;
+                    *leader_idx = idx;
+                    children.push(prev_leader);
+                } else {
+                    children.push(idx);
+                }
+                g_idx
+            } else {
+                let g_idx = app_groups.len();
+                app_groups.push((idx, Vec::new()));
+                if !proc.name.is_empty() {
+                    name_to_groups
+                        .entry((proc.session_id, AsciiCiStr(&proc.name)))
+                        .or_default()
+                        .push(g_idx);
+                }
+                g_idx
             };
-            if !orphan_or_shell_parent {
-                continue;
+
+            if let Some(p) = pkg {
+                pkg_to_group
+                    .entry((proc.session_id, AsciiCiStr(p)))
+                    .or_insert(g_idx);
             }
-            if let Some(&a_idx) = app_by_image.get(&(proc.session_id, AsciiCiStr(&proc.name)))
-                && exe_paths_compatible(cold_cache, self.computed[a_idx].key, proc.key)
-            {
-                app_owner[idx] = Some(a_idx);
-                adopted_any = true;
+            if let Some(e) = exe {
+                exe_to_group
+                    .entry((proc.session_id, AsciiCiStr(e)))
+                    .or_insert(g_idx);
             }
         }
 
-        // Pass 2b: Propagate Pass 2a adoption to Background descendants of adopted helpers.
-        if adopted_any {
-            for idx in 0..n {
-                if self.computed[idx].category != ProcessCategory::Background
-                    || app_owner[idx].is_some()
-                {
-                    continue;
-                }
-                let mut curr = self.latest_tree.parent_index(idx);
-                let mut steps = 0usize;
-                while let Some(a_idx) = curr {
-                    if steps >= n {
-                        break;
-                    }
-                    steps += 1;
-                    if self.computed[a_idx].category != ProcessCategory::Background {
-                        break;
-                    }
-                    if let Some(owner) = app_owner[a_idx] {
-                        app_owner[idx] = Some(owner);
-                        break;
-                    }
-                    curr = self.latest_tree.parent_index(a_idx);
-                }
-            }
-        }
-
-        let mut app_children: Vec<Vec<usize>> = vec![Vec::new(); app_roots.len()];
+        // Step 2: Attach windowless Background processes strictly by matching App identity.
         let mut bg_indices: Vec<usize> = Vec::new();
         let mut sys_indices: Vec<usize> = Vec::new();
         let mut in_remaining_section = vec![false; n];
@@ -981,11 +951,35 @@ impl ProjectionEngine {
             match proc.category {
                 ProcessCategory::App => {}
                 ProcessCategory::Background => {
-                    if let Some(owner_idx) = app_owner[idx] {
-                        let slot = root_slot[owner_idx];
-                        if slot < app_children.len() {
-                            app_children[slot].push(idx);
-                        }
+                    let pkg = process_app_group_id(cold_cache, proc.key);
+                    let exe = process_normalized_exe_slice(cold_cache, proc.key);
+
+                    let matched_group = pkg
+                        .and_then(|p| pkg_to_group.get(&(proc.session_id, AsciiCiStr(p))).copied())
+                        .or_else(|| {
+                            exe.and_then(|e| {
+                                exe_to_group.get(&(proc.session_id, AsciiCiStr(e))).copied()
+                            })
+                        })
+                        .or_else(|| {
+                            if proc.name.is_empty() || is_windows_shell_launcher(&proc.name) {
+                                return None;
+                            }
+                            name_to_groups
+                                .get(&(proc.session_id, AsciiCiStr(&proc.name)))
+                                .and_then(|candidates| {
+                                    candidates.iter().copied().find(|&g_idx| {
+                                        let leader_key = self.computed[app_groups[g_idx].0].key;
+                                        exe_paths_compatible(cold_cache, leader_key, proc.key)
+                                            && app_group_ids_compatible(
+                                                cold_cache, leader_key, proc.key,
+                                            )
+                                    })
+                                })
+                        });
+
+                    if let Some(g_idx) = matched_group {
+                        app_groups[g_idx].1.push(idx);
                     } else if !has_query || matches_process_query(proc, cold_cache, query_lower) {
                         in_remaining_section[idx] = true;
                         bg_indices.push(idx);
@@ -1005,25 +999,23 @@ impl ProjectionEngine {
 
         // 1. Emit Apps section with aggregated metrics and rolled-up status flags.
         let mut visible_apps: Vec<(usize, GroupAggregate, Vec<usize>)> =
-            Vec::with_capacity(app_roots.len());
-        for (slot, &root_idx) in app_roots.iter().enumerate() {
-            let children_all = &mut app_children[slot];
-            let agg = self.compute_group_aggregate(root_idx, children_all, cold_cache);
+            Vec::with_capacity(app_groups.len());
+        for (leader_idx, mut children_all) in app_groups {
+            let agg = self.compute_group_aggregate(leader_idx, &children_all, cold_cache);
             if has_query {
                 let root_matches =
-                    matches_process_query(&self.computed[root_idx], cold_cache, query_lower);
+                    matches_process_query(&self.computed[leader_idx], cold_cache, query_lower);
                 let matching_children: Vec<usize> = children_all
-                    .iter()
-                    .copied()
+                    .into_iter()
                     .filter(|&c_idx| {
                         matches_process_query(&self.computed[c_idx], cold_cache, query_lower)
                     })
                     .collect();
                 if root_matches || !matching_children.is_empty() {
-                    visible_apps.push((root_idx, agg, matching_children));
+                    visible_apps.push((leader_idx, agg, matching_children));
                 }
             } else {
-                visible_apps.push((root_idx, agg, std::mem::take(children_all)));
+                visible_apps.push((leader_idx, agg, std::mem::take(&mut children_all)));
             }
         }
 
@@ -1062,15 +1054,21 @@ impl ProjectionEngine {
                     .then_with(|| a.key.cmp(&b.key))
             });
 
-            for (root_idx, agg, mut children) in visible_apps {
-                let root = &self.computed[root_idx];
+            for (leader_idx, agg, mut children) in visible_apps {
+                let leader = &self.computed[leader_idx];
                 let has_children = !children.is_empty();
                 let is_expanded = has_children
-                    && (has_query || (has_expanded && config.process_expanded.contains(&root.key)));
-                let child_count = children.len() as u32;
+                    && (has_query
+                        || (has_expanded && config.process_expanded.contains(&leader.key)));
+                // Windows Task Manager displays total process count in the group (leader + children).
+                let child_count = if has_children {
+                    (children.len() + 1) as u32
+                } else {
+                    0
+                };
 
                 rows.push(self.build_aggregated_process_row(
-                    root,
+                    leader,
                     agg,
                     cold_cache,
                     0,
@@ -1108,6 +1106,7 @@ impl ProjectionEngine {
         let mut subtree_descendants: Vec<usize> = Vec::new();
         let mut desc_stack: Vec<usize> = Vec::new();
         let mut group_agg: Vec<Option<GroupAggregate>> = vec![None; n];
+        let mut subtree_counts: Vec<u32> = vec![0; n];
 
         for (category, indices) in [
             (ProcessCategory::Background, &bg_indices),
@@ -1122,26 +1121,26 @@ impl ProjectionEngine {
                 let has_same_cat_parent = self.latest_tree.parent_index(idx).is_some_and(|p_idx| {
                     in_remaining_section[p_idx]
                         && self.computed[p_idx].category == category
-                        && (!is_windows_shell_launcher(&self.computed[p_idx].name)
-                            || self.computed[p_idx]
-                                .name
-                                .eq_ignore_ascii_case(&self.computed[idx].name))
+                        && same_windows_app_identity(
+                            &self.computed[p_idx],
+                            &self.computed[idx],
+                            cold_cache,
+                        )
                 });
                 if !has_same_cat_parent {
                     section_roots.push(idx);
                 }
             }
 
-            // Precompute aggregated metrics for any node in this section that has visible children.
+            // Precompute aggregated metrics and total member counts for collapsible section rows.
             for &idx in indices {
                 let proc = &self.computed[idx];
-                let is_shell = is_windows_shell_launcher(&proc.name);
                 subtree_descendants.clear();
                 desc_stack.clear();
                 for &c_idx in self.latest_tree.children_indices(idx) {
                     if in_remaining_section[c_idx]
                         && self.computed[c_idx].category == category
-                        && (!is_shell || proc.name.eq_ignore_ascii_case(&self.computed[c_idx].name))
+                        && same_windows_app_identity(proc, &self.computed[c_idx], cold_cache)
                     {
                         desc_stack.push(c_idx);
                     }
@@ -1153,19 +1152,20 @@ impl ProjectionEngine {
                         }
                         subtree_descendants.push(d_idx);
                         let d_proc = &self.computed[d_idx];
-                        let d_is_shell = is_windows_shell_launcher(&d_proc.name);
                         for &gc_idx in self.latest_tree.children_indices(d_idx) {
                             if in_remaining_section[gc_idx]
                                 && self.computed[gc_idx].category == category
-                                && (!d_is_shell
-                                    || d_proc
-                                        .name
-                                        .eq_ignore_ascii_case(&self.computed[gc_idx].name))
+                                && same_windows_app_identity(
+                                    d_proc,
+                                    &self.computed[gc_idx],
+                                    cold_cache,
+                                )
                             {
                                 desc_stack.push(gc_idx);
                             }
                         }
                     }
+                    subtree_counts[idx] = (subtree_descendants.len() + 1) as u32;
                     group_agg[idx] =
                         Some(self.compute_group_aggregate(idx, &subtree_descendants, cold_cache));
                 }
@@ -1193,12 +1193,11 @@ impl ProjectionEngine {
                 visited[idx] = true;
 
                 let proc = &self.computed[idx];
-                let is_shell = is_windows_shell_launcher(&proc.name);
                 visible_children.clear();
                 for &c_idx in self.latest_tree.children_indices(idx) {
                     if in_remaining_section[c_idx]
                         && self.computed[c_idx].category == category
-                        && (!is_shell || proc.name.eq_ignore_ascii_case(&self.computed[c_idx].name))
+                        && same_windows_app_identity(proc, &self.computed[c_idx], cold_cache)
                     {
                         visible_children.push(c_idx);
                     }
@@ -1207,7 +1206,11 @@ impl ProjectionEngine {
                 let has_children = !visible_children.is_empty();
                 let is_expanded = has_children
                     && (has_query || (has_expanded && config.process_expanded.contains(&proc.key)));
-                let child_count = visible_children.len() as u32;
+                let child_count = if has_children {
+                    subtree_counts[idx].max((visible_children.len() + 1) as u32)
+                } else {
+                    0
+                };
 
                 if let Some(agg) = group_agg[idx] {
                     rows.push(self.build_aggregated_process_row(
@@ -1648,21 +1651,95 @@ fn is_windows_shell_launcher(image_name: &str) -> bool {
 }
 
 #[inline]
+fn process_app_group_id(cold_cache: &ColdMetaCache, key: ProcessKey) -> Option<&str> {
+    cold_cache
+        .get_process(key)
+        .and_then(|m| m.app_group_id.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+#[inline]
+fn process_normalized_exe_slice(cold_cache: &ColdMetaCache, key: ProcessKey) -> Option<&str> {
+    cold_cache
+        .get_process(key)
+        .and_then(|m| m.exe_path.as_deref())
+        .map(str::trim)
+        .map(|p| p.strip_prefix(r"\\?\").unwrap_or(p))
+        .filter(|s| !s.is_empty())
+}
+
+#[inline]
 fn exe_paths_compatible(
     cold_cache: &ColdMetaCache,
     app_key: ProcessKey,
     helper_key: ProcessKey,
 ) -> bool {
-    let app_path = cold_cache
-        .get_process(app_key)
-        .and_then(|m| m.exe_path.as_deref());
-    let helper_path = cold_cache
-        .get_process(helper_key)
-        .and_then(|m| m.exe_path.as_deref());
-    match (app_path, helper_path) {
+    match (
+        process_normalized_exe_slice(cold_cache, app_key),
+        process_normalized_exe_slice(cold_cache, helper_key),
+    ) {
         (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
         _ => true,
     }
+}
+
+#[inline]
+fn app_group_ids_compatible(
+    cold_cache: &ColdMetaCache,
+    app_key: ProcessKey,
+    helper_key: ProcessKey,
+) -> bool {
+    match (
+        process_app_group_id(cold_cache, app_key),
+        process_app_group_id(cold_cache, helper_key),
+    ) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => true,
+    }
+}
+
+#[inline]
+fn same_windows_app_identity(
+    a: &ComputedProcess,
+    b: &ComputedProcess,
+    cold_cache: &ColdMetaCache,
+) -> bool {
+    if a.session_id != b.session_id {
+        return false;
+    }
+    if let (Some(pa), Some(pb)) = (
+        process_app_group_id(cold_cache, a.key),
+        process_app_group_id(cold_cache, b.key),
+    ) {
+        return pa.eq_ignore_ascii_case(pb);
+    }
+    if let (Some(ea), Some(eb)) = (
+        process_normalized_exe_slice(cold_cache, a.key),
+        process_normalized_exe_slice(cold_cache, b.key),
+    ) {
+        return ea.eq_ignore_ascii_case(eb);
+    }
+    !a.name.is_empty()
+        && a.name.eq_ignore_ascii_case(&b.name)
+        && exe_paths_compatible(cold_cache, a.key, b.key)
+        && app_group_ids_compatible(cold_cache, a.key, b.key)
+}
+
+#[inline]
+fn is_better_app_leader(cand: &ComputedProcess, curr: &ComputedProcess) -> bool {
+    let cand_has_title = cand
+        .window_title
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty());
+    let curr_has_title = curr
+        .window_title
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty());
+    if cand_has_title != curr_has_title {
+        return cand_has_title;
+    }
+    (cand.key.create_time_100ns, cand.key.pid) < (curr.key.create_time_100ns, curr.key.pid)
 }
 
 fn section_header_row(category: ProcessCategory, count: usize) -> ProcessRowProjection {
@@ -2258,7 +2335,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                ("chrome.exe", 1, 200 * mib),
+                ("chrome.exe", 2, 200 * mib),
                 ("explorer.exe", 0, 100 * mib),
                 ("Weixin.exe", 0, 100 * mib),
             ]
@@ -2266,7 +2343,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_grouped_aggregates_multiprocess_app_and_rolls_up_status() {
+    fn windows_grouped_aggregates_by_app_identity_and_excludes_different_exes() {
         let mut engine = ProjectionEngine::with_platform(PlatformProfile::WINDOWS);
         let mib = 1024 * 1024;
         let populate = |s: &mut ProcessSampleScratch<()>, tick: u64| {
@@ -2288,116 +2365,155 @@ mod tests {
                 50 * mib,
                 0,
             );
-            // Chrome main process (100 MiB, 5% CPU, 1 MB/s disk).
+
+            // QQ: 1 visible-window leader + 4 windowless QQ.exe helpers = QQ (5).
+            // Plus a child crashpad_handler.exe that MUST stay in Background (not pulled into QQ).
             make_detailed_sample(
                 s,
                 200,
                 100,
                 100,
                 1,
-                "chrome.exe",
+                "QQ.exe",
                 ProcessCategory::App,
                 ProcessStatusFlags::empty(),
                 tick * 500_000,
                 100 * mib,
                 tick * 250_000,
             );
-            // Chrome EcoQoS child (200 MiB, 10% CPU, 2 MB/s disk).
+            for i in 1..=4u32 {
+                let status = if i == 1 {
+                    ProcessStatusFlags::EFFICIENCY_MODE
+                } else if i == 2 {
+                    ProcessStatusFlags::SUSPENDED
+                } else {
+                    ProcessStatusFlags::empty()
+                };
+                make_detailed_sample(
+                    s,
+                    200 + i,
+                    100 + u64::from(i) * 10,
+                    if i == 4 { 9999 } else { 200 },
+                    1,
+                    "QQ.exe",
+                    ProcessCategory::Background,
+                    status,
+                    tick * 250_000,
+                    50 * mib,
+                    if i == 1 { tick * 250_000 } else { 0 },
+                );
+            }
             make_detailed_sample(
                 s,
-                201,
-                110,
-                200,
-                1,
-                "chrome.exe",
-                ProcessCategory::Background,
-                ProcessStatusFlags::EFFICIENCY_MODE,
-                tick * 1_000_000,
-                200 * mib,
-                tick * 500_000,
-            );
-            // Chrome suspended child (300 MiB, 15% CPU) - group must NOT be marked SUSPENDED.
-            make_detailed_sample(
-                s,
-                202,
-                120,
-                200,
-                1,
-                "chrome.exe",
-                ProcessCategory::Background,
-                ProcessStatusFlags::SUSPENDED,
-                tick * 1_500_000,
-                300 * mib,
-                0,
-            );
-            // Orphaned same-image chrome helper (parent exited -> root, 100 MiB, 5% CPU).
-            make_detailed_sample(
-                s,
-                203,
-                130,
-                9999,
-                1,
-                "chrome.exe",
-                ProcessCategory::Background,
-                ProcessStatusFlags::empty(),
-                tick * 500_000,
-                100 * mib,
-                0,
-            );
-            // Different-image helper spawned by chrome (50 MiB).
-            make_detailed_sample(
-                s,
-                204,
-                140,
+                250,
+                160,
                 200,
                 1,
                 "crashpad_handler.exe",
                 ProcessCategory::Background,
                 ProcessStatusFlags::empty(),
                 0,
-                50 * mib,
+                12 * mib,
                 0,
             );
-            // Another App with larger individual memory (250 MiB) than chrome main (100 MiB),
-            // but smaller than chrome's aggregated memory (750 MiB).
+
+            // Weixin: 2 visible-window Weixin.exe + 3 windowless Weixin.exe = single Weixin (5) group!
+            // Plus 10x WeChatAppEx.exe and crashpad_handler.exe children that MUST stay in Background!
             make_detailed_sample(
                 s,
                 300,
-                150,
+                200,
                 100,
                 1,
-                "Antigravity.exe",
+                "Weixin.exe",
                 ProcessCategory::App,
                 ProcessStatusFlags::empty(),
-                0,
-                250 * mib,
+                tick * 500_000,
+                120 * mib,
                 0,
             );
-            // Shell child of Antigravity that launches an independent GUI app (loom-app.exe).
             make_detailed_sample(
                 s,
                 301,
-                160,
+                210,
                 300,
                 1,
-                "pwsh.exe",
+                "Weixin.exe",
+                ProcessCategory::App,
+                ProcessStatusFlags::empty(),
+                0,
+                80 * mib,
+                0,
+            );
+            for i in 2..=4u32 {
+                make_detailed_sample(
+                    s,
+                    300 + i,
+                    200 + u64::from(i) * 10,
+                    300,
+                    1,
+                    "Weixin.exe",
+                    ProcessCategory::Background,
+                    ProcessStatusFlags::empty(),
+                    0,
+                    40 * mib,
+                    0,
+                );
+            }
+            make_detailed_sample(
+                s,
+                350,
+                260,
+                300,
+                1,
+                "WeChatAppEx.exe",
                 ProcessCategory::Background,
                 ProcessStatusFlags::empty(),
                 0,
-                40 * mib,
+                20 * mib,
+                0,
+            );
+            for i in 1..10u32 {
+                make_detailed_sample(
+                    s,
+                    350 + i,
+                    260 + u64::from(i),
+                    350,
+                    1,
+                    "WeChatAppEx.exe",
+                    ProcessCategory::Background,
+                    ProcessStatusFlags::empty(),
+                    0,
+                    10 * mib,
+                    0,
+                );
+            }
+
+            // A fully suspended 2-process app -> group status MUST include SUSPENDED.
+            make_detailed_sample(
+                s,
+                400,
+                300,
+                100,
+                1,
+                "SuspendedApp.exe",
+                ProcessCategory::App,
+                ProcessStatusFlags::SUSPENDED,
+                0,
+                30 * mib,
                 0,
             );
             make_detailed_sample(
                 s,
-                302,
-                170,
-                301,
+                401,
+                310,
+                400,
                 1,
-                "loom-app.exe",
-                ProcessCategory::App,
-                ProcessStatusFlags::empty(),
+                "SuspendedApp.exe",
+                ProcessCategory::Background,
+                ProcessStatusFlags::SUSPENDED,
                 0,
-                60 * mib,
+                10 * mib,
                 0,
             );
         };
@@ -2420,19 +2536,7 @@ mod tests {
 
         let slice = engine.project_processes(&cfg, &cold, 2);
 
-        // All Background helpers were claimed by chrome.exe or Antigravity.exe -> no Background section!
-        assert!(
-            !slice.rows.iter().any(|r| matches!(
-                r.kind,
-                ProcessRowKind::SectionHeader {
-                    category: ProcessCategory::Background,
-                    ..
-                }
-            )),
-            "all app helpers must be grouped under their owning App, not duplicated in Background"
-        );
-
-        // 4 top-level Apps: chrome.exe (750 MiB), Antigravity.exe (290 MiB), loom-app.exe (60 MiB), explorer.exe (50 MiB).
+        // 4 top-level App groups: Weixin (320 MiB), QQ (300 MiB), explorer (50 MiB), SuspendedApp (40 MiB).
         assert_eq!(
             slice.rows[0].kind,
             ProcessRowKind::SectionHeader {
@@ -2440,30 +2544,53 @@ mod tests {
                 count: 4
             }
         );
-        let top_names: Vec<&str> = slice.rows[1..].iter().map(|r| r.name.as_ref()).collect();
+        let app_names: Vec<(&str, u32, u64)> = slice.rows[1..5]
+            .iter()
+            .map(|r| (r.name.as_ref(), r.child_count, r.memory_bytes))
+            .collect();
         assert_eq!(
-            top_names,
+            app_names,
             vec![
-                "chrome.exe",
-                "Antigravity.exe",
-                "loom-app.exe",
-                "explorer.exe"
+                ("Weixin.exe", 5, 320 * mib),
+                ("QQ.exe", 5, 300 * mib),
+                ("explorer.exe", 0, 50 * mib),
+                ("SuspendedApp.exe", 2, 40 * mib),
             ]
         );
 
-        let chrome = &slice.rows[1];
-        assert_eq!(chrome.key, ProcessKey::new(200, 100));
-        assert!(chrome.has_children);
-        assert!(!chrome.is_expanded);
-        assert_eq!(chrome.child_count, 4);
-        assert_eq!(chrome.cpu_permille, 350);
-        assert_eq!(chrome.memory_bytes, 750 * mib);
-        assert_eq!(chrome.memory_permille, 375);
-        assert_eq!(chrome.disk_bytes_per_sec, 3_000_000);
-        assert!(chrome.status.contains(ProcessStatusFlags::EFFICIENCY_MODE));
-        assert!(!chrome.status.contains(ProcessStatusFlags::SUSPENDED));
+        let qq = &slice.rows[2];
+        assert_eq!(qq.key, ProcessKey::new(200, 100));
+        assert!(qq.has_children);
+        assert!(!qq.is_expanded);
+        assert_eq!(qq.child_count, 5);
+        assert_eq!(qq.cpu_permille, 150);
+        assert_eq!(qq.memory_bytes, 300 * mib);
+        assert_eq!(qq.memory_permille, 150);
+        assert_eq!(qq.disk_bytes_per_sec, 2_000_000);
+        assert!(qq.status.contains(ProcessStatusFlags::EFFICIENCY_MODE));
+        assert!(!qq.status.contains(ProcessStatusFlags::SUSPENDED));
 
-        // Expand chrome.exe and verify its 4 children appear at depth 1 with individual metrics and unique keys.
+        let suspended_app = &slice.rows[4];
+        assert!(suspended_app.status.contains(ProcessStatusFlags::SUSPENDED));
+
+        // Background section MUST contain WeChatAppEx.exe (10) and crashpad_handler.exe (not inside Weixin/QQ!).
+        assert_eq!(
+            slice.rows[5].kind,
+            ProcessRowKind::SectionHeader {
+                category: ProcessCategory::Background,
+                count: 2
+            }
+        );
+        let bg_names: Vec<(&str, u32)> = slice.rows[6..]
+            .iter()
+            .map(|r| (r.name.as_ref(), r.child_count))
+            .collect();
+        assert_eq!(
+            bg_names,
+            vec![("WeChatAppEx.exe", 10), ("crashpad_handler.exe", 0)]
+        );
+
+        // Expanding QQ reveals its 4 other QQ.exe members at depth 1 with zero duplicate ProcessKeys.
         cfg.process_expanded.insert(ProcessKey::new(200, 100));
         let expanded = engine.project_processes(&cfg, &cold, 3);
         let mut seen_keys = HashSet::new();
@@ -2474,32 +2601,149 @@ mod tests {
         {
             assert!(seen_keys.insert(row.key), "duplicate key {:?}", row.key);
         }
-        assert!(expanded.rows[1].is_expanded);
-        let child_pids: Vec<u32> = expanded.rows[2..6].iter().map(|r| r.key.pid).collect();
-        assert_eq!(child_pids, vec![202, 201, 203, 204]);
-        assert!(expanded.rows[2..6].iter().all(|r| r.depth == 1));
-        assert_eq!(expanded.rows[2].memory_bytes, 300 * mib);
+        let qq_idx = expanded
+            .rows
+            .iter()
+            .position(|r| r.key == ProcessKey::new(200, 100))
+            .unwrap();
+        assert!(expanded.rows[qq_idx].is_expanded);
+        let qq_children: Vec<&str> = expanded.rows[qq_idx + 1..qq_idx + 5]
+            .iter()
+            .map(|r| r.name.as_ref())
+            .collect();
+        assert_eq!(qq_children, vec!["QQ.exe", "QQ.exe", "QQ.exe", "QQ.exe"]);
         assert!(
-            expanded.rows[2]
-                .status
-                .contains(ProcessStatusFlags::SUSPENDED)
+            expanded.rows[qq_idx + 1..qq_idx + 5]
+                .iter()
+                .all(|r| r.depth == 1)
         );
 
-        // Searching for a child helper auto-expands its owning App group.
+        // Searching by a child PID inside QQ auto-expands QQ so the matching child is visible.
         cfg.process_expanded.clear();
-        cfg.search_query = "crashpad".to_owned();
+        cfg.search_query = "204".to_owned();
         let searched = engine.project_processes(&cfg, &cold, 4);
-        let searched_names: Vec<(&str, u16)> = searched
+        let searched_pids: Vec<(u32, u16)> = searched
             .rows
             .iter()
             .filter(|r| r.kind == ProcessRowKind::Process)
-            .map(|r| (r.name.as_ref(), r.depth))
+            .map(|r| (r.key.pid, r.depth))
             .collect();
-        assert_eq!(
-            searched_names,
-            vec![("chrome.exe", 0), ("crashpad_handler.exe", 1)]
-        );
+        assert_eq!(searched_pids, vec![(200, 0), (204, 1)]);
         assert!(searched.rows[1].is_expanded);
+    }
+
+    #[test]
+    fn windows_grouped_packaged_apps_group_by_app_group_id() {
+        use loom_types::ProcessColdMeta;
+
+        let mut engine = ProjectionEngine::with_platform(PlatformProfile::WINDOWS);
+        let mut scratch = ProcessSampleScratch::<()>::new();
+        scratch.perf.logical_cpu_count = 4;
+
+        make_detailed_sample(
+            &mut scratch,
+            500,
+            100,
+            100,
+            1,
+            "WindowsTerminal.exe",
+            ProcessCategory::App,
+            ProcessStatusFlags::empty(),
+            0,
+            80 * 1024 * 1024,
+            0,
+        );
+        make_detailed_sample(
+            &mut scratch,
+            501,
+            110,
+            500,
+            1,
+            "OpenConsole.exe",
+            ProcessCategory::Background,
+            ProcessStatusFlags::EFFICIENCY_MODE,
+            0,
+            20 * 1024 * 1024,
+            0,
+        );
+        make_detailed_sample(
+            &mut scratch,
+            502,
+            120,
+            500,
+            1,
+            "pwsh.exe",
+            ProcessCategory::Background,
+            ProcessStatusFlags::empty(),
+            0,
+            40 * 1024 * 1024,
+            0,
+        );
+        engine.ingest_process_sample(Timestamp100Ns::new(1_000_000), &scratch, 4);
+
+        let mut cold = ColdMetaCache::new();
+        let pkg: Arc<str> = Arc::from("Microsoft.WindowsTerminal_8wekyb3d8bbwe");
+        cold.insert_process(ProcessColdMeta {
+            key: ProcessKey::new(500, 100),
+            exe_path: Some(Arc::from(
+                r"C:\Program Files\WindowsApps\WT\WindowsTerminal.exe",
+            )),
+            command_line: None,
+            user_name: None,
+            arch: ProcessArch::X64,
+            uac_virtualization: UacVirtualization::NotAllowed,
+            efficiency_mode: false,
+            is_elevated: false,
+            app_group_id: Some(Arc::clone(&pkg)),
+            asset: None,
+        });
+        cold.insert_process(ProcessColdMeta {
+            key: ProcessKey::new(501, 110),
+            exe_path: Some(Arc::from(
+                r"C:\Program Files\WindowsApps\WT\OpenConsole.exe",
+            )),
+            command_line: None,
+            user_name: None,
+            arch: ProcessArch::X64,
+            uac_virtualization: UacVirtualization::NotAllowed,
+            efficiency_mode: false,
+            is_elevated: false,
+            app_group_id: Some(pkg),
+            asset: None,
+        });
+
+        let cfg = ViewProjectionConfig {
+            process_view_mode: ProcessViewMode::Grouped,
+            ..ViewProjectionConfig::default()
+        };
+
+        let slice = engine.project_processes(&cfg, &cold, 1);
+        assert_eq!(
+            slice.rows[0].kind,
+            ProcessRowKind::SectionHeader {
+                category: ProcessCategory::App,
+                count: 1
+            }
+        );
+        // WindowsTerminal.exe and OpenConsole.exe share app_group_id -> grouped as WindowsTerminal (2) (100 MiB).
+        assert_eq!(slice.rows[1].name.as_ref(), "WindowsTerminal.exe");
+        assert_eq!(slice.rows[1].child_count, 2);
+        assert_eq!(slice.rows[1].memory_bytes, 100 * 1024 * 1024);
+        assert!(
+            slice.rows[1]
+                .status
+                .contains(ProcessStatusFlags::EFFICIENCY_MODE)
+        );
+
+        // Unpackaged pwsh.exe stays in Background!
+        assert_eq!(
+            slice.rows[2].kind,
+            ProcessRowKind::SectionHeader {
+                category: ProcessCategory::Background,
+                count: 1
+            }
+        );
+        assert_eq!(slice.rows[3].name.as_ref(), "pwsh.exe");
     }
 
     #[test]

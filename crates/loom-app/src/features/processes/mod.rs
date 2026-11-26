@@ -41,7 +41,7 @@ use crate::shell::{ShellHandle, dialogs};
 use self::state::{
     IconRenderCache, ResourceColumn, apply_resource_display_mode, can_terminate_process,
     find_selected_row, is_efficiency_mode_eligible, next_sort_direction,
-    requires_end_task_confirmation, search_online_query, secondary_subtitle, stable_row_id,
+    requires_end_task_confirmation, search_online_query, stable_row_id,
 };
 
 const PROCESS_ROW_HEIGHT: f32 = 32.0;
@@ -737,9 +737,6 @@ impl Render for ProcessesView {
                                             let child_badge: Option<SharedString> =
                                                 (row.child_count > 0)
                                                     .then(|| format!("({})", row.child_count).into());
-                                            let subtitle: Option<SharedString> =
-                                                secondary_subtitle(row)
-                                                    .map(|s| s.to_owned().into());
                                             let publisher_text: SharedString =
                                                 row.publisher.as_deref().unwrap_or("").to_owned().into();
 
@@ -892,24 +889,6 @@ impl Render for ProcessesView {
                                                                                         muted_fg,
                                                                                     )
                                                                                     .child(badge),
-                                                                            )
-                                                                        },
-                                                                    )
-                                                                    .when_some(
-                                                                        subtitle,
-                                                                        |this, sub| {
-                                                                            this.child(
-                                                                                div()
-                                                                                    .flex_1()
-                                                                                    .min_w_0()
-                                                                                    .truncate()
-                                                                                    .text_color(
-                                                                                        muted_fg
-                                                                                            .opacity(
-                                                                                                0.75,
-                                                                                            ),
-                                                                                    )
-                                                                                    .child(sub),
                                                                             )
                                                                         },
                                                                     ),

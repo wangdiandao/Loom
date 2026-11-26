@@ -339,6 +339,9 @@ pub struct ProcessColdMeta {
     pub efficiency_mode: bool,
     /// Whether the process token is elevated (Administrator / root).
     pub is_elevated: bool,
+    /// Optional platform application package/group identity (e.g., Windows MSIX/UWP
+    /// Package Family Name), used to group multi-process packaged apps together.
+    pub app_group_id: Option<Arc<str>>,
     /// Shared path-level static executable asset.
     pub asset: Option<Arc<ExeStaticAsset>>,
 }

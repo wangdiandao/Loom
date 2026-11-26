@@ -212,22 +212,6 @@ pub(crate) fn is_efficiency_mode_eligible(
         )
 }
 
-/// Returns a subtle secondary text label (image name or window title) when distinct from `display_name`.
-pub(crate) fn secondary_subtitle(row: &ProcessRowProjection) -> Option<&str> {
-    let display = row.display_name.trim();
-    let image = row.name.trim();
-    if !image.is_empty() && !display.eq_ignore_ascii_case(image) {
-        return Some(image);
-    }
-    if let Some(title) = row.window_title.as_deref().map(str::trim)
-        && !title.is_empty()
-        && !display.eq_ignore_ascii_case(title)
-    {
-        return Some(title);
-    }
-    None
-}
-
 /// Returns the best query string for "Search online" on a process row.
 pub(crate) fn search_online_query(row: &ProcessRowProjection) -> String {
     let image = row.name.trim();
@@ -610,24 +594,5 @@ mod tests {
             ),
             SortDirection::Descending
         );
-    }
-
-    #[test]
-    fn secondary_subtitle_prefers_distinct_image_or_window_title() {
-        let mut row = sample_process_row(
-            100,
-            1,
-            "Code.exe",
-            "Visual Studio Code",
-            ProcessCategory::App,
-            ProcessStatusFlags::empty(),
-        );
-        assert_eq!(secondary_subtitle(&row), Some("Code.exe"));
-
-        row.display_name = Arc::from("Code.exe");
-        assert_eq!(secondary_subtitle(&row), None);
-
-        row.window_title = Some(Arc::from("loom — main.rs"));
-        assert_eq!(secondary_subtitle(&row), Some("loom — main.rs"));
     }
 }

@@ -248,6 +248,7 @@ impl SlowMetadataProber for MockSlowProber {
             uac_virtualization: UacVirtualization::NotAllowed,
             efficiency_mode: false,
             is_elevated: self.state.is_elevated.load(Ordering::Acquire),
+            app_group_id: None,
             asset: None,
         })
     }
