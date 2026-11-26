@@ -94,7 +94,6 @@ pub(crate) fn process_arch_label(arch: ProcessArch) -> String {
 }
 
 /// Returns the localized label for a [`UacVirtualization`] state.
-#[allow(dead_code)] // Consumed by 0.0.3 Details table (Issue #11).
 pub(crate) fn uac_virtualization_label(uac: UacVirtualization) -> String {
     match uac {
         UacVirtualization::Enabled => tr("details.uac_enabled"),

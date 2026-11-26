@@ -4,6 +4,26 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ## Unreleased
 
+## 0.0.3 - 2026-11-26
+
+### Engine & PAL
+
+- Extended `loom-types`, `loom-pal-api`, and `loom-engine` for the P0 daily-driver process management milestone: added `ProcessRowProjection` / `DetailsRowProjection` full-field metrics (CPU, Memory, Disk throughput, Network throughput, GPU utilization, dedicated GPU memory, CPU time, Working Set, Private Working Set, Commit, platform architecture, UAC virtualization, EcoQoS state, PE publisher/description, and command line), `ProcessSortColumn` / `DetailsSortColumn`, and `DetailsViewMode` (`Flat` / `Tree`).
+- Added `EngineCommand` and `SystemOperator` support for `GetAffinity` (multi-group >64 CPU affinity mask readback), `BrowseExecutable` (native file picker routed on the slow lane), `SetProcessSort`, `SetDetailsSort`, `SetDetailsViewMode`, `ToggleDetailsExpanded`, `OpenFileLocation`, `ShowFileProperties`, and `SearchOnline`.
+- Added oneshot reply channels (`send_command_with_reply`) in `EngineCoordinator` so interactive dialogs (`RunNewTaskDialog` Browse and `SetAffinityDialog` affinity load) resolve asynchronously without blocking the UI or fast sampler threads.
+
+### Windows Backend
+
+- Implemented live EcoQoS Efficiency Mode probing (`GetProcessInformation(ProcessPowerThrottle)`) and toggling (`SetProcessInformation` + `BELOW_NORMAL_PRIORITY_CLASS` fallback) with `ProcessKey` creation-time identity verification.
+- Implemented multi-group (>64 logical processors) CPU affinity read/write (`GetLogicalProcessorInformationEx` + `GetProcessGroupAffinity` / `SetProcessAffinityMask`), 6-level priority classes, UAC virtualization and elevated token probing, native `GetOpenFileNameW` executable picker, and shell actions (`explorer.exe /select,`, `ShellExecuteExW` properties, and online search).
+- Completed non-blocking top-level window grouping, per-process disk I/O rate deltas, and slow-lane PE `VersionInfo` publisher/description plus `20x20` RGBA8 icon backfill with UNC/`DRIVE_REMOTE` network-drive bypass and `300 ms` circuit-breaker protection.
+
+### UI & UX
+
+- Upgraded the **Processes** slice with 3-section grouped headers (`Apps` / `Background processes` / `Windows processes`), parent-child **Process Tree** toggle, sortable columns, `20x20` cached process icons, amber intensity heatmaps, status badges (`Efficiency mode`, `Suspended`, `Not responding`, `Elevated`), per-column **Resource Values** (`Values` vs. `Percent`) toggle, `ProcessKey`-anchored selection & `Delete` hotkey, and full right-click context menu (`Expand`/`Collapse`, `End task`, `Efficiency mode`, `Resource values`, `Open file location`, `Search online`, `Properties`, and `Jump to details`).
+- Added the shell-scoped **Run new task** modal dialog (accessible from both **Processes** and **Details** toolbars) with native executable **Browse**, **Create this task with administrative privileges** checkbox, and persisted MRU command history pills.
+- Upgraded the RAII-leased **Details** slice with full-field virtualized **Flat** and **Process Tree** views (`Name`, `PID`, `Status`, `User name`, `CPU`, `Memory`, `Priority`, `Platform`, `UAC virtualization`, `Dedicated GPU memory`, `Publisher`, `Command line`), sortable headers, `JumpToDetails(ProcessKey)` cross-page scroll-and-highlight, bottom-up **End process tree** confirmation, 6-level **Set priority** submenu, feature-local multi-group **Set Affinity** dialog (`All processors` + per-group `CPU 0..N` checkboxes), and shell actions.
+
 ## 0.0.2 - 2026-11-26
 
 ### UI & UX

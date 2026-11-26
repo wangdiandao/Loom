@@ -139,7 +139,6 @@ impl UiCommands {
     }
 
     /// Launches a new task via the slow-lane operator.
-    #[allow(dead_code)] // Consumed by 0.0.3 Run New Task dialog (Issue #10).
     pub(crate) fn run_new_task(store: &Entity<UiStore>, req: RunTaskRequest, cx: &mut App) {
         let _ = store
             .read(cx)
@@ -147,7 +146,6 @@ impl UiCommands {
     }
 
     /// Terminates a single process verified by [`ProcessKey`].
-    #[allow(dead_code)] // Consumed by 0.0.3 Processes & Details slices (Issues #10 & #11).
     pub(crate) fn terminate_process(store: &Entity<UiStore>, key: ProcessKey, cx: &mut App) {
         let _ = store
             .read(cx)
@@ -155,7 +153,6 @@ impl UiCommands {
     }
 
     /// Terminates a verified process tree in bottom-up (leaves-to-root) order.
-    #[allow(dead_code)] // Consumed by 0.0.3 Details slice (Issue #11).
     pub(crate) fn terminate_process_tree(store: &Entity<UiStore>, key: ProcessKey, cx: &mut App) {
         let _ = store
             .read(cx)
@@ -163,7 +160,6 @@ impl UiCommands {
     }
 
     /// Enables or disables Efficiency Mode (`EcoQoS`) for `key`.
-    #[allow(dead_code)] // Consumed by 0.0.3 Processes & Details slices (Issues #10 & #11).
     pub(crate) fn set_efficiency_mode(
         store: &Entity<UiStore>,
         key: ProcessKey,
@@ -176,7 +172,6 @@ impl UiCommands {
     }
 
     /// Sets the scheduling priority class of `key`.
-    #[allow(dead_code)] // Consumed by 0.0.3 Details slice (Issue #11).
     pub(crate) fn set_priority(
         store: &Entity<UiStore>,
         key: ProcessKey,
@@ -189,7 +184,6 @@ impl UiCommands {
     }
 
     /// Applies a new multi-group CPU affinity mask to `key`.
-    #[allow(dead_code)] // Consumed by 0.0.3 Set Affinity dialog (Issue #11).
     pub(crate) fn set_affinity(
         store: &Entity<UiStore>,
         key: ProcessKey,
@@ -202,7 +196,6 @@ impl UiCommands {
     }
 
     /// Queries the current multi-group CPU affinity mask of `key`, returning a oneshot reply receiver.
-    #[allow(dead_code)] // Consumed by 0.0.3 Set Affinity dialog (Issue #11).
     pub(crate) fn get_affinity_async(
         store: &Entity<UiStore>,
         key: ProcessKey,
@@ -214,7 +207,6 @@ impl UiCommands {
     }
 
     /// Opens the native executable file picker on the slow lane, returning a oneshot reply receiver.
-    #[allow(dead_code)] // Consumed by 0.0.3 Run New Task dialog (Issue #10).
     pub(crate) fn browse_executable_async(
         store: &Entity<UiStore>,
         cx: &App,
@@ -225,7 +217,6 @@ impl UiCommands {
     }
 
     /// Opens the OS file explorer and selects `path`.
-    #[allow(dead_code)] // Consumed by 0.0.3 Processes & Details context menus (Issues #10 & #11).
     pub(crate) fn open_file_location(store: &Entity<UiStore>, path: PathBuf, cx: &mut App) {
         let _ = store
             .read(cx)
@@ -233,7 +224,6 @@ impl UiCommands {
     }
 
     /// Opens the native OS properties dialog for `path`.
-    #[allow(dead_code)] // Consumed by 0.0.3 Processes & Details context menus (Issues #10 & #11).
     pub(crate) fn show_file_properties(store: &Entity<UiStore>, path: PathBuf, cx: &mut App) {
         let _ = store
             .read(cx)
@@ -241,7 +231,6 @@ impl UiCommands {
     }
 
     /// Opens the user's default browser searching online for `query`.
-    #[allow(dead_code)] // Consumed by 0.0.3 Processes & Details context menus (Issues #10 & #11).
     pub(crate) fn search_online(store: &Entity<UiStore>, query: String, cx: &mut App) {
         let _ = store
             .read(cx)
@@ -249,7 +238,6 @@ impl UiCommands {
     }
 
     /// Updates the sort column and direction of the Processes table.
-    #[allow(dead_code)] // Consumed by 0.0.3 Processes table sorting (Issue #10).
     pub(crate) fn set_process_sort(
         store: &Entity<UiStore>,
         column: ProcessSortColumn,
@@ -262,7 +250,6 @@ impl UiCommands {
     }
 
     /// Updates the sort column and direction of the Details table.
-    #[allow(dead_code)] // Consumed by 0.0.3 Details table sorting (Issue #11).
     pub(crate) fn set_details_sort(
         store: &Entity<UiStore>,
         column: DetailsSortColumn,
@@ -275,7 +262,6 @@ impl UiCommands {
     }
 
     /// Switches the Details view between Flat and Process Tree modes.
-    #[allow(dead_code)] // Consumed by 0.0.3 Details toolbar (Issue #11).
     pub(crate) fn set_details_view_mode(
         store: &Entity<UiStore>,
         mode: DetailsViewMode,
@@ -287,7 +273,6 @@ impl UiCommands {
     }
 
     /// Toggles expansion of a parent process row in the Details tree view.
-    #[allow(dead_code)] // Consumed by 0.0.3 Details tree view (Issue #11).
     pub(crate) fn toggle_details_expanded(store: &Entity<UiStore>, key: ProcessKey, cx: &mut App) {
         let _ = store
             .read(cx)
@@ -295,7 +280,6 @@ impl UiCommands {
     }
 
     /// Updates and atomically persists per-column resource display modes (`Values` vs. `Percent`).
-    #[allow(dead_code)] // Consumed by 0.0.3 Processes Resource Values submenu (Issue #10).
     pub(crate) fn set_resource_display_modes(
         store: &Entity<UiStore>,
         memory: ResourceDisplayMode,
@@ -316,7 +300,6 @@ impl UiCommands {
     }
 
     /// Appends a command to the MRU "Run new task" history and persists it atomically.
-    #[allow(dead_code)] // Consumed by 0.0.3 Run New Task dialog (Issue #10).
     pub(crate) fn record_run_task_history(store: &Entity<UiStore>, command: String, cx: &mut App) {
         store.update(cx, |store, cx| {
             let _ = store.update_settings(|s| s.push_run_task_history(command), cx);
