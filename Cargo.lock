@@ -4174,7 +4174,7 @@ dependencies = [
 
 [[package]]
 name = "loom-app"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "crossbeam-channel",
  "gpui-kit",
@@ -4194,7 +4194,7 @@ dependencies = [
 
 [[package]]
 name = "loom-config"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "directories",
  "loom-types",
@@ -4207,7 +4207,7 @@ dependencies = [
 
 [[package]]
 name = "loom-engine"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "arc-swap",
  "crossbeam-channel",
@@ -4221,7 +4221,7 @@ dependencies = [
 
 [[package]]
 name = "loom-pal"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "loom-pal-api",
  "loom-pal-linux",
@@ -4232,7 +4232,7 @@ dependencies = [
 
 [[package]]
 name = "loom-pal-api"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "loom-types",
  "thiserror 2.0.21",
@@ -4240,7 +4240,7 @@ dependencies = [
 
 [[package]]
 name = "loom-pal-linux"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "loom-pal-api",
  "loom-types",
@@ -4248,7 +4248,7 @@ dependencies = [
 
 [[package]]
 name = "loom-pal-macos"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "loom-pal-api",
  "loom-types",
@@ -4256,7 +4256,7 @@ dependencies = [
 
 [[package]]
 name = "loom-pal-windows"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "loom-pal-api",
  "loom-types",
@@ -4267,7 +4267,7 @@ dependencies = [
 
 [[package]]
 name = "loom-types"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bitflags 2.13.2",
  "serde",
@@ -4276,7 +4276,7 @@ dependencies = [
 
 [[package]]
 name = "loom-ui-kit"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "gpui-kit",
  "image",
