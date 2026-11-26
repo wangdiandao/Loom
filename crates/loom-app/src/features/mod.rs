@@ -7,6 +7,7 @@
 pub(crate) mod details;
 pub(crate) mod processes;
 pub(crate) mod settings;
+pub(crate) mod table_columns;
 
 use gpui_kit::component::{ActiveTheme as _, Icon, StyledExt as _, h_flex, v_flex};
 use gpui_kit::{App, IntoElement, ParentElement as _, Styled as _, div, px};

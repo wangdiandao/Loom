@@ -12,6 +12,10 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ### UI & UX
 
+- Replaced the **Processes** (`Grouped` / `Process tree`) and **Details** (`Flat list` / `Process tree`) text view-mode switcher buttons with compact icon-only toggle buttons (`LayoutList` / `List` / `ListTree`) with localized hover tooltips and accessibility labels.
+- Fixed the **Settings** sidebar footer entry height by rendering it with `SidebarMenuItem` directly so it matches the standard `28px` height and collapsed tooltip behavior of the primary navigation items.
+- Fixed the **TitleBar** sidebar collapse/expand toggle button (and search box controls) failing to respond to clicks on Windows by stopping left mouse-down propagation before `DefWindowProcW` enters a `WM_NCLBUTTONDOWN(HTCAPTION)` window-drag loop.
+- Added interactive column header resizing (draggable column dividers with min/max clamping) and horizontal drag-and-drop column reordering (with live insertion indicator and ghost header preview) to both the **Processes** and **Details** tables, preserving custom column order and widths across page navigation within the session.
 - Removed the trailing grey `.exe` subtitle suffix from **Processes** rows so grouped app rows display clean names and counts (e.g., `QQ (5)`, `Weixin (5)`, `Loom 任务管理器`).
 
 - Simplified **Processes** status badges to compact icon-only indicators with hover tooltips and streamlined the **Processes** toolbar by removing the summary metric pills, **Efficiency mode** button, and **Refresh** button (retaining Efficiency mode in the context menu).

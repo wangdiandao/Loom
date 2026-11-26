@@ -7,15 +7,16 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::sidebar::{
-    Sidebar, SidebarFooter, SidebarMenu, SidebarMenuItem, SidebarToggleButton,
+    Sidebar, SidebarItem as _, SidebarMenu, SidebarMenuItem, SidebarToggleButton,
 };
 use gpui_kit::component::{
-    ActiveTheme as _, Collapsible as _, Icon, IconName, Selectable as _, Sizable as _,
-    StyledExt as _, TitleBar, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, TitleBar, WindowExt as _,
+    h_flex, v_flex,
 };
 use gpui_kit::{
-    AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
-    Subscription, Task, Window, WindowVisibility, div, prelude::FluentBuilder as _, px,
+    AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, MouseButton,
+    ParentElement as _, Render, Styled as _, Subscription, Task, Window, WindowVisibility, div,
+    prelude::FluentBuilder as _, px,
 };
 use loom_types::{CapabilityFlags, LanguagePreference, ProcessKey, ThemePreference};
 
@@ -320,7 +321,7 @@ impl AppShell {
 }
 
 impl Render for AppShell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store_ref = self.store.read(cx);
         let collapsed = store_ref.settings().sidebar_collapsed;
         let is_elevated = store_ref.snapshot().is_elevated;
@@ -349,16 +350,25 @@ impl Render for AppShell {
                         .gap_2()
                         .flex_shrink_0()
                         .child(
-                            SidebarToggleButton::new()
-                                .collapsed(collapsed)
-                                .accessibility_label(i18n::tr("app.sidebar_toggle"))
-                                .on_click(move |_, _, cx| {
-                                    UiCommands::set_sidebar_collapsed(
-                                        &store_toggle,
-                                        !collapsed,
-                                        cx,
-                                    );
-                                }),
+                            // Stop propagation on left mouse-down so Windows does not forward
+                            // `WM_NCLBUTTONDOWN(HTCAPTION)` to `DefWindowProcW` and swallow the
+                            // subsequent release needed for `SidebarToggleButton::on_click`.
+                            div()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    SidebarToggleButton::new()
+                                        .collapsed(collapsed)
+                                        .accessibility_label(i18n::tr("app.sidebar_toggle"))
+                                        .on_click(move |_, _, cx| {
+                                            UiCommands::set_sidebar_collapsed(
+                                                &store_toggle,
+                                                !collapsed,
+                                                cx,
+                                            );
+                                        }),
+                                ),
                         )
                         .child(
                             div()
@@ -383,12 +393,18 @@ impl Render for AppShell {
                 )
                 .child(
                     h_flex().flex_1().justify_center().px_2().child(
-                        div().w(px(340.)).max_w_full().child(
-                            Input::new(&self.search_input)
-                                .small()
-                                .cleanable(true)
-                                .prefix(Icon::new(IconName::Search).small()),
-                        ),
+                        div()
+                            .w(px(340.))
+                            .max_w_full()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                Input::new(&self.search_input)
+                                    .small()
+                                    .cleanable(true)
+                                    .prefix(Icon::new(IconName::Search).small()),
+                            ),
                     ),
                 )
                 .child(div().w(px(72.)).flex_shrink_0()),
@@ -404,36 +420,14 @@ impl Render for AppShell {
                 })
         });
 
-        let settings_label = Route::Settings.label();
-        let settings_footer = SidebarFooter::new()
-            .selected(active_route == Route::Settings)
+        let settings_footer = SidebarMenuItem::new(Route::Settings.label())
+            .icon(Route::Settings.icon())
+            .active(active_route == Route::Settings)
             .collapsed(collapsed)
-            .p_0()
-            .child(
-                Button::new("nav-settings")
-                    .ghost()
-                    .w_full()
-                    .h_8()
-                    .accessibility_label(settings_label.clone())
-                    .when(collapsed, |b| {
-                        b.icon(Icon::new(IconName::Settings).small())
-                            .tooltip(settings_label.clone())
-                    })
-                    .when(!collapsed, |b| {
-                        b.child(
-                            h_flex()
-                                .w_full()
-                                .items_center()
-                                .gap_2()
-                                .px_1()
-                                .child(Icon::new(IconName::Settings).small())
-                                .child(div().text_sm().child(settings_label.clone())),
-                        )
-                    })
-                    .on_click(move |_, window, cx| {
-                        shell_for_settings.navigate(Route::Settings, window, cx);
-                    }),
-            );
+            .on_click(move |_, window, cx| {
+                shell_for_settings.navigate(Route::Settings, window, cx);
+            })
+            .render("nav-settings", window, cx);
 
         let sidebar = Sidebar::new("loom-sidebar")
             .collapsed(collapsed)
@@ -464,5 +458,88 @@ impl Render for AppShell {
                         .child(outlet),
                 ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui_kit::component::TitleBar;
+    use gpui_kit::component::sidebar::SidebarToggleButton;
+    use gpui_kit::{
+        AppContext as _, Context, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
+        MouseDownEvent, ParentElement as _, PlatformInput, Render, TestAppContext,
+        VisualTestContext, Window, div, point, px,
+    };
+
+    struct TitleBarToggleHarness {
+        collapsed: Rc<Cell<bool>>,
+    }
+
+    impl Render for TitleBarToggleHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let collapsed = self.collapsed.get();
+            let flag = self.collapsed.clone();
+            TitleBar::new().child(
+                div()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        SidebarToggleButton::new()
+                            .collapsed(collapsed)
+                            .accessibility_label("Toggle sidebar")
+                            .on_click(move |_, _, _| {
+                                flag.set(!collapsed);
+                            }),
+                    ),
+            )
+        }
+    }
+
+    #[gpui_kit::test]
+    fn titlebar_sidebar_toggle_stops_mousedown_propagation_and_toggles_on_click(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let collapsed = Rc::new(Cell::new(false));
+        let view = cx.new(|_| TitleBarToggleHarness {
+            collapsed: collapsed.clone(),
+        });
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| gpui_kit::base::Root::new(view.clone(), window, cx))
+            })
+            .unwrap()
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // Center of SidebarToggleButton inside TitleBar (left padding 12px + half of 24px = 24px, y = 17px).
+        let at = point(px(24.), px(17.));
+        let down_result = vcx.update(|window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: at,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            )
+        });
+        assert!(
+            !down_result.propagate,
+            "left mouse-down on TitleBar SidebarToggleButton must stop propagation so Windows HTCAPTION does not swallow release"
+        );
+
+        vcx.simulate_mouse_up(at, MouseButton::Left, Modifiers::default());
+        assert!(
+            collapsed.get(),
+            "clicking SidebarToggleButton must toggle collapsed state"
+        );
     }
 }

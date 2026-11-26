@@ -1,5 +1,6 @@
 //! Reactive GPUI [`UiStore`] entity bridging lock-free [`AppSnapshot`] slices and events.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +51,7 @@ pub(crate) struct UiStore {
     event_rx: Receiver<CommandEvent>,
     dormant: bool,
     poll_task: Option<Task<()>>,
+    table_columns: HashMap<&'static str, Vec<(&'static str, f32)>>,
 }
 
 impl EventEmitter<UiStoreEvent> for UiStore {}
@@ -75,6 +77,7 @@ impl UiStore {
             event_rx,
             dormant: false,
             poll_task: None,
+            table_columns: HashMap::new(),
         };
         store.start_polling(cx);
         store
@@ -117,6 +120,21 @@ impl UiStore {
     #[inline]
     pub(crate) fn config_path(&self) -> &Path {
         self.config_store.path()
+    }
+
+    /// Returns the session-saved column order and pixel widths for `table_id`, if any.
+    #[inline]
+    pub(crate) fn table_column_layout(&self, table_id: &str) -> Option<&[(&'static str, f32)]> {
+        self.table_columns.get(table_id).map(Vec::as_slice)
+    }
+
+    /// Saves the active column order and pixel widths for `table_id` across route switches.
+    pub(crate) fn set_table_column_layout(
+        &mut self,
+        table_id: &'static str,
+        layout: Vec<(&'static str, f32)>,
+    ) {
+        self.table_columns.insert(table_id, layout);
     }
 
     /// Acquires an RAII [`ScopedMonitorLease`] for an on-demand domain.

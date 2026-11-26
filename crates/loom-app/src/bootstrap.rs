@@ -1,12 +1,15 @@
 //! Progressive startup pipeline, window lifecycle orchestration, tray residency, and PAL window helpers.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use gpui_kit::assets::{Assets, icon_assets};
 use gpui_kit::component::TitleBar;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Bounds, Entity, Global, QuitMode,
-    Subscription, Window, WindowBounds, WindowOptions, point, px, size,
+    AnyWindowHandle, App, AppContext as _, AssetSource, BorrowAppContext as _, Bounds, Entity,
+    Global, QuitMode, SharedString, Subscription, Window, WindowBounds, WindowOptions, point, px,
+    size,
 };
 use loom_config::{AppSettings, ConfigStore, WindowGeometry};
 use loom_engine::{EngineCommand, EngineCoordinator};
@@ -15,6 +18,27 @@ use loom_pal::{NativeBackend, PlatformBackend, SingleInstanceGuard};
 use crate::bridge::{UiStore, apply_theme};
 use crate::i18n;
 use crate::shell::{AppShell, Route, TrayAction, TrayController, TrayEventSignal};
+
+icon_assets!(LoomExtraIcons, [LayoutList, List, ListTree]);
+
+/// Application asset source combining `gpui-kit`'s default component bundle with
+/// Loom's view-mode switcher icons (`LayoutList`, `List`, `ListTree`).
+struct LoomAssets;
+
+impl AssetSource for LoomAssets {
+    fn load(&self, path: &str) -> gpui_kit::Result<Option<Cow<'static, [u8]>>> {
+        if let Ok(Some(data)) = LoomExtraIcons.load(path) {
+            return Ok(Some(data));
+        }
+        Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> gpui_kit::Result<Vec<SharedString>> {
+        let mut items = Assets.list(path)?;
+        items.extend(LoomExtraIcons.list(path)?);
+        Ok(items)
+    }
+}
 
 /// Single-instance OS mutex identifier shared across normal launches of Loom.
 const SINGLE_INSTANCE_ID: &str = "io.github.wangdiandao.loom.single-instance";
@@ -136,7 +160,7 @@ pub(crate) fn run(args: LaunchArgs) {
     //    Use `QuitMode::Explicit` so closing the window with `close_to_tray` / `minimize_to_tray`
     //    enabled destroys the GPUI window (0% GPU) while keeping the tray icon alive.
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(LoomAssets)
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
             gpui_kit::init(cx);
