@@ -40,5 +40,5 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --workspace --no-deps
 
-      - name: Run headless backend and engine tests
-        run: cargo test --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-windows -p loom-pal -p loom-engine
+      - name: Run workspace tests (including headless Windows E2E)
+        run: cargo test --locked --workspace
