@@ -8,6 +8,7 @@
 pub mod control;
 pub mod history;
 pub mod performance;
+pub mod platform;
 pub mod prefs;
 pub mod process;
 pub mod snapshot;
@@ -16,6 +17,7 @@ pub mod time;
 pub use control::{CapabilityFlags, RunTaskRequest, TreeKillItem, TreeKillReport, WaitChainNode};
 pub use history::{HistoryRing, HistoryRingIter};
 pub use performance::{PerformanceSlice, SystemPerfSample};
+pub use platform::{PlatformKind, PlatformProfile};
 pub use prefs::{
     DetailsSortColumn, DetailsViewMode, LanguagePreference, ProcessSortColumn, ProcessViewMode,
     RefreshSpeed, ResourceDisplayMode, SortDirection, StartupPage, ThemePreference,
@@ -160,5 +162,41 @@ mod tests {
         assert_copy::<ProcessHotSample<()>>();
         assert_copy::<HistoryRing<60>>();
         assert_copy::<SystemPerfSample>();
+        assert_copy::<PlatformKind>();
+        assert_copy::<PlatformProfile>();
+    }
+
+    #[test]
+    fn platform_profile_constants_and_defaults() {
+        assert_eq!(PlatformKind::default(), PlatformKind::Unknown);
+        assert_eq!(PlatformProfile::default(), PlatformProfile::UNKNOWN);
+        assert_eq!(PlatformProfile::WINDOWS.kind, PlatformKind::Windows);
+        assert_eq!(PlatformProfile::WINDOWS.os_name, "Windows");
+        assert_eq!(PlatformProfile::LINUX.kind, PlatformKind::Linux);
+        assert_eq!(PlatformProfile::LINUX.os_name, "Linux");
+        assert_eq!(PlatformProfile::MACOS.kind, PlatformKind::Macos);
+        assert_eq!(PlatformProfile::MACOS.os_name, "macOS");
+        assert_eq!(AppSnapshot::default().platform, PlatformProfile::UNKNOWN);
+    }
+
+    #[test]
+    fn process_category_system_accepts_legacy_windows_serde_alias() {
+        use serde::Deserialize as _;
+        use serde::de::value::{Error as ValueError, StrDeserializer};
+
+        let sys_de: StrDeserializer<'_, ValueError> = StrDeserializer::new("System");
+        assert_eq!(
+            ProcessCategory::deserialize(sys_de).expect("deserialize System"),
+            ProcessCategory::System
+        );
+
+        let legacy_de: StrDeserializer<'_, ValueError> = StrDeserializer::new("Windows");
+        assert_eq!(
+            ProcessCategory::deserialize(legacy_de).expect("deserialize legacy Windows alias"),
+            ProcessCategory::System
+        );
+
+        assert_eq!(ProcessStatusFlags::KERNEL.bits(), 1 << 7);
+        assert_eq!(CapabilityFlags::ALWAYS_ON_TOP.bits(), 1 << 11);
     }
 }

@@ -128,6 +128,7 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
         let slow_prober = Arc::new(backend.create_slow_prober()?);
 
         let initial_snapshot = AppSnapshot {
+            platform: B::PLATFORM,
             capabilities: B::CAPABILITIES,
             is_elevated: backend.operator().is_elevated(),
             ..AppSnapshot::default()

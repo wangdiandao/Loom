@@ -67,7 +67,7 @@ pub(crate) fn process_category_label(category: ProcessCategory) -> String {
     match category {
         ProcessCategory::App => tr("processes.cat_apps"),
         ProcessCategory::Background => tr("processes.cat_background"),
-        ProcessCategory::Windows => tr("processes.cat_windows"),
+        ProcessCategory::System => tr("processes.cat_windows"),
     }
 }
 

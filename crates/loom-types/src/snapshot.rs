@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CapabilityFlags, DetailsSortColumn, DetailsViewMode, ExeIconRgba, PerformanceSlice,
-    ProcessArch, ProcessCategory, ProcessKey, ProcessPriority, ProcessSortColumn,
+    PlatformProfile, ProcessArch, ProcessCategory, ProcessKey, ProcessPriority, ProcessSortColumn,
     ProcessStatusFlags, ProcessViewMode, SortDirection, Timestamp100Ns, UacVirtualization,
 };
 
@@ -76,7 +76,7 @@ pub struct DomainRevisions {
 /// Discriminator for flattened rows in the Processes table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProcessRowKind {
-    /// Section separator header in grouped mode (Apps / Background / Windows).
+    /// Section separator header in grouped mode (Apps / Background / System).
     SectionHeader {
         /// Category represented by this section.
         category: ProcessCategory,
@@ -419,6 +419,8 @@ pub struct AppHistorySlice {
 pub struct AppSnapshot {
     /// Per-domain monotonic revision numbers for incremental UI updates.
     pub revisions: DomainRevisions,
+    /// Static platform identity profile advertised by the active backend.
+    pub platform: PlatformProfile,
     /// Static capabilities advertised by the active platform backend.
     pub capabilities: CapabilityFlags,
     /// Whether the Loom process itself is currently running elevated.

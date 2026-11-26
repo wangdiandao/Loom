@@ -56,8 +56,9 @@ pub enum ProcessCategory {
     /// Non-interactive user or third-party background process.
     #[default]
     Background,
-    /// Core operating-system process.
-    Windows,
+    /// Core operating-system process (e.g., Windows system services, Linux kernel/daemons, macOS system daemons).
+    #[serde(alias = "Windows")]
+    System,
 }
 
 bitflags! {
@@ -78,6 +79,8 @@ bitflags! {
         const CRITICAL = 1 << 5;
         /// System Idle pseudo-process (PID 0 on Windows).
         const SYSTEM_IDLE = 1 << 6;
+        /// OS kernel / non-user-modifiable core process (e.g., Windows System/Idle, Linux `kthreadd`, macOS `kernel_task`).
+        const KERNEL = 1 << 7;
     }
 }
 

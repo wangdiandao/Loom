@@ -294,11 +294,19 @@ pub trait PlatformBackend: Send + 'static {
     type HistoryReader: AppHistoryReader;
     type Operator: SystemOperator;
 
+    /// 静态平台身份画像（`Windows` / `Linux` / `macOS`）
+    const PLATFORM: PlatformProfile;
+
     /// 编译期静态能力位图：用于消除当前平台不支持的 UI/控制分支
     const CAPABILITIES: CapabilityFlags;
 
     /// 进程入口优先级提升
     fn boost_self_priority();
+
+    /// 宿主主窗口置顶与恢复钩子（无头或未实现平台默认空操作）
+    fn set_main_window_always_on_top(_enabled: bool) {}
+    fn is_main_window_minimized() -> bool { false }
+    fn restore_and_focus_main_window() {}
 
     fn initialize() -> Result<Self, PalError>
     where

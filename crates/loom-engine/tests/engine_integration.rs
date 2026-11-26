@@ -19,11 +19,11 @@ use loom_pal_api::{
 };
 use loom_types::{
     AppHistoryRecord, CapabilityFlags, CpuAffinityMask, DetailsViewMode, ExeIconRgba,
-    ExeStaticAsset, MonitorDomain, ProcessArch, ProcessCategory, ProcessColdMeta, ProcessHotSample,
-    ProcessKey, ProcessPriority, ProcessRowKind, ProcessSortColumn, ProcessStatusFlags,
-    ProcessViewMode, RefreshSpeed, RunTaskRequest, ServiceRecord, SortDirection, StartupEntry,
-    SystemPerfSample, Timestamp100Ns, TreeKillItem, TreeKillReport, UacVirtualization,
-    UserSessionRecord, WaitChainNode,
+    ExeStaticAsset, MonitorDomain, PlatformProfile, ProcessArch, ProcessCategory, ProcessColdMeta,
+    ProcessHotSample, ProcessKey, ProcessPriority, ProcessRowKind, ProcessSortColumn,
+    ProcessStatusFlags, ProcessViewMode, RefreshSpeed, RunTaskRequest, ServiceRecord,
+    SortDirection, StartupEntry, SystemPerfSample, Timestamp100Ns, TreeKillItem, TreeKillReport,
+    UacVirtualization, UserSessionRecord, WaitChainNode,
 };
 use parking_lot::Mutex;
 
@@ -408,6 +408,8 @@ impl PlatformBackend for MockBackend {
     type HistoryReader = MockNoopHistory;
     type Operator = MockOperator;
 
+    const PLATFORM: PlatformProfile = PlatformProfile::UNKNOWN;
+
     const CAPABILITIES: CapabilityFlags = CapabilityFlags::all();
 
     fn boost_self_priority() {}
@@ -533,7 +535,7 @@ fn startup_calibration_and_400_process_scan_latency() {
                 category: match i % 3 {
                     0 => ProcessCategory::App,
                     1 => ProcessCategory::Background,
-                    _ => ProcessCategory::Windows,
+                    _ => ProcessCategory::System,
                 },
                 name_offset,
                 name_len,
@@ -1143,4 +1145,80 @@ fn efficiency_mode_priority_affinity_browse_and_cold_projection_fields() {
             r"C:\Windows\System32\notepad.exe"
         ))))
     );
+}
+
+#[test]
+fn engine_coordinator_publishes_backend_platform_profile_in_snapshot() {
+    struct ProfiledMockBackend<const IS_LINUX: bool>(MockBackend);
+
+    impl<const IS_LINUX: bool> PlatformBackend for ProfiledMockBackend<IS_LINUX> {
+        type ProcessExt = ();
+        type FastSampler = MockFastSampler;
+        type SlowProber = MockSlowProber;
+        type ServiceMgr = MockNoopServices;
+        type StartupMgr = MockNoopStartup;
+        type SessionMgr = MockNoopSessions;
+        type HistoryReader = MockNoopHistory;
+        type Operator = MockOperator;
+
+        const PLATFORM: PlatformProfile = if IS_LINUX {
+            PlatformProfile::LINUX
+        } else {
+            PlatformProfile::WINDOWS
+        };
+
+        const CAPABILITIES: CapabilityFlags = CapabilityFlags::all();
+
+        fn boost_self_priority() {}
+
+        fn initialize() -> Result<Self, PalError> {
+            Ok(Self(MockBackend::initialize()?))
+        }
+
+        fn create_fast_sampler(&self) -> Result<Self::FastSampler, PalError> {
+            self.0.create_fast_sampler()
+        }
+
+        fn create_slow_prober(&self) -> Result<Self::SlowProber, PalError> {
+            self.0.create_slow_prober()
+        }
+
+        fn service_manager(&self) -> &Self::ServiceMgr {
+            self.0.service_manager()
+        }
+
+        fn startup_manager(&self) -> &Self::StartupMgr {
+            self.0.startup_manager()
+        }
+
+        fn session_manager(&self) -> &Self::SessionMgr {
+            self.0.session_manager()
+        }
+
+        fn history_reader(&self) -> &Self::HistoryReader {
+            self.0.history_reader()
+        }
+
+        fn operator(&self) -> &Self::Operator {
+            self.0.operator()
+        }
+    }
+
+    let win_coord = EngineCoordinator::new(
+        ProfiledMockBackend::<false>(MockBackend::initialize().unwrap()),
+        AppSettings::default(),
+    )
+    .unwrap();
+    assert_eq!(win_coord.snapshot().platform, PlatformProfile::WINDOWS);
+
+    let linux_coord = EngineCoordinator::new(
+        ProfiledMockBackend::<true>(MockBackend::initialize().unwrap()),
+        AppSettings::default(),
+    )
+    .unwrap();
+    assert_eq!(linux_coord.snapshot().platform, PlatformProfile::LINUX);
+
+    let unknown_coord =
+        EngineCoordinator::new(MockBackend::initialize().unwrap(), AppSettings::default()).unwrap();
+    assert_eq!(unknown_coord.snapshot().platform, PlatformProfile::UNKNOWN);
 }

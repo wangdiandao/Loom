@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use loom_types::{
-    AppHistoryRecord, CapabilityFlags, CpuAffinityMask, ExeStaticAsset, ProcessColdMeta,
-    ProcessKey, ProcessPriority, RunTaskRequest, ServiceRecord, StartupEntry, Timestamp100Ns,
-    TreeKillReport, UserSessionRecord, WaitChainNode,
+    AppHistoryRecord, CapabilityFlags, CpuAffinityMask, ExeStaticAsset, PlatformProfile,
+    ProcessColdMeta, ProcessKey, ProcessPriority, RunTaskRequest, ServiceRecord, StartupEntry,
+    Timestamp100Ns, TreeKillReport, UserSessionRecord, WaitChainNode,
 };
 
 use crate::{PalError, PerfSampleScratch, ProcessSampleScratch};
@@ -41,12 +41,26 @@ pub trait PlatformBackend: Send + Sync + 'static {
     /// System process control, diagnostics, and elevation operator.
     type Operator: SystemOperator;
 
+    /// Static platform identity profile advertised by this backend.
+    const PLATFORM: PlatformProfile;
+
     /// Compile-time capability bitmask advertised by this backend.
     const CAPABILITIES: CapabilityFlags;
 
     /// Boosts the current Loom process priority early during startup so the UI
     /// remains responsive under 100% CPU contention.
     fn boost_self_priority();
+
+    /// Toggles native always-on-top z-order for Loom's primary application window.
+    fn set_main_window_always_on_top(_enabled: bool) {}
+
+    /// Returns `true` when Loom's primary native window is currently minimized.
+    fn is_main_window_minimized() -> bool {
+        false
+    }
+
+    /// Restores Loom's primary native window (if minimized) and brings it to foreground focus.
+    fn restore_and_focus_main_window() {}
 
     /// Initializes the platform backend and any lightweight static hardware caches.
     fn initialize() -> Result<Self, PalError>
