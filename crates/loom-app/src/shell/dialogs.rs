@@ -22,7 +22,7 @@ use gpui_kit::{
     Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use loom_engine::{CommandEvent, CommandOutcome, CommandSuccess};
-use loom_types::{ProcessKey, RunTaskRequest};
+use loom_types::{CapabilityFlags, ProcessKey, RunTaskRequest};
 
 use crate::bridge::{UiCommands, UiStore};
 use crate::i18n;
@@ -32,7 +32,7 @@ const MAX_VISIBLE_HISTORY_PILLS: usize = 8;
 
 /// Formats a path returned by the native file picker for insertion into the command box.
 ///
-/// Paths containing whitespace are wrapped in double quotes so `ShellExecuteExW` argument
+/// Paths containing whitespace are wrapped in double quotes so OS command argument
 /// splitting keeps the executable path intact.
 fn format_picked_executable_path(path: &Path) -> String {
     let raw = path.display().to_string();
@@ -168,13 +168,20 @@ impl RunNewTaskForm {
             return false;
         };
 
+        let supports_elevation = self
+            .store
+            .read(cx)
+            .snapshot()
+            .capabilities
+            .contains(CapabilityFlags::ELEVATION_RELAUNCH);
+
         self.submitted = true;
         UiCommands::record_run_task_history(&self.store, command.clone(), cx);
         UiCommands::run_new_task(
             &self.store,
             RunTaskRequest {
                 command,
-                run_as_admin: self.run_as_admin,
+                run_as_admin: supports_elevation && self.run_as_admin,
             },
             cx,
         );
@@ -190,7 +197,12 @@ impl RunNewTaskForm {
 
 impl Render for RunNewTaskForm {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let history = self.store.read(cx).settings().run_task_history.clone();
+        let store_ref = self.store.read(cx);
+        let history = store_ref.settings().run_task_history.clone();
+        let supports_elevation = store_ref
+            .snapshot()
+            .capabilities
+            .contains(CapabilityFlags::ELEVATION_RELAUNCH);
 
         let theme = cx.theme();
         let fg = theme.foreground;
@@ -253,15 +265,17 @@ impl Render for RunNewTaskForm {
                         )
                     }),
             )
-            .child(
-                Checkbox::new("run-task-admin")
-                    .checked(self.run_as_admin)
-                    .label(i18n::tr("run_task.run_as_admin"))
-                    .on_click(cx.listener(|this, checked, _, cx| {
-                        this.run_as_admin = *checked;
-                        cx.notify();
-                    })),
-            )
+            .when(supports_elevation, |this| {
+                this.child(
+                    Checkbox::new("run-task-admin")
+                        .checked(self.run_as_admin)
+                        .label(i18n::tr("run_task.run_as_admin"))
+                        .on_click(cx.listener(|this, checked, _, cx| {
+                            this.run_as_admin = *checked;
+                            cx.notify();
+                        })),
+                )
+            })
             .when(!history.is_empty(), |this| {
                 this.child(
                     v_flex()
@@ -352,7 +366,7 @@ pub(crate) fn open_run_new_task_dialog(store: Entity<UiStore>, window: &mut Wind
     });
 }
 
-/// Opens a high-risk confirmation dialog before terminating a Windows or critical process.
+/// Opens a high-risk confirmation dialog before terminating a system or critical process.
 pub(crate) fn open_confirm_end_task_dialog(
     store: Entity<UiStore>,
     key: ProcessKey,
@@ -456,9 +470,19 @@ mod tests {
 
     #[test]
     fn format_picked_executable_path_quotes_whitespace_only() {
+        // POSIX paths
         assert_eq!(
-            format_picked_executable_path(Path::new(r"C:\Windows\System32\notepad.exe")),
-            r"C:\Windows\System32\notepad.exe"
+            format_picked_executable_path(Path::new("/usr/bin/loom")),
+            "/usr/bin/loom"
+        );
+        assert_eq!(
+            format_picked_executable_path(Path::new("/opt/My Apps/loom")),
+            "\"/opt/My Apps/loom\""
+        );
+        // Windows paths
+        assert_eq!(
+            format_picked_executable_path(Path::new(r"C:\Tools\loom.exe")),
+            r"C:\Tools\loom.exe"
         );
         assert_eq!(
             format_picked_executable_path(Path::new(r"C:\Program Files\Loom\loom.exe")),
@@ -472,8 +496,8 @@ mod tests {
         assert_eq!(normalize_run_task_command(""), None);
         assert_eq!(normalize_run_task_command("   \t\n "), None);
         assert_eq!(
-            normalize_run_task_command("  wt.exe -p PowerShell  "),
-            Some("wt.exe -p PowerShell".to_owned())
+            normalize_run_task_command("  /usr/bin/env sh -c true  "),
+            Some("/usr/bin/env sh -c true".to_owned())
         );
     }
 }

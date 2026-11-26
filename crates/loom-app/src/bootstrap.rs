@@ -1,4 +1,4 @@
-//! Progressive startup pipeline, window lifecycle orchestration, tray residency, and Win32 helpers.
+//! Progressive startup pipeline, window lifecycle orchestration, tray residency, and PAL window helpers.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,7 +27,7 @@ const MIN_WINDOW_HEIGHT: f32 = 500.0;
 /// Parsed command-line launch arguments for `loom-app`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct LaunchArgs {
-    /// Optional route slug requested via `--restore-route=<slug>` (e.g., after UAC relaunch).
+    /// Optional route slug requested via `--restore-route=<slug>` (e.g., after elevated relaunch).
     pub(crate) restore_route: Option<Route>,
     /// Optional explicit `settings.toml` path via `--config=<path>` (useful for isolated tests).
     pub(crate) config_path: Option<PathBuf>,
@@ -259,7 +259,7 @@ fn open_main_window(cx: &mut App) -> gpui_kit::Result<()> {
 fn show_or_reopen_main_window(cx: &mut App) {
     let existing = cx.global::<AppRuntime>().active_window;
     if let Some(handle) = existing {
-        restore_native_window_if_minimized();
+        loom_pal::window::restore_and_focus_main_window();
         let updated = handle.update(cx, |_, window, _| {
             window.activate_window();
         });
@@ -386,122 +386,14 @@ pub(crate) fn persist_window_geometry(store: &Entity<UiStore>, window: &Window, 
     });
 }
 
-/// Applies native Windows Always-on-Top (`HWND_TOPMOST` / `HWND_NOTOPMOST`) to Loom's window.
-#[cfg(windows)]
+/// Applies native Always-on-Top window z-order via [`loom_pal::window`].
 pub(crate) fn apply_always_on_top(enabled: bool) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
-    };
-
-    if let Some(hwnd) = find_main_window_hwnd() {
-        let insert_after = if enabled {
-            HWND_TOPMOST
-        } else {
-            HWND_NOTOPMOST
-        };
-        // SAFETY: `hwnd` is a live top-level window belonging to the current process.
-        unsafe {
-            SetWindowPos(
-                hwnd,
-                insert_after,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-        }
-    }
+    loom_pal::window::set_main_window_always_on_top(enabled);
 }
 
-/// No-op placeholder on non-Windows platforms until macOS/Linux window z-order adapters ship.
-#[cfg(not(windows))]
-pub(crate) fn apply_always_on_top(_enabled: bool) {}
-
-/// Returns `true` when Loom's native main window is currently minimized (`IsIconic`).
-#[cfg(windows)]
+/// Returns `true` when Loom's native main window is currently minimized.
 pub(crate) fn is_main_window_minimized() -> bool {
-    use windows_sys::Win32::UI::WindowsAndMessaging::IsIconic;
-
-    find_main_window_hwnd().is_some_and(|hwnd| {
-        // SAFETY: `hwnd` is owned by the current process.
-        unsafe { IsIconic(hwnd) != 0 }
-    })
-}
-
-/// Returns `false` on non-Windows platforms.
-#[cfg(not(windows))]
-pub(crate) fn is_main_window_minimized() -> bool {
-    false
-}
-
-#[cfg(windows)]
-fn restore_native_window_if_minimized() {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow,
-    };
-
-    if let Some(hwnd) = find_main_window_hwnd() {
-        // SAFETY: `hwnd` is a top-level window owned by the current process.
-        unsafe {
-            if IsIconic(hwnd) != 0 {
-                ShowWindow(hwnd, SW_RESTORE);
-            }
-            SetForegroundWindow(hwnd);
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn restore_native_window_if_minimized() {}
-
-/// Locates the current process's primary top-level visible Win32 window (`HWND`).
-#[cfg(windows)]
-fn find_main_window_hwnd() -> Option<windows_sys::Win32::Foundation::HWND> {
-    use windows_sys::Win32::Foundation::{HWND, LPARAM};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GW_OWNER, GetWindow, GetWindowTextLengthW, GetWindowThreadProcessId,
-        IsWindowVisible,
-    };
-    use windows_sys::core::BOOL;
-
-    struct SearchCtx {
-        pid: u32,
-        found: HWND,
-    }
-
-    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        // SAFETY: `lparam` points to the stack-local `SearchCtx` for the duration of `EnumWindows`.
-        let ctx = unsafe { &mut *(lparam as *mut SearchCtx) };
-        let mut win_pid: u32 = 0;
-        unsafe {
-            GetWindowThreadProcessId(hwnd, &mut win_pid);
-            if win_pid == ctx.pid
-                && IsWindowVisible(hwnd) != 0
-                && GetWindow(hwnd, GW_OWNER).is_null()
-                && GetWindowTextLengthW(hwnd) > 0
-            {
-                ctx.found = hwnd;
-                return 0; // stop enumeration
-            }
-        }
-        1
-    }
-
-    let mut ctx = SearchCtx {
-        pid: std::process::id(),
-        found: std::ptr::null_mut(),
-    };
-    // SAFETY: `enum_proc` only reads/writes `ctx` while `EnumWindows` executes synchronously.
-    unsafe {
-        EnumWindows(Some(enum_proc), (&mut ctx as *mut SearchCtx) as LPARAM);
-    }
-
-    if ctx.found.is_null() {
-        None
-    } else {
-        Some(ctx.found)
-    }
+    loom_pal::window::is_main_window_minimized()
 }
 
 #[cfg(test)]
@@ -514,30 +406,32 @@ mod tests {
 
     #[test]
     fn launch_args_parses_restore_route_config_and_allow_multiple() {
-        let args = LaunchArgs::parse_from([
+        // Inline `--flag=value` syntax with a POSIX-style path.
+        let posix_args = LaunchArgs::parse_from([
             "--restore-route=details",
-            "--config=C:\\temp\\loom-test.toml",
+            "--config=/var/lib/loom/settings.toml",
             "--allow-multiple",
         ]);
-        assert_eq!(args.restore_route, Some(Route::Details));
+        assert_eq!(posix_args.restore_route, Some(Route::Details));
         assert_eq!(
-            args.config_path,
-            Some(PathBuf::from("C:\\temp\\loom-test.toml"))
+            posix_args.config_path,
+            Some(PathBuf::from("/var/lib/loom/settings.toml"))
         );
-        assert!(args.allow_multiple);
+        assert!(posix_args.allow_multiple);
 
-        let split_args = LaunchArgs::parse_from([
+        // Split `--flag value` syntax with a Windows-style path.
+        let windows_args = LaunchArgs::parse_from([
             "--restore-route",
             "settings",
             "--config",
-            "/tmp/settings.toml",
+            r"C:\ProgramData\Loom\settings.toml",
         ]);
-        assert_eq!(split_args.restore_route, Some(Route::Settings));
+        assert_eq!(windows_args.restore_route, Some(Route::Settings));
         assert_eq!(
-            split_args.config_path,
-            Some(PathBuf::from("/tmp/settings.toml"))
+            windows_args.config_path,
+            Some(PathBuf::from(r"C:\ProgramData\Loom\settings.toml"))
         );
-        assert!(!split_args.allow_multiple);
+        assert!(!windows_args.allow_multiple);
 
         let empty = LaunchArgs::parse_from(Vec::<&str>::new());
         assert_eq!(empty, LaunchArgs::default());

@@ -1,8 +1,8 @@
 //! Localization helpers wrapping `rust-i18n` for live `zh-CN` / `en-US` switching.
 
 use loom_types::{
-    LanguagePreference, ProcessArch, ProcessCategory, ProcessPriority, RefreshSpeed, StartupPage,
-    ThemePreference, UacVirtualization,
+    LanguagePreference, PlatformKind, PlatformProfile, ProcessArch, ProcessCategory,
+    ProcessPriority, RefreshSpeed, StartupPage, ThemePreference, UacVirtualization,
 };
 
 /// Applies `preference` to `rust-i18n`'s active global locale immediately.
@@ -62,12 +62,29 @@ pub(crate) fn language_preference_label(lang: LanguagePreference) -> String {
     }
 }
 
-/// Returns the localized label for a [`ProcessCategory`].
-pub(crate) fn process_category_label(category: ProcessCategory) -> String {
+/// Returns the localized label for a [`ProcessCategory`] adapted to `platform`.
+pub(crate) fn process_category_label(
+    category: ProcessCategory,
+    platform: PlatformProfile,
+) -> String {
     match category {
         ProcessCategory::App => tr("processes.cat_apps"),
         ProcessCategory::Background => tr("processes.cat_background"),
-        ProcessCategory::System => tr("processes.cat_windows"),
+        ProcessCategory::System => match platform.kind {
+            PlatformKind::Windows => tr("processes.cat_windows"),
+            PlatformKind::Macos => tr("processes.cat_macos"),
+            PlatformKind::Linux | PlatformKind::Unknown => tr("processes.cat_system"),
+        },
+    }
+}
+
+/// Returns the localized Details virtualization/sandbox column header adapted to `platform`.
+pub(crate) fn virtualization_column_label(platform: PlatformProfile) -> String {
+    match platform.kind {
+        PlatformKind::Windows => tr("details.col_uac"),
+        PlatformKind::Linux | PlatformKind::Macos | PlatformKind::Unknown => {
+            tr("details.col_sandbox")
+        }
     }
 }
 
@@ -138,6 +155,8 @@ mod tests {
         "processes.cat_apps",
         "processes.cat_background",
         "processes.cat_windows",
+        "processes.cat_macos",
+        "processes.cat_system",
         "processes.status_elevated",
         "processes.menu_expand",
         "processes.menu_collapse",
@@ -166,6 +185,7 @@ mod tests {
         "details.col_working_set",
         "details.col_commit",
         "details.col_uac",
+        "details.col_sandbox",
         "details.col_gpu_memory",
         "details.col_publisher",
         "details.col_description",
@@ -227,8 +247,13 @@ mod tests {
         "milestone.notice",
     ];
 
+    use std::sync::Mutex;
+
+    static LOCALE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn zh_cn_and_en_us_cover_all_core_keys_and_switch_live() {
+        let _guard = LOCALE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for &key in CORE_KEYS {
             apply_locale(LanguagePreference::EnUs);
             let en = tr(key);
@@ -259,5 +284,64 @@ mod tests {
         assert_eq!(tr("uac.action"), "以管理员身份重启");
         assert_eq!(tr("tray.show"), "显示 Loom");
         assert_eq!(tr_milestone_badge("0.0.4"), "计划于 v0.0.4 交付");
+    }
+
+    #[test]
+    fn process_category_and_virtualization_labels_adapt_to_platform_profile() {
+        let _guard = LOCALE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        apply_locale(LanguagePreference::EnUs);
+        assert_eq!(
+            process_category_label(ProcessCategory::System, PlatformProfile::WINDOWS),
+            "Windows processes"
+        );
+        assert_eq!(
+            process_category_label(ProcessCategory::System, PlatformProfile::MACOS),
+            "macOS processes"
+        );
+        assert_eq!(
+            process_category_label(ProcessCategory::System, PlatformProfile::LINUX),
+            "System processes"
+        );
+        assert_eq!(
+            process_category_label(ProcessCategory::System, PlatformProfile::UNKNOWN),
+            "System processes"
+        );
+        assert_eq!(
+            virtualization_column_label(PlatformProfile::WINDOWS),
+            "UAC virtualization"
+        );
+        assert_eq!(
+            virtualization_column_label(PlatformProfile::LINUX),
+            "Sandbox"
+        );
+        assert_eq!(
+            virtualization_column_label(PlatformProfile::MACOS),
+            "Sandbox"
+        );
+
+        apply_locale(LanguagePreference::ZhCn);
+        assert_eq!(
+            process_category_label(ProcessCategory::System, PlatformProfile::WINDOWS),
+            "Windows 进程"
+        );
+        assert_eq!(
+            process_category_label(ProcessCategory::System, PlatformProfile::MACOS),
+            "macOS 进程"
+        );
+        assert_eq!(
+            process_category_label(ProcessCategory::System, PlatformProfile::LINUX),
+            "系统进程"
+        );
+        assert_eq!(
+            process_category_label(ProcessCategory::System, PlatformProfile::UNKNOWN),
+            "系统进程"
+        );
+        assert_eq!(
+            virtualization_column_label(PlatformProfile::WINDOWS),
+            "UAC 虚拟化"
+        );
+        assert_eq!(virtualization_column_label(PlatformProfile::LINUX), "沙箱");
+        assert_eq!(virtualization_column_label(PlatformProfile::MACOS), "沙箱");
     }
 }
