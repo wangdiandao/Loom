@@ -126,11 +126,6 @@ impl UiCommands {
             .dispatch_command(EngineCommand::ToggleProcessExpanded(key));
     }
 
-    /// Requests an immediate fast-lane sampling pass (even when paused).
-    pub(crate) fn force_refresh(store: &Entity<UiStore>, cx: &mut App) {
-        let _ = store.read(cx).dispatch_command(EngineCommand::ForceRefresh);
-    }
-
     /// Requests an on-demand elevated relaunch preserving the given route identifier.
     pub(crate) fn relaunch_elevated(store: &Entity<UiStore>, route: &str, cx: &mut App) {
         let _ = store

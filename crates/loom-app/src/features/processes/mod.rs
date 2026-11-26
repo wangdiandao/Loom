@@ -16,8 +16,8 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
-    StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
+    v_flex,
 };
 use gpui_kit::{
     App, Context, Entity, FocusHandle, Focusable, InteractiveElement as _, IntoElement,
@@ -46,17 +46,13 @@ use self::state::{
 
 const PROCESS_ROW_HEIGHT: f32 = 32.0;
 
-const COL_STATUS_W: f32 = 116.0;
+const COL_STATUS_W: f32 = 76.0;
 const COL_CPU_W: f32 = 74.0;
 const COL_MEMORY_W: f32 = 88.0;
 const COL_DISK_W: f32 = 82.0;
 const COL_NETWORK_W: f32 = 84.0;
 const COL_GPU_W: f32 = 68.0;
 const COL_PUBLISHER_W: f32 = 148.0;
-
-/// Embedded Lucide-style leaf vector matching `loom_ui_kit::status_badges` for the
-/// Efficiency Mode toolbar button and context menu.
-const ECO_LEAF_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 20a10 10 0 0 0 10-10 25.9 25.9 0 0 0-1.04-7.281 1 1 0 0 0-1.755-.325C15.833 5.5 13 5.5 9.8 6.1A7 7 0 0 0 11 20"/><path d="M2 21a5 5 0 0 1 2.911-4.544C7.613 15.212 8.351 15.24 11 13"/></svg>"#;
 
 /// Live Processes overview view.
 pub(crate) struct ProcessesView {
@@ -115,18 +111,6 @@ impl ProcessesView {
             return;
         };
         trigger_end_task_for_row(&self.store, row, window, cx);
-    }
-
-    fn toggle_efficiency_mode_for_selected(&self, cx: &mut Context<Self>) {
-        let snapshot = self.store.read(cx).snapshot().clone();
-        let Some(row) = find_selected_row(&snapshot.processes.rows, self.selected_key) else {
-            return;
-        };
-        if !is_efficiency_mode_eligible(row, snapshot.capabilities) {
-            return;
-        }
-        let next_enabled = !row.status.contains(ProcessStatusFlags::EFFICIENCY_MODE);
-        UiCommands::set_efficiency_mode(&self.store, row.key, next_enabled, cx);
     }
 }
 
@@ -395,9 +379,7 @@ impl Render for ProcessesView {
         let snapshot = store_ref.snapshot().clone();
         let settings = store_ref.settings().clone();
         let slice = snapshot.processes.clone();
-        let capabilities = snapshot.capabilities;
         let platform = snapshot.platform;
-        let eco_supported = capabilities.contains(CapabilityFlags::ECO_MODE);
         let view_mode = slice.view_mode;
         let sort_col = slice.sort_column;
         let sort_dir = slice.sort_direction;
@@ -405,10 +387,6 @@ impl Render for ProcessesView {
 
         let selected_row = find_selected_row(&slice.rows, self.selected_key);
         let end_task_enabled = selected_row.is_some_and(can_terminate_process);
-        let eco_eligible =
-            selected_row.is_some_and(|row| is_efficiency_mode_eligible(row, capabilities));
-        let eco_active =
-            selected_row.is_some_and(|r| r.status.contains(ProcessStatusFlags::EFFICIENCY_MODE));
 
         let theme = cx.theme();
         let border = theme.border;
@@ -423,7 +401,6 @@ impl Render for ProcessesView {
         let store_grouped = self.store.clone();
         let store_tree = self.store.clone();
         let store_run_task = self.store.clone();
-        let store_refresh = self.store.clone();
 
         let toolbar = h_flex()
             .w_full()
@@ -493,31 +470,7 @@ impl Render for ProcessesView {
                                         );
                                     }),
                             ),
-                    )
-                    .child(metric_pill(
-                        i18n::tr("processes.count_label"),
-                        slice.total_process_count.to_string(),
-                        muted_bg,
-                        muted_fg,
-                        fg,
-                        radius,
-                    ))
-                    .child(metric_pill(
-                        i18n::tr("processes.cpu_label"),
-                        format_permille(slice.total_cpu_permille),
-                        muted_bg,
-                        muted_fg,
-                        fg,
-                        radius,
-                    ))
-                    .child(metric_pill(
-                        i18n::tr("processes.memory_label"),
-                        format_permille(slice.total_memory_permille),
-                        muted_bg,
-                        muted_fg,
-                        fg,
-                        radius,
-                    )),
+                    ),
             )
             .child(
                 h_flex()
@@ -554,30 +507,6 @@ impl Render for ProcessesView {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.trigger_end_task_for_selected(window, cx);
                             })),
-                    )
-                    .when(eco_supported, |this| {
-                        this.child(
-                            Button::new("processes-efficiency-mode")
-                                .small()
-                                .outline()
-                                .selected(eco_active)
-                                .icon(Icon::default().data(ECO_LEAF_SVG))
-                                .label(i18n::tr("processes.efficiency_mode"))
-                                .disabled(!eco_eligible)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.toggle_efficiency_mode_for_selected(cx);
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new("processes-refresh")
-                            .small()
-                            .ghost()
-                            .icon(IconName::RefreshCw)
-                            .label(i18n::tr("processes.refresh"))
-                            .on_click(move |_, _, cx| {
-                                UiCommands::force_refresh(&store_refresh, cx);
-                            }),
                     ),
             );
 
@@ -992,6 +921,7 @@ impl Render for ProcessesView {
                                                             .flex_shrink_0()
                                                             .overflow_hidden()
                                                             .child(status_badges(
+                                                                row_id,
                                                                 row.status,
                                                                 &status_labels,
                                                                 &semantic,
@@ -1147,24 +1077,4 @@ fn sortable_column_header(
         .when(is_active, |this| {
             this.child(Icon::new(chevron).xsmall().text_color(primary))
         })
-}
-
-fn metric_pill(
-    label: String,
-    value: String,
-    bg: gpui_kit::Hsla,
-    label_fg: gpui_kit::Hsla,
-    value_fg: gpui_kit::Hsla,
-    radius: gpui_kit::Pixels,
-) -> impl IntoElement {
-    h_flex()
-        .items_center()
-        .gap_1p5()
-        .px_2p5()
-        .py_1()
-        .rounded(radius)
-        .bg(bg.opacity(0.65))
-        .text_xs()
-        .child(div().text_color(label_fg).child(label))
-        .child(div().font_semibold().text_color(value_fg).child(value))
 }

@@ -1025,11 +1025,11 @@ impl ProjectionEngine {
                 DetailsSortColumn::Name => cmp_str_ascii_ci(&a.name, &b.name),
                 DetailsSortColumn::Pid => a.key.pid.cmp(&b.key.pid),
                 DetailsSortColumn::Status => effective_status(a, cold_cache)
-                    .bits()
-                    .cmp(&effective_status(b, cold_cache).bits()),
+                    .contains(ProcessStatusFlags::SUSPENDED)
+                    .cmp(&effective_status(b, cold_cache).contains(ProcessStatusFlags::SUSPENDED)),
                 DetailsSortColumn::UserName => {
-                    let ua = ca.and_then(|m| m.user_name.as_deref()).unwrap_or("");
-                    let ub = cb.and_then(|m| m.user_name.as_deref()).unwrap_or("");
+                    let ua = display_user_for_sort(ca.and_then(|m| m.user_name.as_deref()));
+                    let ub = display_user_for_sort(cb.and_then(|m| m.user_name.as_deref()));
                     cmp_str_ascii_ci(ua, ub)
                 }
                 DetailsSortColumn::Cpu => a.cpu_permille.cmp(&b.cpu_permille),
@@ -1063,6 +1063,17 @@ impl ProjectionEngine {
                 .then_with(|| cmp_str_ascii_ci(&a.name, &b.name))
                 .then_with(|| a.key.cmp(&b.key))
         });
+    }
+}
+
+#[inline]
+fn display_user_for_sort(raw: Option<&str>) -> &str {
+    let Some(name) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return "";
+    };
+    match name.rsplit_once('\\') {
+        Some((_, account)) if !account.is_empty() => account,
+        _ => name,
     }
 }
 
