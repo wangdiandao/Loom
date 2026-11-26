@@ -1,0 +1,11 @@
+[package]
+name = "loom-pal-linux"
+description = "Linux Platform Abstraction Layer backend skeleton for Loom (planned for 0.2.0)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+loom-pal-api.workspace = true
+loom-types.workspace = true

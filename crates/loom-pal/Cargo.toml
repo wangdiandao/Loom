@@ -1,0 +1,19 @@
+[package]
+name = "loom-pal"
+description = "Compile-time static platform backend facade exporting NativeBackend for Loom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+loom-pal-api.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+loom-pal-windows.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+loom-pal-macos.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+loom-pal-linux.workspace = true

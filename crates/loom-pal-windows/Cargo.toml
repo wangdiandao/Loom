@@ -1,0 +1,11 @@
+[package]
+name = "loom-pal-windows"
+description = "Windows native Platform Abstraction Layer backend for Loom (WMI/PDH-free)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+loom-pal-api.workspace = true
+loom-types.workspace = true

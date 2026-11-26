@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/loom-types",
+    "crates/loom-config",
+    "crates/loom-pal-api",
+    "crates/loom-pal-windows",
+    "crates/loom-pal-macos",
+    "crates/loom-pal-linux",
+    "crates/loom-pal",
+    "crates/loom-engine",
+    "crates/loom-ui-kit",
+    "crates/loom-app",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/wangdiandao/Loom"
+
+[workspace.dependencies]
+# Internal workspace crates
+loom-types = { path = "crates/loom-types", version = "0.0.1" }
+loom-config = { path = "crates/loom-config", version = "0.0.1" }
+loom-pal-api = { path = "crates/loom-pal-api", version = "0.0.1" }
+loom-pal-windows = { path = "crates/loom-pal-windows", version = "0.0.1" }
+loom-pal-macos = { path = "crates/loom-pal-macos", version = "0.0.1" }
+loom-pal-linux = { path = "crates/loom-pal-linux", version = "0.0.1" }
+loom-pal = { path = "crates/loom-pal", version = "0.0.1" }
+loom-engine = { path = "crates/loom-engine", version = "0.0.1" }
+loom-ui-kit = { path = "crates/loom-ui-kit", version = "0.0.1" }
+
+# Core external crates
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+thiserror = "2"
+bitflags = { version = "2", features = ["serde"] }
+smallvec = { version = "1", features = ["serde"] }
+arc-swap = "1"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+tempfile = "3"
+directories = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+windows-sys = "0.61"
+rust-i18n = "4"
+tray-icon = "0.27"
+single-instance = "0.3"
+gpui-kit = "0.11.0"

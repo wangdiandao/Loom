@@ -1,0 +1,16 @@
+[package]
+name = "loom-app"
+description = "Loom desktop task manager binary composition root and feature-sliced UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+loom-config.workspace = true
+loom-engine.workspace = true
+loom-pal.workspace = true
+loom-types.workspace = true
+loom-ui-kit.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
