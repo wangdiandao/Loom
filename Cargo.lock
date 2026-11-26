@@ -3959,6 +3959,7 @@ name = "loom-ui-kit"
 version = "0.0.1"
 dependencies = [
  "gpui-kit",
+ "image",
  "loom-types",
 ]
 
