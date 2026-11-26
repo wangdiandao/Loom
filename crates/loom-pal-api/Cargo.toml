@@ -1,0 +1,11 @@
+[package]
+name = "loom-pal-api"
+description = "Static-dispatch Platform Abstraction Layer (PAL) traits, scratch buffers, and errors for Loom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+loom-types.workspace = true
+thiserror.workspace = true

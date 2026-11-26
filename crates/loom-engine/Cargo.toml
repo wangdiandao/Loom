@@ -1,0 +1,13 @@
+[package]
+name = "loom-engine"
+description = "Headless dual-lane sampling, diffing, process-tree, and snapshot projection engine for Loom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+loom-config.workspace = true
+loom-pal-api.workspace = true
+loom-types.workspace = true

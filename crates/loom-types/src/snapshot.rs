@@ -1,0 +1,432 @@
+//! Pre-computed view projections, on-demand monitor domains, and domain-split snapshots.
+
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    CapabilityFlags, DetailsSortColumn, DetailsViewMode, ExeIconRgba, PerformanceSlice,
+    ProcessArch, ProcessCategory, ProcessKey, ProcessPriority, ProcessSortColumn,
+    ProcessStatusFlags, ProcessViewMode, SortDirection, Timestamp100Ns, UacVirtualization,
+};
+
+/// On-demand monitoring domains gated by RAII `MonitorLease` reference counts.
+///
+/// Domains without an active lease are skipped by the engine so hidden tabs
+/// and minimized windows incur zero unnecessary polling or projection overhead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MonitorDomain {
+    /// Full-field Details table projection.
+    Details,
+    /// Hardware Performance metrics and charts.
+    Performance,
+    /// System services (SCM / systemd / launchd).
+    Services,
+    /// Startup applications.
+    Startup,
+    /// Logged-in user sessions.
+    Users,
+    /// Application resource usage history.
+    AppHistory,
+    /// Fine-grained per-logical-CPU utilization and histories.
+    PerCoreCpu,
+}
+
+impl MonitorDomain {
+    /// Total number of [`MonitorDomain`] variants.
+    pub const COUNT: usize = 7;
+
+    /// Returns a dense array index in `0..Self::COUNT` for lock-free lease tables.
+    #[inline]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Details => 0,
+            Self::Performance => 1,
+            Self::Services => 2,
+            Self::Startup => 3,
+            Self::Users => 4,
+            Self::AppHistory => 5,
+            Self::PerCoreCpu => 6,
+        }
+    }
+}
+
+/// Monotonically increasing per-domain revision counters embedded in [`AppSnapshot`].
+///
+/// UI slices compare their last-observed revision against these counters to
+/// re-render only when their subscribed domain actually changed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DomainRevisions {
+    /// Revision of [`AppSnapshot::processes`].
+    pub processes: u64,
+    /// Revision of [`AppSnapshot::details`].
+    pub details: u64,
+    /// Revision of [`AppSnapshot::performance`].
+    pub performance: u64,
+    /// Revision of [`AppSnapshot::services`].
+    pub services: u64,
+    /// Revision of [`AppSnapshot::startup`].
+    pub startup: u64,
+    /// Revision of [`AppSnapshot::users`].
+    pub users: u64,
+    /// Revision of [`AppSnapshot::app_history`].
+    pub app_history: u64,
+}
+
+/// Discriminator for flattened rows in the Processes table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProcessRowKind {
+    /// Section separator header in grouped mode (Apps / Background / Windows).
+    SectionHeader {
+        /// Category represented by this section.
+        category: ProcessCategory,
+        /// Number of processes currently under this section.
+        count: usize,
+    },
+    /// An individual process (or expandable process group/tree node).
+    Process,
+}
+
+/// Pre-computed row projection for O(1) virtualized rendering in the Processes table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessRowProjection {
+    /// Row kind (section header vs. process row).
+    pub kind: ProcessRowKind,
+    /// Composite process key (zeroed for section headers).
+    pub key: ProcessKey,
+    /// Indentation depth (`0` for top-level rows, `1+` for expanded children).
+    pub depth: u16,
+    /// Whether this row can be expanded to reveal child processes.
+    pub has_children: bool,
+    /// Whether this row's children are currently expanded.
+    pub is_expanded: bool,
+    /// Number of direct or grouped child processes under this row.
+    pub child_count: u32,
+    /// Raw executable/process image name.
+    pub name: Arc<str>,
+    /// Friendly display name (file description, window title, or fallback image name).
+    pub display_name: Arc<str>,
+    /// Optional primary window title.
+    pub window_title: Option<Arc<str>>,
+    /// Optional binary publisher name.
+    pub publisher: Option<Arc<str>>,
+    /// Optional downsampled `20x20` RGBA icon.
+    pub icon: Option<ExeIconRgba>,
+    /// Grouping category of this process.
+    pub category: ProcessCategory,
+    /// Dynamic process status flags.
+    pub status: ProcessStatusFlags,
+    /// CPU utilization in permille (`0..=1000`).
+    pub cpu_permille: u16,
+    /// Memory footprint (private working set) in bytes.
+    pub memory_bytes: u64,
+    /// Memory utilization in permille of total RAM (`0..=1000`).
+    pub memory_permille: u16,
+    /// Combined disk read+write throughput in bytes per second.
+    pub disk_bytes_per_sec: u64,
+    /// Combined network recv+send throughput in bytes per second.
+    pub net_bytes_per_sec: u64,
+    /// GPU utilization in permille (`0..=1000`).
+    pub gpu_util_permille: u16,
+    /// Dedicated GPU memory used in bytes.
+    pub gpu_dedicated_bytes: u64,
+}
+
+/// Pre-computed row projection for O(1) virtualized rendering in the Details table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailsRowProjection {
+    /// Composite process lifecycle key.
+    pub key: ProcessKey,
+    /// Verified parent process key, if the parent is alive and older.
+    pub parent_key: Option<ProcessKey>,
+    /// Indentation depth in tree mode (`0` in flat mode).
+    pub depth: u16,
+    /// Whether this node has child processes in tree mode.
+    pub has_children: bool,
+    /// Whether children are currently expanded in tree mode.
+    pub is_expanded: bool,
+    /// Executable image name.
+    pub name: Arc<str>,
+    /// Optional binary file description.
+    pub description: Option<Arc<str>>,
+    /// Optional downsampled RGBA icon.
+    pub icon: Option<ExeIconRgba>,
+    /// Dynamic process status flags.
+    pub status: ProcessStatusFlags,
+    /// Owning user account name, if resolved.
+    pub user_name: Option<Arc<str>>,
+    /// OS login session identifier.
+    pub session_id: u32,
+    /// CPU utilization in permille (`0..=1000`).
+    pub cpu_permille: u16,
+    /// Cumulative CPU time (kernel + user) in 100-nanosecond ticks.
+    pub cpu_time_100ns: u64,
+    /// Private working set memory in bytes.
+    pub private_working_set_bytes: u64,
+    /// Total resident working set memory in bytes.
+    pub working_set_bytes: u64,
+    /// Private committed virtual memory in bytes.
+    pub commit_bytes: u64,
+    /// Active thread count.
+    pub thread_count: u32,
+    /// Open handle / file descriptor count.
+    pub handle_count: u32,
+    /// Scheduling priority class.
+    pub priority: ProcessPriority,
+    /// Process CPU architecture.
+    pub arch: ProcessArch,
+    /// UAC virtualization state.
+    pub uac_virtualization: UacVirtualization,
+    /// Dedicated GPU video memory in bytes.
+    pub gpu_dedicated_bytes: u64,
+    /// Shared GPU memory in bytes.
+    pub gpu_shared_bytes: u64,
+    /// Full executable image path, if resolved.
+    pub exe_path: Option<Arc<str>>,
+    /// Full command line, if resolved.
+    pub command_line: Option<Arc<str>>,
+}
+
+/// Published snapshot slice for the Processes view.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ProcessTableSlice {
+    /// Monotonic revision counter for this slice.
+    pub revision: u64,
+    /// Timestamp of the underlying kernel sample.
+    pub timestamp: Timestamp100Ns,
+    /// Active view mode used to construct `rows`.
+    pub view_mode: ProcessViewMode,
+    /// Active sort column used to construct `rows`.
+    pub sort_column: ProcessSortColumn,
+    /// Active sort direction used to construct `rows`.
+    pub sort_direction: SortDirection,
+    /// Total number of live processes (excluding section header rows).
+    pub total_process_count: usize,
+    /// Aggregate system CPU utilization in permille (`0..=1000`).
+    pub total_cpu_permille: u16,
+    /// Aggregate system memory utilization in permille (`0..=1000`).
+    pub total_memory_permille: u16,
+    /// Aggregate system disk throughput in bytes per second.
+    pub total_disk_bytes_per_sec: u64,
+    /// Aggregate system network throughput in bytes per second.
+    pub total_net_bytes_per_sec: u64,
+    /// Aggregate system GPU utilization in permille (`0..=1000`).
+    pub total_gpu_permille: u16,
+    /// Pre-sorted, pre-filtered flattened rows ready for virtual table rendering.
+    pub rows: Vec<ProcessRowProjection>,
+}
+
+/// Published snapshot slice for the Details view.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DetailsTableSlice {
+    /// Monotonic revision counter for this slice.
+    pub revision: u64,
+    /// Timestamp of the underlying kernel sample.
+    pub timestamp: Timestamp100Ns,
+    /// Active details view mode (`Flat` or `Tree`).
+    pub view_mode: DetailsViewMode,
+    /// Active sort column.
+    pub sort_column: DetailsSortColumn,
+    /// Active sort direction.
+    pub sort_direction: SortDirection,
+    /// Pre-sorted, pre-filtered rows ready for virtual table rendering.
+    pub rows: Vec<DetailsRowProjection>,
+}
+
+/// Lifecycle state of an OS system service.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ServiceState {
+    /// Service is stopped.
+    Stopped,
+    /// Service is starting.
+    StartPending,
+    /// Service is stopping.
+    StopPending,
+    /// Service is running.
+    Running,
+    /// Service is resuming from paused state.
+    ContinuePending,
+    /// Service is pausing.
+    PausePending,
+    /// Service is paused.
+    Paused,
+    /// Service state could not be mapped.
+    #[default]
+    Unknown,
+}
+
+/// Metadata and current status of an OS system service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRecord {
+    /// Internal service name (unique identifier).
+    pub name: Arc<str>,
+    /// Human-readable service display name.
+    pub display_name: Arc<str>,
+    /// Optional service description.
+    pub description: Option<Arc<str>>,
+    /// Hosting process ID if the service is currently running.
+    pub pid: Option<u32>,
+    /// Current lifecycle state.
+    pub state: ServiceState,
+    /// Optional service load-order or host group name.
+    pub group: Option<Arc<str>>,
+}
+
+/// Published snapshot slice for the Services view.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ServicesSlice {
+    /// Monotonic revision counter for this slice.
+    pub revision: u64,
+    /// Timestamp of the last service enumeration.
+    pub timestamp: Timestamp100Ns,
+    /// Enumerated system services.
+    pub items: Vec<ServiceRecord>,
+}
+
+/// Estimated boot impact rating of a startup application.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StartupImpact {
+    /// High startup latency impact.
+    High,
+    /// Medium startup latency impact.
+    Medium,
+    /// Low startup latency impact.
+    Low,
+    /// Impact has not yet been measured by the OS.
+    #[default]
+    NotMeasured,
+    /// Entry is disabled or has negligible impact.
+    None,
+}
+
+/// A single registered startup application entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupEntry {
+    /// Stable platform identifier for toggling this entry.
+    pub id: Arc<str>,
+    /// Display name of the startup item.
+    pub name: Arc<str>,
+    /// Optional publisher name.
+    pub publisher: Option<Arc<str>>,
+    /// Optional command or target path.
+    pub command: Option<Arc<str>>,
+    /// Whether this startup entry is currently enabled.
+    pub enabled: bool,
+    /// Estimated startup impact.
+    pub impact: StartupImpact,
+}
+
+/// Published snapshot slice for the Startup Applications view.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StartupSlice {
+    /// Monotonic revision counter for this slice.
+    pub revision: u64,
+    /// Timestamp of the last startup scan.
+    pub timestamp: Timestamp100Ns,
+    /// Last BIOS/firmware boot time in milliseconds, if reported by the OS.
+    pub last_bios_time_ms: Option<u64>,
+    /// Enumerated startup entries.
+    pub items: Vec<StartupEntry>,
+}
+
+/// Connection state of a logged-in OS user session.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UserSessionState {
+    /// Session is actively attached to a local or remote display.
+    Active,
+    /// Session is disconnected but retains running processes.
+    Disconnected,
+    /// Session is idle.
+    Idle,
+    /// Session state is unknown.
+    #[default]
+    Unknown,
+}
+
+/// Aggregated resource metrics for a single OS user session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserSessionRecord {
+    /// OS session identifier.
+    pub session_id: u32,
+    /// Logged-in user account name.
+    pub user_name: Arc<str>,
+    /// Current session connection state.
+    pub state: UserSessionState,
+    /// Number of running processes belonging to this session.
+    pub process_count: u32,
+    /// Aggregated CPU utilization in permille (`0..=1000`).
+    pub cpu_permille: u16,
+    /// Aggregated private working set memory in bytes.
+    pub memory_bytes: u64,
+    /// Aggregated disk throughput in bytes per second.
+    pub disk_bytes_per_sec: u64,
+    /// Aggregated network throughput in bytes per second.
+    pub net_bytes_per_sec: u64,
+}
+
+/// Published snapshot slice for the Users view.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UsersSlice {
+    /// Monotonic revision counter for this slice.
+    pub revision: u64,
+    /// Timestamp of the last session aggregation.
+    pub timestamp: Timestamp100Ns,
+    /// Active and disconnected user sessions.
+    pub sessions: Vec<UserSessionRecord>,
+}
+
+/// Cumulative historical resource usage record for an application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppHistoryRecord {
+    /// Platform application identifier (e.g., AUMID or package family name).
+    pub app_id: Arc<str>,
+    /// Human-readable application display name.
+    pub name: Arc<str>,
+    /// Cumulative CPU time in 100-nanosecond ticks.
+    pub cpu_time_100ns: u64,
+    /// Cumulative total network traffic in bytes.
+    pub network_bytes: u64,
+    /// Cumulative metered network traffic in bytes.
+    pub metered_network_bytes: u64,
+}
+
+/// Published snapshot slice for the App History view.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AppHistorySlice {
+    /// Monotonic revision counter for this slice.
+    pub revision: u64,
+    /// Timestamp of the last history refresh.
+    pub timestamp: Timestamp100Ns,
+    /// Unix epoch timestamp (in seconds) since which history has been accumulated.
+    pub since_epoch_secs: Option<u64>,
+    /// Cumulative per-application history entries.
+    pub items: Vec<AppHistoryRecord>,
+}
+
+/// Root lock-free immutable snapshot published via `ArcSwap<AppSnapshot>`.
+///
+/// Each domain slice is wrapped in an independent `Arc` so unchanged domains
+/// are reused by pointer copy without cloning their backing vectors.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AppSnapshot {
+    /// Per-domain monotonic revision numbers for incremental UI updates.
+    pub revisions: DomainRevisions,
+    /// Static capabilities advertised by the active platform backend.
+    pub capabilities: CapabilityFlags,
+    /// Whether the Loom process itself is currently running elevated.
+    pub is_elevated: bool,
+    /// Pre-projected Processes table slice.
+    pub processes: Arc<ProcessTableSlice>,
+    /// Pre-projected Details table slice.
+    pub details: Arc<DetailsTableSlice>,
+    /// Hardware Performance metrics and 60-point history slice.
+    pub performance: Arc<PerformanceSlice>,
+    /// System Services slice.
+    pub services: Arc<ServicesSlice>,
+    /// Startup Applications slice.
+    pub startup: Arc<StartupSlice>,
+    /// User Sessions slice.
+    pub users: Arc<UsersSlice>,
+    /// Application History slice.
+    pub app_history: Arc<AppHistorySlice>,
+}

@@ -1,2 +1,6 @@
 /AGENTS.md
-/target/
+/target
+*.dmp
+*.log
+.DS_Store
+Thumbs.db

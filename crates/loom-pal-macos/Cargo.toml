@@ -1,0 +1,11 @@
+[package]
+name = "loom-pal-macos"
+description = "macOS Platform Abstraction Layer backend skeleton for Loom (planned for 0.3.0)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+loom-pal-api.workspace = true
+loom-types.workspace = true
