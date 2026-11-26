@@ -625,6 +625,7 @@ impl Render for DetailsView {
 
         let store_flat = self.store.clone();
         let store_tree = self.store.clone();
+        let store_run_task = self.store.clone();
         let store_refresh = self.store.clone();
         let store_end_task = self.store.clone();
         let store_end_tree = self.store.clone();
@@ -634,6 +635,7 @@ impl Render for DetailsView {
 
         let toolbar = h_flex()
             .w_full()
+            .flex_wrap()
             .items_center()
             .justify_between()
             .gap_3()
@@ -657,9 +659,12 @@ impl Render for DetailsView {
                         h_flex()
                             .items_center()
                             .gap_1()
+                            .p_0p5()
+                            .rounded(radius)
+                            .bg(muted_bg.opacity(0.65))
                             .child(
                                 Button::new("details-mode-flat")
-                                    .small()
+                                    .xsmall()
                                     .label(i18n::tr("details.view_flat"))
                                     .map(|btn| {
                                         if view_mode == DetailsViewMode::Flat {
@@ -678,7 +683,7 @@ impl Render for DetailsView {
                             )
                             .child(
                                 Button::new("details-mode-tree")
-                                    .small()
+                                    .xsmall()
                                     .label(i18n::tr("details.view_tree"))
                                     .map(|btn| {
                                         if view_mode == DetailsViewMode::Tree {
@@ -733,9 +738,24 @@ impl Render for DetailsView {
             )
             .child(
                 h_flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .flex_shrink_0()
+                    .child(
+                        Button::new("details-run-new-task")
+                            .small()
+                            .primary()
+                            .icon(IconName::Play)
+                            .label(i18n::tr("details.run_new_task"))
+                            .on_click(move |_, window, cx| {
+                                crate::shell::dialogs::open_run_new_task_dialog(
+                                    store_run_task.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }),
+                    )
                     .child(
                         Button::new("details-end-task")
                             .small()
@@ -1129,8 +1149,14 @@ impl Render for DetailsView {
                                                         let menu_store = store_for_rows.clone();
                                                         let menu_target = target.clone();
 
+                                                        let row_a11y_label: SharedString =
+                                                            format!("{} (PID {})", row.name, key.pid)
+                                                                .into();
                                                         let row_element = h_flex()
                                                             .id(("details-row", row_id))
+                                                            .role(gpui_kit::Role::ListItem)
+                                                            .aria_label(row_a11y_label)
+                                                            .aria_selected(is_selected)
                                                             .w_full()
                                                             .h(px(DETAILS_ROW_HEIGHT))
                                                             .items_center()

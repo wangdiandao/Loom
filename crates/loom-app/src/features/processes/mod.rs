@@ -848,9 +848,15 @@ impl Render for ProcessesView {
                                                     .into_any_element()
                                             };
 
+                                            let row_a11y_label: SharedString =
+                                                format!("{} (PID {})", row.display_name, key.pid)
+                                                    .into();
                                             Some(
                                                 h_flex()
                                                     .id(("proc-row", row_id))
+                                                    .role(gpui_kit::Role::ListItem)
+                                                    .aria_label(row_a11y_label)
+                                                    .aria_selected(is_selected)
                                                     .w_full()
                                                     .h(px(PROCESS_ROW_HEIGHT))
                                                     .items_center()
@@ -868,19 +874,16 @@ impl Render for ProcessesView {
                                                             s.bg(row_hover)
                                                         }
                                                     })
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        move |_, window, cx| {
-                                                            let _ = select_left.update(
-                                                                cx,
-                                                                |view, cx| {
-                                                                    view.select_process(
-                                                                        key, window, cx,
-                                                                    );
-                                                                },
-                                                            );
-                                                        },
-                                                    )
+                                                    .on_click(move |_, window, cx| {
+                                                        let _ = select_left.update(
+                                                            cx,
+                                                            |view, cx| {
+                                                                view.select_process(
+                                                                    key, window, cx,
+                                                                );
+                                                            },
+                                                        );
+                                                    })
                                                     .on_mouse_down(
                                                         MouseButton::Right,
                                                         move |_, window, cx| {
@@ -938,8 +941,7 @@ impl Render for ProcessesView {
                                                                     .overflow_hidden()
                                                                     .child(
                                                                         div()
-                                                                            .flex_shrink_0()
-                                                                            .max_w_full()
+                                                                            .min_w_0()
                                                                             .truncate()
                                                                             .when(
                                                                                 is_selected

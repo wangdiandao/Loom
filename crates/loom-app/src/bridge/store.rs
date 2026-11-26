@@ -138,7 +138,6 @@ impl UiStore {
     }
 
     /// Dispatches an [`EngineCommand`] and returns a oneshot receiver for its [`CommandEvent`].
-    #[allow(dead_code)] // Consumed by 0.0.3 UI dialogs (Issues #10 & #11).
     pub(crate) fn dispatch_command_with_reply(
         &self,
         command: EngineCommand,
