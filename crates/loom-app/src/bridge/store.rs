@@ -137,6 +137,20 @@ impl UiStore {
         res
     }
 
+    /// Dispatches an [`EngineCommand`] and returns a oneshot receiver for its [`CommandEvent`].
+    #[allow(dead_code)] // Consumed by 0.0.3 UI dialogs (Issues #10 & #11).
+    pub(crate) fn dispatch_command_with_reply(
+        &self,
+        command: EngineCommand,
+    ) -> Result<Receiver<CommandEvent>, EngineCommandError> {
+        let kind = command.kind();
+        let res = self.coordinator.send_command_with_reply(command);
+        if let Err(ref err) = res {
+            tracing::warn!(?kind, %err, "failed to enqueue engine command with reply");
+        }
+        res
+    }
+
     /// Mutates [`AppSettings`], persists atomically via [`ConfigStore`], and notifies subscribers.
     pub(crate) fn update_settings(
         &mut self,

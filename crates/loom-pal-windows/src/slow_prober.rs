@@ -36,8 +36,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     DeleteObject, GetDIBits, GetObjectW, HDC, HGDIOBJ,
 };
 use windows_sys::Win32::Security::{
-    GetLengthSid, GetTokenInformation, LookupAccountSidW, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER,
-    TokenUser, TokenVirtualizationAllowed, TokenVirtualizationEnabled,
+    GetLengthSid, GetTokenInformation, LookupAccountSidW, SID_NAME_USE, TOKEN_ELEVATION,
+    TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser, TokenVirtualizationAllowed,
+    TokenVirtualizationEnabled,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, GetDriveTypeW, GetFileVersionInfoSizeW, GetFileVersionInfoW,
@@ -51,7 +52,9 @@ use windows_sys::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_UNKNOWN,
 };
 use windows_sys::Win32::System::Threading::{
-    IsWow64Process2, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetProcessInformation, IsWow64Process2, OpenProcessToken,
+    PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+    PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_LIMITED_INFORMATION, ProcessPowerThrottling,
     QueryFullProcessImageNameW,
 };
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
@@ -285,7 +288,9 @@ impl SlowMetadataProber for WindowsSlowProber {
         let exe_path = query_process_image_path(handle.as_raw()).map(Arc::<str>::from);
         let command_line = query_process_command_line(handle.as_raw()).map(Arc::<str>::from);
         let arch = query_process_arch(handle.as_raw());
-        let (user_name, uac_virtualization) = query_token_metadata(handle.as_raw(), self);
+        let efficiency_mode = query_efficiency_mode(handle.as_raw());
+        let (user_name, uac_virtualization, is_elevated) =
+            query_token_metadata(handle.as_raw(), self);
 
         Ok(ProcessColdMeta {
             key,
@@ -294,6 +299,8 @@ impl SlowMetadataProber for WindowsSlowProber {
             user_name,
             arch,
             uac_virtualization,
+            efficiency_mode,
+            is_elevated,
             asset: None,
         })
     }
@@ -516,24 +523,62 @@ fn query_process_arch(handle: HANDLE) -> ProcessArch {
     }
 }
 
-/// Queries process token owner account name and UAC virtualization state.
+/// Queries whether EcoQoS / Efficiency Mode is active on `handle` via
+/// `GetProcessInformation(ProcessPowerThrottling)`.
+fn query_efficiency_mode(handle: HANDLE) -> bool {
+    let mut state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: 0,
+        StateMask: 0,
+    };
+    // SAFETY: `handle` has `PROCESS_QUERY_LIMITED_INFORMATION` and `state` matches `ProcessPowerThrottling`.
+    let ok = unsafe {
+        GetProcessInformation(
+            handle,
+            ProcessPowerThrottling,
+            (&mut state as *mut PROCESS_POWER_THROTTLING_STATE).cast::<c_void>(),
+            size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    };
+    ok != 0 && (state.ControlMask & state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
+}
+
+/// Queries process token owner account name, UAC virtualization state, and elevation status.
 fn query_token_metadata(
     proc_handle: HANDLE,
     prober: &WindowsSlowProber,
-) -> (Option<Arc<str>>, UacVirtualization) {
+) -> (Option<Arc<str>>, UacVirtualization, bool) {
     let mut raw_token: HANDLE = ptr::null_mut();
     // SAFETY: `OpenProcessToken` writes a new token handle into `raw_token` when successful.
     let ok = unsafe { OpenProcessToken(proc_handle, TOKEN_QUERY, &mut raw_token) };
     if ok == 0 {
-        return (None, UacVirtualization::Unknown);
+        return (None, UacVirtualization::Unknown, false);
     }
     let Some(token) = OwnedHandle::from_raw(raw_token) else {
-        return (None, UacVirtualization::Unknown);
+        return (None, UacVirtualization::Unknown, false);
     };
 
     let uac = query_uac_virtualization(token.as_raw());
     let user = query_token_user(token.as_raw(), prober);
-    (user, uac)
+    let is_elevated = query_token_elevation(token.as_raw());
+    (user, uac, is_elevated)
+}
+
+/// Queries `TokenElevation` from an open `TOKEN_QUERY` handle.
+fn query_token_elevation(token: HANDLE) -> bool {
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut ret_len: u32 = 0;
+    // SAFETY: `elevation` matches `TokenElevation` output size.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast::<c_void>(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret_len,
+        )
+    };
+    ok != 0 && elevation.TokenIsElevated != 0
 }
 
 /// Queries `TokenVirtualizationAllowed` and `TokenVirtualizationEnabled` from a process token.

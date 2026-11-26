@@ -225,6 +225,11 @@ mod tests {
             scratch.samples.len()
         );
 
+        #[cfg(debug_assertions)]
+        const WARM_BUDGET: Duration = Duration::from_millis(25);
+        #[cfg(not(debug_assertions))]
+        const WARM_BUDGET: Duration = Duration::from_millis(10);
+
         assert!(ts2 >= ts1);
         assert_eq!(
             scratch.samples.capacity(),
@@ -237,8 +242,9 @@ mod tests {
             "scratch.string_buf unexpectedly reallocated on warm tick"
         );
         assert!(
-            elapsed < Duration::from_millis(10),
-            "warm fast-lane scan exceeded 10ms budget: {elapsed:?}"
+            elapsed < WARM_BUDGET,
+            "warm fast-lane scan exceeded {:?} budget: {elapsed:?}",
+            WARM_BUDGET
         );
 
         let my_pid = std::process::id();
@@ -432,5 +438,176 @@ mod tests {
             .terminate_process(bad_key)
             .expect_err("terminate_process with wrong create_time must fail");
         assert!(matches!(err, PalError::ProcessIdentityMismatch(k) if k == bad_key));
+    }
+
+    #[test]
+    fn slow_prober_reads_efficiency_mode_and_elevation_on_current_process() {
+        let op = WindowsSystemOperator::new();
+        let mut fast = WindowsFastSampler::new();
+        let mut scratch = ProcessSampleScratch::<()>::with_capacity(512, 32 * 1024);
+        fast.sample_processes(&mut scratch)
+            .expect("sample_processes");
+
+        let my_pid = std::process::id();
+        let my_key = scratch
+            .samples
+            .iter()
+            .find(|s| s.key.pid == my_pid)
+            .expect("current process in fast sample")
+            .key;
+
+        let prober = WindowsSlowProber::new();
+        let meta = prober
+            .probe_process(my_key)
+            .expect("probe_process on current process");
+
+        assert_eq!(
+            meta.is_elevated,
+            op.is_elevated(),
+            "SlowProber TokenElevation must match SystemOperator::is_elevated for self"
+        );
+        // Verify efficiency_mode field is cleanly populated without panicking.
+        let _eco = meta.efficiency_mode;
+    }
+
+    #[test]
+    fn system_operator_rejects_empty_affinity_and_protects_kernel_processes() {
+        let op = WindowsSystemOperator::new();
+        let mut fast = WindowsFastSampler::new();
+        let mut scratch = ProcessSampleScratch::<()>::with_capacity(512, 32 * 1024);
+        fast.sample_processes(&mut scratch)
+            .expect("sample_processes");
+
+        let my_pid = std::process::id();
+        let my_key = scratch
+            .samples
+            .iter()
+            .find(|s| s.key.pid == my_pid)
+            .expect("current process")
+            .key;
+
+        let empty_mask = loom_types::CpuAffinityMask::empty(op.logical_cpu_count());
+        let err = op
+            .set_affinity(my_key, &empty_mask)
+            .expect_err("empty CPU affinity mask must be rejected");
+        assert!(
+            matches!(err, PalError::InvalidArgument(_)),
+            "expected PalError::InvalidArgument, got {err:?}"
+        );
+
+        // PID 0 (System Idle) and PID 4 (System) must be gracefully rejected without panicking.
+        for kernel_pid in [0u32, 4u32] {
+            let key = scratch
+                .samples
+                .iter()
+                .find(|s| s.key.pid == kernel_pid)
+                .map_or_else(|| ProcessKey::new(kernel_pid, 0), |s| s.key);
+            let eco_err = op
+                .set_efficiency_mode(key, true)
+                .expect_err("kernel process EcoQoS toggle must be rejected");
+            assert!(
+                matches!(
+                    eco_err,
+                    PalError::Unsupported(_) | PalError::ElevationRequired
+                ),
+                "unexpected error for PID {kernel_pid}: {eco_err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn child_process_priority_efficiency_mode_and_terminate_lifecycle() {
+        use std::process::{Child, Command, Stdio};
+
+        struct ChildGuard(Option<Child>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        // Spawn a harmless, silent child process that waits ~30s without requiring stdin.
+        let child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn harmless ping child process");
+        let child_pid = child.id();
+        let mut guard = ChildGuard(Some(child));
+
+        let mut fast = WindowsFastSampler::new();
+        let mut scratch = ProcessSampleScratch::<()>::with_capacity(512, 32 * 1024);
+
+        // Locate child ProcessKey from WindowsFastSampler.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let child_key = loop {
+            fast.sample_processes(&mut scratch)
+                .expect("sample_processes");
+            if let Some(sample) = scratch.samples.iter().find(|s| s.key.pid == child_pid) {
+                break sample.key;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "spawned child PID {child_pid} did not appear in fast sample"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let op = WindowsSystemOperator::new();
+        let prober = WindowsSlowProber::new();
+
+        // 1. Verify set_priority succeeds and is reflected in fast sample.
+        op.set_priority(child_key, loom_types::ProcessPriority::BelowNormal)
+            .expect("set_priority(BelowNormal) on child");
+        fast.sample_processes(&mut scratch)
+            .expect("sample_processes after set_priority");
+        let after_prio = scratch
+            .samples
+            .iter()
+            .find(|s| s.key == child_key)
+            .expect("child process still alive after set_priority");
+        assert_eq!(
+            after_prio.priority,
+            loom_types::ProcessPriority::BelowNormal
+        );
+
+        // 2. Verify set_efficiency_mode(true) -> probe_process sees efficiency_mode == true
+        //    -> set_efficiency_mode(false) -> probe_process sees efficiency_mode == false.
+        op.set_efficiency_mode(child_key, true)
+            .expect("set_efficiency_mode(true) on child");
+        let meta_on = prober
+            .probe_process(child_key)
+            .expect("probe_process after enabling EcoQoS");
+        assert!(
+            meta_on.efficiency_mode,
+            "probe_process must report efficiency_mode == true after set_efficiency_mode(true)"
+        );
+
+        op.set_efficiency_mode(child_key, false)
+            .expect("set_efficiency_mode(false) on child");
+        let meta_off = prober
+            .probe_process(child_key)
+            .expect("probe_process after disabling EcoQoS");
+        assert!(
+            !meta_off.efficiency_mode,
+            "probe_process must report efficiency_mode == false after set_efficiency_mode(false)"
+        );
+
+        // 3. Verify terminate_process kills the child cleanly.
+        op.terminate_process(child_key)
+            .expect("terminate_process on child");
+        let status = guard
+            .0
+            .as_mut()
+            .expect("child handle")
+            .wait()
+            .expect("wait on terminated child");
+        guard.0 = None;
+        assert!(!status.success(), "terminated child should exit non-zero");
     }
 }

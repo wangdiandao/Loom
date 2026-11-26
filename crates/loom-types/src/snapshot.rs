@@ -110,6 +110,8 @@ pub struct ProcessRowProjection {
     pub window_title: Option<Arc<str>>,
     /// Optional binary publisher name.
     pub publisher: Option<Arc<str>>,
+    /// Full executable image path, if resolved on the slow lane.
+    pub exe_path: Option<Arc<str>>,
     /// Optional downsampled `20x20` RGBA icon.
     pub icon: Option<ExeIconRgba>,
     /// Grouping category of this process.
@@ -124,8 +126,12 @@ pub struct ProcessRowProjection {
     pub memory_permille: u16,
     /// Combined disk read+write throughput in bytes per second.
     pub disk_bytes_per_sec: u64,
+    /// Disk throughput share in permille (`0..=1000`) for percentage display mode.
+    pub disk_permille: u16,
     /// Combined network recv+send throughput in bytes per second.
     pub net_bytes_per_sec: u64,
+    /// Network throughput share in permille (`0..=1000`) for percentage display mode.
+    pub net_permille: u16,
     /// GPU utilization in permille (`0..=1000`).
     pub gpu_util_permille: u16,
     /// Dedicated GPU memory used in bytes.
@@ -149,6 +155,8 @@ pub struct DetailsRowProjection {
     pub name: Arc<str>,
     /// Optional binary file description.
     pub description: Option<Arc<str>>,
+    /// Optional binary publisher / company name.
+    pub publisher: Option<Arc<str>>,
     /// Optional downsampled RGBA icon.
     pub icon: Option<ExeIconRgba>,
     /// Dynamic process status flags.

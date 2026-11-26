@@ -337,12 +337,12 @@ impl Render for ProcessesView {
                                             );
                                             let disk_text = format_disk_cell(
                                                 row.disk_bytes_per_sec,
-                                                0,
+                                                row.disk_permille,
                                                 disk_mode,
                                             );
                                             let net_text = format_network_cell(
                                                 row.net_bytes_per_sec,
-                                                0,
+                                                row.net_permille,
                                                 net_mode,
                                             );
 

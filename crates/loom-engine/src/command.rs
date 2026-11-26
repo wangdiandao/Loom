@@ -66,6 +66,8 @@ pub enum EngineCommand {
         /// Target priority class.
         priority: ProcessPriority,
     },
+    /// Queries the current multi-group CPU affinity mask of a process.
+    GetAffinity(ProcessKey),
     /// Applies a new multi-group CPU affinity mask to a process.
     SetAffinity {
         /// Target process lifecycle key.
@@ -73,6 +75,8 @@ pub enum EngineCommand {
         /// Target CPU affinity mask.
         mask: CpuAffinityMask,
     },
+    /// Opens the native OS executable file picker on the slow lane.
+    BrowseExecutable,
     /// Opens the OS file explorer and selects `PathBuf`.
     OpenFileLocation(PathBuf),
     /// Opens the native OS properties dialog for `PathBuf`.
@@ -118,8 +122,12 @@ pub enum CommandKind {
     SetEfficiencyMode,
     /// [`EngineCommand::SetPriority`]
     SetPriority,
+    /// [`EngineCommand::GetAffinity`]
+    GetAffinity,
     /// [`EngineCommand::SetAffinity`]
     SetAffinity,
+    /// [`EngineCommand::BrowseExecutable`]
+    BrowseExecutable,
     /// [`EngineCommand::OpenFileLocation`]
     OpenFileLocation,
     /// [`EngineCommand::ShowFileProperties`]
@@ -152,7 +160,9 @@ impl EngineCommand {
             Self::TerminateProcessTree(_) => CommandKind::TerminateProcessTree,
             Self::SetEfficiencyMode { .. } => CommandKind::SetEfficiencyMode,
             Self::SetPriority { .. } => CommandKind::SetPriority,
+            Self::GetAffinity(_) => CommandKind::GetAffinity,
             Self::SetAffinity { .. } => CommandKind::SetAffinity,
+            Self::BrowseExecutable => CommandKind::BrowseExecutable,
             Self::OpenFileLocation(_) => CommandKind::OpenFileLocation,
             Self::ShowFileProperties(_) => CommandKind::ShowFileProperties,
             Self::SearchOnline(_) => CommandKind::SearchOnline,
@@ -174,6 +184,10 @@ pub enum CommandSuccess {
     },
     /// [`EngineCommand::TerminateProcessTree`] completed with per-process outcomes.
     ProcessTreeTerminated(TreeKillReport),
+    /// [`EngineCommand::GetAffinity`] returned the target process's CPU affinity mask.
+    Affinity(CpuAffinityMask),
+    /// [`EngineCommand::BrowseExecutable`] completed with an optional selected file path.
+    FilePicked(Option<PathBuf>),
 }
 
 /// Structured outcome of executing an [`EngineCommand`].

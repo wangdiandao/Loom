@@ -1,10 +1,15 @@
 //! Typed UI command helpers dispatching [`EngineCommand`]s and persisting [`loom_config::AppSettings`].
 
+use std::path::PathBuf;
+
+use crossbeam_channel::Receiver;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{App, Entity, Window};
-use loom_engine::EngineCommand;
+use loom_engine::{CommandEvent, EngineCommand, EngineCommandError};
 use loom_types::{
-    LanguagePreference, ProcessKey, ProcessViewMode, RefreshSpeed, StartupPage, ThemePreference,
+    CpuAffinityMask, DetailsSortColumn, DetailsViewMode, LanguagePreference, ProcessKey,
+    ProcessPriority, ProcessSortColumn, ProcessViewMode, RefreshSpeed, ResourceDisplayMode,
+    RunTaskRequest, SortDirection, StartupPage, ThemePreference,
 };
 
 use crate::bootstrap;
@@ -131,5 +136,190 @@ impl UiCommands {
         let _ = store
             .read(cx)
             .dispatch_command(EngineCommand::RelaunchElevated(route.to_owned()));
+    }
+
+    /// Launches a new task via the slow-lane operator.
+    #[allow(dead_code)] // Consumed by 0.0.3 Run New Task dialog (Issue #10).
+    pub(crate) fn run_new_task(store: &Entity<UiStore>, req: RunTaskRequest, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::RunNewTask(req));
+    }
+
+    /// Terminates a single process verified by [`ProcessKey`].
+    #[allow(dead_code)] // Consumed by 0.0.3 Processes & Details slices (Issues #10 & #11).
+    pub(crate) fn terminate_process(store: &Entity<UiStore>, key: ProcessKey, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::TerminateProcess(key));
+    }
+
+    /// Terminates a verified process tree in bottom-up (leaves-to-root) order.
+    #[allow(dead_code)] // Consumed by 0.0.3 Details slice (Issue #11).
+    pub(crate) fn terminate_process_tree(store: &Entity<UiStore>, key: ProcessKey, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::TerminateProcessTree(key));
+    }
+
+    /// Enables or disables Efficiency Mode (`EcoQoS`) for `key`.
+    #[allow(dead_code)] // Consumed by 0.0.3 Processes & Details slices (Issues #10 & #11).
+    pub(crate) fn set_efficiency_mode(
+        store: &Entity<UiStore>,
+        key: ProcessKey,
+        enabled: bool,
+        cx: &mut App,
+    ) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SetEfficiencyMode { key, enabled });
+    }
+
+    /// Sets the scheduling priority class of `key`.
+    #[allow(dead_code)] // Consumed by 0.0.3 Details slice (Issue #11).
+    pub(crate) fn set_priority(
+        store: &Entity<UiStore>,
+        key: ProcessKey,
+        priority: ProcessPriority,
+        cx: &mut App,
+    ) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SetPriority { key, priority });
+    }
+
+    /// Applies a new multi-group CPU affinity mask to `key`.
+    #[allow(dead_code)] // Consumed by 0.0.3 Set Affinity dialog (Issue #11).
+    pub(crate) fn set_affinity(
+        store: &Entity<UiStore>,
+        key: ProcessKey,
+        mask: CpuAffinityMask,
+        cx: &mut App,
+    ) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SetAffinity { key, mask });
+    }
+
+    /// Queries the current multi-group CPU affinity mask of `key`, returning a oneshot reply receiver.
+    #[allow(dead_code)] // Consumed by 0.0.3 Set Affinity dialog (Issue #11).
+    pub(crate) fn get_affinity_async(
+        store: &Entity<UiStore>,
+        key: ProcessKey,
+        cx: &App,
+    ) -> Result<Receiver<CommandEvent>, EngineCommandError> {
+        store
+            .read(cx)
+            .dispatch_command_with_reply(EngineCommand::GetAffinity(key))
+    }
+
+    /// Opens the native executable file picker on the slow lane, returning a oneshot reply receiver.
+    #[allow(dead_code)] // Consumed by 0.0.3 Run New Task dialog (Issue #10).
+    pub(crate) fn browse_executable_async(
+        store: &Entity<UiStore>,
+        cx: &App,
+    ) -> Result<Receiver<CommandEvent>, EngineCommandError> {
+        store
+            .read(cx)
+            .dispatch_command_with_reply(EngineCommand::BrowseExecutable)
+    }
+
+    /// Opens the OS file explorer and selects `path`.
+    #[allow(dead_code)] // Consumed by 0.0.3 Processes & Details context menus (Issues #10 & #11).
+    pub(crate) fn open_file_location(store: &Entity<UiStore>, path: PathBuf, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::OpenFileLocation(path));
+    }
+
+    /// Opens the native OS properties dialog for `path`.
+    #[allow(dead_code)] // Consumed by 0.0.3 Processes & Details context menus (Issues #10 & #11).
+    pub(crate) fn show_file_properties(store: &Entity<UiStore>, path: PathBuf, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::ShowFileProperties(path));
+    }
+
+    /// Opens the user's default browser searching online for `query`.
+    #[allow(dead_code)] // Consumed by 0.0.3 Processes & Details context menus (Issues #10 & #11).
+    pub(crate) fn search_online(store: &Entity<UiStore>, query: String, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SearchOnline(query));
+    }
+
+    /// Updates the sort column and direction of the Processes table.
+    #[allow(dead_code)] // Consumed by 0.0.3 Processes table sorting (Issue #10).
+    pub(crate) fn set_process_sort(
+        store: &Entity<UiStore>,
+        column: ProcessSortColumn,
+        direction: SortDirection,
+        cx: &mut App,
+    ) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SetProcessSort { column, direction });
+    }
+
+    /// Updates the sort column and direction of the Details table.
+    #[allow(dead_code)] // Consumed by 0.0.3 Details table sorting (Issue #11).
+    pub(crate) fn set_details_sort(
+        store: &Entity<UiStore>,
+        column: DetailsSortColumn,
+        direction: SortDirection,
+        cx: &mut App,
+    ) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SetDetailsSort { column, direction });
+    }
+
+    /// Switches the Details view between Flat and Process Tree modes.
+    #[allow(dead_code)] // Consumed by 0.0.3 Details toolbar (Issue #11).
+    pub(crate) fn set_details_view_mode(
+        store: &Entity<UiStore>,
+        mode: DetailsViewMode,
+        cx: &mut App,
+    ) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SetDetailsViewMode(mode));
+    }
+
+    /// Toggles expansion of a parent process row in the Details tree view.
+    #[allow(dead_code)] // Consumed by 0.0.3 Details tree view (Issue #11).
+    pub(crate) fn toggle_details_expanded(store: &Entity<UiStore>, key: ProcessKey, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::ToggleDetailsExpanded(key));
+    }
+
+    /// Updates and atomically persists per-column resource display modes (`Values` vs. `Percent`).
+    #[allow(dead_code)] // Consumed by 0.0.3 Processes Resource Values submenu (Issue #10).
+    pub(crate) fn set_resource_display_modes(
+        store: &Entity<UiStore>,
+        memory: ResourceDisplayMode,
+        disk: ResourceDisplayMode,
+        network: ResourceDisplayMode,
+        cx: &mut App,
+    ) {
+        store.update(cx, |store, cx| {
+            let _ = store.update_settings(
+                |s| {
+                    s.memory_display_mode = memory;
+                    s.disk_display_mode = disk;
+                    s.network_display_mode = network;
+                },
+                cx,
+            );
+        });
+    }
+
+    /// Appends a command to the MRU "Run new task" history and persists it atomically.
+    #[allow(dead_code)] // Consumed by 0.0.3 Run New Task dialog (Issue #10).
+    pub(crate) fn record_run_task_history(store: &Entity<UiStore>, command: String, cx: &mut App) {
+        store.update(cx, |store, cx| {
+            let _ = store.update_settings(|s| s.push_run_task_history(command), cx);
+        });
     }
 }

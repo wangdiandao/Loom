@@ -534,11 +534,11 @@ impl ProjectionEngine {
         is_expanded: bool,
         child_count: u32,
     ) -> ProcessRowProjection {
-        let asset = cold_cache
-            .get_process(proc.key)
-            .and_then(|meta| meta.asset.as_ref());
+        let cold = cold_cache.get_process(proc.key);
+        let asset = cold.and_then(|meta| meta.asset.as_ref());
 
         let publisher = asset.and_then(|a| a.publisher.clone());
+        let exe_path = cold.and_then(|meta| meta.exe_path.clone());
         let icon = asset.and_then(|a| a.icon.clone());
         let display_name = asset
             .and_then(|a| a.file_description.as_ref())
@@ -546,6 +546,11 @@ impl ProjectionEngine {
             .cloned()
             .or_else(|| proc.window_title.clone())
             .unwrap_or_else(|| Arc::clone(&proc.name));
+        let status = effective_status(proc, cold_cache);
+        let disk_permille =
+            compute_throughput_permille(proc.disk_bytes_per_sec, self.total_disk_bytes_per_sec);
+        let net_permille =
+            compute_throughput_permille(proc.net_bytes_per_sec, self.total_net_bytes_per_sec);
 
         ProcessRowProjection {
             kind: ProcessRowKind::Process,
@@ -558,14 +563,17 @@ impl ProjectionEngine {
             display_name,
             window_title: proc.window_title.clone(),
             publisher,
+            exe_path,
             icon,
             category: proc.category,
-            status: proc.status,
+            status,
             cpu_permille: proc.cpu_permille,
             memory_bytes: proc.private_working_set_bytes,
             memory_permille: proc.memory_permille,
             disk_bytes_per_sec: proc.disk_bytes_per_sec,
+            disk_permille,
             net_bytes_per_sec: proc.net_bytes_per_sec,
+            net_permille,
             gpu_util_permille: proc.gpu_util_permille,
             gpu_dedicated_bytes: proc.gpu_dedicated_bytes,
         }
@@ -587,6 +595,7 @@ impl ProjectionEngine {
             .latest_tree
             .parent_index(idx)
             .map(|p| self.latest_tree.key_at(p));
+        let status = effective_status(proc, cold_cache);
 
         DetailsRowProjection {
             key: proc.key,
@@ -596,8 +605,9 @@ impl ProjectionEngine {
             is_expanded,
             name: Arc::clone(&proc.name),
             description: asset.and_then(|a| a.file_description.clone()),
+            publisher: asset.and_then(|a| a.publisher.clone()),
             icon: asset.and_then(|a| a.icon.clone()),
-            status: proc.status,
+            status,
             user_name: cold.and_then(|m| m.user_name.clone()),
             session_id: proc.session_id,
             cpu_permille: proc.cpu_permille,
@@ -669,6 +679,7 @@ impl ProjectionEngine {
                 display_name: section_name,
                 window_title: None,
                 publisher: None,
+                exe_path: None,
                 icon: None,
                 category,
                 status: ProcessStatusFlags::empty(),
@@ -676,7 +687,9 @@ impl ProjectionEngine {
                 memory_bytes: 0,
                 memory_permille: 0,
                 disk_bytes_per_sec: 0,
+                disk_permille: 0,
                 net_bytes_per_sec: 0,
+                net_permille: 0,
                 gpu_util_permille: 0,
                 gpu_dedicated_bytes: 0,
             });
@@ -974,7 +987,9 @@ impl ProjectionEngine {
                     let db = process_display_name_ref(b, cold_cache);
                     cmp_str_ascii_ci(da, db)
                 }
-                ProcessSortColumn::Status => a.status.bits().cmp(&b.status.bits()),
+                ProcessSortColumn::Status => effective_status(a, cold_cache)
+                    .bits()
+                    .cmp(&effective_status(b, cold_cache).bits()),
                 ProcessSortColumn::Cpu => a.cpu_permille.cmp(&b.cpu_permille),
                 ProcessSortColumn::Memory => a
                     .private_working_set_bytes
@@ -1009,7 +1024,9 @@ impl ProjectionEngine {
             let ord = match column {
                 DetailsSortColumn::Name => cmp_str_ascii_ci(&a.name, &b.name),
                 DetailsSortColumn::Pid => a.key.pid.cmp(&b.key.pid),
-                DetailsSortColumn::Status => a.status.bits().cmp(&b.status.bits()),
+                DetailsSortColumn::Status => effective_status(a, cold_cache)
+                    .bits()
+                    .cmp(&effective_status(b, cold_cache).bits()),
                 DetailsSortColumn::UserName => {
                     let ua = ca.and_then(|m| m.user_name.as_deref()).unwrap_or("");
                     let ub = cb.and_then(|m| m.user_name.as_deref()).unwrap_or("");
@@ -1047,6 +1064,27 @@ impl ProjectionEngine {
                 .then_with(|| a.key.cmp(&b.key))
         });
     }
+}
+
+#[inline]
+fn effective_status(proc: &ComputedProcess, cold_cache: &ColdMetaCache) -> ProcessStatusFlags {
+    let mut status = proc.status;
+    if cold_cache.efficiency_mode(proc.key) {
+        status |= ProcessStatusFlags::EFFICIENCY_MODE;
+    }
+    if cold_cache.is_elevated(proc.key) {
+        status |= ProcessStatusFlags::ELEVATED;
+    }
+    status
+}
+
+#[inline]
+fn compute_throughput_permille(bytes_per_sec: u64, total_bytes_per_sec: u64) -> u16 {
+    if bytes_per_sec == 0 || total_bytes_per_sec == 0 {
+        return 0;
+    }
+    let total = u128::from(total_bytes_per_sec);
+    ((u128::from(bytes_per_sec) * 1_000 + (total / 2)) / total).min(1_000) as u16
 }
 
 #[inline]

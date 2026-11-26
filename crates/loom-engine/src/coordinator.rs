@@ -746,6 +746,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         let mut need_reproject_details = false;
         let mut need_sample_tick = false;
         let mut pending_acks: Vec<(CommandKind, Sender<CommandEvent>)> = Vec::new();
+        let mut pending_events: Vec<(CommandEvent, Option<Sender<CommandEvent>>)> = Vec::new();
         let mut shutdown_requested = false;
 
         if self.apply_single_command(
@@ -754,6 +755,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             &mut need_reproject_details,
             &mut need_sample_tick,
             &mut pending_acks,
+            &mut pending_events,
         ) {
             shutdown_requested = true;
         } else {
@@ -764,6 +766,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                     &mut need_reproject_details,
                     &mut need_sample_tick,
                     &mut pending_acks,
+                    &mut pending_events,
                 ) {
                     shutdown_requested = true;
                     break;
@@ -784,6 +787,10 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             }
         }
 
+        for (event, reply_tx) in pending_events {
+            self.events.emit(event, reply_tx);
+        }
+
         for (kind, reply_tx) in pending_acks {
             let _ = reply_tx.try_send(CommandEvent::new(
                 kind,
@@ -802,6 +809,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         need_reproject_details: &mut bool,
         need_sample_tick: &mut bool,
         pending_acks: &mut Vec<(CommandKind, Sender<CommandEvent>)>,
+        pending_events: &mut Vec<(CommandEvent, Option<Sender<CommandEvent>>)>,
     ) -> bool {
         let kind = envelope.command.kind();
         let reply = envelope.reply;
@@ -907,16 +915,52 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                     .emit(CommandEvent::new(kind, Some(root_key), outcome), reply);
             }
             EngineCommand::SetEfficiencyMode { key, enabled } => {
-                let outcome = match self.backend.operator().set_efficiency_mode(key, enabled) {
-                    Ok(()) => CommandOutcome::Ok(CommandSuccess::Ack),
-                    Err(err) => CommandOutcome::err(err),
-                };
-                self.events
-                    .emit(CommandEvent::new(kind, Some(key), outcome), reply);
+                match self.backend.operator().set_efficiency_mode(key, enabled) {
+                    Ok(()) => {
+                        self.cold_cache.set_efficiency_mode(key, enabled);
+                        *need_reproject_processes = true;
+                        *need_reproject_details = true;
+                        pending_events.push((
+                            CommandEvent::new(
+                                kind,
+                                Some(key),
+                                CommandOutcome::Ok(CommandSuccess::Ack),
+                            ),
+                            reply,
+                        ));
+                    }
+                    Err(err) => {
+                        self.events.emit(
+                            CommandEvent::new(kind, Some(key), CommandOutcome::err(err)),
+                            reply,
+                        );
+                    }
+                }
             }
             EngineCommand::SetPriority { key, priority } => {
-                let outcome = match self.backend.operator().set_priority(key, priority) {
-                    Ok(()) => CommandOutcome::Ok(CommandSuccess::Ack),
+                match self.backend.operator().set_priority(key, priority) {
+                    Ok(()) => {
+                        *need_sample_tick = true;
+                        pending_events.push((
+                            CommandEvent::new(
+                                kind,
+                                Some(key),
+                                CommandOutcome::Ok(CommandSuccess::Ack),
+                            ),
+                            reply,
+                        ));
+                    }
+                    Err(err) => {
+                        self.events.emit(
+                            CommandEvent::new(kind, Some(key), CommandOutcome::err(err)),
+                            reply,
+                        );
+                    }
+                }
+            }
+            EngineCommand::GetAffinity(key) => {
+                let outcome = match self.backend.operator().get_affinity(key) {
+                    Ok(mask) => CommandOutcome::Ok(CommandSuccess::Affinity(mask)),
                     Err(err) => CommandOutcome::err(err),
                 };
                 self.events
@@ -929,6 +973,9 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 };
                 self.events
                     .emit(CommandEvent::new(kind, Some(key), outcome), reply);
+            }
+            EngineCommand::BrowseExecutable => {
+                self.dispatch_slow_shell_op(kind, SlowShellOp::BrowseExecutable, reply);
             }
             EngineCommand::RunNewTask(req) => {
                 self.dispatch_slow_shell_op(kind, SlowShellOp::RunNewTask(req), reply);
