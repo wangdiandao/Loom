@@ -198,6 +198,7 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
                     next_tick: None,
                     last_details_projected_tick: 0,
                     last_perf_sampled_tick: 0,
+                    last_per_core_sampled_tick: 0,
                     last_domain_poll_tick: [0; MonitorDomain::COUNT],
                 };
                 runner.run();
@@ -344,6 +345,7 @@ struct FastLaneRunner<B: PlatformBackend> {
     next_tick: Option<Instant>,
     last_details_projected_tick: u64,
     last_perf_sampled_tick: u64,
+    last_per_core_sampled_tick: u64,
     last_domain_poll_tick: [u64; MonitorDomain::COUNT],
 }
 
@@ -468,6 +470,9 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 };
                 self.projection.record_performance(Some(sample), per_core);
                 self.last_perf_sampled_tick = self.tick_count;
+                if include_per_core {
+                    self.last_per_core_sampled_tick = self.tick_count;
+                }
             }
             Err(err) => {
                 tracing::warn!(%err, "fast-lane performance sampling failed");
@@ -551,8 +556,9 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
 
         let perf_leased = self.leases.is_active(MonitorDomain::Performance);
         let per_core_leased = self.leases.is_active(MonitorDomain::PerCoreCpu);
-        let need_perf =
-            (perf_leased || per_core_leased) && self.last_perf_sampled_tick != self.tick_count;
+        let need_perf = ((perf_leased || per_core_leased)
+            && self.last_perf_sampled_tick != self.tick_count)
+            || (per_core_leased && self.last_per_core_sampled_tick != self.tick_count);
 
         if need_perf {
             self.sample_full_performance(per_core_leased);
