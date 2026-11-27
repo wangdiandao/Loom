@@ -4,19 +4,34 @@
 //! validates [`ProcessKey::create_time_100ns`] before every read or control
 //! operation to eliminate Windows PID-reuse races.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, c_void};
+use std::mem::{size_of, transmute};
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
+use std::sync::OnceLock;
 
 use loom_pal_api::PalError;
 use loom_types::ProcessKey;
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_CANCELLED, ERROR_INVALID_PARAMETER, FALSE, FILETIME,
-    GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE, STATUS_SUCCESS,
 };
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+
+/// NT `PROCESSINFOCLASS::ProcessSequenceNumber` (`92`, Windows 10 20H1+).
+const PROCESS_SEQUENCE_NUMBER_CLASS: i32 = 92;
+
+type FarProc = unsafe extern "system" fn() -> isize;
+type FnNtQueryInformationProcess = unsafe extern "system" fn(
+    process_handle: HANDLE,
+    process_information_class: i32,
+    process_information: *mut c_void,
+    process_information_length: u32,
+    return_length: *mut u32,
+) -> i32;
 
 /// RAII owner of a Win32 kernel `HANDLE` that invokes `CloseHandle` on drop.
 #[derive(Debug)]
@@ -147,8 +162,84 @@ pub(crate) fn os_str_to_wide_null(s: &OsStr) -> Vec<u16> {
     buf
 }
 
+/// Resolves `ntdll.dll!NtQueryInformationProcess` once for additive kernel queries.
+fn nt_query_information_process() -> Option<FnNtQueryInformationProcess> {
+    static FN_PTR: OnceLock<Option<FnNtQueryInformationProcess>> = OnceLock::new();
+    *FN_PTR.get_or_init(|| {
+        let ntdll_name = to_wide_null("ntdll.dll");
+        // SAFETY: `ntdll.dll` is permanently loaded in every Windows user-mode process.
+        let module = unsafe { GetModuleHandleW(ntdll_name.as_ptr()) };
+        if module.is_null() {
+            return None;
+        }
+        // SAFETY: Resolving documented `NtQueryInformationProcess` export from `ntdll.dll`.
+        let proc_ptr =
+            unsafe { GetProcAddress(module, c"NtQueryInformationProcess".as_ptr().cast()) }?;
+        // SAFETY: `FnNtQueryInformationProcess` matches the exact NT syscall prototype.
+        Some(unsafe { transmute::<FarProc, FnNtQueryInformationProcess>(proc_ptr) })
+    })
+}
+
+/// Queries the kernel-assigned monotonic process sequence number via
+/// `NtQueryInformationProcess(ProcessSequenceNumber = 92)` as an additive PID-reuse guard.
+///
+/// Returns `None` gracefully on invalid handles or older Windows builds (prior to Windows 10
+/// 20H1) that do not implement information class `92`.
+pub(crate) fn query_process_sequence_number(handle: HANDLE) -> Option<u64> {
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let query_fn = nt_query_information_process()?;
+    let mut seq: u64 = 0;
+    let mut return_len: u32 = 0;
+
+    // SAFETY: `seq` is an initialized stack `u64` matching `ProcessSequenceNumber` (class 92).
+    let status = unsafe {
+        query_fn(
+            handle,
+            PROCESS_SEQUENCE_NUMBER_CLASS,
+            (&mut seq as *mut u64).cast::<c_void>(),
+            size_of::<u64>() as u32,
+            &mut return_len,
+        )
+    };
+    if status == STATUS_SUCCESS && (return_len == 0 || return_len as usize >= size_of::<u64>()) {
+        Some(seq)
+    } else {
+        None
+    }
+}
+
 /// Helper returning a null raw pointer with explicit type inference for optional Win32 strings.
 #[inline]
 pub(crate) fn null_wide_ptr() -> *const u16 {
     ptr::null()
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    use super::*;
+
+    #[test]
+    fn query_process_sequence_number_is_stable_for_current_process_and_rejects_invalid_handles() {
+        assert_eq!(query_process_sequence_number(ptr::null_mut()), None);
+        assert_eq!(query_process_sequence_number(INVALID_HANDLE_VALUE), None);
+
+        // SAFETY: `GetCurrentProcess` returns the pseudo-handle for this process.
+        let current = unsafe { GetCurrentProcess() };
+        let first = query_process_sequence_number(current);
+        let second = query_process_sequence_number(current);
+        assert_eq!(
+            first, second,
+            "ProcessSequenceNumber must be stable across repeated queries of the same process"
+        );
+        if let Some(seq) = first {
+            assert!(
+                seq > 0,
+                "ProcessSequenceNumber for a live process should be non-zero"
+            );
+        }
+    }
 }
