@@ -4,6 +4,20 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ## Unreleased
 
+### Engine & PAL
+
+- Extended `loom-types` with `UserSessionProcess` (nested inside `UserSessionRecord::processes`) and `StartupEntry::file_path` for per-session process inspection and startup shell actions.
+- Added 7 slow-lane system management commands in `loom-engine` (`StartService`, `StopService`, `RestartService`, `OpenServicesConsole`, `SetStartupEnabled`, `DisconnectSession`, and `ClearAppHistory`) with `PalError::ElevationRequired` propagation and automatic immediate refresh of leased domains (`Services`, `Startup`, `Users`, `AppHistory`).
+- Wired live in-memory `Users` session process aggregation (`process_count`, clamped `cpu_permille`, `memory_bytes`, `disk_bytes_per_sec`, `net_bytes_per_sec`, and sorted `processes`) and live cumulative `AppHistory` CPU/network delta tracking merged with persisted baselines while strictly enforcing zero polling when unleased.
+
+### Windows Backend
+
+- Implemented WMI/PDH-free Windows system management backends in `loom-pal-windows` and advertised `CapabilityFlags::{SERVICES, STARTUP_APPS, USER_SESSIONS, APP_HISTORY}`:
+  - **Services** (`WindowsServiceManager`): SCM enumeration via `EnumServicesStatusExW`, cached `svchost -k <Group>` / `Group` and indirect `@...` description resolution, lifecycle control (`StartServiceW` / `ControlService` / restart polling), and `services.msc` launcher with `ERROR_ACCESS_DENIED` mapped to `PalError::ElevationRequired`.
+  - **Startup Apps** (`WindowsStartupManager`): BIOS POST time (`FwPOSTTime`), `HKCU`/`HKLM`/`WOW6432Node` Run keys, User/Common Startup folders (with offline `.lnk` target parsing), UWP `StartupTask` states, UNC/`DRIVE_REMOTE`-safe local PE `CompanyName` lookup, and `StartupApproved` / UWP toggle writes.
+  - **Users** (`WindowsSessionManager`): WTS session enumeration (`WTSEnumerateSessionsW` / `WTSQuerySessionInformationW`) skipping Session 0/listener rows and non-blocking `WTSDisconnectSession`.
+  - **App History** (`WindowsAppHistoryReader`): crash-safe atomic local history persistence and clear store under `%LOCALAPPDATA%\Loom\app_history.dat`.
+
 ## 0.0.4 - 2026-11-27
 
 ### Engine & PAL

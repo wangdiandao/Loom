@@ -13,28 +13,31 @@
 
 #![warn(missing_docs)]
 
+pub mod app_history;
 pub mod circuit_breaker;
 pub mod fast_sampler;
 pub(crate) mod handle;
 pub mod operator;
 pub mod perf;
+pub mod services;
 pub mod slow_prober;
+pub mod startup;
+pub mod users;
 pub mod window;
 
+pub use app_history::WindowsAppHistoryReader;
 pub use circuit_breaker::CircuitBreaker;
 pub use fast_sampler::WindowsFastSampler;
 pub use operator::WindowsSystemOperator;
+pub use services::WindowsServiceManager;
 pub use slow_prober::WindowsSlowProber;
+pub use startup::WindowsStartupManager;
+pub use users::WindowsSessionManager;
 
-use loom_pal_api::{
-    AppHistoryReader, PalError, PlatformBackend, ServiceManager, SessionManager, StartupManager,
-};
-use loom_types::{
-    AppHistoryRecord, CapabilityFlags, PlatformProfile, ServiceRecord, StartupEntry,
-    UserSessionRecord,
-};
+use loom_pal_api::{PalError, PlatformBackend};
+use loom_types::{CapabilityFlags, PlatformProfile};
 
-/// Windows native PAL backend combining dual-lane sampling with core process control.
+/// Windows native PAL backend combining dual-lane sampling with system management and process control.
 #[derive(Debug, Default)]
 pub struct WindowsBackend {
     service_mgr: WindowsServiceManager,
@@ -43,22 +46,6 @@ pub struct WindowsBackend {
     history_reader: WindowsAppHistoryReader,
     operator: WindowsSystemOperator,
 }
-
-/// Windows SCM service manager (scheduled for `0.0.5`).
-#[derive(Debug, Default)]
-pub struct WindowsServiceManager;
-
-/// Windows startup application manager (scheduled for `0.0.5`).
-#[derive(Debug, Default)]
-pub struct WindowsStartupManager;
-
-/// Windows WTS user session manager (scheduled for `0.0.6`).
-#[derive(Debug, Default)]
-pub struct WindowsSessionManager;
-
-/// Windows application usage history reader (scheduled for `0.0.6`).
-#[derive(Debug, Default)]
-pub struct WindowsAppHistoryReader;
 
 impl PlatformBackend for WindowsBackend {
     type ProcessExt = ();
@@ -76,6 +63,10 @@ impl PlatformBackend for WindowsBackend {
         .union(CapabilityFlags::CPU_AFFINITY)
         .union(CapabilityFlags::PROCESS_PRIORITY)
         .union(CapabilityFlags::UAC_VIRTUALIZATION)
+        .union(CapabilityFlags::SERVICES)
+        .union(CapabilityFlags::STARTUP_APPS)
+        .union(CapabilityFlags::USER_SESSIONS)
+        .union(CapabilityFlags::APP_HISTORY)
         .union(CapabilityFlags::ELEVATION_RELAUNCH)
         .union(CapabilityFlags::ALWAYS_ON_TOP);
 
@@ -125,80 +116,6 @@ impl PlatformBackend for WindowsBackend {
 
     fn operator(&self) -> &Self::Operator {
         &self.operator
-    }
-}
-
-impl ServiceManager for WindowsServiceManager {
-    fn list_services(&self) -> Result<Vec<ServiceRecord>, PalError> {
-        Err(PalError::Unsupported(
-            "windows service enumeration is scheduled for v0.0.5",
-        ))
-    }
-
-    fn start_service(&self, _name: &str) -> Result<(), PalError> {
-        Err(PalError::Unsupported(
-            "windows service control is scheduled for v0.0.5",
-        ))
-    }
-
-    fn stop_service(&self, _name: &str) -> Result<(), PalError> {
-        Err(PalError::Unsupported(
-            "windows service control is scheduled for v0.0.5",
-        ))
-    }
-
-    fn restart_service(&self, _name: &str) -> Result<(), PalError> {
-        Err(PalError::Unsupported(
-            "windows service control is scheduled for v0.0.5",
-        ))
-    }
-
-    fn open_services_console(&self) -> Result<(), PalError> {
-        Err(PalError::Unsupported(
-            "windows services console is scheduled for v0.0.5",
-        ))
-    }
-}
-
-impl StartupManager for WindowsStartupManager {
-    fn list_startup_entries(&self) -> Result<(Option<u64>, Vec<StartupEntry>), PalError> {
-        Err(PalError::Unsupported(
-            "windows startup enumeration is scheduled for v0.0.5",
-        ))
-    }
-
-    fn set_startup_enabled(&self, _id: &str, _enabled: bool) -> Result<(), PalError> {
-        Err(PalError::Unsupported(
-            "windows startup toggle is scheduled for v0.0.5",
-        ))
-    }
-}
-
-impl SessionManager for WindowsSessionManager {
-    fn list_sessions(&self) -> Result<Vec<UserSessionRecord>, PalError> {
-        Err(PalError::Unsupported(
-            "windows session enumeration is scheduled for v0.0.6",
-        ))
-    }
-
-    fn disconnect_session(&self, _session_id: u32) -> Result<(), PalError> {
-        Err(PalError::Unsupported(
-            "windows session disconnect is scheduled for v0.0.6",
-        ))
-    }
-}
-
-impl AppHistoryReader for WindowsAppHistoryReader {
-    fn read_history(&self) -> Result<(Option<u64>, Vec<AppHistoryRecord>), PalError> {
-        Err(PalError::Unsupported(
-            "windows app history reader is scheduled for v0.0.6",
-        ))
-    }
-
-    fn clear_history(&self) -> Result<(), PalError> {
-        Err(PalError::Unsupported(
-            "windows app history clear is scheduled for v0.0.6",
-        ))
     }
 }
 
@@ -640,6 +557,10 @@ mod tests {
                 | CapabilityFlags::CPU_AFFINITY
                 | CapabilityFlags::PROCESS_PRIORITY
                 | CapabilityFlags::UAC_VIRTUALIZATION
+                | CapabilityFlags::SERVICES
+                | CapabilityFlags::STARTUP_APPS
+                | CapabilityFlags::USER_SESSIONS
+                | CapabilityFlags::APP_HISTORY
                 | CapabilityFlags::ELEVATION_RELAUNCH
                 | CapabilityFlags::ALWAYS_ON_TOP
         ));
@@ -836,5 +757,92 @@ mod tests {
             "warm sample_performance exceeded {:?} budget: {elapsed:?}",
             PERF_BUDGET
         );
+    }
+
+    #[test]
+    fn windows_services_startup_users_and_app_history_live_probe() {
+        use loom_pal_api::{AppHistoryReader, ServiceManager, SessionManager, StartupManager};
+        use loom_types::ServiceState;
+
+        let backend = WindowsBackend::initialize().expect("WindowsBackend::initialize");
+
+        // 1. Services: cold + warm SCM enumeration.
+        let cold_start = Instant::now();
+        let services = backend
+            .service_manager()
+            .list_services()
+            .expect("list_services");
+        let cold_elapsed = cold_start.elapsed();
+        assert!(
+            !services.is_empty(),
+            "Windows SCM must report at least one service"
+        );
+        assert!(
+            services.iter().any(|s| s.state == ServiceState::Running),
+            "Windows host should have at least one running service"
+        );
+        let with_group = services.iter().filter(|s| s.group.is_some()).count();
+        let with_desc = services.iter().filter(|s| s.description.is_some()).count();
+
+        let warm_start = Instant::now();
+        let services_warm = backend
+            .service_manager()
+            .list_services()
+            .expect("warm list_services");
+        let warm_elapsed = warm_start.elapsed();
+        assert!(!services_warm.is_empty());
+        assert!(
+            warm_elapsed < Duration::from_millis(50),
+            "warm list_services exceeded 50 ms budget: {warm_elapsed:?}"
+        );
+        eprintln!(
+            "[loom-pal-windows] services: {} total (groups={}, descs={}) | cold={:.2} ms | warm={:.2} ms",
+            services.len(),
+            with_group,
+            with_desc,
+            cold_elapsed.as_secs_f64() * 1000.0,
+            warm_elapsed.as_secs_f64() * 1000.0,
+        );
+
+        // 2. Startup apps: BIOS time + Run/Folder/UWP entries.
+        let (bios_ms, startup_entries) = backend
+            .startup_manager()
+            .list_startup_entries()
+            .expect("list_startup_entries");
+        for entry in &startup_entries {
+            assert!(!entry.id.is_empty());
+            assert!(!entry.name.is_empty());
+        }
+        eprintln!(
+            "[loom-pal-windows] startup: {} entries | last_bios_time_ms={:?}",
+            startup_entries.len(),
+            bios_ms,
+        );
+
+        // 3. User sessions: WTS active/disconnected sessions.
+        let sessions = backend
+            .session_manager()
+            .list_sessions()
+            .expect("list_sessions");
+        for s in &sessions {
+            assert!(!s.user_name.is_empty());
+        }
+        eprintln!(
+            "[loom-pal-windows] sessions: {} user sessions ({:?})",
+            sessions.len(),
+            sessions
+                .iter()
+                .map(|s| (s.session_id, s.user_name.as_ref(), s.state))
+                .collect::<Vec<_>>(),
+        );
+
+        // 4. App history reader (isolated temp store so test doesn't touch real %LOCALAPPDATA%).
+        let tmp_dir =
+            std::env::temp_dir().join(format!("loom-pal-win-live-history-{}", std::process::id()));
+        let tmp_reader = WindowsAppHistoryReader::with_path(tmp_dir.join("app_history.dat"));
+        let (since, items) = tmp_reader.read_history().expect("read_history");
+        assert!(since.is_some());
+        assert!(items.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

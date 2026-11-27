@@ -23,9 +23,9 @@ use loom_types::{
     GpuEngineSample, HardwareStaticInfo, MemoryHardwareInfo, MonitorDomain, NetAdapterSample,
     NetConnectionType, PlatformProfile, ProcessArch, ProcessCategory, ProcessColdMeta,
     ProcessHotSample, ProcessKey, ProcessPriority, ProcessRowKind, ProcessSortColumn,
-    ProcessStatusFlags, ProcessViewMode, RefreshSpeed, RunTaskRequest, ServiceRecord,
-    SortDirection, StartupEntry, SystemPerfSample, Timestamp100Ns, TreeKillItem, TreeKillReport,
-    UacVirtualization, UserSessionRecord, WaitChainNode,
+    ProcessStatusFlags, ProcessViewMode, RefreshSpeed, RunTaskRequest, ServiceRecord, ServiceState,
+    SortDirection, StartupEntry, StartupImpact, SystemPerfSample, Timestamp100Ns, TreeKillItem,
+    TreeKillReport, UacVirtualization, UserSessionRecord, UserSessionState, WaitChainNode,
 };
 use parking_lot::Mutex;
 
@@ -33,6 +33,7 @@ use parking_lot::Mutex;
 struct MockProcSpec {
     key: ProcessKey,
     parent_pid: u32,
+    session_id: u32,
     name: String,
     window_title: String,
     category: ProcessCategory,
@@ -40,6 +41,8 @@ struct MockProcSpec {
     cpu_delta_per_tick: u64,
     disk_bytes: u64,
     disk_delta_per_tick: u64,
+    net_bytes: u64,
+    net_delta_per_tick: u64,
     private_mem_bytes: u64,
     exe_path: Option<String>,
 }
@@ -49,6 +52,7 @@ impl MockProcSpec {
         Self {
             key: ProcessKey::new(pid, create_time),
             parent_pid,
+            session_id: 1,
             name: name.to_owned(),
             window_title: String::new(),
             category: ProcessCategory::Background,
@@ -56,10 +60,30 @@ impl MockProcSpec {
             cpu_delta_per_tick: 0,
             disk_bytes: 0,
             disk_delta_per_tick: 0,
+            net_bytes: 0,
+            net_delta_per_tick: 0,
             private_mem_bytes: 32 * 1024 * 1024,
             exe_path: None,
         }
     }
+}
+
+#[derive(Default)]
+struct MockMgmtState {
+    list_services_calls: AtomicUsize,
+    list_startup_calls: AtomicUsize,
+    list_sessions_calls: AtomicUsize,
+    read_history_calls: AtomicUsize,
+    open_console_calls: AtomicUsize,
+    services: Mutex<Vec<ServiceRecord>>,
+    startup_bios_ms: Mutex<Option<u64>>,
+    startup_entries: Mutex<Vec<StartupEntry>>,
+    sessions: Mutex<Vec<UserSessionRecord>>,
+    history_since: Mutex<Option<u64>>,
+    history_items: Mutex<Vec<AppHistoryRecord>>,
+    service_ops_require_elevation: AtomicBool,
+    startup_ops_require_elevation: AtomicBool,
+    session_ops_require_elevation: AtomicBool,
 }
 
 struct MockState {
@@ -83,6 +107,7 @@ struct MockState {
     browse_result: Mutex<Option<PathBuf>>,
     terminate_error_elevation: AtomicBool,
     is_elevated: AtomicBool,
+    mgmt: MockMgmtState,
 }
 
 impl MockState {
@@ -108,30 +133,43 @@ impl MockState {
             browse_result: Mutex::new(None),
             terminate_error_elevation: AtomicBool::new(false),
             is_elevated: AtomicBool::new(false),
+            mgmt: MockMgmtState::default(),
         })
     }
 }
 
 struct MockBackend {
     state: Arc<MockState>,
-    services: MockNoopServices,
-    startup: MockNoopStartup,
-    sessions: MockNoopSessions,
-    history: MockNoopHistory,
+    services: MockServices,
+    startup: MockStartup,
+    sessions: MockSessions,
+    history: MockHistory,
     operator: MockOperator,
 }
 
 impl MockBackend {
     fn from_state(state: Arc<MockState>) -> Self {
+        let services = MockServices {
+            state: Arc::clone(&state),
+        };
+        let startup = MockStartup {
+            state: Arc::clone(&state),
+        };
+        let sessions = MockSessions {
+            state: Arc::clone(&state),
+        };
+        let history = MockHistory {
+            state: Arc::clone(&state),
+        };
         let operator = MockOperator {
             state: Arc::clone(&state),
         };
         Self {
             state,
-            services: MockNoopServices,
-            startup: MockNoopStartup,
-            sessions: MockNoopSessions,
-            history: MockNoopHistory,
+            services,
+            startup,
+            sessions,
+            history,
             operator,
         }
     }
@@ -169,6 +207,7 @@ impl FastSystemSampler for MockFastSampler {
             let (window_title_offset, window_title_len) = scratch.push_str(&spec.window_title);
             let cpu = spec.cpu_time_100ns + tick * spec.cpu_delta_per_tick;
             let disk = spec.disk_bytes + tick * spec.disk_delta_per_tick;
+            let net = spec.net_bytes + tick * spec.net_delta_per_tick;
             let priority = self
                 .state
                 .priorities
@@ -179,7 +218,7 @@ impl FastSystemSampler for MockFastSampler {
             scratch.samples.push(ProcessHotSample {
                 key: spec.key,
                 parent_pid: spec.parent_pid,
-                session_id: 1,
+                session_id: spec.session_id,
                 thread_count: 4,
                 handle_count: 64,
                 kernel_time_100ns: cpu / 2,
@@ -188,6 +227,7 @@ impl FastSystemSampler for MockFastSampler {
                 working_set_bytes: spec.private_mem_bytes,
                 commit_bytes: spec.private_mem_bytes,
                 disk_read_bytes: disk,
+                net_recv_bytes: net,
                 category: spec.category,
                 priority,
                 status: ProcessStatusFlags::empty(),
@@ -366,51 +406,153 @@ impl SlowMetadataProber for MockSlowProber {
     }
 }
 
-struct MockNoopServices;
-impl ServiceManager for MockNoopServices {
+struct MockServices {
+    state: Arc<MockState>,
+}
+impl ServiceManager for MockServices {
     fn list_services(&self) -> Result<Vec<ServiceRecord>, PalError> {
-        Ok(Vec::new())
+        self.state
+            .mgmt
+            .list_services_calls
+            .fetch_add(1, Ordering::AcqRel);
+        Ok(self.state.mgmt.services.lock().clone())
     }
-    fn start_service(&self, _name: &str) -> Result<(), PalError> {
+    fn start_service(&self, name: &str) -> Result<(), PalError> {
+        if self
+            .state
+            .mgmt
+            .service_ops_require_elevation
+            .load(Ordering::Acquire)
+        {
+            return Err(PalError::ElevationRequired);
+        }
+        let mut guard = self.state.mgmt.services.lock();
+        if let Some(svc) = guard.iter_mut().find(|s| s.name.as_ref() == name) {
+            svc.state = ServiceState::Running;
+            svc.pid = Some(4242);
+        }
         Ok(())
     }
-    fn stop_service(&self, _name: &str) -> Result<(), PalError> {
+    fn stop_service(&self, name: &str) -> Result<(), PalError> {
+        if self
+            .state
+            .mgmt
+            .service_ops_require_elevation
+            .load(Ordering::Acquire)
+        {
+            return Err(PalError::ElevationRequired);
+        }
+        let mut guard = self.state.mgmt.services.lock();
+        if let Some(svc) = guard.iter_mut().find(|s| s.name.as_ref() == name) {
+            svc.state = ServiceState::Stopped;
+            svc.pid = None;
+        }
         Ok(())
     }
-    fn restart_service(&self, _name: &str) -> Result<(), PalError> {
+    fn restart_service(&self, name: &str) -> Result<(), PalError> {
+        if self
+            .state
+            .mgmt
+            .service_ops_require_elevation
+            .load(Ordering::Acquire)
+        {
+            return Err(PalError::ElevationRequired);
+        }
+        let mut guard = self.state.mgmt.services.lock();
+        if let Some(svc) = guard.iter_mut().find(|s| s.name.as_ref() == name) {
+            svc.state = ServiceState::Running;
+            svc.pid = Some(svc.pid.unwrap_or(1000) + 1);
+        }
         Ok(())
     }
     fn open_services_console(&self) -> Result<(), PalError> {
+        self.state
+            .mgmt
+            .open_console_calls
+            .fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }
 
-struct MockNoopStartup;
-impl StartupManager for MockNoopStartup {
+struct MockStartup {
+    state: Arc<MockState>,
+}
+impl StartupManager for MockStartup {
     fn list_startup_entries(&self) -> Result<(Option<u64>, Vec<StartupEntry>), PalError> {
-        Ok((Some(2_100), Vec::new()))
+        self.state
+            .mgmt
+            .list_startup_calls
+            .fetch_add(1, Ordering::AcqRel);
+        let bios = *self.state.mgmt.startup_bios_ms.lock();
+        let items = self.state.mgmt.startup_entries.lock().clone();
+        Ok((bios.or(Some(2_100)), items))
     }
-    fn set_startup_enabled(&self, _id: &str, _enabled: bool) -> Result<(), PalError> {
+    fn set_startup_enabled(&self, id: &str, enabled: bool) -> Result<(), PalError> {
+        if self
+            .state
+            .mgmt
+            .startup_ops_require_elevation
+            .load(Ordering::Acquire)
+        {
+            return Err(PalError::ElevationRequired);
+        }
+        let mut guard = self.state.mgmt.startup_entries.lock();
+        if let Some(entry) = guard.iter_mut().find(|e| e.id.as_ref() == id) {
+            entry.enabled = enabled;
+            entry.impact = if enabled {
+                StartupImpact::NotMeasured
+            } else {
+                StartupImpact::None
+            };
+        }
         Ok(())
     }
 }
 
-struct MockNoopSessions;
-impl SessionManager for MockNoopSessions {
+struct MockSessions {
+    state: Arc<MockState>,
+}
+impl SessionManager for MockSessions {
     fn list_sessions(&self) -> Result<Vec<UserSessionRecord>, PalError> {
-        Ok(Vec::new())
+        self.state
+            .mgmt
+            .list_sessions_calls
+            .fetch_add(1, Ordering::AcqRel);
+        Ok(self.state.mgmt.sessions.lock().clone())
     }
-    fn disconnect_session(&self, _session_id: u32) -> Result<(), PalError> {
+    fn disconnect_session(&self, session_id: u32) -> Result<(), PalError> {
+        if self
+            .state
+            .mgmt
+            .session_ops_require_elevation
+            .load(Ordering::Acquire)
+        {
+            return Err(PalError::ElevationRequired);
+        }
+        let mut guard = self.state.mgmt.sessions.lock();
+        if let Some(s) = guard.iter_mut().find(|s| s.session_id == session_id) {
+            s.state = UserSessionState::Disconnected;
+        }
         Ok(())
     }
 }
 
-struct MockNoopHistory;
-impl AppHistoryReader for MockNoopHistory {
+struct MockHistory {
+    state: Arc<MockState>,
+}
+impl AppHistoryReader for MockHistory {
     fn read_history(&self) -> Result<(Option<u64>, Vec<AppHistoryRecord>), PalError> {
-        Ok((None, Vec::new()))
+        self.state
+            .mgmt
+            .read_history_calls
+            .fetch_add(1, Ordering::AcqRel);
+        let since = *self.state.mgmt.history_since.lock();
+        let items = self.state.mgmt.history_items.lock().clone();
+        Ok((since, items))
     }
     fn clear_history(&self) -> Result<(), PalError> {
+        *self.state.mgmt.history_since.lock() = Some(1_750_000_000);
+        self.state.mgmt.history_items.lock().clear();
         Ok(())
     }
 }
@@ -500,10 +642,10 @@ impl PlatformBackend for MockBackend {
     type ProcessExt = ();
     type FastSampler = MockFastSampler;
     type SlowProber = MockSlowProber;
-    type ServiceMgr = MockNoopServices;
-    type StartupMgr = MockNoopStartup;
-    type SessionMgr = MockNoopSessions;
-    type HistoryReader = MockNoopHistory;
+    type ServiceMgr = MockServices;
+    type StartupMgr = MockStartup;
+    type SessionMgr = MockSessions;
+    type HistoryReader = MockHistory;
     type Operator = MockOperator;
 
     const PLATFORM: PlatformProfile = PlatformProfile::UNKNOWN;
@@ -816,6 +958,7 @@ fn slow_disk_5s_fault_injection_never_blocks_fast_lane_or_shutdown() {
         browse_result: Mutex::new(None),
         terminate_error_elevation: AtomicBool::new(false),
         is_elevated: AtomicBool::new(false),
+        mgmt: MockMgmtState::default(),
     });
 
     let backend = MockBackend::from_state(Arc::clone(&state));
@@ -1265,10 +1408,10 @@ fn engine_coordinator_publishes_backend_platform_profile_in_snapshot() {
         type ProcessExt = ();
         type FastSampler = MockFastSampler;
         type SlowProber = MockSlowProber;
-        type ServiceMgr = MockNoopServices;
-        type StartupMgr = MockNoopStartup;
-        type SessionMgr = MockNoopSessions;
-        type HistoryReader = MockNoopHistory;
+        type ServiceMgr = MockServices;
+        type StartupMgr = MockStartup;
+        type SessionMgr = MockSessions;
+        type HistoryReader = MockHistory;
         type Operator = MockOperator;
 
         const PLATFORM: PlatformProfile = if IS_LINUX {
@@ -1479,6 +1622,7 @@ fn slow_disk_probe_400ms_never_blocks_fast_lane_and_deduplicates_polls() {
         browse_result: Mutex::new(None),
         terminate_error_elevation: AtomicBool::new(false),
         is_elevated: AtomicBool::new(false),
+        mgmt: MockMgmtState::default(),
     });
 
     let backend = MockBackend::from_state(Arc::clone(&state));
@@ -1529,5 +1673,484 @@ fn slow_disk_probe_400ms_never_blocks_fast_lane_and_deduplicates_polls() {
     // Wait for the 400ms disk poll to finish and publish into PerformanceSlice.
     assert!(wait_until(Duration::from_secs(2), || {
         !coord.snapshot().performance.disks.is_empty()
+    }));
+}
+
+#[test]
+fn system_mgmt_domains_enforce_strict_raii_lease_gating() {
+    let state = MockState::new(vec![MockProcSpec::new(10, 100, 0, "app.exe")]);
+    state.mgmt.services.lock().push(ServiceRecord {
+        name: Arc::from("Spooler"),
+        display_name: Arc::from("Print Spooler"),
+        description: Some(Arc::from("Loads files to memory for later printing")),
+        pid: Some(10),
+        state: ServiceState::Running,
+        group: Some(Arc::from("netsvcs")),
+    });
+    state.mgmt.startup_entries.lock().push(StartupEntry {
+        id: Arc::from("hkcu-run:Loom"),
+        name: Arc::from("Loom"),
+        publisher: Some(Arc::from("Loom")),
+        command: Some(Arc::from(r"C:\Loom\loom.exe")),
+        file_path: Some(Arc::from(r"C:\Loom\loom.exe")),
+        enabled: true,
+        impact: StartupImpact::NotMeasured,
+    });
+    state.mgmt.sessions.lock().push(UserSessionRecord {
+        session_id: 1,
+        user_name: Arc::from("HOST\\Alice"),
+        state: UserSessionState::Active,
+        process_count: 0,
+        cpu_permille: 0,
+        memory_bytes: 0,
+        disk_bytes_per_sec: 0,
+        net_bytes_per_sec: 0,
+        processes: Vec::new(),
+    });
+    *state.mgmt.history_since.lock() = Some(1_700_000_000);
+
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let coord = EngineCoordinator::new(backend, settings).unwrap();
+
+    // Run multiple ticks with NO leases active -> ZERO polls on any of the 4 domains!
+    for _ in 0..3 {
+        coord
+            .send_command_with_reply(EngineCommand::ForceRefresh)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(30));
+
+    assert_eq!(state.mgmt.list_services_calls.load(Ordering::Acquire), 0);
+    assert_eq!(state.mgmt.list_startup_calls.load(Ordering::Acquire), 0);
+    assert_eq!(state.mgmt.list_sessions_calls.load(Ordering::Acquire), 0);
+    assert_eq!(state.mgmt.read_history_calls.load(Ordering::Acquire), 0);
+
+    // Acquire each lease one by one and confirm ONLY that domain polls and populates snapshot.
+    let svc_lease = coord.acquire_lease(MonitorDomain::Services);
+    assert!(wait_until(Duration::from_secs(1), || {
+        coord.snapshot().revisions.services >= 1
+    }));
+    assert_eq!(coord.snapshot().services.items.len(), 1);
+    assert_eq!(state.mgmt.list_startup_calls.load(Ordering::Acquire), 0);
+    assert_eq!(state.mgmt.list_sessions_calls.load(Ordering::Acquire), 0);
+    assert_eq!(state.mgmt.read_history_calls.load(Ordering::Acquire), 0);
+    drop(svc_lease);
+
+    let startup_lease = coord.acquire_lease(MonitorDomain::Startup);
+    assert!(wait_until(Duration::from_secs(1), || {
+        coord.snapshot().revisions.startup >= 1
+    }));
+    assert_eq!(coord.snapshot().startup.items.len(), 1);
+    assert_eq!(coord.snapshot().startup.last_bios_time_ms, Some(2_100));
+    drop(startup_lease);
+
+    let users_lease = coord.acquire_lease(MonitorDomain::Users);
+    assert!(wait_until(Duration::from_secs(1), || {
+        coord.snapshot().revisions.users >= 1
+    }));
+    assert_eq!(coord.snapshot().users.sessions.len(), 1);
+    drop(users_lease);
+
+    let hist_lease = coord.acquire_lease(MonitorDomain::AppHistory);
+    assert!(wait_until(Duration::from_secs(1), || {
+        coord.snapshot().revisions.app_history >= 1
+    }));
+    assert_eq!(
+        coord.snapshot().app_history.since_epoch_secs,
+        Some(1_700_000_000)
+    );
+    drop(hist_lease);
+
+    // After all leases are dropped, further refreshes trigger ZERO polls on all 4 domains.
+    let counts_before = (
+        state.mgmt.list_services_calls.load(Ordering::Acquire),
+        state.mgmt.list_startup_calls.load(Ordering::Acquire),
+        state.mgmt.list_sessions_calls.load(Ordering::Acquire),
+        state.mgmt.read_history_calls.load(Ordering::Acquire),
+    );
+    for _ in 0..3 {
+        coord
+            .send_command_with_reply(EngineCommand::ForceRefresh)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        (
+            state.mgmt.list_services_calls.load(Ordering::Acquire),
+            state.mgmt.list_startup_calls.load(Ordering::Acquire),
+            state.mgmt.list_sessions_calls.load(Ordering::Acquire),
+            state.mgmt.read_history_calls.load(Ordering::Acquire),
+        ),
+        counts_before
+    );
+}
+
+#[test]
+fn users_session_enrichment_aggregates_live_processes_and_sorts_descending() {
+    // Session 1 has 2 processes (busy_high + mem_heavy); Session 2 has 1 process (remote_app).
+    let mut p1 = MockProcSpec::new(101, 1_000, 0, "busy_high.exe");
+    p1.session_id = 1;
+    p1.category = ProcessCategory::App;
+    p1.cpu_delta_per_tick = 4_000_000; // 400 permille on 4 CPUs / 250ms tick
+    p1.disk_delta_per_tick = 250_000; // 1_000_000 B/s
+    p1.net_delta_per_tick = 100_000; // 400_000 B/s
+    p1.private_mem_bytes = 64 * 1024 * 1024;
+
+    let mut p2 = MockProcSpec::new(102, 1_001, 0, "mem_heavy.exe");
+    p2.session_id = 1;
+    p2.category = ProcessCategory::App;
+    p2.cpu_delta_per_tick = 1_000_000; // 100 permille
+    p2.disk_delta_per_tick = 500_000; // 2_000_000 B/s
+    p2.net_delta_per_tick = 250_000; // 1_000_000 B/s
+    p2.private_mem_bytes = 256 * 1024 * 1024;
+
+    let mut p3 = MockProcSpec::new(201, 2_000, 0, "remote_app.exe");
+    p3.session_id = 2;
+    p3.category = ProcessCategory::App;
+    p3.cpu_delta_per_tick = 2_000_000; // 200 permille
+    p3.private_mem_bytes = 128 * 1024 * 1024;
+
+    let state = MockState::new(vec![p1, p2, p3]);
+    *state.mgmt.sessions.lock() = vec![
+        UserSessionRecord {
+            session_id: 1,
+            user_name: Arc::from("HOST\\Alice"),
+            state: UserSessionState::Active,
+            process_count: 0,
+            cpu_permille: 0,
+            memory_bytes: 0,
+            disk_bytes_per_sec: 0,
+            net_bytes_per_sec: 0,
+            processes: Vec::new(),
+        },
+        UserSessionRecord {
+            session_id: 2,
+            user_name: Arc::from("HOST\\Bob"),
+            state: UserSessionState::Disconnected,
+            process_count: 0,
+            cpu_permille: 0,
+            memory_bytes: 0,
+            disk_bytes_per_sec: 0,
+            net_bytes_per_sec: 0,
+            processes: Vec::new(),
+        },
+    ];
+
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let coord = EngineCoordinator::new(backend, settings).unwrap();
+    let _users_lease = coord.acquire_lease(MonitorDomain::Users);
+
+    // Wait for initial session poll, then advance a tick so per-process deltas become non-zero.
+    assert!(wait_until(Duration::from_secs(1), || {
+        coord.snapshot().revisions.users >= 1
+    }));
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    assert!(wait_until(Duration::from_secs(1), || {
+        let snap = coord.snapshot();
+        snap.users
+            .sessions
+            .iter()
+            .any(|s| s.session_id == 1 && s.cpu_permille == 500)
+    }));
+
+    let snap = coord.snapshot();
+    let s1 = snap
+        .users
+        .sessions
+        .iter()
+        .find(|s| s.session_id == 1)
+        .expect("session 1");
+    assert_eq!(s1.process_count, 2);
+    assert_eq!(s1.cpu_permille, 500);
+    assert_eq!(s1.memory_bytes, (64 + 256) * 1024 * 1024);
+    assert_eq!(s1.disk_bytes_per_sec, 3_000_000);
+    assert_eq!(s1.net_bytes_per_sec, 1_400_000);
+    assert_eq!(s1.processes.len(), 2);
+    // Sorted by CPU descending: busy_high (400) before mem_heavy (100).
+    assert_eq!(s1.processes[0].name.as_ref(), "busy_high.exe");
+    assert_eq!(s1.processes[0].cpu_permille, 400);
+    assert_eq!(s1.processes[1].name.as_ref(), "mem_heavy.exe");
+    assert_eq!(s1.processes[1].cpu_permille, 100);
+
+    let s2 = snap
+        .users
+        .sessions
+        .iter()
+        .find(|s| s.session_id == 2)
+        .expect("session 2");
+    assert_eq!(s2.process_count, 1);
+    assert_eq!(s2.cpu_permille, 200);
+    assert_eq!(s2.memory_bytes, 128 * 1024 * 1024);
+    assert_eq!(s2.processes.len(), 1);
+    assert_eq!(s2.processes[0].name.as_ref(), "remote_app.exe");
+}
+
+#[test]
+fn system_mgmt_commands_refresh_leased_snapshots_and_propagate_elevation_required() {
+    let state = MockState::new(vec![MockProcSpec::new(10, 100, 0, "app.exe")]);
+    state.mgmt.services.lock().push(ServiceRecord {
+        name: Arc::from("wuauserv"),
+        display_name: Arc::from("Windows Update"),
+        description: None,
+        pid: None,
+        state: ServiceState::Stopped,
+        group: Some(Arc::from("netsvcs")),
+    });
+    state.mgmt.startup_entries.lock().push(StartupEntry {
+        id: Arc::from("hklm-run:SecurityHealth"),
+        name: Arc::from("SecurityHealth"),
+        publisher: Some(Arc::from("Microsoft Corporation")),
+        command: Some(Arc::from(r"C:\Windows\System32\SecurityHealthSystray.exe")),
+        file_path: Some(Arc::from(r"C:\Windows\System32\SecurityHealthSystray.exe")),
+        enabled: true,
+        impact: StartupImpact::NotMeasured,
+    });
+    state.mgmt.sessions.lock().push(UserSessionRecord {
+        session_id: 2,
+        user_name: Arc::from("HOST\\Guest"),
+        state: UserSessionState::Active,
+        process_count: 0,
+        cpu_permille: 0,
+        memory_bytes: 0,
+        disk_bytes_per_sec: 0,
+        net_bytes_per_sec: 0,
+        processes: Vec::new(),
+    });
+
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let coord = EngineCoordinator::new(backend, settings).unwrap();
+    let _svc_lease = coord.acquire_lease(MonitorDomain::Services);
+    let _startup_lease = coord.acquire_lease(MonitorDomain::Startup);
+    let _users_lease = coord.acquire_lease(MonitorDomain::Users);
+
+    assert!(wait_until(Duration::from_secs(1), || {
+        let s = coord.snapshot();
+        s.revisions.services >= 1 && s.revisions.startup >= 1 && s.revisions.users >= 1
+    }));
+
+    // 1. StartService -> immediately updates snapshot to Running!
+    let ev = coord
+        .send_command_with_reply(EngineCommand::StartService("wuauserv".into()))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(ev.kind, CommandKind::StartService);
+    assert!(ev.is_ok());
+    assert_eq!(
+        coord.snapshot().services.items[0].state,
+        ServiceState::Running
+    );
+    let pid_after_start = coord.snapshot().services.items[0].pid;
+    assert_eq!(pid_after_start, Some(4242));
+
+    // 2. RestartService -> updates PID immediately!
+    let ev = coord
+        .send_command_with_reply(EngineCommand::RestartService("wuauserv".into()))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(ev.kind, CommandKind::RestartService);
+    assert!(ev.is_ok());
+    assert_eq!(coord.snapshot().services.items[0].pid, Some(4243));
+
+    // 3. StopService -> immediately updates snapshot to Stopped!
+    let ev = coord
+        .send_command_with_reply(EngineCommand::StopService("wuauserv".into()))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(ev.kind, CommandKind::StopService);
+    assert!(ev.is_ok());
+    assert_eq!(
+        coord.snapshot().services.items[0].state,
+        ServiceState::Stopped
+    );
+
+    // 4. OpenServicesConsole -> invokes ServiceManager::open_services_console.
+    let ev = coord
+        .send_command_with_reply(EngineCommand::OpenServicesConsole)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(ev.kind, CommandKind::OpenServicesConsole);
+    assert!(ev.is_ok());
+    assert_eq!(state.mgmt.open_console_calls.load(Ordering::Acquire), 1);
+
+    // 5. SetStartupEnabled -> immediately reflects disabled state in StartupSlice!
+    let ev = coord
+        .send_command_with_reply(EngineCommand::SetStartupEnabled {
+            id: "hklm-run:SecurityHealth".into(),
+            enabled: false,
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(ev.kind, CommandKind::SetStartupEnabled);
+    assert!(ev.is_ok());
+    assert!(!coord.snapshot().startup.items[0].enabled);
+    assert_eq!(
+        coord.snapshot().startup.items[0].impact,
+        StartupImpact::None
+    );
+
+    // 6. DisconnectSession -> immediately reflects Disconnected state in UsersSlice!
+    let ev = coord
+        .send_command_with_reply(EngineCommand::DisconnectSession(2))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(ev.kind, CommandKind::DisconnectSession);
+    assert!(ev.is_ok());
+    assert_eq!(
+        coord.snapshot().users.sessions[0].state,
+        UserSessionState::Disconnected
+    );
+
+    // 7. Verify PalError::ElevationRequired propagation across service, startup, and session ops.
+    state
+        .mgmt
+        .service_ops_require_elevation
+        .store(true, Ordering::Release);
+    state
+        .mgmt
+        .startup_ops_require_elevation
+        .store(true, Ordering::Release);
+    state
+        .mgmt
+        .session_ops_require_elevation
+        .store(true, Ordering::Release);
+
+    let svc_ev = coord
+        .send_command_with_reply(EngineCommand::StartService("wuauserv".into()))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert!(svc_ev.is_elevation_required());
+
+    let startup_ev = coord
+        .send_command_with_reply(EngineCommand::SetStartupEnabled {
+            id: "hklm-run:SecurityHealth".into(),
+            enabled: true,
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert!(startup_ev.is_elevation_required());
+
+    let sess_ev = coord
+        .send_command_with_reply(EngineCommand::DisconnectSession(2))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert!(sess_ev.is_elevation_required());
+}
+
+#[test]
+fn app_history_accumulates_live_deltas_merges_persisted_and_clears_atomically() {
+    let mut app = MockProcSpec::new(501, 1_000, 0, "Browser.exe");
+    app.category = ProcessCategory::App;
+    app.cpu_delta_per_tick = 1_500_000;
+    app.net_delta_per_tick = 200_000;
+
+    let mut sys = MockProcSpec::new(4, 1, 0, "System");
+    sys.category = ProcessCategory::System;
+    sys.cpu_delta_per_tick = 9_000_000;
+
+    let state = MockState::new(vec![app, sys]);
+    *state.mgmt.history_since.lock() = Some(1_700_000_000);
+    state.mgmt.history_items.lock().push(AppHistoryRecord {
+        app_id: Arc::from("browser.exe"),
+        name: Arc::from("Browser"),
+        cpu_time_100ns: 10_000_000,
+        network_bytes: 500_000,
+        metered_network_bytes: 1_000,
+    });
+
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let coord = EngineCoordinator::new(backend, settings).unwrap();
+
+    // Advance 2 ticks BEFORE leasing AppHistory -> live deltas accumulate in memory with 0 reads!
+    for _ in 0..2 {
+        coord
+            .send_command_with_reply(EngineCommand::ForceRefresh)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+    }
+    assert_eq!(state.mgmt.read_history_calls.load(Ordering::Acquire), 0);
+
+    // Lease AppHistory -> persisted baseline + 2 ticks of live deltas merge seamlessly.
+    let _hist_lease = coord.acquire_lease(MonitorDomain::AppHistory);
+    assert!(wait_until(Duration::from_secs(1), || {
+        coord.snapshot().revisions.app_history >= 1
+    }));
+
+    let snap = coord.snapshot();
+    assert_eq!(snap.app_history.since_epoch_secs, Some(1_700_000_000));
+    assert_eq!(
+        snap.app_history.items.len(),
+        1,
+        "System process must be excluded and browser.exe merged with persisted baseline"
+    );
+    let rec = &snap.app_history.items[0];
+    assert_eq!(rec.app_id.as_ref(), "browser.exe");
+    assert_eq!(rec.cpu_time_100ns, 10_000_000 + 2 * 1_500_000);
+    assert_eq!(rec.network_bytes, 500_000 + 2 * 200_000);
+    assert_eq!(rec.metered_network_bytes, 1_000);
+
+    // ClearAppHistory wipes both persisted store and live in-memory accumulator atomically!
+    let ev = coord
+        .send_command_with_reply(EngineCommand::ClearAppHistory)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(ev.kind, CommandKind::ClearAppHistory);
+    assert!(ev.is_ok());
+
+    let cleared = coord.snapshot();
+    assert_eq!(cleared.app_history.since_epoch_secs, Some(1_750_000_000));
+    assert!(
+        cleared.app_history.items.is_empty(),
+        "ClearAppHistory must reset both persisted and live accumulated entries"
+    );
+
+    // One more tick starts accumulating cleanly from zero.
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(1), || {
+        coord
+            .snapshot()
+            .app_history
+            .items
+            .iter()
+            .any(|r| r.app_id.as_ref() == "browser.exe" && r.cpu_time_100ns == 1_500_000)
     }));
 }

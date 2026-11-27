@@ -320,6 +320,8 @@ pub struct StartupEntry {
     pub publisher: Option<Arc<str>>,
     /// Optional command or target path.
     pub command: Option<Arc<str>>,
+    /// Resolved local executable or target file path, when available for shell actions.
+    pub file_path: Option<Arc<str>>,
     /// Whether this startup entry is currently enabled.
     pub enabled: bool,
     /// Estimated startup impact.
@@ -353,6 +355,27 @@ pub enum UserSessionState {
     Unknown,
 }
 
+/// Compact live process summary nested inside [`UserSessionRecord`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserSessionProcess {
+    /// Composite process lifecycle key.
+    pub key: ProcessKey,
+    /// Raw executable/process image name.
+    pub name: Arc<str>,
+    /// Friendly display name (file description, window title, or fallback image name).
+    pub display_name: Arc<str>,
+    /// Dynamic process status flags.
+    pub status: ProcessStatusFlags,
+    /// CPU utilization in permille (`0..=1000`).
+    pub cpu_permille: u16,
+    /// Private working set memory in bytes.
+    pub memory_bytes: u64,
+    /// Combined disk throughput in bytes per second.
+    pub disk_bytes_per_sec: u64,
+    /// Combined network throughput in bytes per second.
+    pub net_bytes_per_sec: u64,
+}
+
 /// Aggregated resource metrics for a single OS user session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserSessionRecord {
@@ -372,6 +395,8 @@ pub struct UserSessionRecord {
     pub disk_bytes_per_sec: u64,
     /// Aggregated network throughput in bytes per second.
     pub net_bytes_per_sec: u64,
+    /// Live processes running in this session, sorted by CPU and memory descending.
+    pub processes: Vec<UserSessionProcess>,
 }
 
 /// Published snapshot slice for the Users view.

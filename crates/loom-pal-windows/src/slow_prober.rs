@@ -391,7 +391,7 @@ pub fn is_unc_path(path: &str) -> bool {
 
 /// Extracts an uppercase ASCII drive letter (`b'A'..=b'Z'`) from local or extended paths
 /// (e.g., `C:\Windows\notepad.exe` or `\\?\C:\Windows\notepad.exe`).
-fn extract_drive_letter(path: &str) -> Option<u8> {
+pub(crate) fn extract_drive_letter(path: &str) -> Option<u8> {
     let trimmed = path.trim();
     let stripped = trimmed
         .strip_prefix(r"\\?\")
@@ -704,7 +704,7 @@ fn query_token_user(token: HANDLE, prober: &WindowsSlowProber) -> Option<Arc<str
 
 /// Reads local PE version resources (`CompanyName`, `FileDescription`) without performing
 /// any network certificate revocation (CRL/OCSP) checks.
-fn read_pe_version_info(exe_path: &str) -> (Option<Arc<str>>, Option<Arc<str>>) {
+pub(crate) fn read_pe_version_info(exe_path: &str) -> (Option<Arc<str>>, Option<Arc<str>>) {
     let wide_path = to_wide_null(exe_path);
     let mut unused_handle: u32 = 0;
 

@@ -10,13 +10,13 @@ use std::sync::Arc;
 
 use loom_pal_api::ProcessSampleScratch;
 use loom_types::{
-    DetailsRowProjection, DetailsSortColumn, DetailsTableSlice, DetailsViewMode, DiskDeviceSample,
-    DiskDeviceSlice, GpuAdapterSample, GpuAdapterSlice, GpuEngineSlice, HardwareStaticInfo,
-    HistoryRing, NetAdapterSample, NetAdapterSlice, PerformanceSlice, PlatformKind,
-    PlatformProfile, ProcessArch, ProcessCategory, ProcessKey, ProcessPriority, ProcessRowKind,
-    ProcessRowProjection, ProcessSortColumn, ProcessStatusFlags, ProcessTableSlice,
-    ProcessViewMode, SortDirection, SystemPerfSample, ThroughputRing, Timestamp100Ns,
-    UacVirtualization,
+    AppHistoryRecord, AppHistorySlice, DetailsRowProjection, DetailsSortColumn, DetailsTableSlice,
+    DetailsViewMode, DiskDeviceSample, DiskDeviceSlice, GpuAdapterSample, GpuAdapterSlice,
+    GpuEngineSlice, HardwareStaticInfo, HistoryRing, NetAdapterSample, NetAdapterSlice,
+    PerformanceSlice, PlatformKind, PlatformProfile, ProcessArch, ProcessCategory, ProcessKey,
+    ProcessPriority, ProcessRowKind, ProcessRowProjection, ProcessSortColumn, ProcessStatusFlags,
+    ProcessTableSlice, ProcessViewMode, SortDirection, SystemPerfSample, ThroughputRing,
+    Timestamp100Ns, UacVirtualization, UserSessionProcess, UserSessionRecord, UsersSlice,
 };
 
 use crate::slow_lane::ColdMetaCache;
@@ -24,6 +24,9 @@ use crate::tree::{FastBuildHasher, ProcessTree};
 
 /// Maximum number of interned strings retained by the fast-lane interner.
 const MAX_INTERNED_STRINGS: usize = 4_096;
+
+/// Maximum number of distinct application keys retained in the live App History accumulator.
+const MAX_LIVE_APP_HISTORY_ENTRIES: usize = 2_048;
 
 /// View filtering, grouping, sorting, and tree expansion parameters.
 #[derive(Debug, Default, Clone)]
@@ -88,7 +91,7 @@ impl DeltaTracker {
         net_bytes: u64,
         elapsed_100ns: u64,
         logical_cpus: u64,
-    ) -> (u16, u64, u64) {
+    ) -> (u16, u64, u64, u64, u64) {
         self.next_counters.insert(
             key,
             PrevProcCounters {
@@ -99,11 +102,11 @@ impl DeltaTracker {
         );
 
         if elapsed_100ns == 0 {
-            return (0, 0, 0);
+            return (0, 0, 0, 0, 0);
         }
 
         let Some(&prev) = self.prev_counters.get(&key) else {
-            return (0, 0, 0);
+            return (0, 0, 0, 0, 0);
         };
 
         let delta_cpu = cpu_time_100ns.saturating_sub(prev.cpu_time_100ns);
@@ -122,7 +125,7 @@ impl DeltaTracker {
             / u128::from(elapsed_100ns))
         .min(u128::from(u64::MAX)) as u64;
 
-        (cpu_permille, disk_bps, net_bps)
+        (cpu_permille, disk_bps, net_bps, delta_cpu, delta_net)
     }
 
     fn finish_tick(&mut self, timestamp: Timestamp100Ns) {
@@ -152,6 +155,15 @@ impl StringInterner {
     }
 }
 
+/// In-memory cumulative application usage counters accumulated on the fast lane.
+#[derive(Debug, Clone)]
+struct LiveAppHistoryEntry {
+    name: Arc<str>,
+    cpu_time_100ns: u64,
+    network_bytes: u64,
+    metered_network_bytes: u64,
+}
+
 /// Per-process hot + computed delta snapshot cached on the fast-lane thread.
 #[derive(Debug, Clone)]
 struct ComputedProcess {
@@ -160,6 +172,7 @@ struct ComputedProcess {
     thread_count: u32,
     handle_count: u32,
     cpu_time_100ns: u64,
+    delta_cpu_100ns: u64,
     cpu_permille: u16,
     private_working_set_bytes: u64,
     working_set_bytes: u64,
@@ -167,6 +180,7 @@ struct ComputedProcess {
     memory_permille: u16,
     disk_bytes_per_sec: u64,
     net_bytes_per_sec: u64,
+    delta_net_bytes: u64,
     gpu_dedicated_bytes: u64,
     gpu_shared_bytes: u64,
     gpu_util_permille: u16,
@@ -205,6 +219,7 @@ pub struct ProjectionEngine {
     gpus: Vec<GpuAdapterSlice>,
     latest_disk_read_bps: u64,
     latest_disk_write_bps: u64,
+    app_history_live: HashMap<Arc<str>, LiveAppHistoryEntry>,
 }
 
 impl Default for ProjectionEngine {
@@ -248,6 +263,7 @@ impl ProjectionEngine {
             gpus: Vec::new(),
             latest_disk_read_bps: 0,
             latest_disk_write_bps: 0,
+            app_history_live: HashMap::new(),
         }
     }
 
@@ -297,15 +313,20 @@ impl ProjectionEngine {
                 .saturating_add(sample.disk_write_bytes);
             let net_bytes = sample.net_recv_bytes.saturating_add(sample.net_sent_bytes);
 
-            let (cpu_permille, disk_bytes_per_sec, net_bytes_per_sec) =
-                self.delta_tracker.compute_for_process(
-                    sample.key,
-                    cpu_time_100ns,
-                    disk_bytes,
-                    net_bytes,
-                    elapsed_100ns,
-                    logical_cpus,
-                );
+            let (
+                cpu_permille,
+                disk_bytes_per_sec,
+                net_bytes_per_sec,
+                delta_cpu_100ns,
+                delta_net_bytes,
+            ) = self.delta_tracker.compute_for_process(
+                sample.key,
+                cpu_time_100ns,
+                disk_bytes,
+                net_bytes,
+                elapsed_100ns,
+                logical_cpus,
+            );
 
             let memory_permille = if mem_total_bytes > 0 {
                 ((u128::from(sample.private_working_set_bytes) * 1_000)
@@ -340,6 +361,7 @@ impl ProjectionEngine {
                 thread_count: sample.thread_count,
                 handle_count: sample.handle_count,
                 cpu_time_100ns,
+                delta_cpu_100ns,
                 cpu_permille,
                 private_working_set_bytes: sample.private_working_set_bytes,
                 working_set_bytes: sample.working_set_bytes,
@@ -347,6 +369,7 @@ impl ProjectionEngine {
                 memory_permille,
                 disk_bytes_per_sec,
                 net_bytes_per_sec,
+                delta_net_bytes,
                 gpu_dedicated_bytes: sample.gpu_dedicated_bytes,
                 gpu_shared_bytes: sample.gpu_shared_bytes,
                 gpu_util_permille: sample.gpu_util_permille,
@@ -765,6 +788,196 @@ impl ProjectionEngine {
         }
     }
 
+    /// Accumulates per-tick CPU and network deltas from non-system processes into the
+    /// in-memory App History map (keyed by app group ID or lowercase image name).
+    pub fn accumulate_app_history(&mut self, cold_cache: &ColdMetaCache) {
+        for proc in &self.computed {
+            if proc.delta_cpu_100ns == 0 && proc.delta_net_bytes == 0 {
+                continue;
+            }
+            if proc.category == ProcessCategory::System
+                || proc
+                    .status
+                    .intersects(ProcessStatusFlags::SYSTEM_IDLE | ProcessStatusFlags::KERNEL)
+            {
+                continue;
+            }
+
+            let cold = cold_cache.get_process(proc.key);
+            let app_id: Arc<str> =
+                if let Some(group_id) = cold.and_then(|meta| meta.app_group_id.as_ref()) {
+                    Arc::clone(group_id)
+                } else if proc.name.bytes().all(|b| !b.is_ascii_uppercase()) {
+                    Arc::clone(&proc.name)
+                } else {
+                    Arc::from(proc.name.to_ascii_lowercase())
+                };
+
+            let friendly_name = resolve_display_name(proc, cold_cache);
+
+            if let Some(entry) = self.app_history_live.get_mut(&app_id) {
+                entry.cpu_time_100ns = entry.cpu_time_100ns.saturating_add(proc.delta_cpu_100ns);
+                entry.network_bytes = entry.network_bytes.saturating_add(proc.delta_net_bytes);
+                // Upgrade raw image name once PE description / window title resolves.
+                if entry.name.as_ref() == proc.name.as_ref()
+                    && friendly_name.as_ref() != proc.name.as_ref()
+                {
+                    entry.name = friendly_name;
+                }
+            } else if self.app_history_live.len() < MAX_LIVE_APP_HISTORY_ENTRIES {
+                self.app_history_live.insert(
+                    app_id,
+                    LiveAppHistoryEntry {
+                        name: friendly_name,
+                        cpu_time_100ns: proc.delta_cpu_100ns,
+                        network_bytes: proc.delta_net_bytes,
+                        metered_network_bytes: 0,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Clears all in-memory cumulative App History counters.
+    pub fn clear_app_history(&mut self) {
+        self.app_history_live.clear();
+    }
+
+    /// Builds an [`AppHistorySlice`] by merging persisted baseline entries with live
+    /// in-memory cumulative usage counters, sorted by CPU time and network bytes descending.
+    pub fn project_app_history(
+        &self,
+        since_epoch_secs: Option<u64>,
+        persisted: &[AppHistoryRecord],
+        revision: u64,
+    ) -> AppHistorySlice {
+        let mut merged: HashMap<Arc<str>, AppHistoryRecord> =
+            HashMap::with_capacity(persisted.len().saturating_add(self.app_history_live.len()));
+
+        for rec in persisted {
+            merged.insert(Arc::clone(&rec.app_id), rec.clone());
+        }
+
+        for (app_id, live) in &self.app_history_live {
+            if let Some(existing) = merged.get_mut(app_id) {
+                existing.cpu_time_100ns =
+                    existing.cpu_time_100ns.saturating_add(live.cpu_time_100ns);
+                existing.network_bytes = existing.network_bytes.saturating_add(live.network_bytes);
+                existing.metered_network_bytes = existing
+                    .metered_network_bytes
+                    .saturating_add(live.metered_network_bytes);
+                if existing.name.is_empty() && !live.name.is_empty() {
+                    existing.name = Arc::clone(&live.name);
+                }
+            } else {
+                merged.insert(
+                    Arc::clone(app_id),
+                    AppHistoryRecord {
+                        app_id: Arc::clone(app_id),
+                        name: Arc::clone(&live.name),
+                        cpu_time_100ns: live.cpu_time_100ns,
+                        network_bytes: live.network_bytes,
+                        metered_network_bytes: live.metered_network_bytes,
+                    },
+                );
+            }
+        }
+
+        let mut items: Vec<AppHistoryRecord> = merged.into_values().collect();
+        items.sort_by(|a, b| {
+            b.cpu_time_100ns
+                .cmp(&a.cpu_time_100ns)
+                .then_with(|| b.network_bytes.cmp(&a.network_bytes))
+                .then_with(|| {
+                    a.name
+                        .as_bytes()
+                        .iter()
+                        .map(u8::to_ascii_lowercase)
+                        .cmp(b.name.as_bytes().iter().map(u8::to_ascii_lowercase))
+                })
+                .then_with(|| a.app_id.cmp(&b.app_id))
+        });
+
+        AppHistorySlice {
+            revision,
+            timestamp: self.latest_timestamp,
+            since_epoch_secs,
+            items,
+        }
+    }
+
+    /// Enriches OS user sessions with live per-session process aggregates and sorted
+    /// per-session process lists from the latest fast-lane sample.
+    pub fn project_users(
+        &self,
+        base_sessions: &[UserSessionRecord],
+        cold_cache: &ColdMetaCache,
+        revision: u64,
+    ) -> UsersSlice {
+        let mut sessions = Vec::with_capacity(base_sessions.len());
+
+        for base in base_sessions {
+            let mut cpu_sum: u32 = 0;
+            let mut memory_bytes: u64 = 0;
+            let mut disk_bytes_per_sec: u64 = 0;
+            let mut net_bytes_per_sec: u64 = 0;
+            let mut processes = Vec::new();
+
+            for proc in &self.computed {
+                if proc.session_id != base.session_id {
+                    continue;
+                }
+                cpu_sum = cpu_sum.saturating_add(u32::from(proc.cpu_permille));
+                memory_bytes = memory_bytes.saturating_add(proc.private_working_set_bytes);
+                disk_bytes_per_sec = disk_bytes_per_sec.saturating_add(proc.disk_bytes_per_sec);
+                net_bytes_per_sec = net_bytes_per_sec.saturating_add(proc.net_bytes_per_sec);
+
+                processes.push(UserSessionProcess {
+                    key: proc.key,
+                    name: Arc::clone(&proc.name),
+                    display_name: resolve_display_name(proc, cold_cache),
+                    status: effective_status(proc, cold_cache),
+                    cpu_permille: proc.cpu_permille,
+                    memory_bytes: proc.private_working_set_bytes,
+                    disk_bytes_per_sec: proc.disk_bytes_per_sec,
+                    net_bytes_per_sec: proc.net_bytes_per_sec,
+                });
+            }
+
+            processes.sort_by(|a, b| {
+                b.cpu_permille
+                    .cmp(&a.cpu_permille)
+                    .then_with(|| b.memory_bytes.cmp(&a.memory_bytes))
+                    .then_with(|| {
+                        a.name
+                            .as_bytes()
+                            .iter()
+                            .map(u8::to_ascii_lowercase)
+                            .cmp(b.name.as_bytes().iter().map(u8::to_ascii_lowercase))
+                    })
+                    .then_with(|| a.key.cmp(&b.key))
+            });
+
+            sessions.push(UserSessionRecord {
+                session_id: base.session_id,
+                user_name: Arc::clone(&base.user_name),
+                state: base.state,
+                process_count: processes.len() as u32,
+                cpu_permille: cpu_sum.min(1_000) as u16,
+                memory_bytes,
+                disk_bytes_per_sec,
+                net_bytes_per_sec,
+                processes,
+            });
+        }
+
+        UsersSlice {
+            revision,
+            timestamp: self.latest_timestamp,
+            sessions,
+        }
+    }
+
     #[inline]
     fn build_process_row(
         &self,
@@ -782,12 +995,7 @@ impl ProjectionEngine {
         let exe_path = cold.and_then(|meta| meta.exe_path.clone());
         let command_line = cold.and_then(|meta| meta.command_line.clone());
         let icon = asset.and_then(|a| a.icon.clone());
-        let display_name = asset
-            .and_then(|a| a.file_description.as_ref())
-            .filter(|desc| !desc.trim().is_empty())
-            .cloned()
-            .or_else(|| proc.window_title.clone())
-            .unwrap_or_else(|| Arc::clone(&proc.name));
+        let display_name = resolve_display_name(proc, cold_cache);
         let status = effective_status(proc, cold_cache);
         let disk_permille =
             compute_throughput_permille(proc.disk_bytes_per_sec, self.total_disk_bytes_per_sec);
@@ -2051,6 +2259,18 @@ fn display_user_for_sort(raw: Option<&str>) -> &str {
         Some((_, account)) if !account.is_empty() => account,
         _ => name,
     }
+}
+
+#[inline]
+fn resolve_display_name(proc: &ComputedProcess, cold_cache: &ColdMetaCache) -> Arc<str> {
+    cold_cache
+        .get_process(proc.key)
+        .and_then(|meta| meta.asset.as_ref())
+        .and_then(|asset| asset.file_description.as_ref())
+        .filter(|desc| !desc.trim().is_empty())
+        .cloned()
+        .or_else(|| proc.window_title.clone())
+        .unwrap_or_else(|| Arc::clone(&proc.name))
 }
 
 #[inline]
