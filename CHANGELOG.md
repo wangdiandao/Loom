@@ -4,6 +4,12 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ## Unreleased
 
+### UI & UX
+
+- Added pure-Rust UI layout, chart scaling, and export logic in `loom-ui-kit::logic`: smooth stepped disk throughput (`stepped_throughput_ceiling`) and network bit-rate (`stepped_network_ceiling`) Y-axis ceilings, adaptive logical-core grid layout scoring (`compute_core_grid_layout` targeting `~1.4:1` plot aspect ratio with `8%` resize hysteresis and `Full`/`Short`/`Hidden` progressive header degradation), active GPU engine pane selection (`select_active_gpu_engines`), stable open-time ordering (`merge_stable_order`), and UTF-8 BOM / RFC 4180 formula-injection-safe CSV formatting helpers (`format_csv_cell`, `build_csv_document`).
+- Added W3C WCAG 2.1 relative luminance and contrast solver utilities (`srgb_relative_luminance`, `wcag_contrast_ratio`, `ensure_wcag_contrast`, `hsla_to_srgb`) plus heterogeneous CPU core (`cpu_core_p`, `cpu_core_e`, `cpu_core_lp_e`), `leak_warning`, and `sort_paused` semantic color tokens in `LoomSemanticColors` with automated light/dark AA contrast verification (`>= 4.5:1` text, `>= 3.0:1` charts/accents).
+- Added honest unavailable metric formatters (`UNAVAILABLE_LABEL` `"—"`, `format_opt_percent_permille`, `format_opt_temp_celsius`) and gap-aware sparkline window/segment builders (`GapAwareSparklinePoint`, `PERMILLE_GAP_SENTINEL`, `SparklinePoint::from_opt_f32_segments` / `from_opt_permille_segments` / `from_f32_gap_safe_segments` / `from_permille_sentinel_segments` / `from_opt_f32_padded` / `from_opt_f32_window`) in `loom-ui-kit`.
+
 ## 0.1.0 - 2026-11-27
 
 ### Engine & PAL

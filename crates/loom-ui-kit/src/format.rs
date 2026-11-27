@@ -20,6 +20,11 @@ const RATE_CRITICAL_BPS: u64 = 100 * MIB;
 /// 100-nanosecond ticks per second (`10_000_000`).
 const TICKS_PER_SECOND: u64 = 10_000_000;
 
+/// Honest placeholder string rendered when a sensor, counter, or sleeping
+/// device cannot report a valid measurement (`"—"` instead of a fabricated
+/// `0%` or `0°C`).
+pub const UNAVAILABLE_LABEL: &str = "—";
+
 /// Semantic intensity bucket for process resource heatmap cells.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HeatmapLevel {
@@ -185,6 +190,32 @@ pub fn format_permille_shared(permille: u16) -> SharedString {
         0 => SharedString::new_static("0.0%"),
         1_000 => SharedString::new_static("100.0%"),
         _ => format_permille(permille).into(),
+    }
+}
+
+/// Formats an optional permille utilization value (`0..=1000`) as a percentage
+/// [`SharedString`], or [`UNAVAILABLE_LABEL`] (`"—"`) when the metric is
+/// unavailable rather than fabricating `"0.0%"`.
+#[inline]
+pub fn format_opt_percent_permille(val: Option<u16>) -> SharedString {
+    match val {
+        Some(permille) => format_permille_shared(permille),
+        None => SharedString::new_static(UNAVAILABLE_LABEL),
+    }
+}
+
+/// Formats an optional temperature in whole degrees Celsius, returning
+/// [`UNAVAILABLE_LABEL`] (`"—"`) when the device is sleeping (e.g. D3cold
+/// discrete GPU) or the sensor reading is unavailable rather than fabricating
+/// `"0°C"`.
+#[inline]
+pub fn format_opt_temp_celsius(val: Option<i16>, sleeping: bool) -> SharedString {
+    if sleeping {
+        return SharedString::new_static(UNAVAILABLE_LABEL);
+    }
+    match val {
+        Some(celsius) => SharedString::from(format!("{celsius}°C")),
+        None => SharedString::new_static(UNAVAILABLE_LABEL),
     }
 }
 
