@@ -4,6 +4,8 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ## Unreleased
 
+## 0.0.6 - 2026-11-27
+
 ### Engine & PAL
 
 - Added `CapabilityFlags::{DEBUGGER_ATTACH, GLOBAL_HOTKEY}` in `loom-types`, `PalError::Cancelled` and `SystemOperator::attach_debugger` in `loom-pal-api`, backward-compatible `AppSettings::global_hotkey` persistence with whitespace sanitization in `loom-config`, and cross-platform `GlobalHotkeyController` in `loom-pal`.
@@ -12,6 +14,12 @@ See [versioning and releases](docs/release.md) for the version progression polic
 ### Windows Backend
 
 - Implemented Windows Wait Chain Traversal (`OpenThreadWaitChainSession` / `GetThreadWaitChain` dynamically loaded from `advapi32.dll` with RAII session cleanup), cancellable streaming memory dumps (`MiniDumpWriteDump` dynamically loaded from `dbghelp.dll` with `CancelCallback` partial-file cleanup), live UAC virtualization toggling (`SetTokenInformation(TokenVirtualizationEnabled)`), JIT debugger attachment (`AeDebug\Debugger` registry lookup + `CreateProcessW`), and zero-idle on-demand global wakeup hotkeys (`RegisterHotKey` / `UnregisterHotKey`) in `loom-pal-windows`, advertising `CapabilityFlags::{WAIT_CHAIN, MINIDUMP, DEBUGGER_ATTACH, GLOBAL_HOTKEY}`.
+
+### Performance & Diagnostics
+
+- Deferred Explorer system tray (`Shell_NotifyIconW`) and global wakeup hotkey registration past `open_main_window` in `loom-app` so OS shell IPC does not delay initial window creation on startup.
+- Added deterministic 512-process high-load fault-injection stress tests (`high_load_500_processes_hung_windows_and_slow_disk_stress_test`) and dormancy/unleased-domain zero-overhead regression tests (`steady_state_dormancy_and_unleased_domains_zero_overhead_test`) in `loom-engine`, verifying non-blocking fast-lane ticks under `410–500 ms` slow-disk/asset stalls, `300 ms` `CircuitBreaker` drive bypass, `NOT_RESPONDING` hung-window projection, bottom-up process tree termination, and zero sampling ticks while dormant.
+- Extended real-Windows headless end-to-end verification (`headless_windows_engineering_budget_verification` in `loom-app`) covering cold/warm config load latency, `EngineCoordinator::<NativeBackend>::new` time-to-first-snapshot (`< 50 ms` release), bounded `<= 3` engine background thread delta, steady-state 1s headless CPU% budget, and full `Performance`/`PerCoreCpu`/`Services`/`Startup`/`Users`/`AppHistory` RAII lease acquire/release isolation.
 
 ### UI & UX
 
