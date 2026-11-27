@@ -6,9 +6,20 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ### Engine & PAL
 
+- Added fixed-size stack-allocated `ThroughputRing<N>` and structured hardware telemetry types (`CpuStaticInfo`, `MemoryHardwareInfo`, `HardwareStaticInfo`, `DiskMediaType`, `DiskDeviceSample`/`DiskDeviceSlice`, `NetConnectionType`, `NetAdapterSample`/`NetAdapterSlice`, `GpuEngineSample`/`GpuEngineSlice`, `GpuAdapterSample`/`GpuAdapterSlice`) in `loom-types`, extending `PerformanceSlice` with per-device metadata and 60-point history rings.
+- Extended `PerfSampleScratch` (`networks`, `gpus`) and `SlowMetadataProber` (`probe_hardware_static_info`, `probe_disk_performance`) in `loom-pal-api`, and wired `loom-engine` to gate static hardware and deduplicated slow-lane disk polling strictly behind `MonitorDomain::Performance` leases while maintaining 60-point histories across CPU, Memory, Per-Core CPU, Disk `0..N`, Network adapters, and GPU `0..N` engines.
 - Fixed a fast-lane lease wakeup race in `FastLaneRunner` where acquiring `MonitorDomain::PerCoreCpu` on the same tick after `MonitorDomain::Performance` had already sampled skipped per-core sampling until the next tick (stalling indefinitely when `RefreshSpeed::Paused`).
 - Refined Windows **Processes** `Grouped` view (`PlatformKind::Windows` only) to group multi-process apps strictly by app identity—MSIX/UWP Package Family Name (`ProcessColdMeta::app_group_id` via `GetPackageFamilyName`) or executable path / image name—rather than swallowing different-executable OS children (keeping `WeChatAppEx.exe`, `crashpad_handler.exe`, etc. in `Background`), displaying total group process counts (`(N)`), aggregating CPU/Memory/Disk/Network/GPU metrics, rolling up `EFFICIENCY_MODE`/`NOT_RESPONDING` (and `SUSPENDED` only when all group members are suspended), and keeping `Process Tree` and non-Windows (`Linux` / `macOS`) grouping unchanged.
 - Aligned the Windows **Processes** `Grouped` view (`PlatformKind::Windows` only) with Windows Task Manager: stopped nesting independent desktop apps or background daemons under `explorer.exe`, grouped windowless multi-process helper/renderer descendants (and same-image orphaned helpers) under their owning top-level `App` row with aggregated CPU/Memory/Disk/Network/GPU metrics and rolled-up EcoQoS/`Not responding` status flags, and auto-expanded owning `App` groups when searching for child processes—while keeping `Process Tree` and non-Windows (`Linux` / `macOS`) grouping unchanged.
+
+### Windows Backend
+
+- Implemented WMI/PDH-free Windows hardware performance monitoring in `loom-pal-windows`:
+  - **CPU**: dynamic and nominal frequency via `CallNtPowerInformation(ProcessorInformation)`, static sockets/physical cores/L1–L3 cache topology via `GetLogicalProcessorInformationEx`, processor brand from registry, and firmware virtualization status via `IsProcessorFeaturePresent(PF_VIRT_FIRMWARE_ENABLED)`.
+  - **Memory**: modified/standby/free page composition via `NtQuerySystemInformation(SystemMemoryListInformation)` with safe fallback and a pure-Rust SMBIOS Type 17 parser (`GetSystemFirmwareTable('RSMB', 0)`) for RAM speed (MT/s), slot counts, form factor, and hardware-reserved bytes.
+  - **Disk `0..N`**: slow-lane physical disk telemetry via `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`, `IOCTL_STORAGE_QUERY_PROPERTY` (model, NVMe/SSD/HDD detection), `IOCTL_DISK_GET_LENGTH_INFO`, and `IOCTL_DISK_PERFORMANCE` deltas with mandatory `DRIVE_REMOTE`/`DRIVE_CDROM` bypass and per-device `300 ms` `CircuitBreaker` isolation.
+  - **Network**: operational Ethernet and Wi-Fi adapter throughput, link speed, IPv4/IPv6, and DNS suffix via `iphlpapi` (`GetIfTable2` + `GetAdaptersAddresses`).
+  - **GPU `0..N`**: dynamic `dxgi.dll` (`CreateDXGIFactory1`) and `gdi32.dll` (`D3DKMTQueryStatistics` / `D3DKMTQueryAdapterInfo`) VRAM usage, per-node engine utilization, optional core temperature, PCI location, WDDM/DirectX version, and display driver version with safe headless/software fallback.
 
 ### UI & UX
 

@@ -26,6 +26,7 @@ use windows_sys::Win32::Foundation::{
     UNICODE_STRING,
 };
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+use windows_sys::Win32::System::Power::PROCESSOR_POWER_INFORMATION;
 use windows_sys::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
 use windows_sys::Win32::System::SystemInformation::{
     GetSystemTimeAsFileTime, GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX,
@@ -44,6 +45,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use windows_sys::core::BOOL;
 
 use crate::handle::filetime_to_u64;
+use crate::perf::cpu::{populate_memory_list_composition, sample_cpu_frequencies};
+use crate::perf::gpu::GpuPerfSampler;
+use crate::perf::net::NetworkPerfSampler;
 
 /// Initial size of the reusable `SystemProcessInformation` buffer (512 KiB).
 const INITIAL_PROC_BUF_BYTES: usize = 512 * 1024;
@@ -152,6 +156,12 @@ pub struct WindowsFastSampler {
     window_titles: String,
     /// Reusable UTF-16 buffer for `InternalGetWindowText`.
     utf16_title_buf: Vec<u16>,
+    /// Reusable buffer for `CallNtPowerInformation(ProcessorInformation)`.
+    power_info_buf: Vec<PROCESSOR_POWER_INFORMATION>,
+    /// Fast-lane `iphlpapi` network adapter throughput sampler.
+    net_sampler: NetworkPerfSampler,
+    /// Fast-lane `DXGI` + `D3DKMT` GPU telemetry sampler.
+    gpu_sampler: GpuPerfSampler,
     /// Cached total logical CPU count across all processor groups.
     logical_cpu_count: u32,
 }
@@ -188,6 +198,9 @@ impl WindowsFastSampler {
             window_map: HashMap::with_capacity(128),
             window_titles: String::with_capacity(4096),
             utf16_title_buf: vec![0u16; MAX_WINDOW_TITLE_CHARS],
+            power_info_buf: vec![PROCESSOR_POWER_INFORMATION::default(); cpu_cap],
+            net_sampler: NetworkPerfSampler::new(),
+            gpu_sampler: GpuPerfSampler::new(),
             logical_cpu_count,
         }
     }
@@ -571,13 +584,26 @@ impl FastSystemSampler for WindowsFastSampler {
             &mut self.prev_perf_cpu,
             Some(&mut scratch.per_core_permille),
         );
+        let (cpu_freq_mhz, cpu_base_freq_mhz) =
+            sample_cpu_frequencies(&mut self.power_info_buf, self.logical_cpu_count);
+        let (net_recv_bytes_per_sec, net_sent_bytes_per_sec) =
+            self.net_sampler.sample(&mut scratch.networks);
+        let gpu_summary = self.gpu_sampler.sample(&mut scratch.gpus);
 
         let mut sample = SystemPerfSample {
             timestamp,
             cpu_total_permille,
             cpu_kernel_permille,
+            cpu_freq_mhz,
+            cpu_base_freq_mhz,
             logical_cpu_count: self.logical_cpu_count,
             uptime_secs: current_uptime_secs(),
+            net_recv_bytes_per_sec,
+            net_sent_bytes_per_sec,
+            gpu_util_permille: gpu_summary.util_permille,
+            gpu_dedicated_used_bytes: gpu_summary.dedicated_used_bytes,
+            gpu_dedicated_total_bytes: gpu_summary.dedicated_total_bytes,
+            gpu_shared_used_bytes: gpu_summary.shared_used_bytes,
             ..SystemPerfSample::default()
         };
         populate_memory_counters(&mut sample, true);
@@ -804,7 +830,10 @@ fn populate_memory_counters(sample: &mut SystemPerfSample, include_counts: bool)
             sample.process_count = perf_info.ProcessCount;
             sample.thread_count = perf_info.ThreadCount;
             sample.handle_count = perf_info.HandleCount;
+            populate_memory_list_composition(sample, page, perf_info.SystemCache);
         }
+    } else if include_counts {
+        populate_memory_list_composition(sample, 4096, 0);
     }
 }
 

@@ -15,8 +15,12 @@ pub mod snapshot;
 pub mod time;
 
 pub use control::{CapabilityFlags, RunTaskRequest, TreeKillItem, TreeKillReport, WaitChainNode};
-pub use history::{HistoryRing, HistoryRingIter};
-pub use performance::{PerformanceSlice, SystemPerfSample};
+pub use history::{HistoryRing, HistoryRingIter, ThroughputRing, ThroughputRingIter};
+pub use performance::{
+    CpuStaticInfo, DiskDeviceSample, DiskDeviceSlice, DiskMediaType, GpuAdapterSample,
+    GpuAdapterSlice, GpuEngineSample, GpuEngineSlice, HardwareStaticInfo, MemoryHardwareInfo,
+    NetAdapterSample, NetAdapterSlice, NetConnectionType, PerformanceSlice, SystemPerfSample,
+};
 pub use platform::{PlatformKind, PlatformProfile};
 pub use prefs::{
     DetailsSortColumn, DetailsViewMode, LanguagePreference, ProcessSortColumn, ProcessViewMode,
@@ -115,6 +119,38 @@ mod tests {
     }
 
     #[test]
+    fn throughput_ring_push_wraparound_and_max_value() {
+        let mut ring = ThroughputRing::<4>::new();
+        assert!(ring.is_empty());
+        assert_eq!(ring.len(), 0);
+        assert_eq!(ring.latest(), None);
+        assert_eq!(ring.max_value(), 0);
+        assert_eq!(ring.to_vec(), Vec::<u64>::new());
+
+        ring.push(1_000);
+        ring.push(5_000_000_000);
+        assert!(!ring.is_empty());
+        assert_eq!(ring.len(), 2);
+        assert_eq!(ring.latest(), Some(5_000_000_000));
+        assert_eq!(ring.max_value(), 5_000_000_000);
+        assert_eq!(ring.iter().collect::<Vec<_>>(), vec![1_000, 5_000_000_000]);
+
+        ring.push(250);
+        ring.push(4_096);
+        ring.push(2_048); // evicts 1_000
+        ring.push(8_192); // evicts 5_000_000_000
+        assert_eq!(ring.len(), 4);
+        assert_eq!(ring.latest(), Some(8_192));
+        assert_eq!(ring.to_vec(), vec![250, 4_096, 2_048, 8_192]);
+        assert_eq!(ring.max_value(), 8_192);
+
+        let copy = ring;
+        ring.clear();
+        assert!(ring.is_empty());
+        assert_eq!(copy.len(), 4);
+    }
+
+    #[test]
     fn cpu_affinity_mask_supports_more_than_64_cpus() {
         // Test 128 logical CPUs (2 full groups)
         let mask128 = CpuAffinityMask::all(128);
@@ -161,6 +197,7 @@ mod tests {
         fn assert_copy<T: Copy>() {}
         assert_copy::<ProcessHotSample<()>>();
         assert_copy::<HistoryRing<60>>();
+        assert_copy::<ThroughputRing<60>>();
         assert_copy::<SystemPerfSample>();
         assert_copy::<PlatformKind>();
         assert_copy::<PlatformProfile>();
