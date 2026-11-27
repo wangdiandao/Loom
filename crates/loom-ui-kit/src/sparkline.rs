@@ -9,6 +9,38 @@ use gpui_kit::{
 
 use crate::theme::LoomSemanticColors;
 
+/// Sentinel permille value (`u16::MAX`) indicating a missing, paused, or
+/// error sample inside fixed-width `u16` history buffers.
+pub const PERMILLE_GAP_SENTINEL: u16 = u16::MAX;
+
+/// A single slot in a right-aligned time-series window that distinguishes a
+/// missing/paused/error interval (`value: None`) from a genuine `0.0` sample.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GapAwareSparklinePoint {
+    /// Monotonic sample index along the horizontal axis (`0..window_len`).
+    pub index: usize,
+    /// Finite metric value when sampled cleanly, or `None` for a gap slot.
+    pub value: Option<f32>,
+}
+
+impl GapAwareSparklinePoint {
+    /// Creates a new [`GapAwareSparklinePoint`], normalizing non-finite floats
+    /// (`NaN`, `±inf`) into `None`.
+    #[inline]
+    pub fn new(index: usize, value: Option<f32>) -> Self {
+        Self {
+            index,
+            value: value.filter(|v| v.is_finite()),
+        }
+    }
+
+    /// Returns `true` when this slot represents a missing/paused/error gap.
+    #[inline]
+    pub const fn is_gap(&self) -> bool {
+        self.value.is_none()
+    }
+}
+
 /// A single ordered data point rendered inside [`sparkline_card`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SparklinePoint {
@@ -88,6 +120,130 @@ impl SparklinePoint {
             }
         }
         points
+    }
+
+    /// Builds a fixed-length right-aligned window of [`GapAwareSparklinePoint`]
+    /// entries from `Option<f32>` samples.
+    ///
+    /// Leading slots before enough samples exist, `None` entries, and non-finite
+    /// float sentinels (`NaN`, `±inf`) are all preserved as `value: None` gaps
+    /// rather than fabricated `0.0` points.
+    pub fn from_opt_f32_window(
+        values: impl IntoIterator<Item = Option<f32>>,
+        window_len: usize,
+    ) -> Vec<GapAwareSparklinePoint> {
+        if window_len == 0 {
+            return Vec::new();
+        }
+        let samples: Vec<Option<f32>> = values.into_iter().collect();
+        let mut window = Vec::with_capacity(window_len);
+        if samples.len() >= window_len {
+            let start = samples.len() - window_len;
+            for (index, &opt) in samples[start..].iter().enumerate() {
+                window.push(GapAwareSparklinePoint::new(index, opt));
+            }
+        } else {
+            let pad = window_len - samples.len();
+            for index in 0..pad {
+                window.push(GapAwareSparklinePoint::new(index, None));
+            }
+            for (offset, &opt) in samples.iter().enumerate() {
+                window.push(GapAwareSparklinePoint::new(pad + offset, opt));
+            }
+        }
+        window
+    }
+
+    /// Splits a right-aligned `Option<f32>` sample stream into contiguous
+    /// valid [`SparklinePoint`] segments separated by gaps (`None` or
+    /// non-finite sentinels).
+    ///
+    /// Preserves each point's true horizontal `index` within `0..window_len`
+    /// so paused/error intervals break the line instead of fabricating flat
+    /// zero lines or bogus connecting ramps.
+    pub fn from_opt_f32_segments(
+        values: impl IntoIterator<Item = Option<f32>>,
+        window_len: usize,
+    ) -> Vec<Vec<Self>> {
+        let window = Self::from_opt_f32_window(values, window_len);
+        let mut segments: Vec<Vec<Self>> = Vec::new();
+        let mut current: Vec<Self> = Vec::new();
+
+        for slot in window {
+            match slot.value {
+                Some(value) => current.push(Self::new(slot.index, value)),
+                None => {
+                    if !current.is_empty() {
+                        segments.push(std::mem::take(&mut current));
+                    }
+                }
+            }
+        }
+        if !current.is_empty() {
+            segments.push(current);
+        }
+        segments
+    }
+
+    /// Splits a right-aligned `Option<u16>` permille (`0..=1000`) stream into
+    /// contiguous percentage (`0.0..=100.0`) [`SparklinePoint`] segments
+    /// separated by `None` gaps.
+    pub fn from_opt_permille_segments(
+        values: impl IntoIterator<Item = Option<u16>>,
+        window_len: usize,
+    ) -> Vec<Vec<Self>> {
+        Self::from_opt_f32_segments(
+            values
+                .into_iter()
+                .map(|opt| opt.map(|permille| f32::from(permille) / 10.0)),
+            window_len,
+        )
+    }
+
+    /// Splits a right-aligned `f32` sample stream into contiguous finite
+    /// [`SparklinePoint`] segments, treating `NaN` and `±inf` sentinels as gaps.
+    pub fn from_f32_gap_safe_segments(
+        values: impl IntoIterator<Item = f32>,
+        window_len: usize,
+    ) -> Vec<Vec<Self>> {
+        Self::from_opt_f32_segments(
+            values
+                .into_iter()
+                .map(|v| if v.is_finite() { Some(v) } else { None }),
+            window_len,
+        )
+    }
+
+    /// Splits a right-aligned `u16` permille stream into contiguous percentage
+    /// [`SparklinePoint`] segments, treating [`PERMILLE_GAP_SENTINEL`]
+    /// (`u16::MAX`) as a gap.
+    pub fn from_permille_sentinel_segments(
+        values: impl IntoIterator<Item = u16>,
+        window_len: usize,
+    ) -> Vec<Vec<Self>> {
+        Self::from_opt_permille_segments(
+            values.into_iter().map(|permille| {
+                if permille == PERMILLE_GAP_SENTINEL {
+                    None
+                } else {
+                    Some(permille)
+                }
+            }),
+            window_len,
+        )
+    }
+
+    /// Builds a right-aligned `Vec<SparklinePoint>` from `Option<f32>` samples
+    /// while omitting `None` and non-finite gap slots and preserving each valid
+    /// sample's true horizontal `index` within `0..window_len`.
+    pub fn from_opt_f32_padded(
+        values: impl IntoIterator<Item = Option<f32>>,
+        window_len: usize,
+    ) -> Vec<Self> {
+        Self::from_opt_f32_window(values, window_len)
+            .into_iter()
+            .filter_map(|slot| slot.value.map(|v| Self::new(slot.index, v)))
+            .collect()
     }
 }
 
