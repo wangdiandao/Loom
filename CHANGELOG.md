@@ -4,6 +4,8 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ## Unreleased
 
+## 0.0.5 - 2026-11-27
+
 ### Engine & PAL
 
 - Extended `loom-types` with `UserSessionProcess` (nested inside `UserSessionRecord::processes`) and `StartupEntry::file_path` for per-session process inspection and startup shell actions.
