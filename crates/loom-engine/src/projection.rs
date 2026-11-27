@@ -615,6 +615,7 @@ impl ProjectionEngine {
                 dedicated_total_bytes: sample.dedicated_total_bytes,
                 shared_used_bytes: sample.shared_used_bytes,
                 shared_total_bytes: sample.shared_total_bytes,
+                d3_asleep: sample.d3_asleep,
                 util_history,
                 dedicated_mem_history,
                 shared_mem_history,
@@ -1027,6 +1028,9 @@ impl ProjectionEngine {
             net_permille,
             gpu_util_permille: proc.gpu_util_permille,
             gpu_dedicated_bytes: proc.gpu_dedicated_bytes,
+            parent_key: None,
+            leak_warning: None,
+            webview2_role: None,
         }
     }
 
@@ -1075,6 +1079,8 @@ impl ProjectionEngine {
             gpu_shared_bytes: proc.gpu_shared_bytes,
             exe_path: cold.and_then(|m| m.exe_path.clone()),
             command_line: cold.and_then(|m| m.command_line.clone()),
+            leak_warning: None,
+            webview2_role: None,
         }
     }
 
@@ -2247,6 +2253,9 @@ fn section_header_row(category: ProcessCategory, count: usize) -> ProcessRowProj
         net_permille: 0,
         gpu_util_permille: 0,
         gpu_dedicated_bytes: 0,
+        parent_key: None,
+        leak_warning: None,
+        webview2_role: None,
     }
 }
 

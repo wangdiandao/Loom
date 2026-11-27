@@ -92,6 +92,18 @@ pub struct AppSettings {
     /// Optional global system wakeup hotkey string (e.g., `"Ctrl+Shift+L"`), or `None` when disabled.
     #[serde(default)]
     pub global_hotkey: Option<String>,
+    /// Group `msedgewebview2.exe` subprocesses under their hosting application in Grouped view.
+    #[serde(default = "default_true")]
+    pub webview2_host_grouping: bool,
+    /// Display advisory resource-leak warnings on processes showing sustained handle/child growth.
+    #[serde(default = "default_true")]
+    pub show_leak_warnings: bool,
+    /// Executable paths or image names excluded from resource-leak warnings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leak_ignored_paths: Vec<String>,
+    /// Hide core Windows system processes in the Processes view when enabled.
+    #[serde(default)]
+    pub hide_windows_system_processes: bool,
 }
 
 impl Default for AppSettings {
@@ -116,6 +128,10 @@ impl Default for AppSettings {
             processes_columns: Vec::new(),
             details_columns: Vec::new(),
             global_hotkey: None,
+            webview2_host_grouping: true,
+            show_leak_warnings: true,
+            leak_ignored_paths: Vec::new(),
+            hide_windows_system_processes: false,
         }
     }
 }
@@ -177,6 +193,26 @@ impl AppSettings {
                 Some(trimmed.to_owned())
             }
         });
+    }
+
+    /// Normalizes `leak_ignored_paths` by trimming whitespace and removing blank or duplicate entries.
+    pub(crate) fn sanitize_leak_ignored_paths(&mut self) {
+        let mut cleaned = Vec::with_capacity(self.leak_ignored_paths.len());
+        for entry in self.leak_ignored_paths.drain(..) {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if cleaned.iter().any(|existing: &String| existing == trimmed) {
+                continue;
+            }
+            if trimmed.len() == entry.len() {
+                cleaned.push(entry);
+            } else {
+                cleaned.push(trimmed.to_owned());
+            }
+        }
+        self.leak_ignored_paths = cleaned;
     }
 }
 
@@ -241,5 +277,6 @@ pub fn migrate_toml_value(raw: &str) -> Result<AppSettings, ConfigError> {
     settings.schema_version = CURRENT_SCHEMA_VERSION;
     settings.sanitize_run_task_history();
     settings.sanitize_global_hotkey();
+    settings.sanitize_leak_ignored_paths();
     Ok(settings)
 }

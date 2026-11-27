@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{HistoryRing, ThroughputRing, Timestamp100Ns};
 
 /// Single-tick system-wide CPU, memory, disk, network, and GPU summary sample.
@@ -82,6 +84,20 @@ impl SystemPerfSample {
     }
 }
 
+/// Heterogeneous processor core microarchitecture classification (e.g., hybrid P/E/LP-E cores).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CpuCoreKind {
+    /// Core class is uniform/symmetric or could not be determined.
+    #[default]
+    Unknown,
+    /// High-performance core (P-core).
+    Performance,
+    /// Power-efficiency core (E-core).
+    Efficiency,
+    /// Low-power efficiency core (LP-E core).
+    LowPowerEfficiency,
+}
+
 /// Static CPU hardware identity, topology, virtualization, and cache metadata.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CpuStaticInfo {
@@ -103,6 +119,8 @@ pub struct CpuStaticInfo {
     pub l2_cache_bytes: u64,
     /// Total L3 cache size in bytes across all packages.
     pub l3_cache_bytes: u64,
+    /// Optional per-logical-processor heterogeneous core classification (empty on uniform CPUs).
+    pub core_kinds: Vec<CpuCoreKind>,
 }
 
 /// Static physical RAM hardware metadata decoded from firmware SMBIOS tables.
@@ -312,6 +330,8 @@ pub struct GpuAdapterSample {
     pub shared_used_bytes: u64,
     /// Total shared system video memory capacity in bytes.
     pub shared_total_bytes: u64,
+    /// `true` when this discrete GPU is currently powered down in D3 sleep to avoid waking it.
+    pub d3_asleep: bool,
     /// Per-engine utilization samples reported for this GPU adapter.
     pub engines: Vec<GpuEngineSample>,
 }
@@ -343,6 +363,8 @@ pub struct GpuAdapterSlice {
     pub shared_used_bytes: u64,
     /// Total shared system video memory capacity in bytes.
     pub shared_total_bytes: u64,
+    /// `true` when this discrete GPU is currently powered down in D3 sleep to avoid waking it.
+    pub d3_asleep: bool,
     /// 60-point overall GPU utilization history (`0..=1000` permille).
     pub util_history: HistoryRing<60>,
     /// 60-point dedicated video memory utilization history (`0..=1000` permille).

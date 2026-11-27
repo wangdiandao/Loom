@@ -22,7 +22,7 @@ use std::time::Instant;
 use loom_pal_api::{PalError, SlowMetadataProber};
 use loom_types::{
     DiskDeviceSample, ExeIconRgba, ExeStaticAsset, HardwareStaticInfo, ProcessArch,
-    ProcessColdMeta, ProcessKey, UacVirtualization,
+    ProcessColdMeta, ProcessKey, ProcessSocketRecord, UacVirtualization,
 };
 use parking_lot::RwLock;
 use windows_sys::Wdk::System::Threading::{
@@ -368,6 +368,10 @@ impl SlowMetadataProber for WindowsSlowProber {
 
     fn probe_disk_performance(&self) -> Result<Vec<DiskDeviceSample>, PalError> {
         Ok(self.disk_prober.probe(&self.circuit_breaker))
+    }
+
+    fn list_listening_ports(&self) -> Result<Vec<ProcessSocketRecord>, PalError> {
+        crate::ports::list_listening_ports()
     }
 }
 

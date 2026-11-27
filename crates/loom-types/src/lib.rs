@@ -14,10 +14,13 @@ pub mod process;
 pub mod snapshot;
 pub mod time;
 
-pub use control::{CapabilityFlags, RunTaskRequest, TreeKillItem, TreeKillReport, WaitChainNode};
+pub use control::{
+    CapabilityFlags, FileLockHolder, ProcessSocketRecord, RunTaskRequest, SocketProtocol,
+    TreeKillItem, TreeKillReport, WaitChainNode,
+};
 pub use history::{HistoryRing, HistoryRingIter, ThroughputRing, ThroughputRingIter};
 pub use performance::{
-    CpuStaticInfo, DiskDeviceSample, DiskDeviceSlice, DiskMediaType, GpuAdapterSample,
+    CpuCoreKind, CpuStaticInfo, DiskDeviceSample, DiskDeviceSlice, DiskMediaType, GpuAdapterSample,
     GpuAdapterSlice, GpuEngineSample, GpuEngineSlice, HardwareStaticInfo, MemoryHardwareInfo,
     NetAdapterSample, NetAdapterSlice, NetConnectionType, PerformanceSlice, SystemPerfSample,
 };
@@ -27,8 +30,9 @@ pub use prefs::{
     RefreshSpeed, ResourceDisplayMode, SortDirection, StartupPage, ThemePreference,
 };
 pub use process::{
-    CpuAffinityMask, ExeIconRgba, ExeStaticAsset, ProcessArch, ProcessCategory, ProcessColdMeta,
-    ProcessHotSample, ProcessKey, ProcessPriority, ProcessStatusFlags, UacVirtualization,
+    CpuAffinityMask, ExeIconRgba, ExeStaticAsset, LeakKind, LeakWarning, ProcessArch,
+    ProcessCategory, ProcessColdMeta, ProcessHotSample, ProcessKey, ProcessPriority,
+    ProcessStatusFlags, UacVirtualization, WebView2Role,
 };
 pub use snapshot::{
     AppHistoryRecord, AppHistorySlice, AppSnapshot, DetailsRowProjection, DetailsTableSlice,
@@ -235,5 +239,43 @@ mod tests {
 
         assert_eq!(ProcessStatusFlags::KERNEL.bits(), 1 << 7);
         assert_eq!(CapabilityFlags::ALWAYS_ON_TOP.bits(), 1 << 11);
+        assert_eq!(CapabilityFlags::SUSPEND_RESUME.bits(), 1 << 14);
+        assert_eq!(CapabilityFlags::FILE_LOCKS.bits(), 1 << 15);
+        assert_eq!(CapabilityFlags::PROCESS_SOCKETS.bits(), 1 << 16);
+        assert_eq!(CapabilityFlags::ELEVATED_PROCESS_NET.bits(), 1 << 17);
+        assert_eq!(MonitorDomain::COUNT, 8);
+        assert_eq!(MonitorDomain::ProcessNetwork.index(), 7);
+    }
+
+    #[test]
+    fn history_and_throughput_rings_handle_gap_sentinels_without_breaking_copy_or_max() {
+        let mut h = HistoryRing::<4>::new();
+        h.push(250);
+        h.push_gap();
+        h.push(1500); // clamped to 1000
+        assert!(HistoryRing::<4>::is_gap(HistoryRing::<4>::GAP_SENTINEL));
+        assert!(!HistoryRing::<4>::is_gap(1000));
+        assert_eq!(h.to_vec_f32(), vec![25.0, 0.0, 100.0]);
+        assert_eq!(h.to_vec_opt_f32(), vec![Some(25.0), None, Some(100.0)]);
+        assert_eq!(
+            std::mem::size_of::<HistoryRing<60>>(),
+            60 * std::mem::size_of::<u16>() + 2 * std::mem::size_of::<usize>()
+        );
+
+        let mut t = ThroughputRing::<4>::new();
+        t.push_gap();
+        assert_eq!(t.max_value(), 0);
+        t.push(1024);
+        t.push_gap();
+        t.push(4096);
+        assert!(ThroughputRing::<4>::is_gap(
+            ThroughputRing::<4>::GAP_SENTINEL
+        ));
+        assert_eq!(t.max_value(), 4096);
+        assert_eq!(t.to_vec_opt(), vec![None, Some(1024), None, Some(4096)]);
+        // Real push of u64::MAX must clamp so it never collides with GAP_SENTINEL.
+        t.push(u64::MAX);
+        assert!(!ThroughputRing::<4>::is_gap(t.latest().unwrap()));
+        assert_eq!(t.latest(), Some(u64::MAX - 1));
     }
 }

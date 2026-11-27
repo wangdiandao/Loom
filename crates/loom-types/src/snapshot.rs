@@ -5,9 +5,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CapabilityFlags, DetailsSortColumn, DetailsViewMode, ExeIconRgba, PerformanceSlice,
-    PlatformProfile, ProcessArch, ProcessCategory, ProcessKey, ProcessPriority, ProcessSortColumn,
-    ProcessStatusFlags, ProcessViewMode, SortDirection, Timestamp100Ns, UacVirtualization,
+    CapabilityFlags, DetailsSortColumn, DetailsViewMode, ExeIconRgba, LeakWarning,
+    PerformanceSlice, PlatformProfile, ProcessArch, ProcessCategory, ProcessKey, ProcessPriority,
+    ProcessSortColumn, ProcessStatusFlags, ProcessViewMode, SortDirection, Timestamp100Ns,
+    UacVirtualization, WebView2Role,
 };
 
 /// On-demand monitoring domains gated by RAII `MonitorLease` reference counts.
@@ -30,11 +31,13 @@ pub enum MonitorDomain {
     AppHistory,
     /// Fine-grained per-logical-CPU utilization and histories.
     PerCoreCpu,
+    /// Optional elevated-only per-process network byte attribution (e.g., ETW).
+    ProcessNetwork,
 }
 
 impl MonitorDomain {
     /// Total number of [`MonitorDomain`] variants.
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
 
     /// Returns a dense array index in `0..Self::COUNT` for lock-free lease tables.
     #[inline]
@@ -47,6 +50,7 @@ impl MonitorDomain {
             Self::Users => 4,
             Self::AppHistory => 5,
             Self::PerCoreCpu => 6,
+            Self::ProcessNetwork => 7,
         }
     }
 }
@@ -138,6 +142,12 @@ pub struct ProcessRowProjection {
     pub gpu_util_permille: u16,
     /// Dedicated GPU memory used in bytes.
     pub gpu_dedicated_bytes: u64,
+    /// Verified parent process key, if the parent is alive and older.
+    pub parent_key: Option<ProcessKey>,
+    /// Optional advisory resource-leak warning attached to this process.
+    pub leak_warning: Option<LeakWarning>,
+    /// Optional identified WebView2 subprocess role when this process is `msedgewebview2.exe`.
+    pub webview2_role: Option<WebView2Role>,
 }
 
 /// Pre-computed row projection for O(1) virtualized rendering in the Details table.
@@ -195,6 +205,10 @@ pub struct DetailsRowProjection {
     pub exe_path: Option<Arc<str>>,
     /// Full command line, if resolved.
     pub command_line: Option<Arc<str>>,
+    /// Optional advisory resource-leak warning attached to this process.
+    pub leak_warning: Option<LeakWarning>,
+    /// Optional identified WebView2 subprocess role when this process is `msedgewebview2.exe`.
+    pub webview2_role: Option<WebView2Role>,
 }
 
 /// Published snapshot slice for the Processes view.

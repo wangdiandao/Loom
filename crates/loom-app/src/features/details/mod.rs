@@ -2193,6 +2193,8 @@ mod tests {
             gpu_shared_bytes: 0,
             exe_path: None,
             command_line: None,
+            leak_warning: None,
+            webview2_role: None,
         }
     }
 

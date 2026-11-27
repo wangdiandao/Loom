@@ -16,11 +16,14 @@
 pub mod app_history;
 pub mod circuit_breaker;
 pub mod diagnostics;
+pub(crate) mod etw_net;
 pub mod fast_sampler;
+pub mod filelock;
 pub(crate) mod handle;
 pub mod hotkey;
 pub mod operator;
 pub mod perf;
+pub mod ports;
 pub mod services;
 pub mod slow_prober;
 pub mod startup;
@@ -75,7 +78,11 @@ impl PlatformBackend for WindowsBackend {
         .union(CapabilityFlags::ELEVATION_RELAUNCH)
         .union(CapabilityFlags::ALWAYS_ON_TOP)
         .union(CapabilityFlags::DEBUGGER_ATTACH)
-        .union(CapabilityFlags::GLOBAL_HOTKEY);
+        .union(CapabilityFlags::GLOBAL_HOTKEY)
+        .union(CapabilityFlags::SUSPEND_RESUME)
+        .union(CapabilityFlags::FILE_LOCKS)
+        .union(CapabilityFlags::PROCESS_SOCKETS)
+        .union(CapabilityFlags::ELEVATED_PROCESS_NET);
 
     fn boost_self_priority() {
         fast_sampler::boost_self_priority();
@@ -541,7 +548,24 @@ mod tests {
             "probe_process must report efficiency_mode == false after set_efficiency_mode(false)"
         );
 
-        // 3. Verify terminate_process kills the child cleanly.
+        // 3. Verify suspend_process / resume_process lifecycle on child process and guard rails.
+        op.suspend_process(child_key)
+            .expect("suspend_process on child");
+        op.resume_process(child_key)
+            .expect("resume_process on child");
+
+        // Self-PID and kernel PIDs 0/4 must be refused cleanly.
+        let my_pid = std::process::id();
+        assert!(matches!(
+            op.suspend_process(ProcessKey::new(my_pid, 0)),
+            Err(PalError::Unsupported(_))
+        ));
+        assert!(matches!(
+            op.suspend_process(ProcessKey::new(4, 0)),
+            Err(PalError::Unsupported(_))
+        ));
+
+        // 4. Verify terminate_process kills the child cleanly.
         op.terminate_process(child_key)
             .expect("terminate_process on child");
         let status = guard
@@ -574,6 +598,10 @@ mod tests {
                 | CapabilityFlags::ALWAYS_ON_TOP
                 | CapabilityFlags::DEBUGGER_ATTACH
                 | CapabilityFlags::GLOBAL_HOTKEY
+                | CapabilityFlags::SUSPEND_RESUME
+                | CapabilityFlags::FILE_LOCKS
+                | CapabilityFlags::PROCESS_SOCKETS
+                | CapabilityFlags::ELEVATED_PROCESS_NET
         ));
 
         // Own-process window host helpers must safely no-op in a headless test binary.

@@ -5,9 +5,9 @@ use std::sync::atomic::AtomicBool;
 
 use loom_types::{
     AppHistoryRecord, CapabilityFlags, CpuAffinityMask, DiskDeviceSample, ExeStaticAsset,
-    HardwareStaticInfo, PlatformProfile, ProcessColdMeta, ProcessKey, ProcessPriority,
-    RunTaskRequest, ServiceRecord, StartupEntry, Timestamp100Ns, TreeKillReport, UserSessionRecord,
-    WaitChainNode,
+    FileLockHolder, HardwareStaticInfo, PlatformProfile, ProcessColdMeta, ProcessKey,
+    ProcessPriority, ProcessSocketRecord, RunTaskRequest, ServiceRecord, StartupEntry,
+    Timestamp100Ns, TreeKillReport, UserSessionRecord, WaitChainNode,
 };
 
 use crate::{PalError, PerfSampleScratch, ProcessSampleScratch};
@@ -109,6 +109,9 @@ pub trait FastSystemSampler: Send {
         &mut self,
         scratch: &mut PerfSampleScratch,
     ) -> Result<Timestamp100Ns, PalError>;
+
+    /// Enables or disables optional elevated per-process network byte attribution.
+    fn set_per_process_network_enabled(&mut self, _enabled: bool) {}
 }
 
 /// Slow-lane bulkhead metadata prober for operations that may touch disk or Shell APIs.
@@ -135,6 +138,11 @@ pub trait SlowMetadataProber: Send + Sync {
     /// Probes physical disk devices (`0..N`) for active time, throughput, average response
     /// latency, and media metadata behind per-device circuit-breaker isolation.
     fn probe_disk_performance(&self) -> Result<Vec<DiskDeviceSample>, PalError> {
+        Ok(Vec::new())
+    }
+
+    /// Lists currently listening TCP and UDP socket endpoints across all processes.
+    fn list_listening_ports(&self) -> Result<Vec<ProcessSocketRecord>, PalError> {
         Ok(Vec::new())
     }
 }
@@ -182,6 +190,15 @@ pub trait AppHistoryReader: Send + Sync {
 
     /// Clears accumulated application usage history.
     fn clear_history(&self) -> Result<(), PalError>;
+
+    /// Atomically persists `(since_epoch_secs, records)` to the backing history store.
+    fn save_history(
+        &self,
+        _since_epoch_secs: u64,
+        _records: &[AppHistoryRecord],
+    ) -> Result<(), PalError> {
+        Ok(())
+    }
 }
 
 /// Process control, diagnostics, shell integration, and elevation contract.
@@ -228,6 +245,34 @@ pub trait SystemOperator: Send + Sync {
     fn attach_debugger(&self, _key: ProcessKey) -> Result<(), PalError> {
         Err(PalError::Unsupported(
             "attach debugger is not supported on this platform",
+        ))
+    }
+
+    /// Suspends all threads of a non-critical process verified by `key`.
+    fn suspend_process(&self, _key: ProcessKey) -> Result<(), PalError> {
+        Err(PalError::Unsupported(
+            "suspend process is not supported on this platform",
+        ))
+    }
+
+    /// Resumes all threads of a previously suspended process verified by `key`.
+    fn resume_process(&self, _key: ProcessKey) -> Result<(), PalError> {
+        Err(PalError::Unsupported(
+            "resume process is not supported on this platform",
+        ))
+    }
+
+    /// Safely restarts the desktop shell / file explorer (e.g., `explorer.exe`).
+    fn restart_explorer(&self) -> Result<(), PalError> {
+        Err(PalError::Unsupported(
+            "restart explorer is not supported on this platform",
+        ))
+    }
+
+    /// Queries processes currently holding open file or directory locks on `path`.
+    fn find_file_locks(&self, _path: &Path) -> Result<Vec<FileLockHolder>, PalError> {
+        Err(PalError::Unsupported(
+            "file lock finder is not supported on this platform",
         ))
     }
 

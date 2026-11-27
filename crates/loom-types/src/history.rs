@@ -23,6 +23,12 @@ impl<const N: usize> HistoryRing<N> {
     /// Maximum representable quantized permille value (`100.0%`).
     pub const MAX_PERMILLE: u16 = 1000;
 
+    /// Sentinel value marking a sampling discontinuity / sleep gap in the ring buffer.
+    ///
+    /// Distinct from all valid permille samples (`0..=1000`) while keeping the ring
+    /// `Copy` with identical inline `[u16; N]` storage layout.
+    pub const GAP_SENTINEL: u16 = u16::MAX;
+
     /// Creates an empty ring buffer.
     #[inline]
     pub const fn new() -> Self {
@@ -39,6 +45,12 @@ impl<const N: usize> HistoryRing<N> {
         N
     }
 
+    /// Returns `true` if `raw` is the [`Self::GAP_SENTINEL`] discontinuity marker.
+    #[inline]
+    pub const fn is_gap(raw: u16) -> bool {
+        raw == Self::GAP_SENTINEL
+    }
+
     /// Pushes a quantized permille value (`0..=1000`), clamping values above `1000`.
     ///
     /// When the buffer is already full, the oldest entry is overwritten.
@@ -48,6 +60,20 @@ impl<const N: usize> HistoryRing<N> {
             return;
         }
         self.buf[self.head] = value_permille.min(Self::MAX_PERMILLE);
+        self.head = (self.head + 1) % N;
+        if self.len < N {
+            self.len += 1;
+        }
+    }
+
+    /// Pushes a [`Self::GAP_SENTINEL`] marker recording a sampling discontinuity
+    /// (such as system suspend/resume or paused collection).
+    #[inline]
+    pub fn push_gap(&mut self) {
+        if N == 0 {
+            return;
+        }
+        self.buf[self.head] = Self::GAP_SENTINEL;
         self.head = (self.head + 1) % N;
         if self.len < N {
             self.len += 1;
@@ -96,8 +122,27 @@ impl<const N: usize> HistoryRing<N> {
     }
 
     /// Converts the stored samples (oldest to newest) into floating-point percentages (`0.0..=100.0`).
+    ///
+    /// Gap sentinels are mapped to `0.0` for backward compatibility with callers expecting
+    /// dense numeric slices; use [`Self::to_vec_opt_f32`] to preserve gap discontinuities.
     pub fn to_vec_f32(&self) -> Vec<f32> {
-        self.iter_ordered().map(|v| f32::from(v) / 10.0).collect()
+        self.iter_ordered()
+            .map(|v| {
+                if Self::is_gap(v) {
+                    0.0
+                } else {
+                    f32::from(v) / 10.0
+                }
+            })
+            .collect()
+    }
+
+    /// Converts the stored samples (oldest to newest) into optional floating-point
+    /// percentages (`Some(0.0..=100.0)`), mapping [`Self::GAP_SENTINEL`] entries to `None`.
+    pub fn to_vec_opt_f32(&self) -> Vec<Option<f32>> {
+        self.iter_ordered()
+            .map(|v| (!Self::is_gap(v)).then(|| f32::from(v) / 10.0))
+            .collect()
     }
 }
 
@@ -156,6 +201,12 @@ impl<const N: usize> Default for ThroughputRing<N> {
 }
 
 impl<const N: usize> ThroughputRing<N> {
+    /// Sentinel value marking a sampling discontinuity / sleep gap in the ring buffer.
+    ///
+    /// Preserves `Copy` semantics and exact `[u64; N]` inline layout without wrapping
+    /// each element in `Option<u64>`.
+    pub const GAP_SENTINEL: u64 = u64::MAX;
+
     /// Creates an empty throughput ring buffer.
     #[inline]
     pub const fn new() -> Self {
@@ -172,13 +223,35 @@ impl<const N: usize> ThroughputRing<N> {
         N
     }
 
+    /// Returns `true` if `raw` is the [`Self::GAP_SENTINEL`] discontinuity marker.
+    #[inline]
+    pub const fn is_gap(raw: u64) -> bool {
+        raw == Self::GAP_SENTINEL
+    }
+
     /// Pushes a `u64` throughput sample, overwriting the oldest entry when full.
+    ///
+    /// Values equal to [`Self::GAP_SENTINEL`] (`u64::MAX`) are clamped to `u64::MAX - 1`
+    /// so real throughput samples never collide with the gap marker.
     #[inline]
     pub fn push(&mut self, value: u64) {
         if N == 0 {
             return;
         }
-        self.buf[self.head] = value;
+        self.buf[self.head] = value.min(Self::GAP_SENTINEL - 1);
+        self.head = (self.head + 1) % N;
+        if self.len < N {
+            self.len += 1;
+        }
+    }
+
+    /// Pushes a [`Self::GAP_SENTINEL`] marker recording a sampling discontinuity.
+    #[inline]
+    pub fn push_gap(&mut self) {
+        if N == 0 {
+            return;
+        }
+        self.buf[self.head] = Self::GAP_SENTINEL;
         self.head = (self.head + 1) % N;
         if self.len < N {
             self.len += 1;
@@ -231,10 +304,19 @@ impl<const N: usize> ThroughputRing<N> {
         self.iter().collect()
     }
 
-    /// Returns the maximum value currently stored in the ring, or `0` when empty.
+    /// Collects stored samples (oldest to newest) into a `Vec<Option<u64>>`,
+    /// mapping [`Self::GAP_SENTINEL`] entries to `None`.
+    pub fn to_vec_opt(&self) -> Vec<Option<u64>> {
+        self.iter()
+            .map(|v| (!Self::is_gap(v)).then_some(v))
+            .collect()
+    }
+
+    /// Returns the maximum non-gap value currently stored in the ring, or `0` when empty
+    /// or containing only gap sentinels.
     #[inline]
     pub fn max_value(&self) -> u64 {
-        self.iter().max().unwrap_or(0)
+        self.iter().filter(|&v| !Self::is_gap(v)).max().unwrap_or(0)
     }
 }
 

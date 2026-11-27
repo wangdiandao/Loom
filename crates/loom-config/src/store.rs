@@ -114,6 +114,7 @@ impl ConfigStore {
         }
         normalized.sanitize_run_task_history();
         normalized.sanitize_global_hotkey();
+        normalized.sanitize_leak_ignored_paths();
 
         let serialized = toml::to_string_pretty(&normalized)?;
 

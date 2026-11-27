@@ -4,11 +4,29 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ## Unreleased
 
+### Engine & PAL
+
+- Extended `loom-types` additively while keeping `Copy` hot-sample layouts intact: added `GAP_SENTINEL` discontinuity markers (`push_gap`, `is_gap`, `to_vec_opt_f32` / `to_vec_opt`, gap-aware `max_value`) on `HistoryRing<N>` and `ThroughputRing<N>`, heterogeneous `CpuCoreKind` (`CpuStaticInfo::core_kinds`), `d3_asleep` on `GpuAdapterSample`/`GpuAdapterSlice`, `SocketProtocol`/`ProcessSocketRecord`, `FileLockHolder`, `LeakKind`/`LeakWarning`, `WebView2Role`, `MonitorDomain::ProcessNetwork`, and `CapabilityFlags::{SUSPEND_RESUME, FILE_LOCKS, PROCESS_SOCKETS, ELEVATED_PROCESS_NET}`.
+- Extended frozen v1 `loom-pal-api` traits (`PAL_API_CONTRACT_VERSION = 1`) exclusively with defaulted additive methods: `AppHistoryReader::save_history`, `FastSystemSampler::set_per_process_network_enabled`, `SlowMetadataProber::list_listening_ports`, and `SystemOperator::{suspend_process, resume_process, restart_explorer, find_file_locks}`.
+
+### Windows Backend
+
+- Implemented WMI/PDH-free Windows process controls and diagnostics in `loom-pal-windows` while advertising `CapabilityFlags::{SUSPEND_RESUME, FILE_LOCKS, PROCESS_SOCKETS, ELEVATED_PROCESS_NET}`:
+  - Safe `suspend_process` / `resume_process` via dynamically loaded `ntdll!NtSuspendProcess` / `NtResumeProcess` with `ProcessKey` verification, `IsProcessCritical` refusal, and `dwm.exe`/kernel/self-PID guards.
+  - Safe `restart_explorer` and de-elevated `run_new_task` spawning via the desktop shell primary token (`GetShellWindow` -> `DuplicateTokenEx` -> `CreateProcessWithTokenW`) when Loom runs elevated, with graceful fallback.
+  - On-demand listening TCP/UDP port enumeration (`ports.rs`) via dynamically loaded `iphlpapi.dll` (`GetExtendedTcpTable` / `GetExtendedUdpTable` for IPv4 & IPv6).
+  - File/directory lock inspection (`filelock.rs`) via dynamically loaded Restart Manager (`rstrtmgr.dll`) with RAII session teardown and recursive binary-split batch fallback.
+  - Clean-room elevated-only per-process ETW network byte collector (`etw_net.rs`, `Microsoft-Windows-Kernel-Network`, bounded to 1 thread with clean `ControlTraceW` teardown) and wired `AppHistoryReader::save_history`.
+
 ### UI & UX
 
 - Added pure-Rust UI layout, chart scaling, and export logic in `loom-ui-kit::logic`: smooth stepped disk throughput (`stepped_throughput_ceiling`) and network bit-rate (`stepped_network_ceiling`) Y-axis ceilings, adaptive logical-core grid layout scoring (`compute_core_grid_layout` targeting `~1.4:1` plot aspect ratio with `8%` resize hysteresis and `Full`/`Short`/`Hidden` progressive header degradation), active GPU engine pane selection (`select_active_gpu_engines`), stable open-time ordering (`merge_stable_order`), and UTF-8 BOM / RFC 4180 formula-injection-safe CSV formatting helpers (`format_csv_cell`, `build_csv_document`).
 - Added W3C WCAG 2.1 relative luminance and contrast solver utilities (`srgb_relative_luminance`, `wcag_contrast_ratio`, `ensure_wcag_contrast`, `hsla_to_srgb`) plus heterogeneous CPU core (`cpu_core_p`, `cpu_core_e`, `cpu_core_lp_e`), `leak_warning`, and `sort_paused` semantic color tokens in `LoomSemanticColors` with automated light/dark AA contrast verification (`>= 4.5:1` text, `>= 3.0:1` charts/accents).
 - Added honest unavailable metric formatters (`UNAVAILABLE_LABEL` `"—"`, `format_opt_percent_permille`, `format_opt_temp_celsius`) and gap-aware sparkline window/segment builders (`GapAwareSparklinePoint`, `PERMILLE_GAP_SENTINEL`, `SparklinePoint::from_opt_f32_segments` / `from_opt_permille_segments` / `from_f32_gap_safe_segments` / `from_permille_sentinel_segments` / `from_opt_f32_padded` / `from_opt_f32_window`) in `loom-ui-kit`.
+
+### Config & Localization
+
+- Added backward-compatible `#[serde(default)]` v1 optional preferences to `loom-config` (`AppSettings::{webview2_host_grouping, show_leak_warnings, leak_ignored_paths, hide_windows_system_processes}`) while keeping `CONFIG_CONTRACT_VERSION = "1.0"` and `CURRENT_SCHEMA_VERSION = 1` intact.
 
 ## 0.1.0 - 2026-11-27
 

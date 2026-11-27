@@ -5,41 +5,49 @@
 //! `ERROR_ACCESS_DENIED` to [`PalError::ElevationRequired`].
 
 use std::ffi::c_void;
-use std::mem::{size_of, zeroed};
+use std::mem::{size_of, transmute, zeroed};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use loom_pal_api::{PalError, SystemOperator};
 use loom_types::{
-    CpuAffinityMask, ProcessKey, ProcessPriority, RunTaskRequest, TreeKillItem, TreeKillReport,
-    WaitChainNode,
+    CpuAffinityMask, FileLockHolder, ProcessKey, ProcessPriority, RunTaskRequest, TreeKillItem,
+    TreeKillReport, WaitChainNode,
 };
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION,
     ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_SUCCESS, FALSE, GetLastError, HANDLE,
+    STATUS_ACCESS_DENIED, STATUS_PROCESS_IS_TERMINATING,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ELEVATION, TOKEN_QUERY,
-    TokenElevation, TokenVirtualizationAllowed, TokenVirtualizationEnabled,
+    DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, SetTokenInformation,
+    TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+    TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation, TokenPrimary, TokenVirtualizationAllowed,
+    TokenVirtualizationEnabled,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_EXPAND_SZ, REG_SZ, RegCloseKey, RegOpenKeyExW,
     RegQueryValueExW,
 };
+use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
 use windows_sys::Win32::System::Threading::{
     ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, CreateProcessW,
     GetActiveProcessorCount, GetActiveProcessorGroupCount, GetCurrentProcess,
     GetProcessAffinityMask, GetProcessDefaultCpuSetMasks, GetProcessGroupAffinity, GetProcessId,
-    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenProcessToken,
+    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenProcess, OpenProcessToken,
     PROCESS_INFORMATION, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
     PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_TERMINATE,
-    ProcessPowerThrottling, QueryFullProcessImageNameW, REALTIME_PRIORITY_CLASS, STARTUPINFOW,
-    SetPriorityClass, SetProcessAffinityMask, SetProcessDefaultCpuSetMasks, SetProcessInformation,
-    TerminateProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SUSPEND_RESUME,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, ProcessPowerThrottling, QueryFullProcessImageNameW,
+    REALTIME_PRIORITY_CLASS, STARTUPINFOW, SetPriorityClass, SetProcessAffinityMask,
+    SetProcessDefaultCpuSetMasks, SetProcessInformation, TerminateProcess, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
@@ -48,8 +56,12 @@ use windows_sys::Win32::UI::Shell::{
     SEE_MASK_INVOKEIDLIST, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     ShellExecuteExW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOW, SW_SHOWNORMAL};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetShellWindow, GetWindowThreadProcessId, SW_SHOW, SW_SHOWNORMAL,
+};
+use windows_sys::core::BOOL;
 
+use crate::diagnostics::OwnedModule;
 use crate::fast_sampler::query_logical_cpu_count;
 use crate::handle::{
     OwnedHandle, map_win32_error, null_wide_ptr, open_verified_process, os_str_to_wide_null,
@@ -73,6 +85,17 @@ impl SystemOperator for WindowsSystemOperator {
         let trimmed = req.command.trim();
         if trimmed.is_empty() {
             return Err(PalError::InvalidArgument("command cannot be empty".into()));
+        }
+
+        // When Loom itself is running elevated and the user did NOT request an elevated task,
+        // attempt to launch de-elevated via the desktop Shell primary token before falling back
+        // to `ShellExecuteExW` (e.g., for URLs, documents, or shell verbs).
+        if self.is_elevated()
+            && !req.run_as_admin
+            && let Some(token) = duplicate_shell_primary_token()
+            && let Some(pid) = spawn_with_token(&token, trimmed)
+        {
+            return Ok(Some(pid));
         }
 
         ensure_com_initialized();
@@ -527,6 +550,89 @@ impl SystemOperator for WindowsSystemOperator {
         Ok(())
     }
 
+    fn suspend_process(&self, key: ProcessKey) -> Result<(), PalError> {
+        suspend_or_resume_process(key, true)
+    }
+
+    fn resume_process(&self, key: ProcessKey) -> Result<(), PalError> {
+        suspend_or_resume_process(key, false)
+    }
+
+    fn restart_explorer(&self) -> Result<(), PalError> {
+        // Capture the non-elevated desktop shell token BEFORE terminating `explorer.exe`
+        // so an elevated Loom instance can relaunch Explorer de-elevated cleanly.
+        let shell_token = if self.is_elevated() {
+            duplicate_shell_primary_token()
+        } else {
+            None
+        };
+
+        let my_session = current_process_session_id();
+        let explorer_pids = find_session_explorer_pids(my_session);
+
+        for pid in explorer_pids {
+            // SAFETY: Opens existing user-session `explorer.exe` for termination and wait.
+            let raw = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, FALSE, pid) };
+            let Some(handle) = OwnedHandle::from_raw(raw) else {
+                continue;
+            };
+            // SAFETY: `handle` has `PROCESS_TERMINATE` and `PROCESS_SYNCHRONIZE`.
+            let ok = unsafe { TerminateProcess(handle.as_raw(), 1) };
+            if ok != 0 {
+                // SAFETY: Bounded 2 s wait for Explorer teardown.
+                unsafe {
+                    WaitForSingleObject(handle.as_raw(), 2_000);
+                }
+            }
+        }
+
+        // Give Windows `AutoRestartShell` a brief window before spawning a replacement manually.
+        std::thread::sleep(Duration::from_millis(150));
+        if !find_session_explorer_pids(my_session).is_empty() {
+            return Ok(());
+        }
+
+        let explorer_cmd = explorer_exe_path();
+        if let Some(ref token) = shell_token
+            && spawn_with_token(token, &explorer_cmd).is_some()
+        {
+            return Ok(());
+        }
+
+        let mut wide_cmd = to_wide_null(&explorer_cmd);
+        // SAFETY: `STARTUPINFOW` and `PROCESS_INFORMATION` are plain C POD structs.
+        let mut si: STARTUPINFOW = unsafe { zeroed() };
+        si.cb = size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = unsafe { zeroed() };
+        // SAFETY: `wide_cmd` is a mutable null-terminated UTF-16 command line.
+        let ok = unsafe {
+            CreateProcessW(
+                null_wide_ptr(),
+                wide_cmd.as_mut_ptr(),
+                ptr::null(),
+                ptr::null(),
+                FALSE,
+                0,
+                ptr::null(),
+                null_wide_ptr(),
+                &si,
+                &mut pi,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: Reads thread-local Win32 error set by `CreateProcessW`.
+            let err = unsafe { GetLastError() };
+            return Err(map_win32_error(err, None, "CreateProcessW(explorer.exe)"));
+        }
+        let _proc = OwnedHandle::from_raw(pi.hProcess);
+        let _thread = OwnedHandle::from_raw(pi.hThread);
+        Ok(())
+    }
+
+    fn find_file_locks(&self, path: &Path) -> Result<Vec<FileLockHolder>, PalError> {
+        crate::filelock::find_file_locks(path)
+    }
+
     fn relaunch_self_elevated(&self, restore_route: &str) -> Result<(), PalError> {
         ensure_com_initialized();
 
@@ -715,6 +821,282 @@ impl SystemOperator for WindowsSystemOperator {
 
 /// Double-null-terminated Win32 `OPENFILENAMEW` filter for executable file selection.
 const BROWSE_EXECUTABLE_FILTER: &str = "Executables (*.exe;*.bat;*.cmd;*.msc;*.com)\0*.exe;*.bat;*.cmd;*.msc;*.com\0All Files (*.*)\0*.*\0\0";
+
+/// `LOGON_WITH_PROFILE` flag for `advapi32!CreateProcessWithTokenW`.
+const LOGON_WITH_PROFILE: u32 = 0x0000_0001;
+
+type NtProcessControlFn = unsafe extern "system" fn(HANDLE) -> i32;
+type IsProcessCriticalFn = unsafe extern "system" fn(HANDLE, *mut BOOL) -> BOOL;
+type CreateProcessWithTokenWFn = unsafe extern "system" fn(
+    h_token: HANDLE,
+    dw_logon_flags: u32,
+    lp_application_name: *const u16,
+    lp_command_line: *mut u16,
+    dw_creation_flags: u32,
+    lp_environment: *const c_void,
+    lp_current_directory: *const u16,
+    lp_startup_info: *const STARTUPINFOW,
+    lp_process_information: *mut PROCESS_INFORMATION,
+) -> BOOL;
+
+/// Image names that must never be suspended/resumed to protect desktop and kernel stability.
+const PROTECTED_SUSPEND_NAMES: [&str; 6] = [
+    "dwm.exe",
+    "csrss.exe",
+    "smss.exe",
+    "wininit.exe",
+    "winlogon.exe",
+    "lsass.exe",
+];
+
+fn is_protected_suspend_image(image_name: &str) -> bool {
+    PROTECTED_SUSPEND_NAMES
+        .iter()
+        .any(|blocked| image_name.eq_ignore_ascii_case(blocked))
+}
+
+/// Suspends or resumes all threads of `key` via dynamically loaded `ntdll!NtSuspendProcess` /
+/// `ntdll!NtResumeProcess` after verifying identity, non-criticality, and protected-UI exclusions.
+fn suspend_or_resume_process(key: ProcessKey, suspend: bool) -> Result<(), PalError> {
+    if key.pid == 0 || key.pid == 4 || key.pid == std::process::id() {
+        return Err(PalError::Unsupported(
+            "cannot suspend or resume kernel processes or Loom itself",
+        ));
+    }
+
+    let handle = open_verified_process(key, PROCESS_SUSPEND_RESUME)?;
+
+    // Refuse if `IsProcessCritical` reports true OR cannot be queried safely.
+    if !verify_not_critical_process(handle.as_raw()) {
+        return Err(PalError::Unsupported(
+            "cannot suspend or resume a critical or unverified system process",
+        ));
+    }
+
+    // Refuse core desktop/session processes such as `dwm.exe`.
+    if let Some(short_name) = query_short_image_name(handle.as_raw())
+        && is_protected_suspend_image(&short_name)
+    {
+        return Err(PalError::Unsupported(
+            "cannot suspend or resume protected Windows desktop/session processes",
+        ));
+    }
+
+    let ntdll = OwnedModule::load("ntdll.dll")?;
+    let symbol: &[u8] = if suspend {
+        b"NtSuspendProcess\0"
+    } else {
+        b"NtResumeProcess\0"
+    };
+    let fn_addr = ntdll.proc_addr(symbol).ok_or(PalError::Unsupported(
+        "NtSuspendProcess/NtResumeProcess is unavailable in ntdll.dll",
+    ))?;
+    // SAFETY: Signature matches `NTSTATUS NTAPI NtSuspendProcess/NtResumeProcess(HANDLE)`.
+    let nt_call: NtProcessControlFn = unsafe { transmute(fn_addr) };
+
+    // SAFETY: `handle` is verified against `key` and opened with `PROCESS_SUSPEND_RESUME`.
+    let status = unsafe { nt_call(handle.as_raw()) };
+    if status < 0 {
+        if status == STATUS_ACCESS_DENIED {
+            return Err(PalError::ElevationRequired);
+        }
+        if status == STATUS_PROCESS_IS_TERMINATING {
+            return Err(PalError::ProcessNotFound(key));
+        }
+        return Err(PalError::OsError {
+            code: status,
+            message: format!(
+                "{} failed with NTSTATUS 0x{:08X}",
+                if suspend {
+                    "NtSuspendProcess"
+                } else {
+                    "NtResumeProcess"
+                },
+                status as u32
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Returns `true` ONLY when `kernel32!IsProcessCritical` succeeds and confirms `critical == 0`.
+fn verify_not_critical_process(handle: HANDLE) -> bool {
+    let Ok(kernel32) = OwnedModule::load("kernel32.dll") else {
+        return false;
+    };
+    let Some(addr) = kernel32.proc_addr(b"IsProcessCritical\0") else {
+        return false;
+    };
+    // SAFETY: Signature matches `BOOL WINAPI IsProcessCritical(HANDLE, PBOOL)`.
+    let is_critical_fn: IsProcessCriticalFn = unsafe { transmute(addr) };
+    let mut critical: BOOL = 1;
+    // SAFETY: `handle` has `PROCESS_QUERY_LIMITED_INFORMATION` and `critical` is a valid out pointer.
+    let ok = unsafe { is_critical_fn(handle, &mut critical) };
+    ok != 0 && critical == 0
+}
+
+fn query_short_image_name(handle: HANDLE) -> Option<String> {
+    let mut buf = [0u16; 512];
+    let mut len = buf.len() as u32;
+    // SAFETY: `handle` has `PROCESS_QUERY_LIMITED_INFORMATION` and `buf` is writable for `len`.
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) };
+    if ok == 0 || len == 0 {
+        return None;
+    }
+    let full = String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())]);
+    Path::new(&full)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_owned)
+}
+
+/// Duplicates the non-elevated desktop shell (`explorer.exe`) primary token via `GetShellWindow`.
+fn duplicate_shell_primary_token() -> Option<OwnedHandle> {
+    // SAFETY: `GetShellWindow` takes no arguments and returns null if no shell window exists.
+    let shell_hwnd = unsafe { GetShellWindow() };
+    if shell_hwnd.is_null() {
+        return None;
+    }
+    let mut shell_pid: u32 = 0;
+    // SAFETY: `shell_hwnd` is non-null and `shell_pid` is a valid stack local.
+    unsafe {
+        GetWindowThreadProcessId(shell_hwnd, &mut shell_pid);
+    }
+    if shell_pid == 0 {
+        return None;
+    }
+
+    // SAFETY: Opens the shell process with minimal read-only query rights.
+    let raw_proc = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, shell_pid) };
+    let shell_proc = OwnedHandle::from_raw(raw_proc)?;
+
+    let mut raw_token: HANDLE = ptr::null_mut();
+    // SAFETY: Requests `TOKEN_DUPLICATE` on the shell process token.
+    let ok = unsafe { OpenProcessToken(shell_proc.as_raw(), TOKEN_DUPLICATE, &mut raw_token) };
+    if ok == 0 {
+        return None;
+    }
+    let shell_token = OwnedHandle::from_raw(raw_token)?;
+
+    let desired_access = TOKEN_ASSIGN_PRIMARY
+        | TOKEN_DUPLICATE
+        | TOKEN_QUERY
+        | TOKEN_ADJUST_DEFAULT
+        | TOKEN_ADJUST_SESSIONID;
+    let mut raw_primary: HANDLE = ptr::null_mut();
+    // SAFETY: Duplicates `shell_token` as a primary token suitable for `CreateProcessWithTokenW`.
+    let dup_ok = unsafe {
+        DuplicateTokenEx(
+            shell_token.as_raw(),
+            desired_access,
+            ptr::null(),
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut raw_primary,
+        )
+    };
+    if dup_ok == 0 {
+        return None;
+    }
+    OwnedHandle::from_raw(raw_primary)
+}
+
+/// Spawns `command_line` under a duplicated primary user token via dynamically loaded
+/// `advapi32!CreateProcessWithTokenW`, returning the spawned PID on success.
+fn spawn_with_token(primary_token: &OwnedHandle, command_line: &str) -> Option<u32> {
+    let advapi32 = OwnedModule::load("advapi32.dll").ok()?;
+    let addr = advapi32.proc_addr(b"CreateProcessWithTokenW\0")?;
+    // SAFETY: Signature matches `CreateProcessWithTokenW` in `winbase.h`.
+    let create_proc_with_token: CreateProcessWithTokenWFn = unsafe { transmute(addr) };
+
+    let mut wide_cmd = to_wide_null(command_line);
+    // SAFETY: `STARTUPINFOW` and `PROCESS_INFORMATION` are plain C POD structs.
+    let mut si: STARTUPINFOW = unsafe { zeroed() };
+    si.cb = size_of::<STARTUPINFOW>() as u32;
+    let mut pi: PROCESS_INFORMATION = unsafe { zeroed() };
+
+    // SAFETY: `primary_token` is a valid primary token and `wide_cmd` is mutable null-terminated UTF-16.
+    let ok = unsafe {
+        create_proc_with_token(
+            primary_token.as_raw(),
+            LOGON_WITH_PROFILE,
+            null_wide_ptr(),
+            wide_cmd.as_mut_ptr(),
+            0,
+            ptr::null(),
+            null_wide_ptr(),
+            &si,
+            &mut pi,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+
+    let pid = pi.dwProcessId;
+    let _proc = OwnedHandle::from_raw(pi.hProcess);
+    let _thread = OwnedHandle::from_raw(pi.hThread);
+    (pid != 0).then_some(pid)
+}
+
+fn current_process_session_id() -> Option<u32> {
+    let mut session_id: u32 = 0;
+    // SAFETY: Queries Windows session ID of the current process.
+    let ok = unsafe { ProcessIdToSessionId(std::process::id(), &mut session_id) };
+    (ok != 0).then_some(session_id)
+}
+
+fn find_session_explorer_pids(target_session: Option<u32>) -> Vec<u32> {
+    // SAFETY: `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)` takes no pointers.
+    let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    let Some(snapshot) = OwnedHandle::from_raw(raw) else {
+        return Vec::new();
+    };
+
+    // SAFETY: `PROCESSENTRY32W` is C POD with `dwSize` initialized before calling `Process32FirstW`.
+    let mut entry: PROCESSENTRY32W = unsafe { zeroed() };
+    entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+
+    let mut pids = Vec::new();
+    // SAFETY: `snapshot` is a valid process snapshot handle.
+    let mut has_next = unsafe { Process32FirstW(snapshot.as_raw(), &mut entry) };
+    while has_next != 0 {
+        let nul = entry
+            .szExeFile
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..nul]);
+        if name.eq_ignore_ascii_case("explorer.exe") {
+            let pid = entry.th32ProcessID;
+            let same_session = match target_session {
+                Some(expected) => {
+                    let mut sid: u32 = 0;
+                    // SAFETY: Queries session ID for enumerated `explorer.exe` PID.
+                    unsafe { ProcessIdToSessionId(pid, &mut sid) != 0 && sid == expected }
+                }
+                None => true,
+            };
+            if same_session {
+                pids.push(pid);
+            }
+        }
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        // SAFETY: Continues process snapshot iteration.
+        has_next = unsafe { Process32NextW(snapshot.as_raw(), &mut entry) };
+    }
+
+    pids
+}
+
+fn explorer_exe_path() -> String {
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_owned());
+    PathBuf::from(windir)
+        .join("explorer.exe")
+        .to_string_lossy()
+        .into_owned()
+}
 
 /// Queries the active logical processor count for each Windows processor group `0..group_count`.
 fn query_processor_group_counts() -> Vec<u32> {
@@ -1189,5 +1571,15 @@ mod tests {
             format_aedebug_command(r"%SystemRoot%\system32\vsjitdebugger.exe -p %d", 1234),
             r"%SystemRoot%\system32\vsjitdebugger.exe -p 1234"
         );
+    }
+
+    #[test]
+    fn protected_suspend_image_filter_blocks_dwm_and_core_system_processes() {
+        assert!(is_protected_suspend_image("dwm.exe"));
+        assert!(is_protected_suspend_image("DWM.EXE"));
+        assert!(is_protected_suspend_image("csrss.exe"));
+        assert!(is_protected_suspend_image("lsass.exe"));
+        assert!(!is_protected_suspend_image("notepad.exe"));
+        assert!(!is_protected_suspend_image("cargo.exe"));
     }
 }

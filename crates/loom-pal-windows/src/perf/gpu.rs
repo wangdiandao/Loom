@@ -381,6 +381,7 @@ impl GpuPerfSampler {
                 dedicated_total_bytes: dedicated_total,
                 shared_used_bytes: shared_used_clamped,
                 shared_total_bytes: shared_total,
+                d3_asleep: false,
                 engines,
             });
         }

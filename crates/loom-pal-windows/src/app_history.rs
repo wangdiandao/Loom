@@ -96,6 +96,14 @@ impl AppHistoryReader for WindowsAppHistoryReader {
         let now = current_unix_epoch_secs();
         write_store_atomic(&self.store_path, now, &[])
     }
+
+    fn save_history(
+        &self,
+        since_epoch_secs: u64,
+        records: &[AppHistoryRecord],
+    ) -> Result<(), PalError> {
+        WindowsAppHistoryReader::save_history(self, since_epoch_secs, records)
+    }
 }
 
 fn current_unix_epoch_secs() -> u64 {
