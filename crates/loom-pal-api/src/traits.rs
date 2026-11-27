@@ -224,6 +224,13 @@ pub trait SystemOperator: Send + Sync {
         cancel: &AtomicBool,
     ) -> Result<(), PalError>;
 
+    /// Launches the OS-configured JIT debugger attached to `key`.
+    fn attach_debugger(&self, _key: ProcessKey) -> Result<(), PalError> {
+        Err(PalError::Unsupported(
+            "attach debugger is not supported on this platform",
+        ))
+    }
+
     /// Relaunches Loom with elevated privileges and instructs the new instance
     /// to restore `restore_route`.
     fn relaunch_self_elevated(&self, restore_route: &str) -> Result<(), PalError>;

@@ -1148,23 +1148,79 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 self.events
                     .emit(CommandEvent::new(kind, Some(key), outcome), reply);
             }
+            EngineCommand::SetUacVirtualization { key, enabled } => {
+                match self.backend.operator().set_uac_virtualization(key, enabled) {
+                    Ok(()) => {
+                        self.cold_cache.set_uac_virtualization(key, enabled);
+                        *need_reproject_details = true;
+                        pending_events.push((
+                            CommandEvent::new(
+                                kind,
+                                Some(key),
+                                CommandOutcome::Ok(CommandSuccess::Ack),
+                            ),
+                            reply,
+                        ));
+                    }
+                    Err(err) => {
+                        self.events.emit(
+                            CommandEvent::new(kind, Some(key), CommandOutcome::err(err)),
+                            reply,
+                        );
+                    }
+                }
+            }
+            EngineCommand::AnalyzeWaitChain(key) => {
+                self.dispatch_slow_shell_op(
+                    kind,
+                    Some(key),
+                    SlowShellOp::AnalyzeWaitChain(key),
+                    reply,
+                );
+            }
+            EngineCommand::WriteMiniDump { key, dest, cancel } => {
+                self.dispatch_slow_shell_op(
+                    kind,
+                    Some(key),
+                    SlowShellOp::WriteMiniDump { key, dest, cancel },
+                    reply,
+                );
+            }
+            EngineCommand::AttachDebugger(key) => {
+                self.dispatch_slow_shell_op(
+                    kind,
+                    Some(key),
+                    SlowShellOp::AttachDebugger(key),
+                    reply,
+                );
+            }
             EngineCommand::BrowseExecutable => {
-                self.dispatch_slow_shell_op(kind, SlowShellOp::BrowseExecutable, reply);
+                self.dispatch_slow_shell_op(kind, None, SlowShellOp::BrowseExecutable, reply);
             }
             EngineCommand::RunNewTask(req) => {
-                self.dispatch_slow_shell_op(kind, SlowShellOp::RunNewTask(req), reply);
+                self.dispatch_slow_shell_op(kind, None, SlowShellOp::RunNewTask(req), reply);
             }
             EngineCommand::OpenFileLocation(path) => {
-                self.dispatch_slow_shell_op(kind, SlowShellOp::OpenFileLocation(path), reply);
+                self.dispatch_slow_shell_op(kind, None, SlowShellOp::OpenFileLocation(path), reply);
             }
             EngineCommand::ShowFileProperties(path) => {
-                self.dispatch_slow_shell_op(kind, SlowShellOp::ShowFileProperties(path), reply);
+                self.dispatch_slow_shell_op(
+                    kind,
+                    None,
+                    SlowShellOp::ShowFileProperties(path),
+                    reply,
+                );
             }
             EngineCommand::SearchOnline(query) => {
-                self.dispatch_slow_shell_op(kind, SlowShellOp::SearchOnline(query), reply);
+                self.dispatch_slow_shell_op(kind, None, SlowShellOp::SearchOnline(query), reply);
             }
             EngineCommand::RelaunchElevated(route) => {
-                self.dispatch_slow_shell_op(kind, SlowShellOp::RelaunchElevated(route), reply);
+                self.dispatch_slow_shell_op(
+                    kind,
+                    None,
+                    SlowShellOp::RelaunchElevated(route),
+                    reply,
+                );
             }
             EngineCommand::StartService(name) => {
                 self.dispatch_slow_mgmt_op(kind, SlowMgmtOp::StartService(name), reply);
@@ -1199,6 +1255,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
     fn dispatch_slow_shell_op(
         &self,
         kind: CommandKind,
+        target: Option<ProcessKey>,
         op: SlowShellOp,
         reply: Option<Sender<CommandEvent>>,
     ) {
@@ -1208,7 +1265,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         {
             let event = CommandEvent::new(
                 kind,
-                None,
+                target,
                 CommandOutcome::err(PalError::CircuitOpen {
                     target: "slow-lane".to_owned(),
                     retry_after_ms: 100,

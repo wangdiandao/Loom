@@ -4,6 +4,20 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ## Unreleased
 
+### Engine & PAL
+
+- Added `CapabilityFlags::{DEBUGGER_ATTACH, GLOBAL_HOTKEY}` in `loom-types`, `PalError::Cancelled` and `SystemOperator::attach_debugger` in `loom-pal-api`, backward-compatible `AppSettings::global_hotkey` persistence with whitespace sanitization in `loom-config`, and cross-platform `GlobalHotkeyController` in `loom-pal`.
+- Added engine commands `SetUacVirtualization`, `AnalyzeWaitChain`, `WriteMiniDump` (with shared `Arc<AtomicBool>` cancellation), and `AttachDebugger` in `loom-engine`, routing wait-chain, minidump, and debugger operations onto the bounded slow-lane bulkhead pool while updating `ColdMetaCache` and reprojecting Details live on UAC virtualization toggles.
+
+### Windows Backend
+
+- Implemented Windows Wait Chain Traversal (`OpenThreadWaitChainSession` / `GetThreadWaitChain` dynamically loaded from `advapi32.dll` with RAII session cleanup), cancellable streaming memory dumps (`MiniDumpWriteDump` dynamically loaded from `dbghelp.dll` with `CancelCallback` partial-file cleanup), live UAC virtualization toggling (`SetTokenInformation(TokenVirtualizationEnabled)`), JIT debugger attachment (`AeDebug\Debugger` registry lookup + `CreateProcessW`), and zero-idle on-demand global wakeup hotkeys (`RegisterHotKey` / `UnregisterHotKey`) in `loom-pal-windows`, advertising `CapabilityFlags::{WAIT_CHAIN, MINIDUMP, DEBUGGER_ATTACH, GLOBAL_HOTKEY}`.
+
+### UI & UX
+
+- Added feature-local **Analyze wait chain** `Dialog` in **Details** using `gpui-kit`'s `Tree` widget with deadlock badges and inline **End blocking process** controls, plus a shared **Create memory dump file** progress/cancel dialog (with **Open file location** on completion) accessible from both **Processes** and **Details** context menus.
+- Wired **UAC virtualization** checkbox toggling and **Attach debugger** context menu actions (gated by `CapabilityFlags`), and added a live **Global wakeup hotkey** preset selector (`Disabled`, `Ctrl+Shift+L`, `Ctrl+Alt+L`, `Ctrl+Shift+M`, `Alt+Shift+T`) in **Settings** that wakes/restores Loom from minimized or tray state, with full `en-US` and `zh-CN` localization.
+
 ## 0.0.5 - 2026-11-27
 
 ### Engine & PAL

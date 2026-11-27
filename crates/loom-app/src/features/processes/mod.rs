@@ -1272,6 +1272,10 @@ fn build_row_context_menu(
     let key = fallback_row.key;
     let snapshot = store.read(cx).snapshot().clone();
     let eco_supported = snapshot.capabilities.contains(CapabilityFlags::ECO_MODE);
+    let minidump_supported = snapshot.capabilities.contains(CapabilityFlags::MINIDUMP);
+    let debugger_supported = snapshot
+        .capabilities
+        .contains(CapabilityFlags::DEBUGGER_ATTACH);
     let row = find_selected_row(&snapshot.processes.rows, Some(key))
         .cloned()
         .unwrap_or(fallback_row);
@@ -1279,6 +1283,9 @@ fn build_row_context_menu(
     let has_children = row.has_children;
     let is_expanded = row.is_expanded;
     let can_end = can_terminate_process(&row);
+    let is_kernel_or_idle = row
+        .status
+        .intersects(ProcessStatusFlags::SYSTEM_IDLE | ProcessStatusFlags::KERNEL);
     let eco_eligible = is_efficiency_mode_eligible(&row, snapshot.capabilities);
     let eco_active = row.status.contains(ProcessStatusFlags::EFFICIENCY_MODE);
     let exe_path = row.exe_path.clone();
@@ -1324,6 +1331,39 @@ fn build_row_context_menu(
                     UiCommands::set_efficiency_mode(&store_eco, key, !eco_active, cx);
                 }),
         );
+    }
+
+    if minidump_supported || debugger_supported {
+        menu = menu.separator();
+        if minidump_supported {
+            let store_dump = store.clone();
+            let dump_name = row.name.to_string();
+            menu = menu.item(
+                PopupMenuItem::new(i18n::tr("processes.menu_create_dump"))
+                    .icon(IconName::File)
+                    .disabled(is_kernel_or_idle)
+                    .on_click(move |_, window, cx| {
+                        dialogs::open_minidump_dialog(
+                            store_dump.clone(),
+                            key,
+                            dump_name.clone(),
+                            window,
+                            cx,
+                        );
+                    }),
+            );
+        }
+        if debugger_supported {
+            let store_dbg = store.clone();
+            menu = menu.item(
+                PopupMenuItem::new(i18n::tr("processes.menu_attach_debugger"))
+                    .icon(IconName::SquareTerminal)
+                    .disabled(is_kernel_or_idle)
+                    .on_click(move |_, _, cx| {
+                        UiCommands::attach_debugger(&store_dbg, key, cx);
+                    }),
+            );
+        }
     }
 
     let store_res = store.clone();

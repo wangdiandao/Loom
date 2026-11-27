@@ -113,6 +113,7 @@ impl ConfigStore {
             });
         }
         normalized.sanitize_run_task_history();
+        normalized.sanitize_global_hotkey();
 
         let serialized = toml::to_string_pretty(&normalized)?;
 

@@ -38,6 +38,10 @@ bitflags! {
         const ELEVATION_RELAUNCH = 1 << 10;
         /// Supports toggling host window always-on-top z-order.
         const ALWAYS_ON_TOP = 1 << 11;
+        /// Supports attaching the OS-configured JIT debugger to a running process.
+        const DEBUGGER_ATTACH = 1 << 12;
+        /// Supports registering a system-wide global wakeup hotkey.
+        const GLOBAL_HOTKEY = 1 << 13;
     }
 }
 

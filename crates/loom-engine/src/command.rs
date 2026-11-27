@@ -2,13 +2,14 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crossbeam_channel::Sender;
 use loom_pal_api::PalError;
 use loom_types::{
     CpuAffinityMask, DetailsSortColumn, DetailsViewMode, ProcessKey, ProcessPriority,
     ProcessSortColumn, ProcessViewMode, RefreshSpeed, RunTaskRequest, SortDirection,
-    TreeKillReport,
+    TreeKillReport, WaitChainNode,
 };
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -75,6 +76,26 @@ pub enum EngineCommand {
         /// Target CPU affinity mask.
         mask: CpuAffinityMask,
     },
+    /// Enables or disables UAC virtualization for a process.
+    SetUacVirtualization {
+        /// Target process lifecycle key.
+        key: ProcessKey,
+        /// Desired UAC virtualization state.
+        enabled: bool,
+    },
+    /// Inspects the cross-process wait chain / deadlock graph for a process on the slow lane.
+    AnalyzeWaitChain(ProcessKey),
+    /// Streams a cancellable process memory minidump to `dest` on the slow lane.
+    WriteMiniDump {
+        /// Target process lifecycle key.
+        key: ProcessKey,
+        /// Destination `.DMP` file path.
+        dest: PathBuf,
+        /// Shared cancellation flag polled during dump streaming.
+        cancel: Arc<AtomicBool>,
+    },
+    /// Launches the OS-configured JIT debugger attached to a process on the slow lane.
+    AttachDebugger(ProcessKey),
     /// Opens the native OS executable file picker on the slow lane.
     BrowseExecutable,
     /// Opens the OS file explorer and selects `PathBuf`.
@@ -145,6 +166,14 @@ pub enum CommandKind {
     GetAffinity,
     /// [`EngineCommand::SetAffinity`]
     SetAffinity,
+    /// [`EngineCommand::SetUacVirtualization`]
+    SetUacVirtualization,
+    /// [`EngineCommand::AnalyzeWaitChain`]
+    AnalyzeWaitChain,
+    /// [`EngineCommand::WriteMiniDump`]
+    WriteMiniDump,
+    /// [`EngineCommand::AttachDebugger`]
+    AttachDebugger,
     /// [`EngineCommand::BrowseExecutable`]
     BrowseExecutable,
     /// [`EngineCommand::OpenFileLocation`]
@@ -195,6 +224,10 @@ impl EngineCommand {
             Self::SetPriority { .. } => CommandKind::SetPriority,
             Self::GetAffinity(_) => CommandKind::GetAffinity,
             Self::SetAffinity { .. } => CommandKind::SetAffinity,
+            Self::SetUacVirtualization { .. } => CommandKind::SetUacVirtualization,
+            Self::AnalyzeWaitChain(_) => CommandKind::AnalyzeWaitChain,
+            Self::WriteMiniDump { .. } => CommandKind::WriteMiniDump,
+            Self::AttachDebugger(_) => CommandKind::AttachDebugger,
             Self::BrowseExecutable => CommandKind::BrowseExecutable,
             Self::OpenFileLocation(_) => CommandKind::OpenFileLocation,
             Self::ShowFileProperties(_) => CommandKind::ShowFileProperties,
@@ -226,6 +259,10 @@ pub enum CommandSuccess {
     ProcessTreeTerminated(TreeKillReport),
     /// [`EngineCommand::GetAffinity`] returned the target process's CPU affinity mask.
     Affinity(CpuAffinityMask),
+    /// [`EngineCommand::AnalyzeWaitChain`] returned the inspected wait-chain tree roots.
+    WaitChain(Vec<WaitChainNode>),
+    /// [`EngineCommand::WriteMiniDump`] completed and wrote the dump file at the returned path.
+    MiniDumpWritten(PathBuf),
     /// [`EngineCommand::BrowseExecutable`] completed with an optional selected file path.
     FilePicked(Option<PathBuf>),
 }

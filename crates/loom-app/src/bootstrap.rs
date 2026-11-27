@@ -1,8 +1,11 @@
 //! Progressive startup pipeline, window lifecycle orchestration, tray residency, and PAL window helpers.
 
 use std::borrow::Cow;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll, Waker};
 
 use gpui_kit::assets::{Assets, icon_assets};
 use gpui_kit::component::TitleBar;
@@ -13,7 +16,11 @@ use gpui_kit::{
 };
 use loom_config::{AppSettings, ConfigStore, WindowGeometry};
 use loom_engine::{EngineCommand, EngineCoordinator};
-use loom_pal::{NativeBackend, PlatformBackend, SingleInstanceGuard};
+use loom_pal::{
+    GlobalHotkeyController, NativeBackend, PalError, PlatformBackend, SingleInstanceGuard,
+};
+use loom_types::CapabilityFlags;
+use parking_lot::Mutex;
 
 use crate::bridge::{UiStore, apply_theme};
 use crate::i18n;
@@ -100,7 +107,74 @@ impl LaunchArgs {
     }
 }
 
-/// Application-wide GPUI global managing the active window handle, tray icon, and exit policy.
+#[derive(Default)]
+struct HotkeySignalState {
+    pending: bool,
+    waker: Option<Waker>,
+    closed: bool,
+}
+
+/// Zero-polling waker-backed wakeup signal delivering global hotkey presses onto the GPUI loop.
+#[derive(Clone, Default)]
+struct HotkeyWakeSignal {
+    inner: Arc<Mutex<HotkeySignalState>>,
+}
+
+impl HotkeyWakeSignal {
+    fn trigger(&self) {
+        let waker = {
+            let mut state = self.inner.lock();
+            if state.closed {
+                return;
+            }
+            state.pending = true;
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn close(&self) {
+        let waker = {
+            let mut state = self.inner.lock();
+            state.closed = true;
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn next(&self) -> NextHotkeyWake {
+        NextHotkeyWake {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+struct NextHotkeyWake {
+    inner: Arc<Mutex<HotkeySignalState>>,
+}
+
+impl Future for NextHotkeyWake {
+    type Output = bool;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let mut state = self.inner.lock();
+        if state.pending {
+            state.pending = false;
+            return Poll::Ready(true);
+        }
+        if state.closed {
+            return Poll::Ready(false);
+        }
+        state.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+/// Application-wide GPUI global managing the active window handle, tray icon, global hotkey, and exit policy.
 struct AppRuntime {
     store: Entity<UiStore>,
     active_window: Option<AnyWindowHandle>,
@@ -108,6 +182,8 @@ struct AppRuntime {
     hiding_to_tray: bool,
     explicit_exit: bool,
     tray: Option<TrayController>,
+    hotkey: Option<GlobalHotkeyController>,
+    hotkey_signal: Option<HotkeyWakeSignal>,
     _window_closed_sub: Option<Subscription>,
     _single_instance: Option<SingleInstanceGuard>,
 }
@@ -172,6 +248,7 @@ pub(crate) fn run(args: LaunchArgs) {
             gpui_kit::init(cx);
             apply_theme(settings.theme, None, cx);
 
+            let initial_hotkey = settings.global_hotkey.clone();
             let store = cx.new(|cx| UiStore::new(coordinator, config_store, settings, cx));
 
             let (tray, tray_signal) = match TrayController::new() {
@@ -182,6 +259,18 @@ pub(crate) fn run(args: LaunchArgs) {
                 }
             };
 
+            let hotkey_signal = HotkeyWakeSignal::default();
+            let trigger_signal = hotkey_signal.clone();
+            let mut hotkey = GlobalHotkeyController::new(Arc::new(move || {
+                trigger_signal.trigger();
+            }));
+            if NativeBackend::CAPABILITIES.contains(CapabilityFlags::GLOBAL_HOTKEY)
+                && let Some(ref spec) = initial_hotkey
+                && let Err(err) = hotkey.set_hotkey(Some(spec))
+            {
+                tracing::warn!(%err, hotkey = %spec, "failed to register configured global wakeup hotkey");
+            }
+
             cx.set_global(AppRuntime {
                 store,
                 active_window: None,
@@ -189,6 +278,8 @@ pub(crate) fn run(args: LaunchArgs) {
                 hiding_to_tray: false,
                 explicit_exit: false,
                 tray,
+                hotkey: Some(hotkey),
+                hotkey_signal: Some(hotkey_signal.clone()),
                 _window_closed_sub: None,
                 _single_instance: single_instance,
             });
@@ -203,6 +294,7 @@ pub(crate) fn run(args: LaunchArgs) {
             if let Some(signal) = tray_signal {
                 spawn_tray_event_loop(signal, cx);
             }
+            spawn_hotkey_event_loop(hotkey_signal, cx);
 
             if let Err(err) = open_main_window(cx) {
                 tracing::error!(%err, "failed to open Loom main window");
@@ -227,6 +319,17 @@ fn spawn_tray_event_loop(signal: TrayEventSignal, cx: &mut App) {
             if !should_continue {
                 break;
             }
+        }
+    })
+    .detach();
+}
+
+fn spawn_hotkey_event_loop(signal: HotkeyWakeSignal, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        while signal.next().await {
+            cx.update(|cx| {
+                show_or_reopen_main_window(cx);
+            });
         }
     })
     .detach();
@@ -355,6 +458,10 @@ fn quit_application(cx: &mut App) {
     let (store, active_window) = {
         let runtime = cx.global_mut::<AppRuntime>();
         runtime.explicit_exit = true;
+        if let Some(signal) = runtime.hotkey_signal.take() {
+            signal.close();
+        }
+        runtime.hotkey = None;
         runtime.tray = None;
         runtime._single_instance = None;
         (runtime.store.clone(), runtime.active_window.take())
@@ -419,6 +526,19 @@ pub(crate) fn persist_window_geometry(store: &Entity<UiStore>, window: &Window, 
 /// Applies native Always-on-Top window z-order via [`loom_pal::window`].
 pub(crate) fn apply_always_on_top(enabled: bool) {
     loom_pal::window::set_main_window_always_on_top(enabled);
+}
+
+/// Applies or clears the system-wide global wakeup hotkey live via [`GlobalHotkeyController`].
+pub(crate) fn apply_global_hotkey(spec: Option<&str>, cx: &mut App) -> Result<(), PalError> {
+    if !cx.has_global::<AppRuntime>() {
+        return Ok(());
+    }
+    let runtime = cx.global_mut::<AppRuntime>();
+    if let Some(controller) = runtime.hotkey.as_mut() {
+        controller.set_hotkey(spec)
+    } else {
+        Ok(())
+    }
 }
 
 /// Returns `true` when Loom's native main window is currently minimized.

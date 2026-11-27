@@ -15,8 +15,10 @@
 
 pub mod app_history;
 pub mod circuit_breaker;
+pub mod diagnostics;
 pub mod fast_sampler;
 pub(crate) mod handle;
+pub mod hotkey;
 pub mod operator;
 pub mod perf;
 pub mod services;
@@ -28,6 +30,7 @@ pub mod window;
 pub use app_history::WindowsAppHistoryReader;
 pub use circuit_breaker::CircuitBreaker;
 pub use fast_sampler::WindowsFastSampler;
+pub use hotkey::{WindowsGlobalHotkeyController, parse_hotkey_spec};
 pub use operator::WindowsSystemOperator;
 pub use services::WindowsServiceManager;
 pub use slow_prober::WindowsSlowProber;
@@ -63,12 +66,16 @@ impl PlatformBackend for WindowsBackend {
         .union(CapabilityFlags::CPU_AFFINITY)
         .union(CapabilityFlags::PROCESS_PRIORITY)
         .union(CapabilityFlags::UAC_VIRTUALIZATION)
+        .union(CapabilityFlags::WAIT_CHAIN)
+        .union(CapabilityFlags::MINIDUMP)
         .union(CapabilityFlags::SERVICES)
         .union(CapabilityFlags::STARTUP_APPS)
         .union(CapabilityFlags::USER_SESSIONS)
         .union(CapabilityFlags::APP_HISTORY)
         .union(CapabilityFlags::ELEVATION_RELAUNCH)
-        .union(CapabilityFlags::ALWAYS_ON_TOP);
+        .union(CapabilityFlags::ALWAYS_ON_TOP)
+        .union(CapabilityFlags::DEBUGGER_ATTACH)
+        .union(CapabilityFlags::GLOBAL_HOTKEY);
 
     fn boost_self_priority() {
         fast_sampler::boost_self_priority();
@@ -557,12 +564,16 @@ mod tests {
                 | CapabilityFlags::CPU_AFFINITY
                 | CapabilityFlags::PROCESS_PRIORITY
                 | CapabilityFlags::UAC_VIRTUALIZATION
+                | CapabilityFlags::WAIT_CHAIN
+                | CapabilityFlags::MINIDUMP
                 | CapabilityFlags::SERVICES
                 | CapabilityFlags::STARTUP_APPS
                 | CapabilityFlags::USER_SESSIONS
                 | CapabilityFlags::APP_HISTORY
                 | CapabilityFlags::ELEVATION_RELAUNCH
                 | CapabilityFlags::ALWAYS_ON_TOP
+                | CapabilityFlags::DEBUGGER_ATTACH
+                | CapabilityFlags::GLOBAL_HOTKEY
         ));
 
         // Own-process window host helpers must safely no-op in a headless test binary.
@@ -844,5 +855,122 @@ mod tests {
         assert!(since.is_some());
         assert!(items.is_empty());
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn analyze_wait_chain_on_current_process_succeeds_without_panicking() {
+        let mut fast = WindowsFastSampler::new();
+        let mut scratch = ProcessSampleScratch::<()>::with_capacity(512, 32 * 1024);
+        fast.sample_processes(&mut scratch)
+            .expect("sample_processes");
+
+        let my_pid = std::process::id();
+        let my_key = scratch
+            .samples
+            .iter()
+            .find(|s| s.key.pid == my_pid)
+            .expect("current process in fast sample")
+            .key;
+
+        let op = WindowsSystemOperator::new();
+        let chains = op
+            .analyze_wait_chain(my_key)
+            .expect("analyze_wait_chain on current process must succeed");
+        eprintln!(
+            "[loom-pal-windows] analyze_wait_chain(self PID {}): {} wait chain root(s)",
+            my_pid,
+            chains.len()
+        );
+
+        // Kernel processes (PID 0 / PID 4) must be gracefully rejected.
+        for kpid in [0u32, 4u32] {
+            let err = op
+                .analyze_wait_chain(ProcessKey::new(kpid, 0))
+                .expect_err("kernel PID wait chain must be rejected");
+            assert!(matches!(err, PalError::Unsupported(_)));
+        }
+    }
+
+    #[test]
+    fn write_minidump_writes_mdmp_magic_and_pre_cancel_leaves_no_file() {
+        use std::io::Read as _;
+        use std::process::{Child, Command, Stdio};
+        use std::sync::atomic::AtomicBool;
+
+        struct ChildGuard(Option<Child>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn harmless ping child process");
+        let child_pid = child.id();
+        let _guard = ChildGuard(Some(child));
+
+        let mut fast = WindowsFastSampler::new();
+        let mut scratch = ProcessSampleScratch::<()>::with_capacity(512, 32 * 1024);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let child_key = loop {
+            fast.sample_processes(&mut scratch)
+                .expect("sample_processes");
+            if let Some(sample) = scratch.samples.iter().find(|s| s.key.pid == child_pid) {
+                break sample.key;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "spawned child PID {child_pid} did not appear in fast sample"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let op = WindowsSystemOperator::new();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "loom-minidump-test-{}-{}",
+            std::process::id(),
+            child_pid
+        ));
+        let dump_path = temp_dir.join(format!("ping_{child_pid}.DMP"));
+        let cancelled_path = temp_dir.join(format!("ping_{child_pid}_cancelled.DMP"));
+
+        // 1. Pre-cancelled dump must abort with `PalError::Cancelled` and leave no file behind.
+        let pre_cancel = AtomicBool::new(true);
+        let cancel_err = op
+            .write_minidump(child_key, &cancelled_path, &pre_cancel)
+            .expect_err("pre-cancelled minidump must return Cancelled");
+        assert!(
+            matches!(cancel_err, PalError::Cancelled),
+            "expected PalError::Cancelled, got {cancel_err:?}"
+        );
+        assert!(
+            !cancelled_path.exists(),
+            "cancelled minidump must not leave a partial file behind"
+        );
+
+        // 2. Live dump on child must succeed and begin with the `MDMP` magic header.
+        let active_cancel = AtomicBool::new(false);
+        op.write_minidump(child_key, &dump_path, &active_cancel)
+            .expect("write_minidump on child must succeed");
+
+        let mut magic = [0u8; 4];
+        {
+            let mut f = std::fs::File::open(&dump_path).expect("open created minidump");
+            f.read_exact(&mut magic).expect("read MDMP magic header");
+        }
+        assert_eq!(&magic, b"MDMP", "minidump must start with MDMP magic bytes");
+
+        // Clean up temporary dump artifacts immediately.
+        let _ = std::fs::remove_file(&dump_path);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

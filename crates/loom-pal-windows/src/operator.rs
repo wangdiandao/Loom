@@ -17,20 +17,27 @@ use loom_types::{
     WaitChainNode,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, GetLastError, HANDLE,
+    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION,
+    ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_SUCCESS, FALSE, GetLastError, HANDLE,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    GetTokenInformation, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ELEVATION, TOKEN_QUERY,
+    TokenElevation, TokenVirtualizationAllowed, TokenVirtualizationEnabled,
+};
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_EXPAND_SZ, REG_SZ, RegCloseKey, RegOpenKeyExW,
+    RegQueryValueExW,
 };
 use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
 use windows_sys::Win32::System::Threading::{
-    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, GetActiveProcessorCount,
-    GetActiveProcessorGroupCount, GetCurrentProcess, GetProcessAffinityMask,
-    GetProcessDefaultCpuSetMasks, GetProcessGroupAffinity, GetProcessId, HIGH_PRIORITY_CLASS,
-    IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenProcessToken,
-    PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-    PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
-    PROCESS_TERMINATE, ProcessPowerThrottling, QueryFullProcessImageNameW, REALTIME_PRIORITY_CLASS,
+    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, CreateProcessW,
+    GetActiveProcessorCount, GetActiveProcessorGroupCount, GetCurrentProcess,
+    GetProcessAffinityMask, GetProcessDefaultCpuSetMasks, GetProcessGroupAffinity, GetProcessId,
+    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenProcessToken,
+    PROCESS_INFORMATION, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_TERMINATE,
+    ProcessPowerThrottling, QueryFullProcessImageNameW, REALTIME_PRIORITY_CLASS, STARTUPINFOW,
     SetPriorityClass, SetProcessAffinityMask, SetProcessDefaultCpuSetMasks, SetProcessInformation,
     TerminateProcess,
 };
@@ -375,27 +382,149 @@ impl SystemOperator for WindowsSystemOperator {
         Ok(())
     }
 
-    fn set_uac_virtualization(&self, _key: ProcessKey, _enabled: bool) -> Result<(), PalError> {
-        Err(PalError::Unsupported(
-            "set_uac_virtualization is scheduled for v0.0.5",
-        ))
+    fn set_uac_virtualization(&self, key: ProcessKey, enabled: bool) -> Result<(), PalError> {
+        if key.pid == 0 || key.pid == 4 {
+            return Err(PalError::Unsupported(
+                "UAC virtualization is not supported for Windows kernel system processes",
+            ));
+        }
+
+        let proc_handle = open_verified_process(key, PROCESS_QUERY_LIMITED_INFORMATION)?;
+
+        let mut raw_token: HANDLE = ptr::null_mut();
+        // SAFETY: `proc_handle` is verified and open with `PROCESS_QUERY_LIMITED_INFORMATION`.
+        let open_ok = unsafe {
+            OpenProcessToken(
+                proc_handle.as_raw(),
+                TOKEN_ADJUST_DEFAULT | TOKEN_QUERY,
+                &mut raw_token,
+            )
+        };
+        if open_ok == 0 {
+            // SAFETY: Reads thread-local Win32 error set by `OpenProcessToken`.
+            let err = unsafe { GetLastError() };
+            return Err(map_win32_error(
+                err,
+                Some(key),
+                "OpenProcessToken(set_uac_virtualization)",
+            ));
+        }
+        let Some(token) = OwnedHandle::from_raw(raw_token) else {
+            return Err(PalError::ElevationRequired);
+        };
+
+        // Query `TokenVirtualizationAllowed` first so 64-bit/elevated processes yield a clear Unsupported error.
+        let mut allowed: u32 = 0;
+        let mut ret_len: u32 = 0;
+        // SAFETY: `allowed` is a 4-byte `u32` matching `TokenVirtualizationAllowed`.
+        let allowed_ok = unsafe {
+            GetTokenInformation(
+                token.as_raw(),
+                TokenVirtualizationAllowed,
+                (&mut allowed as *mut u32).cast::<c_void>(),
+                size_of::<u32>() as u32,
+                &mut ret_len,
+            )
+        };
+        if allowed_ok != 0 && allowed == 0 {
+            return Err(PalError::Unsupported(
+                "UAC virtualization is not allowed for this process",
+            ));
+        }
+
+        let value: u32 = u32::from(enabled);
+        // SAFETY: `token` has `TOKEN_ADJUST_DEFAULT` and `value` is a 4-byte `DWORD`.
+        let set_ok = unsafe {
+            SetTokenInformation(
+                token.as_raw(),
+                TokenVirtualizationEnabled,
+                (&value as *const u32).cast::<c_void>(),
+                size_of::<u32>() as u32,
+            )
+        };
+        if set_ok == 0 {
+            // SAFETY: Reads thread-local Win32 error set by `SetTokenInformation`.
+            let err = unsafe { GetLastError() };
+            return match err {
+                ERROR_ACCESS_DENIED => Err(PalError::ElevationRequired),
+                ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED => Err(PalError::Unsupported(
+                    "UAC virtualization is not supported for this process",
+                )),
+                _ => Err(map_win32_error(
+                    err,
+                    Some(key),
+                    "SetTokenInformation(TokenVirtualizationEnabled)",
+                )),
+            };
+        }
+
+        Ok(())
     }
 
-    fn analyze_wait_chain(&self, _key: ProcessKey) -> Result<Vec<WaitChainNode>, PalError> {
-        Err(PalError::Unsupported(
-            "analyze_wait_chain is scheduled for v0.0.5",
-        ))
+    fn analyze_wait_chain(&self, key: ProcessKey) -> Result<Vec<WaitChainNode>, PalError> {
+        crate::diagnostics::analyze_wait_chain(key)
     }
 
     fn write_minidump(
         &self,
-        _key: ProcessKey,
-        _dest: &Path,
-        _cancel: &AtomicBool,
+        key: ProcessKey,
+        dest: &Path,
+        cancel: &AtomicBool,
     ) -> Result<(), PalError> {
-        Err(PalError::Unsupported(
-            "write_minidump is scheduled for v0.0.5",
-        ))
+        crate::diagnostics::write_minidump(key, dest, cancel)
+    }
+
+    fn attach_debugger(&self, key: ProcessKey) -> Result<(), PalError> {
+        if key.pid == 0 || key.pid == 4 {
+            return Err(PalError::Unsupported(
+                "attaching a debugger is not supported for Windows kernel system processes",
+            ));
+        }
+
+        // Verify target process identity before reading AeDebug or launching any debugger.
+        let _verified = open_verified_process(key, PROCESS_QUERY_LIMITED_INFORMATION)?;
+
+        let template = read_aedebug_command()?.ok_or(PalError::Unsupported(
+            "No JIT debugger configured in Windows AeDebug registry",
+        ))?;
+
+        let command_line = expand_env_vars(&format_aedebug_command(&template, key.pid));
+        let mut wide_cmd = to_wide_null(&command_line);
+
+        // SAFETY: `STARTUPINFOW` and `PROCESS_INFORMATION` are plain C POD structs.
+        let mut si: STARTUPINFOW = unsafe { zeroed() };
+        si.cb = size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = unsafe { zeroed() };
+
+        // SAFETY: `wide_cmd` is a mutable null-terminated UTF-16 command line as required by `CreateProcessW`.
+        let ok = unsafe {
+            CreateProcessW(
+                null_wide_ptr(),
+                wide_cmd.as_mut_ptr(),
+                ptr::null(),
+                ptr::null(),
+                FALSE,
+                0,
+                ptr::null(),
+                null_wide_ptr(),
+                &si,
+                &mut pi,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: Reads thread-local Win32 error set by `CreateProcessW`.
+            let err = unsafe { GetLastError() };
+            return Err(map_win32_error(
+                err,
+                Some(key),
+                "CreateProcessW(attach_debugger)",
+            ));
+        }
+
+        // Close spawned debugger process and primary thread handles immediately via RAII.
+        let _proc = OwnedHandle::from_raw(pi.hProcess);
+        let _thread = OwnedHandle::from_raw(pi.hThread);
+        Ok(())
     }
 
     fn relaunch_self_elevated(&self, restore_route: &str) -> Result<(), PalError> {
@@ -820,6 +949,160 @@ fn percent_encode_query(input: &str) -> String {
     out
 }
 
+const AEDEBUG_PATHS: [&str; 2] = [
+    r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\AeDebug",
+    r"SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\AeDebug",
+];
+
+/// Reads `HKLM\...\AeDebug\Debugger` (falling back to `WOW6432Node`), returning `Ok(None)`
+/// if no JIT debugger is configured on this machine.
+fn read_aedebug_command() -> Result<Option<String>, PalError> {
+    let value_name = to_wide_null("Debugger");
+
+    for subkey_path in AEDEBUG_PATHS {
+        let wide_subkey = to_wide_null(subkey_path);
+        let mut hkey: HKEY = ptr::null_mut();
+        // SAFETY: `wide_subkey` is a valid null-terminated UTF-16 registry subkey path.
+        let open_status = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                wide_subkey.as_ptr(),
+                0,
+                KEY_READ,
+                &mut hkey,
+            )
+        };
+        if open_status != ERROR_SUCCESS || hkey.is_null() {
+            continue;
+        }
+
+        let mut reg_type: u32 = 0;
+        let mut byte_len: u32 = 0;
+        // SAFETY: Size-discovery call with null data buffer on valid `hkey`.
+        let size_status = unsafe {
+            RegQueryValueExW(
+                hkey,
+                value_name.as_ptr(),
+                ptr::null(),
+                &mut reg_type,
+                ptr::null_mut(),
+                &mut byte_len,
+            )
+        };
+        if size_status != ERROR_SUCCESS
+            || byte_len == 0
+            || (reg_type != REG_SZ && reg_type != REG_EXPAND_SZ)
+        {
+            // SAFETY: Closes `hkey` opened above.
+            unsafe {
+                RegCloseKey(hkey);
+            }
+            continue;
+        }
+
+        let mut buf = vec![0u16; (byte_len as usize).div_ceil(2)];
+        let mut actual_bytes = (buf.len() * 2) as u32;
+        // SAFETY: `buf` is sized to hold `byte_len` bytes of UTF-16 registry string data.
+        let read_status = unsafe {
+            RegQueryValueExW(
+                hkey,
+                value_name.as_ptr(),
+                ptr::null(),
+                &mut reg_type,
+                buf.as_mut_ptr().cast::<u8>(),
+                &mut actual_bytes,
+            )
+        };
+        // SAFETY: Always close `hkey` immediately.
+        unsafe {
+            RegCloseKey(hkey);
+        }
+
+        if read_status != ERROR_SUCCESS {
+            continue;
+        }
+
+        let u16_len = ((actual_bytes as usize) / 2).min(buf.len());
+        let nul_pos = buf[..u16_len]
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(u16_len);
+        let raw = String::from_utf16_lossy(&buf[..nul_pos]);
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_owned()));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Formats a Windows `AeDebug` debugger command template (substituting `%ld`/`%lu`/`%d`/`%u`
+/// placeholders: first placeholder -> `pid`, subsequent placeholders -> `0`).
+pub(crate) fn format_aedebug_command(template: &str, pid: u32) -> String {
+    let mut out = String::with_capacity(template.len() + 16);
+    let mut rest = template;
+    let mut arg_index = 0usize;
+
+    while let Some(pct_idx) = rest.find('%') {
+        out.push_str(&rest[..pct_idx]);
+        let after = &rest[pct_idx + 1..];
+
+        if let Some(rem) = after.strip_prefix('%') {
+            out.push('%');
+            rest = rem;
+            continue;
+        }
+
+        let matched = after
+            .strip_prefix("ld")
+            .or_else(|| after.strip_prefix("lu"))
+            .or_else(|| after.strip_prefix('d'))
+            .or_else(|| after.strip_prefix('u'));
+
+        if let Some(rem) = matched {
+            if arg_index == 0 {
+                out.push_str(&pid.to_string());
+            } else {
+                out.push('0');
+            }
+            arg_index += 1;
+            rest = rem;
+        } else {
+            out.push('%');
+            rest = after;
+        }
+    }
+
+    out.push_str(rest);
+    out
+}
+
+/// Expands Windows `%ENV_VAR%` tokens using process environment variables (leaving unknown tokens intact).
+fn expand_env_vars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        if let Some(end) = after.find('%') {
+            let var_name = &after[..end];
+            if !var_name.is_empty()
+                && !var_name.chars().any(char::is_whitespace)
+                && let Ok(val) = std::env::var(var_name)
+            {
+                out.push_str(&val);
+                rest = &after[end + 1..];
+                continue;
+            }
+        }
+        out.push('%');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -887,5 +1170,24 @@ mod tests {
         assert!(BROWSE_EXECUTABLE_FILTER.ends_with("\0\0"));
         assert!(BROWSE_EXECUTABLE_FILTER.contains("*.exe;*.bat;*.cmd;*.msc;*.com"));
         assert!(BROWSE_EXECUTABLE_FILTER.contains("All Files (*.*)\0*.*\0\0"));
+    }
+
+    #[test]
+    fn format_aedebug_command_substitutes_pid_and_event_placeholders() {
+        assert_eq!(
+            format_aedebug_command(
+                r#""C:\Windows\system32\vsjitdebugger.exe" -p %ld -e %ld"#,
+                4242
+            ),
+            r#""C:\Windows\system32\vsjitdebugger.exe" -p 4242 -e 0"#
+        );
+        assert_eq!(
+            format_aedebug_command("windbg.exe -p %u -e %u -g", 9001),
+            "windbg.exe -p 9001 -e 0 -g"
+        );
+        assert_eq!(
+            format_aedebug_command(r"%SystemRoot%\system32\vsjitdebugger.exe -p %d", 1234),
+            r"%SystemRoot%\system32\vsjitdebugger.exe -p 1234"
+        );
     }
 }

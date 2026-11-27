@@ -21,7 +21,8 @@ use loom_pal_api::{
 };
 use loom_types::{
     AppHistoryRecord, DiskDeviceSample, ExeStaticAsset, HardwareStaticInfo, MonitorDomain,
-    ProcessColdMeta, ProcessKey, RunTaskRequest, ServiceRecord, StartupEntry, UserSessionRecord,
+    ProcessColdMeta, ProcessKey, RunTaskRequest, ServiceRecord, StartupEntry, UacVirtualization,
+    UserSessionRecord,
 };
 use parking_lot::{Condvar, Mutex};
 
@@ -168,6 +169,7 @@ pub struct ColdMetaCache {
     proc_meta: HashMap<ProcessKey, Arc<ProcessColdMeta>>,
     exe_assets: HashMap<Arc<str>, Arc<ExeStaticAsset>>,
     eco_overrides: HashMap<ProcessKey, bool>,
+    uac_overrides: HashMap<ProcessKey, UacVirtualization>,
 }
 
 impl ColdMetaCache {
@@ -220,6 +222,28 @@ impl ColdMetaCache {
         }
     }
 
+    /// Immediately updates the cached UAC virtualization state for `key`.
+    ///
+    /// If `key` is already in Level 1, its `ProcessColdMeta` is updated immediately;
+    /// otherwise, the override is staged until the slow-lane probe populates the entry.
+    pub fn set_uac_virtualization(&mut self, key: ProcessKey, enabled: bool) {
+        let next = if enabled {
+            UacVirtualization::Enabled
+        } else {
+            UacVirtualization::Disabled
+        };
+        if let Some(meta_arc) = self.proc_meta.get_mut(&key) {
+            if meta_arc.uac_virtualization != next {
+                let mut cloned = (**meta_arc).clone();
+                cloned.uac_virtualization = next;
+                *meta_arc = Arc::new(cloned);
+            }
+            self.uac_overrides.remove(&key);
+        } else {
+            self.uac_overrides.insert(key, next);
+        }
+    }
+
     /// Looks up a cached path-deduplicated executable asset by normalized key.
     #[inline]
     pub fn get_asset(&self, cache_key: &str) -> Option<&Arc<ExeStaticAsset>> {
@@ -268,6 +292,9 @@ impl ColdMetaCache {
         if let Some(overridden_eco) = self.eco_overrides.remove(&proc_key) {
             meta.efficiency_mode = overridden_eco;
         }
+        if let Some(overridden_uac) = self.uac_overrides.remove(&proc_key) {
+            meta.uac_virtualization = overridden_uac;
+        }
         self.proc_meta.insert(proc_key, Arc::new(meta));
         needs_asset_probe
     }
@@ -304,6 +331,7 @@ impl ColdMetaCache {
     pub fn retain_live_processes(&mut self, live: &HashSet<ProcessKey>) {
         self.proc_meta.retain(|k, _| live.contains(k));
         self.eco_overrides.retain(|k, _| live.contains(k));
+        self.uac_overrides.retain(|k, _| live.contains(k));
     }
 
     fn insert_asset_arc(
@@ -330,6 +358,13 @@ pub(crate) enum SlowShellOp {
     ShowFileProperties(PathBuf),
     SearchOnline(String),
     RelaunchElevated(String),
+    AnalyzeWaitChain(ProcessKey),
+    WriteMiniDump {
+        key: ProcessKey,
+        dest: PathBuf,
+        cancel: Arc<AtomicBool>,
+    },
+    AttachDebugger(ProcessKey),
 }
 
 /// Blocking system management operations (Services, Startup, Users, App History)
@@ -668,6 +703,44 @@ fn execute_priority_job<B: PlatformBackend>(
                         ),
                     }
                 }
+                SlowShellOp::AnalyzeWaitChain(key) => match operator.analyze_wait_chain(key) {
+                    Ok(nodes) => CommandEvent::new(
+                        CommandKind::AnalyzeWaitChain,
+                        Some(key),
+                        CommandOutcome::Ok(CommandSuccess::WaitChain(nodes)),
+                    ),
+                    Err(err) => CommandEvent::new(
+                        CommandKind::AnalyzeWaitChain,
+                        Some(key),
+                        CommandOutcome::err(err),
+                    ),
+                },
+                SlowShellOp::WriteMiniDump { key, dest, cancel } => {
+                    match operator.write_minidump(key, &dest, &cancel) {
+                        Ok(()) => CommandEvent::new(
+                            CommandKind::WriteMiniDump,
+                            Some(key),
+                            CommandOutcome::Ok(CommandSuccess::MiniDumpWritten(dest)),
+                        ),
+                        Err(err) => CommandEvent::new(
+                            CommandKind::WriteMiniDump,
+                            Some(key),
+                            CommandOutcome::err(err),
+                        ),
+                    }
+                }
+                SlowShellOp::AttachDebugger(key) => match operator.attach_debugger(key) {
+                    Ok(()) => CommandEvent::new(
+                        CommandKind::AttachDebugger,
+                        Some(key),
+                        CommandOutcome::Ok(CommandSuccess::Ack),
+                    ),
+                    Err(err) => CommandEvent::new(
+                        CommandKind::AttachDebugger,
+                        Some(key),
+                        CommandOutcome::err(err),
+                    ),
+                },
             };
             events.emit(event, reply);
         }

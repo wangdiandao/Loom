@@ -25,6 +25,10 @@ pub enum PalError {
     #[error("platform operation timed out after {0:?}")]
     TimedOut(Duration),
 
+    /// The operation was cancelled before completion.
+    #[error("operation cancelled")]
+    Cancelled,
+
     /// A slow-lane circuit breaker is currently open for `target`.
     #[error("circuit breaker open for '{target}' (retry after {retry_after_ms} ms)")]
     CircuitOpen {
