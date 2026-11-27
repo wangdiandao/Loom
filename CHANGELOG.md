@@ -4,6 +4,8 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ## Unreleased
 
+## 0.0.4 - 2026-11-27
+
 ### Engine & PAL
 
 - Added fixed-size stack-allocated `ThroughputRing<N>` and structured hardware telemetry types (`CpuStaticInfo`, `MemoryHardwareInfo`, `HardwareStaticInfo`, `DiskMediaType`, `DiskDeviceSample`/`DiskDeviceSlice`, `NetConnectionType`, `NetAdapterSample`/`NetAdapterSlice`, `GpuEngineSample`/`GpuEngineSlice`, `GpuAdapterSample`/`GpuAdapterSlice`) in `loom-types`, extending `PerformanceSlice` with per-device metadata and 60-point history rings.
