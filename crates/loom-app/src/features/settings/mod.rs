@@ -4,11 +4,13 @@
 //! and persist atomically to `settings.toml` via [`UiCommands`].
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, IndexPath, Sizable as _, StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Icon, IconName, IndexPath, Sizable as _, StyledExt as _, WindowExt as _,
+    h_flex, v_flex,
 };
 use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -45,6 +47,14 @@ const THEME_PREFS: [ThemePreference; 3] = [
 
 const LANGUAGE_PREFS: [LanguagePreference; 2] =
     [LanguagePreference::ZhCn, LanguagePreference::EnUs];
+
+const GLOBAL_HOTKEY_PRESETS: [Option<&str>; 5] = [
+    None,
+    Some("Ctrl+Shift+L"),
+    Some("Ctrl+Alt+L"),
+    Some("Ctrl+Shift+M"),
+    Some("Alt+Shift+T"),
+];
 
 /// Strongly-typed option entry for [`SelectState`].
 #[derive(Debug, Clone)]
@@ -105,6 +115,51 @@ fn language_options() -> Vec<SelectOption<LanguagePreference>> {
         .collect()
 }
 
+fn global_hotkey_options(current: Option<&str>) -> Vec<SelectOption<Option<String>>> {
+    let mut options: Vec<SelectOption<Option<String>>> = GLOBAL_HOTKEY_PRESETS
+        .into_iter()
+        .map(|preset| match preset {
+            None => SelectOption {
+                value: None,
+                label: i18n::tr("settings.global_hotkey_disabled").into(),
+            },
+            Some(spec) => SelectOption {
+                value: Some(spec.to_owned()),
+                label: SharedString::new_static(spec),
+            },
+        })
+        .collect();
+
+    if let Some(custom) = current.map(str::trim).filter(|s| !s.is_empty())
+        && !GLOBAL_HOTKEY_PRESETS
+            .iter()
+            .flatten()
+            .any(|preset| preset.eq_ignore_ascii_case(custom))
+    {
+        options.push(SelectOption {
+            value: Some(custom.to_owned()),
+            label: custom.to_owned().into(),
+        });
+    }
+
+    options
+}
+
+fn hotkey_index_of(
+    options: &[SelectOption<Option<String>>],
+    target: Option<&str>,
+) -> Option<IndexPath> {
+    let normalized = target.map(str::trim).filter(|s| !s.is_empty());
+    options
+        .iter()
+        .position(|opt| match (opt.value.as_deref(), normalized) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => false,
+        })
+        .map(|row| IndexPath::default().row(row))
+}
+
 fn index_of<T: PartialEq>(slice: &[T], target: &T) -> Option<IndexPath> {
     slice
         .iter()
@@ -118,6 +173,7 @@ pub(crate) struct SettingsView {
     last_locale: LanguagePreference,
     startup_page_select: Entity<SelectState<Vec<SelectOption<StartupPage>>>>,
     refresh_speed_select: Entity<SelectState<Vec<SelectOption<RefreshSpeed>>>>,
+    global_hotkey_select: Entity<SelectState<Vec<SelectOption<Option<String>>>>>,
     theme_select: Entity<SelectState<Vec<SelectOption<ThemePreference>>>>,
     language_select: Entity<SelectState<Vec<SelectOption<LanguagePreference>>>>,
     _subscriptions: Vec<Subscription>,
@@ -144,6 +200,10 @@ impl SettingsView {
                 cx,
             )
         });
+        let hotkey_opts = global_hotkey_options(settings.global_hotkey.as_deref());
+        let hotkey_idx = hotkey_index_of(&hotkey_opts, settings.global_hotkey.as_deref());
+        let global_hotkey_select =
+            cx.new(|cx| SelectState::new(hotkey_opts, hotkey_idx, window, cx));
         let theme_select = cx.new(|cx| {
             SelectState::new(
                 theme_options(),
@@ -161,7 +221,7 @@ impl SettingsView {
             )
         });
 
-        let mut subscriptions = Vec::with_capacity(5);
+        let mut subscriptions = Vec::with_capacity(6);
 
         subscriptions.push(cx.subscribe_in(
             &startup_page_select,
@@ -182,6 +242,32 @@ impl SettingsView {
                     return;
                 };
                 UiCommands::set_refresh_speed(&this.store, *speed, cx);
+            },
+        ));
+
+        subscriptions.push(cx.subscribe_in(
+            &global_hotkey_select,
+            window,
+            |this, state, event: &SelectEvent<Vec<SelectOption<Option<String>>>>, window, cx| {
+                let SelectEvent::Confirm(Some(selected_hotkey)) = event else {
+                    return;
+                };
+                if let Err(err) =
+                    UiCommands::set_global_hotkey(&this.store, selected_hotkey.clone(), cx)
+                {
+                    let msg = rust_i18n::t!(
+                        "settings.global_hotkey_error",
+                        error = err.to_string().as_str()
+                    )
+                    .into_owned();
+                    window.push_notification(Notification::error(msg), cx);
+                    let previous = this.store.read(cx).settings().global_hotkey.clone();
+                    let opts = global_hotkey_options(previous.as_deref());
+                    let prev_idx = hotkey_index_of(&opts, previous.as_deref());
+                    state.update(cx, |s, cx| {
+                        s.set_selected_index(prev_idx, window, cx);
+                    });
+                }
             },
         ));
 
@@ -230,6 +316,7 @@ impl SettingsView {
             last_locale: settings.language,
             startup_page_select,
             refresh_speed_select,
+            global_hotkey_select,
             theme_select,
             language_select,
             _subscriptions: subscriptions,
@@ -237,11 +324,15 @@ impl SettingsView {
     }
 
     fn refresh_select_labels(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let current_hotkey = self.store.read(cx).settings().global_hotkey.clone();
         self.startup_page_select.update(cx, |state, cx| {
             state.set_items(startup_page_options(), window, cx);
         });
         self.refresh_speed_select.update(cx, |state, cx| {
             state.set_items(refresh_speed_options(), window, cx);
+        });
+        self.global_hotkey_select.update(cx, |state, cx| {
+            state.set_items(global_hotkey_options(current_hotkey.as_deref()), window, cx);
         });
         self.theme_select.update(cx, |state, cx| {
             state.set_items(theme_options(), window, cx);
@@ -260,6 +351,7 @@ impl Render for SettingsView {
         let is_elevated = snapshot.is_elevated;
         let capabilities = snapshot.capabilities;
         let supports_always_on_top = capabilities.contains(CapabilityFlags::ALWAYS_ON_TOP);
+        let supports_global_hotkey = capabilities.contains(CapabilityFlags::GLOBAL_HOTKEY);
         let supports_elevation_relaunch =
             capabilities.contains(CapabilityFlags::ELEVATION_RELAUNCH);
         let config_path = store_ref.config_path().display().to_string();
@@ -293,6 +385,7 @@ impl Render for SettingsView {
         let always_on_top_label = i18n::tr("settings.always_on_top_label");
         let min_tray_label = i18n::tr("settings.minimize_to_tray_label");
         let close_tray_label = i18n::tr("settings.close_to_tray_label");
+        let global_hotkey_label = i18n::tr("settings.global_hotkey_label");
         let theme_label = i18n::tr("settings.theme_label");
         let language_label = i18n::tr("settings.language_label");
 
@@ -393,7 +486,20 @@ impl Render for SettingsView {
                                 .on_change(move |checked, _, cx| {
                                     UiCommands::set_close_to_tray(&store_close, *checked, cx);
                                 }),
-                        )),
+                        ))
+                        .when(supports_global_hotkey, |section| {
+                            section.child(setting_row(
+                                global_hotkey_label.clone(),
+                                fg,
+                                border,
+                                true,
+                                div().w(px(220.)).child(
+                                    Select::new(&self.global_hotkey_select)
+                                        .small()
+                                        .accessibility_label(global_hotkey_label),
+                                ),
+                            ))
+                        }),
                     )
                     // 3. Appearance & Language
                     .child(

@@ -236,6 +236,9 @@ impl UiStore {
                     command: event.kind,
                 });
             } else if let Some(err) = event.error() {
+                if matches!(err, loom_pal::PalError::Cancelled) {
+                    continue;
+                }
                 tracing::warn!(kind = ?event.kind, %err, "engine command failed");
                 cx.emit(UiStoreEvent::CommandFailed {
                     command: event.kind,

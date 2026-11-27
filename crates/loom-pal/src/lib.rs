@@ -7,6 +7,8 @@
 
 #![warn(missing_docs)]
 
+use std::sync::Arc;
+
 pub use loom_pal_api::*;
 
 /// Active compile-time native backend on Windows.
@@ -89,6 +91,83 @@ impl SingleInstanceGuard {
     #[inline]
     pub fn is_single(&self) -> bool {
         self.inner.is_single()
+    }
+}
+
+/// Cross-platform global wakeup hotkey controller.
+///
+/// On Windows, wraps [`loom_pal_windows::WindowsGlobalHotkeyController`] backed by Win32
+/// `RegisterHotKey`/`UnregisterHotKey` and spawns a lightweight listener thread **only**
+/// while a hotkey is actively configured. On Linux and macOS, acts as a zero-thread safe
+/// no-op (`Ok(())` when disabled, [`PalError::Unsupported`] when attempting to register).
+#[derive(Debug)]
+pub struct GlobalHotkeyController {
+    #[cfg(windows)]
+    inner: loom_pal_windows::WindowsGlobalHotkeyController,
+    #[cfg(not(windows))]
+    active_spec: Option<String>,
+}
+
+impl GlobalHotkeyController {
+    /// Creates a new controller in the disabled state that invokes `on_trigger` whenever
+    /// the registered global wakeup hotkey fires.
+    pub fn new(on_trigger: Arc<dyn Fn() + Send + Sync>) -> Self {
+        #[cfg(windows)]
+        {
+            Self {
+                inner: loom_pal_windows::WindowsGlobalHotkeyController::new(on_trigger),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = on_trigger;
+            Self { active_spec: None }
+        }
+    }
+
+    /// Returns the currently registered hotkey specification, if any.
+    #[inline]
+    pub fn active_hotkey(&self) -> Option<&str> {
+        #[cfg(windows)]
+        {
+            self.inner.active_hotkey()
+        }
+        #[cfg(not(windows))]
+        {
+            self.active_spec.as_deref()
+        }
+    }
+
+    /// Registers `spec` (e.g., `"Ctrl+Shift+L"`) as the active global wakeup hotkey, or
+    /// unregisters and shuts down the listener thread when `spec` is `None` or blank.
+    pub fn set_hotkey(&mut self, spec: Option<&str>) -> Result<(), PalError> {
+        #[cfg(windows)]
+        {
+            self.inner.set_hotkey(spec)
+        }
+        #[cfg(not(windows))]
+        {
+            let normalized = spec.map(str::trim).filter(|s| !s.is_empty());
+            if normalized.is_none() {
+                self.active_spec = None;
+                return Ok(());
+            }
+            Err(PalError::Unsupported(
+                "global wakeup hotkey is not supported on this platform",
+            ))
+        }
+    }
+
+    /// Unregisters any active global wakeup hotkey and releases associated OS resources.
+    pub fn clear(&mut self) {
+        #[cfg(windows)]
+        {
+            self.inner.clear();
+        }
+        #[cfg(not(windows))]
+        {
+            self.active_spec = None;
+        }
     }
 }
 

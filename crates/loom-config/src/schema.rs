@@ -89,6 +89,9 @@ pub struct AppSettings {
     /// Persisted column layout (order, width, visibility) for the Details table.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub details_columns: Vec<TableColumnSetting>,
+    /// Optional global system wakeup hotkey string (e.g., `"Ctrl+Shift+L"`), or `None` when disabled.
+    #[serde(default)]
+    pub global_hotkey: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -112,6 +115,7 @@ impl Default for AppSettings {
             run_task_history: Vec::new(),
             processes_columns: Vec::new(),
             details_columns: Vec::new(),
+            global_hotkey: None,
         }
     }
 }
@@ -159,6 +163,20 @@ impl AppSettings {
             }
         }
         self.run_task_history = cleaned;
+    }
+
+    /// Normalizes `global_hotkey` by trimming whitespace and collapsing blank strings to `None`.
+    pub(crate) fn sanitize_global_hotkey(&mut self) {
+        self.global_hotkey = self.global_hotkey.take().and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.len() == raw.len() {
+                Some(raw)
+            } else {
+                Some(trimmed.to_owned())
+            }
+        });
     }
 }
 
@@ -222,5 +240,6 @@ pub fn migrate_toml_value(raw: &str) -> Result<AppSettings, ConfigError> {
     let mut settings: AppSettings = toml::Value::Table(table).try_into()?;
     settings.schema_version = CURRENT_SCHEMA_VERSION;
     settings.sanitize_run_task_history();
+    settings.sanitize_global_hotkey();
     Ok(settings)
 }

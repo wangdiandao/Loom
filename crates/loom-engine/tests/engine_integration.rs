@@ -106,6 +106,11 @@ struct MockState {
     priorities: Mutex<HashMap<ProcessKey, ProcessPriority>>,
     browse_result: Mutex<Option<PathBuf>>,
     terminate_error_elevation: AtomicBool,
+    uac_error_elevation: AtomicBool,
+    debugger_error_elevation: AtomicBool,
+    debugger_attached_keys: Mutex<Vec<ProcessKey>>,
+    wait_chain_nodes: Mutex<Vec<WaitChainNode>>,
+    minidump_sleep: Duration,
     is_elevated: AtomicBool,
     mgmt: MockMgmtState,
 }
@@ -132,6 +137,11 @@ impl MockState {
             priorities: Mutex::new(HashMap::new()),
             browse_result: Mutex::new(None),
             terminate_error_elevation: AtomicBool::new(false),
+            uac_error_elevation: AtomicBool::new(false),
+            debugger_error_elevation: AtomicBool::new(false),
+            debugger_attached_keys: Mutex::new(Vec::new()),
+            wait_chain_nodes: Mutex::new(Vec::new()),
+            minidump_sleep: Duration::ZERO,
             is_elevated: AtomicBool::new(false),
             mgmt: MockMgmtState::default(),
         })
@@ -602,17 +612,37 @@ impl SystemOperator for MockOperator {
         Ok(())
     }
     fn set_uac_virtualization(&self, _key: ProcessKey, _enabled: bool) -> Result<(), PalError> {
+        if self.state.uac_error_elevation.load(Ordering::Acquire) {
+            return Err(PalError::ElevationRequired);
+        }
         Ok(())
     }
     fn analyze_wait_chain(&self, _key: ProcessKey) -> Result<Vec<WaitChainNode>, PalError> {
-        Ok(Vec::new())
+        Ok(self.state.wait_chain_nodes.lock().clone())
     }
     fn write_minidump(
         &self,
         _key: ProcessKey,
-        _dest: &Path,
-        _cancel: &AtomicBool,
+        dest: &Path,
+        cancel: &AtomicBool,
     ) -> Result<(), PalError> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PalError::Cancelled);
+        }
+        if !self.state.minidump_sleep.is_zero() {
+            std::thread::sleep(self.state.minidump_sleep);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PalError::Cancelled);
+        }
+        let _ = dest;
+        Ok(())
+    }
+    fn attach_debugger(&self, key: ProcessKey) -> Result<(), PalError> {
+        if self.state.debugger_error_elevation.load(Ordering::Acquire) {
+            return Err(PalError::ElevationRequired);
+        }
+        self.state.debugger_attached_keys.lock().push(key);
         Ok(())
     }
     fn relaunch_self_elevated(&self, _restore_route: &str) -> Result<(), PalError> {
@@ -957,6 +987,11 @@ fn slow_disk_5s_fault_injection_never_blocks_fast_lane_or_shutdown() {
         priorities: Mutex::new(HashMap::new()),
         browse_result: Mutex::new(None),
         terminate_error_elevation: AtomicBool::new(false),
+        uac_error_elevation: AtomicBool::new(false),
+        debugger_error_elevation: AtomicBool::new(false),
+        debugger_attached_keys: Mutex::new(Vec::new()),
+        wait_chain_nodes: Mutex::new(Vec::new()),
+        minidump_sleep: Duration::ZERO,
         is_elevated: AtomicBool::new(false),
         mgmt: MockMgmtState::default(),
     });
@@ -1621,6 +1656,11 @@ fn slow_disk_probe_400ms_never_blocks_fast_lane_and_deduplicates_polls() {
         priorities: Mutex::new(HashMap::new()),
         browse_result: Mutex::new(None),
         terminate_error_elevation: AtomicBool::new(false),
+        uac_error_elevation: AtomicBool::new(false),
+        debugger_error_elevation: AtomicBool::new(false),
+        debugger_attached_keys: Mutex::new(Vec::new()),
+        wait_chain_nodes: Mutex::new(Vec::new()),
+        minidump_sleep: Duration::ZERO,
         is_elevated: AtomicBool::new(false),
         mgmt: MockMgmtState::default(),
     });
@@ -2153,4 +2193,175 @@ fn app_history_accumulates_live_deltas_merges_persisted_and_clears_atomically() 
             .iter()
             .any(|r| r.app_id.as_ref() == "browser.exe" && r.cpu_time_100ns == 1_500_000)
     }));
+}
+
+#[test]
+fn diagnostics_commands_support_wait_chain_minidump_cancel_uac_and_debugger_attach() {
+    let target_key = ProcessKey::new(777, 10_000);
+    let blocker_key = ProcessKey::new(888, 20_000);
+
+    let state = MockState::new(vec![
+        MockProcSpec::new(777, 10_000, 0, "legacy32.exe"),
+        MockProcSpec::new(888, 20_000, 0, "blocker.exe"),
+    ]);
+    *state.wait_chain_nodes.lock() = vec![WaitChainNode {
+        thread_id: 1001,
+        process_key: Some(target_key),
+        process_name: Some(Arc::from("legacy32.exe")),
+        object_type: Arc::from("Thread"),
+        object_name: None,
+        is_deadlocked: true,
+        children: vec![WaitChainNode {
+            thread_id: 0,
+            process_key: None,
+            process_name: None,
+            object_type: Arc::from("SendMessage"),
+            object_name: None,
+            is_deadlocked: true,
+            children: vec![WaitChainNode {
+                thread_id: 2002,
+                process_key: Some(blocker_key),
+                process_name: Some(Arc::from("blocker.exe")),
+                object_type: Arc::from("Thread"),
+                object_name: None,
+                is_deadlocked: true,
+                children: Vec::new(),
+            }],
+        }],
+    }];
+
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let coord = EngineCoordinator::new(backend, settings).unwrap();
+    let _details_lease = coord.acquire_lease(MonitorDomain::Details);
+    assert!(wait_until(Duration::from_secs(1), || {
+        coord.snapshot().revisions.details >= 1
+    }));
+
+    // 1. AnalyzeWaitChain returns structured WaitChain tree on slow lane.
+    let wct_ev = coord
+        .send_command_with_reply(EngineCommand::AnalyzeWaitChain(target_key))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(wct_ev.kind, CommandKind::AnalyzeWaitChain);
+    assert_eq!(wct_ev.target, Some(target_key));
+    match wct_ev.outcome.as_ok() {
+        Some(CommandSuccess::WaitChain(nodes)) => {
+            assert_eq!(nodes.len(), 1);
+            assert!(nodes[0].is_deadlocked);
+            assert_eq!(nodes[0].thread_id, 1001);
+            assert_eq!(
+                nodes[0].children[0].children[0].process_key,
+                Some(blocker_key)
+            );
+        }
+        other => panic!("expected WaitChain success, got {other:?}"),
+    }
+
+    // 2. WriteMiniDump succeeds when not cancelled, and returns Cancelled when cancel is set.
+    let dump_dest = PathBuf::from(r"C:\Temp\legacy32_777.DMP");
+    let ok_ev = coord
+        .send_command_with_reply(EngineCommand::WriteMiniDump {
+            key: target_key,
+            dest: dump_dest.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(ok_ev.kind, CommandKind::WriteMiniDump);
+    assert_eq!(ok_ev.target, Some(target_key));
+    assert_eq!(
+        ok_ev.outcome.as_ok(),
+        Some(&CommandSuccess::MiniDumpWritten(dump_dest.clone()))
+    );
+
+    let cancel_ev = coord
+        .send_command_with_reply(EngineCommand::WriteMiniDump {
+            key: target_key,
+            dest: dump_dest,
+            cancel: Arc::new(AtomicBool::new(true)),
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(cancel_ev.kind, CommandKind::WriteMiniDump);
+    assert!(matches!(cancel_ev.error(), Some(PalError::Cancelled)));
+
+    // 3. SetUacVirtualization updates ColdMetaCache and reprojects Details, and propagates ElevationRequired.
+    let uac_on = coord
+        .send_command_with_reply(EngineCommand::SetUacVirtualization {
+            key: target_key,
+            enabled: true,
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(uac_on.kind, CommandKind::SetUacVirtualization);
+    assert!(uac_on.is_ok());
+    assert!(wait_until(Duration::from_secs(1), || {
+        coord
+            .snapshot()
+            .details
+            .rows
+            .iter()
+            .any(|r| r.key == target_key && r.uac_virtualization == UacVirtualization::Enabled)
+    }));
+
+    let uac_off = coord
+        .send_command_with_reply(EngineCommand::SetUacVirtualization {
+            key: target_key,
+            enabled: false,
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert!(uac_off.is_ok());
+    assert!(wait_until(Duration::from_secs(1), || {
+        coord
+            .snapshot()
+            .details
+            .rows
+            .iter()
+            .any(|r| r.key == target_key && r.uac_virtualization == UacVirtualization::Disabled)
+    }));
+
+    state.uac_error_elevation.store(true, Ordering::Release);
+    let uac_denied = coord
+        .send_command_with_reply(EngineCommand::SetUacVirtualization {
+            key: target_key,
+            enabled: true,
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert!(uac_denied.is_elevation_required());
+
+    // 4. AttachDebugger succeeds on slow lane and propagates ElevationRequired when denied.
+    let dbg_ok = coord
+        .send_command_with_reply(EngineCommand::AttachDebugger(target_key))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(dbg_ok.kind, CommandKind::AttachDebugger);
+    assert_eq!(dbg_ok.target, Some(target_key));
+    assert!(dbg_ok.is_ok());
+    assert_eq!(
+        state.debugger_attached_keys.lock().as_slice(),
+        &[target_key]
+    );
+
+    state
+        .debugger_error_elevation
+        .store(true, Ordering::Release);
+    let dbg_denied = coord
+        .send_command_with_reply(EngineCommand::AttachDebugger(target_key))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert!(dbg_denied.is_elevation_required());
 }

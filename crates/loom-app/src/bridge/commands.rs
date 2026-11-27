@@ -1,12 +1,15 @@
 //! Typed UI command helpers dispatching [`EngineCommand`]s and persisting [`loom_config::AppSettings`].
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crossbeam_channel::Receiver;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{App, Entity, Window};
 use loom_config::TableColumnSetting;
 use loom_engine::{CommandEvent, EngineCommand, EngineCommandError};
+use loom_pal::PalError;
 use loom_types::{
     CpuAffinityMask, DetailsSortColumn, DetailsViewMode, LanguagePreference, ProcessKey,
     ProcessPriority, ProcessSortColumn, ProcessViewMode, RefreshSpeed, ResourceDisplayMode,
@@ -200,6 +203,70 @@ impl UiCommands {
         store
             .read(cx)
             .dispatch_command_with_reply(EngineCommand::GetAffinity(key))
+    }
+
+    /// Enables or disables UAC virtualization for `key`.
+    pub(crate) fn set_uac_virtualization(
+        store: &Entity<UiStore>,
+        key: ProcessKey,
+        enabled: bool,
+        cx: &mut App,
+    ) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SetUacVirtualization { key, enabled });
+    }
+
+    /// Inspects the wait chain / deadlock graph for `key` on the slow lane, returning a oneshot reply receiver.
+    pub(crate) fn analyze_wait_chain_async(
+        store: &Entity<UiStore>,
+        key: ProcessKey,
+        cx: &App,
+    ) -> Result<Receiver<CommandEvent>, EngineCommandError> {
+        store
+            .read(cx)
+            .dispatch_command_with_reply(EngineCommand::AnalyzeWaitChain(key))
+    }
+
+    /// Streams a cancellable process memory minidump to `dest` on the slow lane, returning a oneshot reply receiver.
+    pub(crate) fn write_minidump_async(
+        store: &Entity<UiStore>,
+        key: ProcessKey,
+        dest: PathBuf,
+        cancel: Arc<AtomicBool>,
+        cx: &App,
+    ) -> Result<Receiver<CommandEvent>, EngineCommandError> {
+        store
+            .read(cx)
+            .dispatch_command_with_reply(EngineCommand::WriteMiniDump { key, dest, cancel })
+    }
+
+    /// Launches the OS-configured JIT debugger attached to `key` on the slow lane.
+    pub(crate) fn attach_debugger(store: &Entity<UiStore>, key: ProcessKey, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::AttachDebugger(key));
+    }
+
+    /// Registers or clears the system-wide global wakeup hotkey live and persists it to `settings.toml`.
+    pub(crate) fn set_global_hotkey(
+        store: &Entity<UiStore>,
+        hotkey: Option<String>,
+        cx: &mut App,
+    ) -> Result<(), PalError> {
+        let normalized = hotkey.and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        });
+        bootstrap::apply_global_hotkey(normalized.as_deref(), cx)?;
+        store.update(cx, |store, cx| {
+            let _ = store.update_settings(|s| s.global_hotkey = normalized, cx);
+        });
+        Ok(())
     }
 
     /// Opens the native executable file picker on the slow lane, returning a oneshot reply receiver.

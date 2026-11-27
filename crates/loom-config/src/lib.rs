@@ -82,6 +82,7 @@ mod tests {
                     visible: true,
                 },
             ],
+            global_hotkey: Some("Ctrl+Shift+L".to_owned()),
         };
         for i in 0..MAX_RUN_TASK_HISTORY {
             settings.push_run_task_history(format!(r"C:\Windows\System32\tool_{i}.exe --flag"));
@@ -391,5 +392,47 @@ mod tests {
             "warm sync load exceeded < 1 ms budget: median {:?} per load ({byte_len} bytes)",
             median_elapsed
         );
+    }
+
+    #[test]
+    fn global_hotkey_is_backward_compatible_sanitized_and_roundtrips() {
+        // Legacy v1 TOML without `global_hotkey` loads cleanly as `None`.
+        let old_v1_toml = r#"
+            schema_version = 1
+            startup_page = "Processes"
+            refresh_speed = "Normal1S"
+            theme = "System"
+            language = "EnUs"
+        "#;
+        let loaded_legacy = migrate_toml_value(old_v1_toml).expect("load legacy v1 without hotkey");
+        assert_eq!(loaded_legacy.global_hotkey, None);
+
+        // Blank / whitespace-only hotkey strings normalize to `None`.
+        let blank_toml = r#"
+            schema_version = 1
+            global_hotkey = "   \t  "
+        "#;
+        let loaded_blank = migrate_toml_value(blank_toml).expect("sanitize blank hotkey");
+        assert_eq!(loaded_blank.global_hotkey, None);
+
+        // Trimmed hotkey strings round-trip cleanly through ConfigStore.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let store = ConfigStore::new(dir.path().join(CONFIG_FILE_NAME));
+        let with_hotkey = AppSettings {
+            global_hotkey: Some("  Ctrl+Shift+L  ".to_owned()),
+            ..AppSettings::default()
+        };
+        store.save(&with_hotkey).expect("save hotkey settings");
+        let reloaded = store.load().expect("reload hotkey settings");
+        assert_eq!(reloaded.global_hotkey.as_deref(), Some("Ctrl+Shift+L"));
+
+        // Clearing back to `None` round-trips cleanly.
+        let cleared = AppSettings {
+            global_hotkey: Some("   ".to_owned()),
+            ..reloaded
+        };
+        store.save(&cleared).expect("save cleared hotkey settings");
+        let reloaded_cleared = store.load().expect("reload cleared hotkey settings");
+        assert_eq!(reloaded_cleared.global_hotkey, None);
     }
 }

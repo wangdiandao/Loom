@@ -6,6 +6,7 @@
 //! the surrounding shell and toolbar as retained subtrees.
 
 mod affinity_dialog;
+mod wait_chain_dialog;
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -43,7 +44,7 @@ use crate::features::table_columns::{
     TableColumnLayout, build_column_header_menu, open_select_columns_dialog,
 };
 use crate::i18n;
-use crate::shell::ShellHandle;
+use crate::shell::{ShellHandle, dialogs};
 
 const DETAILS_HEADER_HEIGHT: f32 = 32.0;
 
@@ -306,6 +307,7 @@ struct ProcessActionTarget {
     name: Arc<str>,
     status: ProcessStatusFlags,
     priority: ProcessPriority,
+    uac_virtualization: UacVirtualization,
     exe_path: Option<Arc<str>>,
 }
 
@@ -316,6 +318,7 @@ impl ProcessActionTarget {
             name: Arc::clone(&row.name),
             status: row.status,
             priority: row.priority,
+            uac_virtualization: row.uac_virtualization,
             exe_path: row.exe_path.clone(),
         }
     }
@@ -1937,9 +1940,21 @@ fn build_row_context_menu(
 ) -> PopupMenu {
     let key = target.key;
     let current_priority = target.priority;
+    let is_kernel_or_idle = target
+        .status
+        .intersects(ProcessStatusFlags::SYSTEM_IDLE | ProcessStatusFlags::KERNEL);
     let eco_supported = capabilities.contains(CapabilityFlags::ECO_MODE);
+    let wait_chain_supported = capabilities.contains(CapabilityFlags::WAIT_CHAIN);
+    let minidump_supported = capabilities.contains(CapabilityFlags::MINIDUMP);
+    let uac_supported = capabilities.contains(CapabilityFlags::UAC_VIRTUALIZATION);
+    let debugger_supported = capabilities.contains(CapabilityFlags::DEBUGGER_ATTACH);
     let eco_enabled = target.status.contains(ProcessStatusFlags::EFFICIENCY_MODE);
     let eco_eligible = is_eco_mode_eligible(target.status, capabilities);
+    let uac_enabled = target.uac_virtualization == UacVirtualization::Enabled;
+    let uac_toggleable = matches!(
+        target.uac_virtualization,
+        UacVirtualization::Enabled | UacVirtualization::Disabled
+    );
     let priority_allowed = can_set_priority(target.status, capabilities);
     let affinity_allowed = can_set_affinity(target.status, capabilities);
     let has_exe_path = target.exe_path.is_some();
@@ -2027,6 +2042,68 @@ fn build_row_context_menu(
                     UiCommands::set_efficiency_mode(&store_eco, key, !eco_enabled, cx);
                 }),
         );
+    }
+
+    if wait_chain_supported || minidump_supported || uac_supported || debugger_supported {
+        menu = menu.separator();
+        if wait_chain_supported {
+            let store_wct = store.clone();
+            let wct_name = target.name.to_string();
+            menu = menu.item(
+                PopupMenuItem::new(i18n::tr("details.menu_analyze_wait_chain"))
+                    .icon(IconName::Search)
+                    .disabled(is_kernel_or_idle)
+                    .on_click(move |_, window, cx| {
+                        wait_chain_dialog::open_wait_chain_dialog(
+                            store_wct.clone(),
+                            key,
+                            wct_name.clone(),
+                            window,
+                            cx,
+                        );
+                    }),
+            );
+        }
+        if minidump_supported {
+            let store_dump = store.clone();
+            let dump_name = target.name.to_string();
+            menu = menu.item(
+                PopupMenuItem::new(i18n::tr("details.menu_create_dump"))
+                    .icon(IconName::File)
+                    .disabled(is_kernel_or_idle)
+                    .on_click(move |_, window, cx| {
+                        dialogs::open_minidump_dialog(
+                            store_dump.clone(),
+                            key,
+                            dump_name.clone(),
+                            window,
+                            cx,
+                        );
+                    }),
+            );
+        }
+        if uac_supported {
+            let store_uac = store.clone();
+            menu = menu.item(
+                PopupMenuItem::new(i18n::tr("details.menu_uac_virtualization"))
+                    .checked(uac_enabled)
+                    .disabled(!uac_toggleable || is_kernel_or_idle)
+                    .on_click(move |_, _, cx| {
+                        UiCommands::set_uac_virtualization(&store_uac, key, !uac_enabled, cx);
+                    }),
+            );
+        }
+        if debugger_supported {
+            let store_dbg = store.clone();
+            menu = menu.item(
+                PopupMenuItem::new(i18n::tr("details.menu_attach_debugger"))
+                    .icon(IconName::SquareTerminal)
+                    .disabled(is_kernel_or_idle)
+                    .on_click(move |_, _, cx| {
+                        UiCommands::attach_debugger(&store_dbg, key, cx);
+                    }),
+            );
+        }
     }
 
     menu.separator()
