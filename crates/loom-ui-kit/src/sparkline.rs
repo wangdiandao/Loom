@@ -3,8 +3,8 @@
 use gpui_kit::component::chart::AreaChart;
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::{
-    Div, Hsla, InteractiveElement as _, ParentElement as _, SharedString, Stateful, Styled as _,
-    linear_color_stop, linear_gradient, px,
+    Div, Hsla, InteractiveElement as _, ParentElement as _, Role, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, div, linear_color_stop, linear_gradient, px,
 };
 
 use crate::theme::LoomSemanticColors;
@@ -45,6 +45,49 @@ impl SparklinePoint {
                 value: f32::from(permille) / 10.0,
             })
             .collect()
+    }
+
+    /// Converts an iterator of permille values (`0..=1000`) into a fixed-length
+    /// right-aligned window of percentage [`SparklinePoint`] values, left-padded
+    /// with `0.0` so the newest sample always sits at the right edge.
+    pub fn from_permille_padded(
+        values: impl IntoIterator<Item = u16>,
+        window_len: usize,
+    ) -> Vec<Self> {
+        Self::from_f32_padded(
+            values
+                .into_iter()
+                .map(|permille| f32::from(permille) / 10.0),
+            window_len,
+        )
+    }
+
+    /// Converts an iterator of `f32` samples into a fixed-length right-aligned
+    /// window of [`SparklinePoint`] values, left-padded with `0.0`.
+    pub fn from_f32_padded(values: impl IntoIterator<Item = f32>, window_len: usize) -> Vec<Self> {
+        if window_len == 0 {
+            return Vec::new();
+        }
+        let samples: Vec<f32> = values.into_iter().collect();
+        let mut points = Vec::with_capacity(window_len);
+        if samples.len() >= window_len {
+            let start = samples.len() - window_len;
+            for (index, &value) in samples[start..].iter().enumerate() {
+                points.push(Self { index, value });
+            }
+        } else {
+            let pad = window_len - samples.len();
+            for index in 0..pad {
+                points.push(Self { index, value: 0.0 });
+            }
+            for (offset, &value) in samples.iter().enumerate() {
+                points.push(Self {
+                    index: pad + offset,
+                    value,
+                });
+            }
+        }
+        points
     }
 }
 
@@ -107,8 +150,24 @@ pub fn sparkline_card(props: SparklineCardProps, colors: &LoomSemanticColors) ->
     };
     let hover_bg = colors.card_hover_bg;
 
+    let aria_label: SharedString = match (
+        props.primary_metric.trim().is_empty(),
+        props.subtitle.trim().is_empty(),
+    ) {
+        (true, true) => props.title.clone(),
+        (false, true) => format!("{} {}", props.title, props.primary_metric).into(),
+        (true, false) => format!("{} {}", props.title, props.subtitle).into(),
+        (false, false) => format!(
+            "{} {} {}",
+            props.title, props.primary_metric, props.subtitle
+        )
+        .into(),
+    };
+
     h_flex()
         .id(props.id)
+        .role(Role::Button)
+        .aria_label(aria_label)
         .w_full()
         .gap_2p5()
         .px_2p5()
@@ -142,13 +201,13 @@ pub fn sparkline_card(props: SparklineCardProps, colors: &LoomSemanticColors) ->
                         .items_baseline()
                         .gap_1()
                         .child(
-                            h_flex()
+                            div()
+                                .flex_1()
                                 .min_w_0()
-                                .overflow_hidden()
+                                .truncate()
                                 .text_sm()
                                 .font_semibold()
                                 .text_color(colors.text_primary)
-                                .whitespace_nowrap()
                                 .child(props.title),
                         )
                         .child(
@@ -162,12 +221,12 @@ pub fn sparkline_card(props: SparklineCardProps, colors: &LoomSemanticColors) ->
                         ),
                 )
                 .child(
-                    h_flex()
+                    div()
+                        .w_full()
                         .min_w_0()
-                        .overflow_hidden()
+                        .truncate()
                         .text_xs()
                         .text_color(colors.text_muted)
-                        .whitespace_nowrap()
                         .child(props.subtitle),
                 ),
         )

@@ -135,21 +135,19 @@ impl Route {
     #[inline]
     pub(crate) const fn milestone_version(self) -> Option<&'static str> {
         match self {
-            Self::Performance => Some("0.0.4"),
             Self::AppHistory | Self::Startup | Self::Users | Self::Services => Some("0.0.5"),
-            Self::Processes | Self::Details | Self::Settings => None,
+            Self::Processes | Self::Performance | Self::Details | Self::Settings => None,
         }
     }
 
     /// Returns the localized roadmap description for an unimplemented P1 route.
     pub(crate) fn milestone_description(self) -> Option<String> {
         match self {
-            Self::Performance => Some(i18n::tr("milestone.performance_desc")),
             Self::AppHistory => Some(i18n::tr("milestone.app_history_desc")),
             Self::Startup => Some(i18n::tr("milestone.startup_desc")),
             Self::Users => Some(i18n::tr("milestone.users_desc")),
             Self::Services => Some(i18n::tr("milestone.services_desc")),
-            Self::Processes | Self::Details | Self::Settings => None,
+            Self::Processes | Self::Performance | Self::Details | Self::Settings => None,
         }
     }
 }
@@ -263,10 +261,10 @@ mod tests {
     #[test]
     fn live_routes_have_no_milestone_notice_while_p1_routes_do() {
         assert_eq!(Route::Processes.milestone_version(), None);
+        assert_eq!(Route::Performance.milestone_version(), None);
         assert_eq!(Route::Details.milestone_version(), None);
         assert_eq!(Route::Settings.milestone_version(), None);
 
-        assert_eq!(Route::Performance.milestone_version(), Some("0.0.4"));
         assert_eq!(Route::AppHistory.milestone_version(), Some("0.0.5"));
         assert_eq!(Route::Startup.milestone_version(), Some("0.0.5"));
         assert_eq!(Route::Users.milestone_version(), Some("0.0.5"));

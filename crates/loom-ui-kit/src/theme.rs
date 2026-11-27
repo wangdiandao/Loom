@@ -47,12 +47,18 @@ pub struct LoomSemanticColors {
     pub chart_cpu_kernel: Hsla,
     /// Stroke/accent color for Memory utilization charts.
     pub chart_memory: Hsla,
-    /// Stroke/accent color for Disk activity/throughput charts.
+    /// Stroke/accent color for Disk activity and read throughput charts.
     pub chart_disk: Hsla,
-    /// Stroke/accent color for Network throughput charts.
+    /// Secondary stroke/accent color for Disk write throughput charts.
+    pub chart_disk_write: Hsla,
+    /// Stroke/accent color for Network receive throughput charts.
     pub chart_network: Hsla,
-    /// Stroke/accent color for GPU utilization/VRAM charts.
+    /// Secondary stroke/accent color for Network send throughput charts.
+    pub chart_network_send: Hsla,
+    /// Stroke/accent color for GPU utilization and dedicated VRAM charts.
     pub chart_gpu: Hsla,
+    /// Secondary stroke/accent color for GPU shared system memory charts.
+    pub chart_gpu_shared: Hsla,
 
     /// Default surface background for selectable cards.
     pub card_bg: Hsla,
@@ -137,26 +143,41 @@ impl LoomSemanticColors {
             )
         };
 
-        let (chart_cpu, chart_cpu_kernel, chart_memory, chart_disk, chart_network, chart_gpu) =
-            if is_dark {
-                (
-                    hsla(204.0 / 360.0, 0.86, 0.60, 1.0),
-                    hsla(14.0 / 360.0, 0.86, 0.62, 1.0),
-                    hsla(268.0 / 360.0, 0.76, 0.66, 1.0),
-                    hsla(146.0 / 360.0, 0.68, 0.54, 1.0),
-                    hsla(334.0 / 360.0, 0.78, 0.64, 1.0),
-                    hsla(186.0 / 360.0, 0.76, 0.54, 1.0),
-                )
-            } else {
-                (
-                    hsla(204.0 / 360.0, 0.84, 0.44, 1.0),
-                    hsla(12.0 / 360.0, 0.82, 0.48, 1.0),
-                    hsla(268.0 / 360.0, 0.66, 0.48, 1.0),
-                    hsla(146.0 / 360.0, 0.64, 0.38, 1.0),
-                    hsla(334.0 / 360.0, 0.72, 0.48, 1.0),
-                    hsla(186.0 / 360.0, 0.78, 0.38, 1.0),
-                )
-            };
+        let (
+            chart_cpu,
+            chart_cpu_kernel,
+            chart_memory,
+            chart_disk,
+            chart_disk_write,
+            chart_network,
+            chart_network_send,
+            chart_gpu,
+            chart_gpu_shared,
+        ) = if is_dark {
+            (
+                hsla(204.0 / 360.0, 0.86, 0.60, 1.0),
+                hsla(14.0 / 360.0, 0.86, 0.62, 1.0),
+                hsla(268.0 / 360.0, 0.76, 0.66, 1.0),
+                hsla(146.0 / 360.0, 0.68, 0.54, 1.0),
+                hsla(42.0 / 360.0, 0.86, 0.60, 1.0),
+                hsla(334.0 / 360.0, 0.78, 0.64, 1.0),
+                hsla(24.0 / 360.0, 0.88, 0.62, 1.0),
+                hsla(186.0 / 360.0, 0.76, 0.54, 1.0),
+                hsla(220.0 / 360.0, 0.74, 0.64, 1.0),
+            )
+        } else {
+            (
+                hsla(204.0 / 360.0, 0.84, 0.44, 1.0),
+                hsla(12.0 / 360.0, 0.82, 0.48, 1.0),
+                hsla(268.0 / 360.0, 0.66, 0.48, 1.0),
+                hsla(146.0 / 360.0, 0.64, 0.38, 1.0),
+                hsla(36.0 / 360.0, 0.84, 0.44, 1.0),
+                hsla(334.0 / 360.0, 0.72, 0.48, 1.0),
+                hsla(22.0 / 360.0, 0.84, 0.46, 1.0),
+                hsla(186.0 / 360.0, 0.78, 0.38, 1.0),
+                hsla(220.0 / 360.0, 0.68, 0.48, 1.0),
+            )
+        };
 
         Self {
             is_dark,
@@ -178,8 +199,11 @@ impl LoomSemanticColors {
             chart_cpu_kernel,
             chart_memory,
             chart_disk,
+            chart_disk_write,
             chart_network,
+            chart_network_send,
             chart_gpu,
+            chart_gpu_shared,
             card_bg: theme.background,
             card_selected_bg: theme.list_active,
             card_hover_bg: theme.list_hover,

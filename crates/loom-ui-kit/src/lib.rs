@@ -17,11 +17,13 @@ pub mod status_badge;
 pub mod theme;
 
 pub use format::{
-    HeatmapLevel, format_bytes, format_bytes_shared, format_cpu_time, format_cpu_time_shared,
-    format_disk_cell, format_disk_cell_shared, format_memory_cell, format_memory_cell_shared,
-    format_network_cell, format_network_cell_shared, format_network_rate_mbps,
-    format_network_rate_mbps_shared, format_permille, format_permille_shared,
-    format_rate_bytes_per_sec, format_rate_bytes_per_sec_shared, format_uptime,
+    HeatmapLevel, adaptive_network_scale, adaptive_throughput_scale, format_bits_per_sec,
+    format_bytes, format_bytes_shared, format_cpu_time, format_cpu_time_shared, format_disk_cell,
+    format_disk_cell_shared, format_freq_ghz, format_latency_us, format_memory_cell,
+    format_memory_cell_shared, format_network_cell, format_network_cell_shared,
+    format_network_rate_mbps, format_network_rate_mbps_shared, format_permille,
+    format_permille_shared, format_rate_bytes_per_sec, format_rate_bytes_per_sec_shared,
+    format_uptime,
 };
 pub use heatmap::heatmap_cell;
 pub use icon::rgba_icon_to_render_image;
@@ -287,6 +289,74 @@ mod tests {
                 SparklinePoint::new(2, 100.0),
             ]
         );
+
+        let padded = SparklinePoint::from_permille_padded([250, 500], 4);
+        assert_eq!(
+            padded,
+            vec![
+                SparklinePoint::new(0, 0.0),
+                SparklinePoint::new(1, 0.0),
+                SparklinePoint::new(2, 25.0),
+                SparklinePoint::new(3, 50.0),
+            ]
+        );
+
+        let truncated = SparklinePoint::from_f32_padded([1.0, 2.0, 3.0, 4.0], 2);
+        assert_eq!(
+            truncated,
+            vec![SparklinePoint::new(0, 3.0), SparklinePoint::new(1, 4.0)]
+        );
+    }
+
+    #[test]
+    fn format_performance_metrics_and_adaptive_scales() {
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * KIB;
+        const GIB: u64 = 1024 * MIB;
+
+        assert_eq!(format_freq_ghz(0), "0.00 GHz");
+        assert_eq!(format_freq_ghz(800), "0.80 GHz");
+        assert_eq!(format_freq_ghz(3_820), "3.82 GHz");
+
+        assert_eq!(format_bits_per_sec(0), "0 bps");
+        assert_eq!(format_bits_per_sec(500), "500 bps");
+        assert_eq!(format_bits_per_sec(100_000), "100.0 Kbps");
+        assert_eq!(format_bits_per_sec(100_000_000), "100.0 Mbps");
+        assert_eq!(format_bits_per_sec(2_500_000_000), "2.5 Gbps");
+
+        assert_eq!(format_latency_us(0), "0.0 ms");
+        assert_eq!(format_latency_us(250), "250 µs");
+        assert_eq!(format_latency_us(1_000), "1.0 ms");
+        assert_eq!(format_latency_us(12_450), "12.4 ms");
+        assert_eq!(format_latency_us(1_500_000), "1.50 s");
+
+        let (y_idle, lbl_idle) = adaptive_throughput_scale(0);
+        assert_eq!(y_idle, (100 * KIB) as f32);
+        assert_eq!(lbl_idle.as_ref(), "100 KB/s");
+
+        let (y_mb, lbl_mb) = adaptive_throughput_scale(15 * MIB);
+        assert_eq!(y_mb, (50 * MIB) as f32);
+        assert_eq!(lbl_mb.as_ref(), "50 MB/s");
+
+        let (y_gb, lbl_gb) = adaptive_throughput_scale(3 * GIB);
+        assert_eq!(y_gb, (5 * GIB) as f32);
+        assert_eq!(lbl_gb.as_ref(), "5 GB/s");
+
+        let (y_huge, lbl_huge) = adaptive_throughput_scale(12 * GIB + 1);
+        assert_eq!(y_huge, (13 * GIB) as f32);
+        assert_eq!(lbl_huge.as_ref(), "13 GB/s");
+
+        let (ny_idle, nlbl_idle) = adaptive_network_scale(0);
+        assert_eq!(ny_idle, 100_000.0);
+        assert_eq!(nlbl_idle.as_ref(), "100 Kbps");
+
+        let (ny_mbps, nlbl_mbps) = adaptive_network_scale(5_000_000); // 40 Mbps
+        assert_eq!(ny_mbps, 50_000_000.0);
+        assert_eq!(nlbl_mbps.as_ref(), "50 Mbps");
+
+        let (ny_gbps, nlbl_gbps) = adaptive_network_scale(200_000_000); // 1.6 Gbps
+        assert_eq!(ny_gbps, 2_000_000_000.0);
+        assert_eq!(nlbl_gbps.as_ref(), "2 Gbps");
     }
 
     #[test]

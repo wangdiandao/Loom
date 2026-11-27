@@ -22,7 +22,9 @@ use loom_types::{CapabilityFlags, LanguagePreference, ProcessKey, ThemePreferenc
 
 use crate::bootstrap;
 use crate::bridge::{UiCommands, UiStore, UiStoreEvent, apply_theme};
-use crate::features::{DetailsView, ProcessesView, SettingsView, render_upcoming_milestone};
+use crate::features::{
+    DetailsView, PerformanceView, ProcessesView, SettingsView, render_upcoming_milestone,
+};
 use crate::i18n;
 use crate::shell::nav::{NavigationIntent, Route, ShellHandle};
 
@@ -34,10 +36,11 @@ struct ElevationNotice;
 
 /// Mounted page entity owned by [`AppShell`].
 ///
-/// Dropping [`ActivePage::Details`] when switching away immediately releases its
-/// RAII [`crate::bridge::ScopedMonitorLease`] for `MonitorDomain::Details`.
+/// Dropping on-demand views ([`ActivePage::Performance`] or [`ActivePage::Details`]) when
+/// switching away immediately releases their RAII [`crate::bridge::ScopedMonitorLease`]s.
 enum ActivePage {
     Processes(Entity<ProcessesView>),
+    Performance(Entity<PerformanceView>),
     Details(Entity<DetailsView>),
     Settings(Entity<SettingsView>),
     Upcoming(Route),
@@ -226,6 +229,10 @@ impl AppShell {
                 ActivePage::Processes(
                     cx.new(|cx| ProcessesView::new(store, shell_handle, window, cx)),
                 )
+            }
+            Route::Performance => {
+                let store = store.clone();
+                ActivePage::Performance(cx.new(|cx| PerformanceView::new(store, window, cx)))
             }
             Route::Details => {
                 let store = store.clone();
@@ -442,6 +449,7 @@ impl Render for AppShell {
 
         let outlet = match &self.active_page {
             ActivePage::Processes(view) => view.clone().into_any_element(),
+            ActivePage::Performance(view) => view.clone().into_any_element(),
             ActivePage::Details(view) => view.clone().into_any_element(),
             ActivePage::Settings(view) => view.clone().into_any_element(),
             ActivePage::Upcoming(route) => render_upcoming_milestone(*route, cx).into_any_element(),
