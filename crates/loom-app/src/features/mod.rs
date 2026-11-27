@@ -5,6 +5,7 @@
 //! [`crate::shell::nav::NavigationIntent`].
 
 pub(crate) mod details;
+pub(crate) mod performance;
 pub(crate) mod processes;
 pub(crate) mod settings;
 pub(crate) mod table_columns;
@@ -16,6 +17,7 @@ use crate::i18n;
 use crate::shell::Route;
 
 pub(crate) use details::DetailsView;
+pub(crate) use performance::PerformanceView;
 pub(crate) use processes::ProcessesView;
 pub(crate) use settings::SettingsView;
 

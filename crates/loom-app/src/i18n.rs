@@ -1,8 +1,9 @@
 //! Localization helpers wrapping `rust-i18n` for live `zh-CN` / `en-US` switching.
 
 use loom_types::{
-    LanguagePreference, PlatformKind, PlatformProfile, ProcessArch, ProcessCategory,
-    ProcessPriority, RefreshSpeed, StartupPage, ThemePreference, UacVirtualization,
+    DiskMediaType, LanguagePreference, NetConnectionType, PlatformKind, PlatformProfile,
+    ProcessArch, ProcessCategory, ProcessPriority, RefreshSpeed, StartupPage, ThemePreference,
+    UacVirtualization,
 };
 
 /// Applies `preference` to `rust-i18n`'s active global locale immediately.
@@ -117,6 +118,57 @@ pub(crate) fn uac_virtualization_label(uac: UacVirtualization) -> String {
         UacVirtualization::Disabled => tr("details.uac_disabled"),
         UacVirtualization::NotAllowed => tr("details.uac_not_allowed"),
         UacVirtualization::Unknown => tr("details.uac_unknown"),
+    }
+}
+
+/// Returns the localized label for a [`DiskMediaType`].
+pub(crate) fn disk_media_type_label(media_type: DiskMediaType) -> String {
+    match media_type {
+        DiskMediaType::Nvme => tr("perf.media_nvme"),
+        DiskMediaType::Ssd => tr("perf.media_ssd"),
+        DiskMediaType::Hdd => tr("perf.media_hdd"),
+        DiskMediaType::Unknown => tr("perf.media_unknown"),
+    }
+}
+
+/// Returns the localized label for a [`NetConnectionType`].
+pub(crate) fn net_connection_type_label(conn_type: NetConnectionType) -> String {
+    match conn_type {
+        NetConnectionType::Ethernet => tr("perf.ethernet"),
+        NetConnectionType::WiFi => tr("perf.wifi"),
+        NetConnectionType::Other => tr("perf.network_other"),
+    }
+}
+
+/// Formats a localized disk title (`"Disk 0 (C: D:)"` or `"Disk 0"`).
+pub(crate) fn perf_disk_title(index: u32, drive_letters: &str) -> String {
+    let trimmed = drive_letters.trim();
+    if trimmed.is_empty() {
+        rust_i18n::t!("perf.disk_numbered", index = index).into_owned()
+    } else {
+        rust_i18n::t!("perf.disk_with_drives", index = index, drives = trimmed).into_owned()
+    }
+}
+
+/// Formats a localized GPU display title (`"GPU 0"`).
+#[inline]
+pub(crate) fn perf_gpu_title(index: u32) -> String {
+    rust_i18n::t!("perf.gpu_numbered", index = index).into_owned()
+}
+
+/// Formats a localized logical CPU cell label (`"CPU 0"`).
+#[inline]
+pub(crate) fn perf_cpu_core_label(index: usize) -> String {
+    rust_i18n::t!("perf.cpu_core_label", index = index).into_owned()
+}
+
+/// Formats a localized relative time label for a 60-second chart hover tooltip.
+#[inline]
+pub(crate) fn perf_time_offset_label(secs_ago: usize) -> String {
+    if secs_ago == 0 {
+        tr("perf.now")
+    } else {
+        rust_i18n::t!("perf.seconds_ago", secs = secs_ago).into_owned()
     }
 }
 
@@ -261,6 +313,88 @@ mod tests {
         "tray.show",
         "tray.exit",
         "milestone.notice",
+        "perf.cpu",
+        "perf.memory",
+        "perf.ethernet",
+        "perf.wifi",
+        "perf.network_other",
+        "perf.media_nvme",
+        "perf.media_ssd",
+        "perf.media_hdd",
+        "perf.media_unknown",
+        "perf.time_axis_start",
+        "perf.time_axis_end",
+        "perf.now",
+        "perf.unavailable",
+        "perf.enabled",
+        "perf.disabled",
+        "perf.send_short",
+        "perf.recv_short",
+        "perf.cpu_overall",
+        "perf.cpu_logical",
+        "perf.cpu_show_kernel",
+        "perf.cpu_utilization",
+        "perf.cpu_kernel_time",
+        "perf.cpu_speed",
+        "perf.cpu_processes",
+        "perf.cpu_threads",
+        "perf.cpu_handles",
+        "perf.cpu_uptime",
+        "perf.cpu_base_speed",
+        "perf.cpu_sockets",
+        "perf.cpu_cores",
+        "perf.cpu_logical_processors",
+        "perf.cpu_virtualization",
+        "perf.cpu_l1_cache",
+        "perf.cpu_l2_cache",
+        "perf.cpu_l3_cache",
+        "perf.cpu_sampling_cores",
+        "perf.mem_usage_chart",
+        "perf.mem_composition",
+        "perf.mem_in_use",
+        "perf.mem_modified",
+        "perf.mem_standby",
+        "perf.mem_free",
+        "perf.mem_available",
+        "perf.mem_committed",
+        "perf.mem_cached",
+        "perf.mem_paged_pool",
+        "perf.mem_nonpaged_pool",
+        "perf.mem_speed",
+        "perf.mem_slots_used",
+        "perf.mem_form_factor",
+        "perf.mem_hardware_reserved",
+        "perf.disk_active_chart",
+        "perf.disk_transfer_chart",
+        "perf.disk_read",
+        "perf.disk_write",
+        "perf.disk_active_time",
+        "perf.disk_avg_response",
+        "perf.disk_read_speed",
+        "perf.disk_write_speed",
+        "perf.disk_capacity",
+        "perf.disk_drive_letters",
+        "perf.disk_type",
+        "perf.disk_circuit_open",
+        "perf.net_throughput_chart",
+        "perf.net_send",
+        "perf.net_receive",
+        "perf.net_adapter_name",
+        "perf.net_connection_type",
+        "perf.net_link_speed",
+        "perf.net_ipv4",
+        "perf.net_ipv6",
+        "perf.net_dns_suffix",
+        "perf.gpu_view_grid",
+        "perf.gpu_view_single",
+        "perf.gpu_utilization",
+        "perf.gpu_dedicated_memory",
+        "perf.gpu_shared_memory",
+        "perf.gpu_temperature",
+        "perf.gpu_driver_version",
+        "perf.gpu_directx_version",
+        "perf.gpu_pci_location",
+        "perf.gpu_select_engine",
     ];
 
     use std::sync::Mutex;

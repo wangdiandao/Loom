@@ -266,3 +266,108 @@ pub fn format_cpu_time_shared(ticks_100ns: u64) -> SharedString {
         format_cpu_time(ticks_100ns).into()
     }
 }
+
+/// Formats a processor frequency in MHz as GHz with two decimal places
+/// (e.g., `3820` -> `"3.82 GHz"`, `800` -> `"0.80 GHz"`).
+#[inline]
+pub fn format_freq_ghz(mhz: u32) -> String {
+    format!("{:.2} GHz", f64::from(mhz) / 1000.0)
+}
+
+/// Formats a bit rate in bits per second using decimal SI prefixes
+/// (`bps`, `Kbps`, `Mbps`, `Gbps`).
+pub fn format_bits_per_sec(bps: u64) -> String {
+    if bps == 0 {
+        return String::from("0 bps");
+    }
+    if bps < 1_000 {
+        format!("{bps} bps")
+    } else if bps < 1_000_000 {
+        format!("{:.1} Kbps", bps as f64 / 1_000.0)
+    } else if bps < 1_000_000_000 {
+        format!("{:.1} Mbps", bps as f64 / 1_000_000.0)
+    } else {
+        format!("{:.1} Gbps", bps as f64 / 1_000_000_000.0)
+    }
+}
+
+/// Formats an I/O response latency in microseconds (`"0.0 ms"`, `"250 µs"`,
+/// `"12.4 ms"`, `"1.50 s"`).
+pub fn format_latency_us(us: u64) -> String {
+    if us == 0 {
+        String::from("0.0 ms")
+    } else if us < 1_000 {
+        format!("{us} µs")
+    } else if us < 1_000_000 {
+        format!("{:.1} ms", us as f64 / 1_000.0)
+    } else {
+        format!("{:.2} s", us as f64 / 1_000_000.0)
+    }
+}
+
+/// Computes a discrete, jitter-resistant Y-axis ceiling (in bytes per second) and
+/// formatted top-right scale label (`KB/s`, `MB/s`, `GB/s`) for disk transfer charts.
+///
+/// The returned `f32` ceiling uses a minimum floor of `100 KB/s` (`102_400.0`) so
+/// idle disks render against a stable baseline.
+pub fn adaptive_throughput_scale(max_bytes_per_sec: u64) -> (f32, SharedString) {
+    const STEPS: &[(u64, &str)] = &[
+        (100 * KIB, "100 KB/s"),
+        (500 * KIB, "500 KB/s"),
+        (MIB, "1 MB/s"),
+        (10 * MIB, "10 MB/s"),
+        (50 * MIB, "50 MB/s"),
+        (100 * MIB, "100 MB/s"),
+        (500 * MIB, "500 MB/s"),
+        (GIB, "1 GB/s"),
+        (2 * GIB, "2 GB/s"),
+        (5 * GIB, "5 GB/s"),
+        (10 * GIB, "10 GB/s"),
+    ];
+
+    for &(limit, label) in STEPS {
+        if max_bytes_per_sec <= limit {
+            return (limit as f32, SharedString::new_static(label));
+        }
+    }
+
+    let gbps = max_bytes_per_sec.div_ceil(GIB);
+    let ceiling = gbps.saturating_mul(GIB);
+    (ceiling as f32, SharedString::from(format!("{gbps} GB/s")))
+}
+
+/// Computes a discrete, jitter-resistant Y-axis ceiling (in **bits per second**)
+/// and formatted top-right scale label (`Kbps`, `Mbps`, `Gbps`) for network charts.
+///
+/// Accepts peak throughput in `bytes_per_sec` (as stored in `ThroughputRing`) and
+/// converts to decimal bits per second (`bytes * 8`) with a minimum floor of
+/// `100 Kbps` (`100_000.0`).
+pub fn adaptive_network_scale(max_bytes_per_sec: u64) -> (f32, SharedString) {
+    const KBPS: u64 = 1_000;
+    const MBPS: u64 = 1_000_000;
+    const GBPS: u64 = 1_000_000_000;
+    const STEPS: &[(u64, &str)] = &[
+        (100 * KBPS, "100 Kbps"),
+        (500 * KBPS, "500 Kbps"),
+        (MBPS, "1 Mbps"),
+        (10 * MBPS, "10 Mbps"),
+        (50 * MBPS, "50 Mbps"),
+        (100 * MBPS, "100 Mbps"),
+        (500 * MBPS, "500 Mbps"),
+        (GBPS, "1 Gbps"),
+        (2 * GBPS, "2 Gbps"),
+        (5 * GBPS, "5 Gbps"),
+        (10 * GBPS, "10 Gbps"),
+    ];
+
+    let max_bps = max_bytes_per_sec.saturating_mul(8);
+    for &(limit, label) in STEPS {
+        if max_bps <= limit {
+            return (limit as f32, SharedString::new_static(label));
+        }
+    }
+
+    let gbps = max_bps.div_ceil(GBPS);
+    let ceiling = gbps.saturating_mul(GBPS);
+    (ceiling as f32, SharedString::from(format!("{gbps} Gbps")))
+}
