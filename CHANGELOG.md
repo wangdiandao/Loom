@@ -17,6 +17,10 @@ See [versioning and releases](docs/release.md) for the version progression polic
   - On-demand listening TCP/UDP port enumeration (`ports.rs`) via dynamically loaded `iphlpapi.dll` (`GetExtendedTcpTable` / `GetExtendedUdpTable` for IPv4 & IPv6).
   - File/directory lock inspection (`filelock.rs`) via dynamically loaded Restart Manager (`rstrtmgr.dll`) with RAII session teardown and recursive binary-split batch fallback.
   - Clean-room elevated-only per-process ETW network byte collector (`etw_net.rs`, `Microsoft-Windows-Kernel-Network`, bounded to 1 thread with clean `ControlTraceW` teardown) and wired `AppHistoryReader::save_history`.
+- Added a hybrid GPU `D3` power-gate (`GpuPowerGate` + dynamic `cfgmgr32.dll` `DEVPKEY_Device_PowerData`) in `loom-pal-windows` so sleeping hybrid discrete GPUs (`D1`–`D3`) skip `KMTQAITYPE_ADAPTERPERFDATA` without waking the dGPU, and idle `D0` queries are throttled to `20 s`.
+- Implemented pure kernel-mode `gdi32!D3DKMTQueryStatistics` per-process GPU telemetry (`gpu_dedicated_bytes`, `gpu_shared_bytes`, `gpu_util_permille`) using short-lived `PROCESS_QUERY_LIMITED_INFORMATION` handles, zero PDH, `checked_sub` counter-reset safety, and stale `ProcessKey` pruning.
+- Upgraded Windows fast-lane CPU accounting to prefer `NtQuerySystemInformationEx(SystemProcessorIdleCycleTimeInformation)` with QPC-validated per-group cycle baselines and clean fallback to `SystemProcessorPerformanceInformation`, plus heterogeneous `P`/`E`/`LP-E` core topology classification via `EfficiencyClass` and L3 cache sharing.
+- Added PnP storage controller driver allowlisting (`DEVPKEY_Device_Service`: `stornvme`, `storahci`, `atapi`), rotational HDD activity-change guarding, `CM_Register_Notification` safe-eject cooperation (`DEVICEQUERYREMOVE`), `checked_sub` counter-reset hardening for disk and network throughput deltas, and additive `ProcessSequenceNumber` (`NtQueryInformationProcess` class `92`) PID-reuse protection.
 
 ### UI & UX
 

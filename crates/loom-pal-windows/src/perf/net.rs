@@ -293,8 +293,14 @@ fn compute_net_rates(
         return (0, 0);
     }
 
-    let d_in = in_octets.saturating_sub(prev.in_octets);
-    let d_out = out_octets.saturating_sub(prev.out_octets);
+    let (Some(d_in), Some(d_out)) = (
+        in_octets.checked_sub(prev.in_octets),
+        out_octets.checked_sub(prev.out_octets),
+    ) else {
+        // Counter reset (e.g., NIC driver reload or interface reconnect): baseline was already
+        // refreshed above, so emit zero rather than fabricating a throughput spike.
+        return (0, 0);
+    };
 
     let recv_bps =
         ((u128::from(d_in) * 1_000_000_000) / elapsed_ns).min(u128::from(u64::MAX)) as u64;
@@ -386,5 +392,65 @@ fn conn_sort_rank(kind: NetConnectionType) -> u8 {
         NetConnectionType::Ethernet => 0,
         NetConnectionType::WiFi => 1,
         NetConnectionType::Other => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn compute_net_rates_calculates_expected_throughput() {
+        let mut prev = HashMap::new();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(2);
+
+        assert_eq!(compute_net_rates(&mut prev, 42, 1000, 2000, t0), (0, 0));
+        assert_eq!(
+            compute_net_rates(&mut prev, 42, 1000 + 20_000, 2000 + 4_000, t1),
+            (10_000, 2_000)
+        );
+    }
+
+    #[test]
+    fn compute_net_rates_returns_zero_on_counter_reset_without_spike() {
+        let mut prev = HashMap::new();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        let t2 = t1 + Duration::from_secs(1);
+        let t3 = t2 + Duration::from_secs(1);
+
+        assert_eq!(
+            compute_net_rates(&mut prev, 7, 500_000, 300_000, t0),
+            (0, 0)
+        );
+        // Simulate NIC reconnect resetting InOctets below previous value.
+        assert_eq!(
+            compute_net_rates(&mut prev, 7, 1_000, 350_000, t1),
+            (0, 0),
+            "backward InOctets must emit 0 instead of underflowing or spiking"
+        );
+        // Simulate OutOctets counter reset on next tick.
+        assert_eq!(
+            compute_net_rates(&mut prev, 7, 2_000, 500, t2),
+            (0, 0),
+            "backward OutOctets must emit 0 instead of underflowing or spiking"
+        );
+        // Subsequent monotonic tick must resume accurate delta reporting from reset baseline.
+        assert_eq!(
+            compute_net_rates(&mut prev, 7, 12_000, 5_500, t3),
+            (10_000, 5_000)
+        );
+    }
+
+    #[test]
+    fn compute_net_rates_handles_zero_elapsed_time() {
+        let mut prev = HashMap::new();
+        let t0 = Instant::now();
+
+        assert_eq!(compute_net_rates(&mut prev, 9, 100, 200, t0), (0, 0));
+        assert_eq!(compute_net_rates(&mut prev, 9, 500, 900, t0), (0, 0));
     }
 }
