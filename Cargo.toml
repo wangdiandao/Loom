@@ -14,22 +14,22 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.6"
+version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/wangdiandao/Loom"
 
 [workspace.dependencies]
 # Internal workspace crates
-loom-types = { path = "crates/loom-types", version = "0.0.6" }
-loom-config = { path = "crates/loom-config", version = "0.0.6" }
-loom-pal-api = { path = "crates/loom-pal-api", version = "0.0.6" }
-loom-pal-windows = { path = "crates/loom-pal-windows", version = "0.0.6" }
-loom-pal-macos = { path = "crates/loom-pal-macos", version = "0.0.6" }
-loom-pal-linux = { path = "crates/loom-pal-linux", version = "0.0.6" }
-loom-pal = { path = "crates/loom-pal", version = "0.0.6" }
-loom-engine = { path = "crates/loom-engine", version = "0.0.6" }
-loom-ui-kit = { path = "crates/loom-ui-kit", version = "0.0.6" }
+loom-types = { path = "crates/loom-types", version = "0.1.0" }
+loom-config = { path = "crates/loom-config", version = "0.1.0" }
+loom-pal-api = { path = "crates/loom-pal-api", version = "0.1.0" }
+loom-pal-windows = { path = "crates/loom-pal-windows", version = "0.1.0" }
+loom-pal-macos = { path = "crates/loom-pal-macos", version = "0.1.0" }
+loom-pal-linux = { path = "crates/loom-pal-linux", version = "0.1.0" }
+loom-pal = { path = "crates/loom-pal", version = "0.1.0" }
+loom-engine = { path = "crates/loom-engine", version = "0.1.0" }
+loom-ui-kit = { path = "crates/loom-ui-kit", version = "0.1.0" }
 
 # Core external crates
 serde = { version = "1", features = ["derive"] }

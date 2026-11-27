@@ -4,6 +4,29 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ## Unreleased
 
+## 0.1.0 - 2026-11-27
+
+### Engine & PAL
+
+- Froze the cross-platform zero-cost static-dispatch PAL contract in `loom-pal-api` (`PAL_API_CONTRACT_VERSION = 1`), locking all 8 core traits (`PlatformBackend`, `FastSystemSampler`, `SlowMetadataProber`, `ServiceManager`, `StartupManager`, `SessionManager`, `AppHistoryReader`, and `SystemOperator`), associated type/thread-safety bounds, `Copy` hot sample layouts (`ProcessKey`, `ProcessHotSample<()>`, `SystemPerfSample`), and reusable scratch buffers for Windows and upcoming `0.2.0` Linux / `0.3.0` macOS backends, guarded by compile-time contract-freeze tests.
+
+### Config & Localization
+
+- Froze the `loom-config` v1 configuration forward-migration contract (`CONFIG_CONTRACT_VERSION = "1.0"`, `CURRENT_SCHEMA_VERSION = 1`), backed by deterministic golden `settings.toml` round-trip tests, legacy/partial v0 forward-migration coverage, forward tolerance for unknown future optional keys, and structured `ConfigError::UnsupportedSchemaVersion` rejection for future incompatible schema versions (`schema_version = 2`).
+
+### Windows Backend & Release Packaging
+
+- Delivered Loom's first stable Windows release (`0.1.0`), consolidating all 8 native Task Manager views (`Processes`, `Performance`, `App History`, `Startup Apps`, `Users`, `Details`, `Services`, and `Settings`), WMI/PDH-free hardware performance telemetry, kernel diagnostics (`WCT` wait chains, streaming `MiniDump`, live UAC virtualization, JIT debugger attach, global wakeup hotkey), and verified engineering budgets (`< 50 ms` cold start, `< 0.15%` steady-state CPU, bounded threads, and `300 ms` slow-I/O circuit-breaker isolation).
+- Added Windows WiX v4/v5 MSI installer definition (`packaging/windows/wix/main.wxs`) installing `loom-app.exe`, `LICENSE`, and Start Menu shortcut (`Loom Task Manager`) with stable `UpgradeCode` and `MajorUpgrade` support.
+- Added Windows release packaging script (`packaging/windows/package-release.ps1`) emitting `loom-<Version>-windows-<Arch>-portable.zip`, `loom-<Version>-windows-<Arch>.msi`, and `SHA256SUMS.txt`, with conditional Authenticode code signing (`LOOM_SIGN_PFX_BASE64` + `LOOM_SIGN_PFX_PASSWORD` or `LOOM_SIGN_CERT_PATH`) and secure temporary `.pfx` cleanup.
+- Added automated CI release workflow (`.github/workflows/release.yml`) triggered on `v*` tags and `workflow_dispatch` dry-runs: verifies Windows workspace and Linux headless crates, packages Windows MSI + Portable ZIP artifacts with optional signing secrets (`WINDOWS_SIGN_PFX_BASE64` / `WINDOWS_SIGN_PFX_PASSWORD`), extracts matching release notes from `CHANGELOG.md`, and publishes GitHub Releases with checksums.
+
+### Contributors
+
+- @wangdiandao
+
+**Full Changelog**: https://github.com/wangdiandao/Loom/compare/v0.0.6...v0.1.0
+
 ## 0.0.6 - 2026-11-27
 
 ### Engine & PAL

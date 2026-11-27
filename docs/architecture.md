@@ -177,8 +177,8 @@ flowchart BT
 | Crate | Kind | Core Responsibility | Dependency & Decoupling Boundary |
 | --- | --- | --- | --- |
 | `loom-types` | lib | Cross-platform compact domain models (`ProcessKey`, `ProcessHotSample`, `ProcessColdMeta`, hardware snapshots, services, startup entries, sessions, history, `CapabilityFlags`). | No OS or UI dependencies; hot structs use `Copy` POD layouts. |
-| `loom-config` | lib | Local configuration (`settings.toml`: startup page, refresh cadence, theme, locale, window bounds, always-on-top/tray behavior, column preferences), schema migrations, atomic writes. | Synchronous load targeting `< 1 ms`; no dependency on platform backends or UI. |
-| `loom-pal-api` | lib | Static PAL traits (`PlatformBackend`, `FastSystemSampler`, `SlowMetadataProber`, etc.), caller-reused `SampleScratch` arenas, and `PalError`. | Depends solely on `loom-types`; does not expose raw OS handle or header types. |
+| `loom-config` | lib | Local configuration (`settings.toml`: startup page, refresh cadence, theme, locale, window bounds, always-on-top/tray behavior, column preferences, global hotkey), frozen `v1` (`CONFIG_CONTRACT_VERSION = "1.0"`) forward migrations, atomic writes. | Synchronous load targeting `< 1 ms`; no dependency on platform backends or UI; tolerates unknown future optional keys and rejects unsupported future `schema_version`. |
+| `loom-pal-api` | lib | Frozen `v1` (`PAL_API_CONTRACT_VERSION = 1`) static PAL traits (`PlatformBackend`, `FastSystemSampler`, `SlowMetadataProber`, `ServiceManager`, `StartupManager`, `SessionManager`, `AppHistoryReader`, `SystemOperator`), caller-reused `SampleScratch` arenas, and `PalError`. | Depends solely on `loom-types`; does not expose raw OS handle or header types. |
 | `loom-pal-windows` | lib | Windows sampling and system control backend (`ntdll`, `D3DKMT`, `IOCTL`, `SMBIOS`, `SCM`, `WTS`, `WCT`, `MiniDump`). | Compiled only under `cfg(windows)` using `windows-sys`; encapsulates `unsafe` FFI and enforces the six anti-hang constraints. |
 | `loom-pal-macos` | lib | macOS backend skeleton (`Mach` / `libproc` / `IOKit` / `launchd` targets). | Compiled only under `cfg(target_os = "macos")`; contract stub scheduled for full implementation in `0.3.0`. |
 | `loom-pal-linux` | lib | Linux backend skeleton (`procfs` / `sysfs` / `netlink` / `drm` / `systemd` targets). | Compiled only under `cfg(target_os = "linux")`; contract stub scheduled for full implementation in `0.2.0`. |
@@ -280,9 +280,16 @@ Windows frequently recycles exited `PID`s. Loom keys each process instance by `P
 
 ## 7. Core static extension contracts
 
+Starting in Loom `0.1.0`, two stability boundaries are frozen and enforced by deterministic unit tests:
+
+- **`loom-pal-api` (`PAL_API_CONTRACT_VERSION = 1`)**: Freezes the 8 zero-cost static-dispatch PAL traits (`PlatformBackend`, `FastSystemSampler`, `SlowMetadataProber`, `ServiceManager`, `StartupManager`, `SessionManager`, `AppHistoryReader`, and `SystemOperator`), their associated type/thread-safety bounds, `Copy` hot sample structs (`ProcessKey`, `ProcessHotSample<()>`, `SystemPerfSample`), and caller-reused scratch buffers (`ProcessSampleScratch`, `PerfSampleScratch`) for `loom-pal-windows`, `0.2.0` (`loom-pal-linux`), and `0.3.0` (`loom-pal-macos`).
+- **`loom-config` (`CONFIG_CONTRACT_VERSION = "1.0"`, `CURRENT_SCHEMA_VERSION = 1`)**: Freezes the `settings.toml` v1 schema forward-migration guarantee—legacy/partial v0 files migrate forward cleanly, unknown future optional keys are ignored cleanly (no `deny_unknown_fields`), and unsupported future schema versions (`schema_version > 1`) fail with `ConfigError::UnsupportedSchemaVersion`.
+
 ```rust
-// crates/loom-pal-api: compile-time monomorphized platform backend contract (no vtables)
-pub trait PlatformBackend: Send + 'static {
+// crates/loom-pal-api: frozen v1 compile-time monomorphized platform backend contract (no vtables)
+pub const PAL_API_CONTRACT_VERSION: u32 = 1;
+
+pub trait PlatformBackend: Send + Sync + 'static {
     /// Compact Copy extension payload (use `()` 0-byte ZST on platforms needing no extra fields)
     type ProcessExt: Copy + Default + Send + Sync + 'static;
 

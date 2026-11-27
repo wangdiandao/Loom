@@ -1,0 +1,194 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version for dry-run packaging (e.g. 0.1.0)'
+        required: true
+        type: string
+        default: '0.1.0'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - label: Windows
+            os: windows-latest
+            kind: windows
+          - label: Linux headless
+            os: ubuntu-latest
+            kind: linux
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Configure Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        if: matrix.kind == 'windows'
+        run: cargo fmt --all --check
+
+      - name: Run Clippy (Windows workspace)
+        if: matrix.kind == 'windows'
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Build documentation (Windows workspace)
+        if: matrix.kind == 'windows'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --no-deps
+
+      - name: Run workspace tests (Windows)
+        if: matrix.kind == 'windows'
+        run: cargo test --locked --workspace
+
+      - name: Check headless crates on Linux
+        if: matrix.kind == 'linux'
+        run: cargo check --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal -p loom-engine
+
+      - name: Run Clippy on headless crates (Linux)
+        if: matrix.kind == 'linux'
+        run: cargo clippy --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal -p loom-engine --all-targets -- -D warnings
+
+      - name: Run headless tests on Linux
+        if: matrix.kind == 'linux'
+        run: cargo test --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal -p loom-engine
+
+  package-windows:
+    name: Package Windows (x64 MSI + Portable ZIP)
+    needs: verify
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: meta
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $raw = "${{ inputs.version }}"
+          } else {
+            $raw = "${{ github.ref_name }}"
+          }
+          $version = $raw.Trim().TrimStart('v', 'V')
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "Resolved release version is empty."
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Resolved release version: $version"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --locked --release -p loom-app
+
+      - name: Install WiX CLI
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" --version
+
+      - name: Package Windows MSI and Portable ZIP
+        shell: pwsh
+        env:
+          LOOM_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+          LOOM_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
+        run: |
+          ./packaging/windows/package-release.ps1 `
+            -Version "${{ steps.meta.outputs.version }}" `
+            -Arch x64 `
+            -BinaryPath "target/release/loom-app.exe" `
+            -OutputDir "dist"
+
+          $expected = @(
+            "dist/loom-${{ steps.meta.outputs.version }}-windows-x64.msi",
+            "dist/loom-${{ steps.meta.outputs.version }}-windows-x64-portable.zip",
+            "dist/SHA256SUMS.txt"
+          )
+          foreach ($artifact in $expected) {
+            if (-not (Test-Path -LiteralPath $artifact)) {
+              throw "Expected release artifact missing: $artifact"
+            }
+          }
+          Get-Content -LiteralPath "dist/SHA256SUMS.txt"
+
+      - name: Upload Windows release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: loom-${{ steps.meta.outputs.version }}-windows-x64
+          path: |
+            dist/*.msi
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Extract release notes from CHANGELOG.md
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = "${{ steps.meta.outputs.version }}"
+          $lines = Get-Content -LiteralPath "CHANGELOG.md"
+          $pattern = "^##\s+" + [regex]::Escape($version) + "(\s|$)"
+          $inSection = $false
+          $body = New-Object System.Collections.Generic.List[string]
+
+          foreach ($line in $lines) {
+            if (-not $inSection) {
+              if ($line -match $pattern) {
+                $inSection = $true
+              }
+            } else {
+              if ($line -match '^##\s+') {
+                break
+              }
+              $body.Add($line)
+            }
+          }
+
+          $notes = ($body -join "`n").Trim()
+          if ([string]::IsNullOrWhiteSpace($notes)) {
+            $notes = "Release Loom v$version.`n`nSee [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details."
+          }
+
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText("dist/RELEASE_NOTES.md", ($notes + "`n"), $utf8NoBom)
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Loom v${{ steps.meta.outputs.version }}
+          body_path: dist/RELEASE_NOTES.md
+          prerelease: ${{ contains(steps.meta.outputs.version, '-') }}
+          files: |
+            dist/*.msi
+            dist/*.zip
+            dist/SHA256SUMS.txt
