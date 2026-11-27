@@ -15,8 +15,8 @@ use loom_pal_api::{
     SystemOperator,
 };
 use loom_types::{
-    AppHistorySlice, AppSnapshot, MonitorDomain, ProcessKey, RefreshSpeed, ServicesSlice,
-    StartupSlice, UsersSlice,
+    AppHistoryRecord, AppSnapshot, MonitorDomain, ProcessKey, RefreshSpeed, ServicesSlice,
+    StartupSlice, UserSessionRecord,
 };
 use parking_lot::Mutex;
 
@@ -27,8 +27,8 @@ use crate::command::{
 use crate::lease::{MonitorLease, MonitorLeaseRegistry};
 use crate::projection::{ProjectionEngine, ViewProjectionConfig};
 use crate::slow_lane::{
-    CircuitBreaker, ColdMetaCache, SlowLanePool, SlowPriorityJob, SlowProbeJob, SlowResult,
-    SlowShellOp,
+    CircuitBreaker, ColdMetaCache, MgmtDomainRefresh, SlowLanePool, SlowMgmtOp, SlowPriorityJob,
+    SlowProbeJob, SlowResult, SlowShellOp,
 };
 use crate::tree::collect_bottom_up_kill_order;
 
@@ -144,6 +144,7 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
         let slow_pool = SlowLanePool::spawn(
             Arc::clone(&backend),
             slow_prober,
+            Arc::clone(&leases),
             Arc::clone(&events),
             config.slow_workers,
             config.slow_queue_capacity,
@@ -204,6 +205,10 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
                     pending_hardware_info: false,
                     pending_disk_perf: false,
                     last_disk_poll_tick: 0,
+                    cached_user_sessions: Vec::new(),
+                    persisted_app_history_since: None,
+                    persisted_app_history: Vec::new(),
+                    app_history_polled_once: false,
                 };
                 runner.run();
             })
@@ -355,6 +360,10 @@ struct FastLaneRunner<B: PlatformBackend> {
     pending_hardware_info: bool,
     pending_disk_perf: bool,
     last_disk_poll_tick: u64,
+    cached_user_sessions: Vec<UserSessionRecord>,
+    persisted_app_history_since: Option<u64>,
+    persisted_app_history: Vec<AppHistoryRecord>,
+    app_history_polled_once: bool,
 }
 
 impl<B: PlatformBackend> FastLaneRunner<B> {
@@ -441,6 +450,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             &self.process_scratch,
             self.logical_cpu_count,
         );
+        self.projection.accumulate_app_history(&self.cold_cache);
         self.tick_count = self.tick_count.saturating_add(1);
 
         // Maintain live-set caches and enqueue cold metadata probes non-blockingly.
@@ -612,12 +622,14 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         let mut cold_updated = false;
         let mut perf_updated = false;
         let mut snapshot_dirty = false;
+        let mut pending_events: Vec<(CommandEvent, Option<Sender<CommandEvent>>)> = Vec::new();
 
         self.apply_slow_result(
             first,
             &mut cold_updated,
             &mut perf_updated,
             &mut snapshot_dirty,
+            &mut pending_events,
         );
 
         for _ in 1..SLOW_RESULT_DRAIN_BATCH {
@@ -627,22 +639,26 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                     &mut cold_updated,
                     &mut perf_updated,
                     &mut snapshot_dirty,
+                    &mut pending_events,
                 ),
                 Err(_) => break,
             }
         }
 
-        if self.window_dormant {
-            return;
+        if !self.window_dormant {
+            if cold_updated || perf_updated {
+                let details_leased = cold_updated && self.leases.is_active(MonitorDomain::Details);
+                let per_core_leased =
+                    perf_updated && self.leases.is_active(MonitorDomain::PerCoreCpu);
+                self.publish_slices(cold_updated, details_leased, perf_updated, per_core_leased);
+            } else if snapshot_dirty {
+                self.snapshot_store
+                    .store(Arc::new(self.current_snapshot.clone()));
+            }
         }
 
-        if cold_updated || perf_updated {
-            let details_leased = cold_updated && self.leases.is_active(MonitorDomain::Details);
-            let per_core_leased = perf_updated && self.leases.is_active(MonitorDomain::PerCoreCpu);
-            self.publish_slices(cold_updated, details_leased, perf_updated, per_core_leased);
-        } else if snapshot_dirty {
-            self.snapshot_store
-                .store(Arc::new(self.current_snapshot.clone()));
+        for (event, reply) in pending_events {
+            self.events.emit(event, reply);
         }
     }
 
@@ -652,6 +668,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         cold_updated: &mut bool,
         perf_updated: &mut bool,
         snapshot_dirty: &mut bool,
+        pending_events: &mut Vec<(CommandEvent, Option<Sender<CommandEvent>>)>,
     ) {
         let now = Instant::now();
         match res {
@@ -757,13 +774,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 if let Ok(items) = result
                     && self.leases.is_active(MonitorDomain::Services)
                 {
-                    let rev = self.current_snapshot.revisions.services.saturating_add(1);
-                    self.current_snapshot.revisions.services = rev;
-                    self.current_snapshot.services = Arc::new(ServicesSlice {
-                        revision: rev,
-                        timestamp: self.projection.latest_timestamp(),
-                        items,
-                    });
+                    self.apply_services_snapshot(items);
                     *snapshot_dirty = true;
                 }
             }
@@ -772,14 +783,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 if let Ok((last_bios_time_ms, items)) = result
                     && self.leases.is_active(MonitorDomain::Startup)
                 {
-                    let rev = self.current_snapshot.revisions.startup.saturating_add(1);
-                    self.current_snapshot.revisions.startup = rev;
-                    self.current_snapshot.startup = Arc::new(StartupSlice {
-                        revision: rev,
-                        timestamp: self.projection.latest_timestamp(),
-                        last_bios_time_ms,
-                        items,
-                    });
+                    self.apply_startup_snapshot(last_bios_time_ms, items);
                     *snapshot_dirty = true;
                 }
             }
@@ -788,13 +792,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 if let Ok(sessions) = result
                     && self.leases.is_active(MonitorDomain::Users)
                 {
-                    let rev = self.current_snapshot.revisions.users.saturating_add(1);
-                    self.current_snapshot.revisions.users = rev;
-                    self.current_snapshot.users = Arc::new(UsersSlice {
-                        revision: rev,
-                        timestamp: self.projection.latest_timestamp(),
-                        sessions,
-                    });
+                    self.apply_users_snapshot(sessions);
                     *snapshot_dirty = true;
                 }
             }
@@ -803,22 +801,114 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 if let Ok((since_epoch_secs, items)) = result
                     && self.leases.is_active(MonitorDomain::AppHistory)
                 {
-                    let rev = self
-                        .current_snapshot
-                        .revisions
-                        .app_history
-                        .saturating_add(1);
-                    self.current_snapshot.revisions.app_history = rev;
-                    self.current_snapshot.app_history = Arc::new(AppHistorySlice {
-                        revision: rev,
-                        timestamp: self.projection.latest_timestamp(),
-                        since_epoch_secs,
-                        items,
-                    });
+                    self.apply_app_history_snapshot(since_epoch_secs, items);
                     *snapshot_dirty = true;
                 }
             }
+            SlowResult::MgmtOpCompleted {
+                event,
+                reply,
+                cleared_app_history,
+                refresh,
+            } => {
+                if cleared_app_history {
+                    self.projection.clear_app_history();
+                    self.persisted_app_history.clear();
+                    if refresh.is_none() && self.leases.is_active(MonitorDomain::AppHistory) {
+                        let since = self.persisted_app_history_since;
+                        self.apply_app_history_snapshot(since, Vec::new());
+                        *snapshot_dirty = true;
+                    }
+                }
+                if let Some(domain_refresh) = refresh {
+                    match domain_refresh {
+                        MgmtDomainRefresh::Services(Ok(items))
+                            if self.leases.is_active(MonitorDomain::Services) =>
+                        {
+                            self.apply_services_snapshot(items);
+                            *snapshot_dirty = true;
+                        }
+                        MgmtDomainRefresh::Startup(Ok((bios_ms, items)))
+                            if self.leases.is_active(MonitorDomain::Startup) =>
+                        {
+                            self.apply_startup_snapshot(bios_ms, items);
+                            *snapshot_dirty = true;
+                        }
+                        MgmtDomainRefresh::Users(Ok(sessions))
+                            if self.leases.is_active(MonitorDomain::Users) =>
+                        {
+                            self.apply_users_snapshot(sessions);
+                            *snapshot_dirty = true;
+                        }
+                        MgmtDomainRefresh::AppHistory(Ok((since, items)))
+                            if self.leases.is_active(MonitorDomain::AppHistory) =>
+                        {
+                            self.apply_app_history_snapshot(since, items);
+                            *snapshot_dirty = true;
+                        }
+                        _ => {}
+                    }
+                }
+                pending_events.push((event, reply));
+            }
         }
+    }
+
+    fn apply_services_snapshot(&mut self, items: Vec<loom_types::ServiceRecord>) {
+        let rev = self.current_snapshot.revisions.services.saturating_add(1);
+        self.current_snapshot.revisions.services = rev;
+        self.current_snapshot.services = Arc::new(ServicesSlice {
+            revision: rev,
+            timestamp: self.projection.latest_timestamp(),
+            items,
+        });
+    }
+
+    fn apply_startup_snapshot(
+        &mut self,
+        last_bios_time_ms: Option<u64>,
+        items: Vec<loom_types::StartupEntry>,
+    ) {
+        let rev = self.current_snapshot.revisions.startup.saturating_add(1);
+        self.current_snapshot.revisions.startup = rev;
+        self.current_snapshot.startup = Arc::new(StartupSlice {
+            revision: rev,
+            timestamp: self.projection.latest_timestamp(),
+            last_bios_time_ms,
+            items,
+        });
+    }
+
+    fn apply_users_snapshot(&mut self, sessions: Vec<UserSessionRecord>) {
+        self.cached_user_sessions = sessions;
+        let rev = self.current_snapshot.revisions.users.saturating_add(1);
+        self.current_snapshot.revisions.users = rev;
+        self.current_snapshot.users = Arc::new(self.projection.project_users(
+            &self.cached_user_sessions,
+            &self.cold_cache,
+            rev,
+        ));
+    }
+
+    fn apply_app_history_snapshot(
+        &mut self,
+        since_epoch_secs: Option<u64>,
+        items: Vec<AppHistoryRecord>,
+    ) {
+        self.persisted_app_history_since = since_epoch_secs;
+        self.persisted_app_history = items;
+        self.app_history_polled_once = true;
+        let rev = self
+            .current_snapshot
+            .revisions
+            .app_history
+            .saturating_add(1);
+        self.current_snapshot.revisions.app_history = rev;
+        self.current_snapshot.app_history = Arc::new(self.projection.project_app_history(
+            self.persisted_app_history_since,
+            &self.persisted_app_history,
+            rev,
+        ));
     }
 
     /// Processes the received command plus any additional queued commands in one batch,
@@ -1076,6 +1166,31 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             EngineCommand::RelaunchElevated(route) => {
                 self.dispatch_slow_shell_op(kind, SlowShellOp::RelaunchElevated(route), reply);
             }
+            EngineCommand::StartService(name) => {
+                self.dispatch_slow_mgmt_op(kind, SlowMgmtOp::StartService(name), reply);
+            }
+            EngineCommand::StopService(name) => {
+                self.dispatch_slow_mgmt_op(kind, SlowMgmtOp::StopService(name), reply);
+            }
+            EngineCommand::RestartService(name) => {
+                self.dispatch_slow_mgmt_op(kind, SlowMgmtOp::RestartService(name), reply);
+            }
+            EngineCommand::OpenServicesConsole => {
+                self.dispatch_slow_mgmt_op(kind, SlowMgmtOp::OpenServicesConsole, reply);
+            }
+            EngineCommand::SetStartupEnabled { id, enabled } => {
+                self.dispatch_slow_mgmt_op(
+                    kind,
+                    SlowMgmtOp::SetStartupEnabled { id, enabled },
+                    reply,
+                );
+            }
+            EngineCommand::DisconnectSession(session_id) => {
+                self.dispatch_slow_mgmt_op(kind, SlowMgmtOp::DisconnectSession(session_id), reply);
+            }
+            EngineCommand::ClearAppHistory => {
+                self.dispatch_slow_mgmt_op(kind, SlowMgmtOp::ClearAppHistory, reply);
+            }
         }
 
         false
@@ -1090,6 +1205,28 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         if let Err(SlowPriorityJob::ShellOp { reply, .. }) = self
             .slow_pool
             .try_enqueue_priority(SlowPriorityJob::ShellOp { op, reply })
+        {
+            let event = CommandEvent::new(
+                kind,
+                None,
+                CommandOutcome::err(PalError::CircuitOpen {
+                    target: "slow-lane".to_owned(),
+                    retry_after_ms: 100,
+                }),
+            );
+            self.events.emit(event, reply);
+        }
+    }
+
+    fn dispatch_slow_mgmt_op(
+        &self,
+        kind: CommandKind,
+        op: SlowMgmtOp,
+        reply: Option<Sender<CommandEvent>>,
+    ) {
+        if let Err(SlowPriorityJob::MgmtOp { reply, .. }) = self
+            .slow_pool
+            .try_enqueue_priority(SlowPriorityJob::MgmtOp { op, reply })
         {
             let event = CommandEvent::new(
                 kind,
@@ -1120,6 +1257,27 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 &self.cold_cache,
                 rev,
             ));
+
+            if self.leases.is_active(MonitorDomain::Users) && !self.cached_user_sessions.is_empty()
+            {
+                let users_rev = next.revisions.users.saturating_add(1);
+                next.revisions.users = users_rev;
+                next.users = Arc::new(self.projection.project_users(
+                    &self.cached_user_sessions,
+                    &self.cold_cache,
+                    users_rev,
+                ));
+            }
+
+            if self.leases.is_active(MonitorDomain::AppHistory) && self.app_history_polled_once {
+                let hist_rev = next.revisions.app_history.saturating_add(1);
+                next.revisions.app_history = hist_rev;
+                next.app_history = Arc::new(self.projection.project_app_history(
+                    self.persisted_app_history_since,
+                    &self.persisted_app_history,
+                    hist_rev,
+                ));
+            }
         }
 
         if update_details {

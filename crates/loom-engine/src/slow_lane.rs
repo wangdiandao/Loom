@@ -26,6 +26,7 @@ use loom_types::{
 use parking_lot::{Condvar, Mutex};
 
 use crate::command::{CommandEvent, CommandKind, CommandOutcome, CommandSuccess, EventBus};
+use crate::lease::MonitorLeaseRegistry;
 
 /// Maximum number of path-deduplicated static assets retained in Level-2 cache.
 const MAX_ASSET_CACHE_ENTRIES: usize = 4_096;
@@ -331,11 +332,38 @@ pub(crate) enum SlowShellOp {
     RelaunchElevated(String),
 }
 
+/// Blocking system management operations (Services, Startup, Users, App History)
+/// executed on the high-priority slow-lane channel.
+#[derive(Debug)]
+pub(crate) enum SlowMgmtOp {
+    StartService(String),
+    StopService(String),
+    RestartService(String),
+    OpenServicesConsole,
+    SetStartupEnabled { id: String, enabled: bool },
+    DisconnectSession(u32),
+    ClearAppHistory,
+}
+
+/// Refreshed domain payload fetched immediately after a mutating [`SlowMgmtOp`] succeeds
+/// while the affected [`MonitorDomain`] holds an active lease.
+#[derive(Debug)]
+pub(crate) enum MgmtDomainRefresh {
+    Services(Result<Vec<ServiceRecord>, PalError>),
+    Startup(Result<(Option<u64>, Vec<StartupEntry>), PalError>),
+    Users(Result<Vec<UserSessionRecord>, PalError>),
+    AppHistory(Result<(Option<u64>, Vec<AppHistoryRecord>), PalError>),
+}
+
 /// High-priority jobs executed ahead of background icon/metadata probes.
 #[derive(Debug)]
 pub(crate) enum SlowPriorityJob {
     ShellOp {
         op: SlowShellOp,
+        reply: Option<Sender<CommandEvent>>,
+    },
+    MgmtOp {
+        op: SlowMgmtOp,
         reply: Option<Sender<CommandEvent>>,
     },
     PollOnDemandDomain(MonitorDomain),
@@ -373,6 +401,12 @@ pub(crate) enum SlowResult {
     StartupPolled(Result<(Option<u64>, Vec<StartupEntry>), PalError>),
     UsersPolled(Result<Vec<UserSessionRecord>, PalError>),
     AppHistoryPolled(Result<(Option<u64>, Vec<AppHistoryRecord>), PalError>),
+    MgmtOpCompleted {
+        event: CommandEvent,
+        reply: Option<Sender<CommandEvent>>,
+        cleared_app_history: bool,
+        refresh: Option<MgmtDomainRefresh>,
+    },
 }
 
 /// Bounded slow-lane bulkhead pool (strictly `1..=2` threads) with deduplicated submission
@@ -392,6 +426,7 @@ impl SlowLanePool {
     pub(crate) fn spawn<B: PlatformBackend>(
         backend: Arc<B>,
         prober: Arc<B::SlowProber>,
+        leases: Arc<MonitorLeaseRegistry>,
         events: Arc<EventBus>,
         workers: usize,
         queue_capacity: usize,
@@ -410,6 +445,7 @@ impl SlowLanePool {
         for idx in 0..worker_count {
             let backend = Arc::clone(&backend);
             let prober = Arc::clone(&prober);
+            let leases = Arc::clone(&leases);
             let events = Arc::clone(&events);
             let priority_rx = priority_rx.clone();
             let probe_rx = probe_rx.clone();
@@ -423,6 +459,7 @@ impl SlowLanePool {
                     slow_worker_loop(
                         backend,
                         prober,
+                        leases,
                         events,
                         priority_rx,
                         probe_rx,
@@ -515,9 +552,11 @@ impl Drop for SlowLanePool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn slow_worker_loop<B: PlatformBackend>(
     backend: Arc<B>,
     prober: Arc<B::SlowProber>,
+    leases: Arc<MonitorLeaseRegistry>,
     events: Arc<EventBus>,
     priority_rx: Receiver<SlowPriorityJob>,
     probe_rx: Receiver<SlowProbeJob>,
@@ -532,7 +571,7 @@ fn slow_worker_loop<B: PlatformBackend>(
         select_biased! {
             recv(priority_rx) -> msg => {
                 match msg {
-                    Ok(job) => execute_priority_job(&*backend, &*prober, &events, &result_tx, job),
+                    Ok(job) => execute_priority_job(&*backend, &*prober, &leases, &events, &result_tx, job),
                     Err(_) => break,
                 }
             }
@@ -549,6 +588,7 @@ fn slow_worker_loop<B: PlatformBackend>(
 fn execute_priority_job<B: PlatformBackend>(
     backend: &B,
     prober: &B::SlowProber,
+    leases: &MonitorLeaseRegistry,
     events: &EventBus,
     result_tx: &Sender<SlowResult>,
     job: SlowPriorityJob,
@@ -630,6 +670,96 @@ fn execute_priority_job<B: PlatformBackend>(
                 }
             };
             events.emit(event, reply);
+        }
+        SlowPriorityJob::MgmtOp { op, reply } => {
+            let (kind, result, affected_domain, cleared_app_history) = match op {
+                SlowMgmtOp::StartService(name) => (
+                    CommandKind::StartService,
+                    backend.service_manager().start_service(&name),
+                    Some(MonitorDomain::Services),
+                    false,
+                ),
+                SlowMgmtOp::StopService(name) => (
+                    CommandKind::StopService,
+                    backend.service_manager().stop_service(&name),
+                    Some(MonitorDomain::Services),
+                    false,
+                ),
+                SlowMgmtOp::RestartService(name) => (
+                    CommandKind::RestartService,
+                    backend.service_manager().restart_service(&name),
+                    Some(MonitorDomain::Services),
+                    false,
+                ),
+                SlowMgmtOp::OpenServicesConsole => (
+                    CommandKind::OpenServicesConsole,
+                    backend.service_manager().open_services_console(),
+                    None,
+                    false,
+                ),
+                SlowMgmtOp::SetStartupEnabled { id, enabled } => (
+                    CommandKind::SetStartupEnabled,
+                    backend.startup_manager().set_startup_enabled(&id, enabled),
+                    Some(MonitorDomain::Startup),
+                    false,
+                ),
+                SlowMgmtOp::DisconnectSession(session_id) => (
+                    CommandKind::DisconnectSession,
+                    backend.session_manager().disconnect_session(session_id),
+                    Some(MonitorDomain::Users),
+                    false,
+                ),
+                SlowMgmtOp::ClearAppHistory => (
+                    CommandKind::ClearAppHistory,
+                    backend.history_reader().clear_history(),
+                    Some(MonitorDomain::AppHistory),
+                    true,
+                ),
+            };
+
+            let (outcome, succeeded) = match result {
+                Ok(()) => (CommandOutcome::Ok(CommandSuccess::Ack), true),
+                Err(err) => (CommandOutcome::err(err), false),
+            };
+            let event = CommandEvent::new(kind, None, outcome);
+
+            // Immediately refresh the affected domain on success ONLY while that domain is leased.
+            let refresh = if succeeded
+                && let Some(domain) = affected_domain
+                && leases.is_active(domain)
+            {
+                match domain {
+                    MonitorDomain::Services => Some(MgmtDomainRefresh::Services(
+                        backend.service_manager().list_services(),
+                    )),
+                    MonitorDomain::Startup => Some(MgmtDomainRefresh::Startup(
+                        backend.startup_manager().list_startup_entries(),
+                    )),
+                    MonitorDomain::Users => Some(MgmtDomainRefresh::Users(
+                        backend.session_manager().list_sessions(),
+                    )),
+                    MonitorDomain::AppHistory => Some(MgmtDomainRefresh::AppHistory(
+                        backend.history_reader().read_history(),
+                    )),
+                    MonitorDomain::Details
+                    | MonitorDomain::Performance
+                    | MonitorDomain::PerCoreCpu => None,
+                }
+            } else {
+                None
+            };
+
+            let msg = SlowResult::MgmtOpCompleted {
+                event,
+                reply,
+                cleared_app_history: succeeded && cleared_app_history,
+                refresh,
+            };
+            if let Err(err) = result_tx.send_timeout(msg, Duration::from_millis(200))
+                && let SlowResult::MgmtOpCompleted { event, reply, .. } = err.into_inner()
+            {
+                events.emit(event, reply);
+            }
         }
         SlowPriorityJob::PollOnDemandDomain(domain) => {
             let msg = match domain {

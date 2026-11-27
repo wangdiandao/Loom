@@ -34,7 +34,7 @@ pub use snapshot::{
     AppHistoryRecord, AppHistorySlice, AppSnapshot, DetailsRowProjection, DetailsTableSlice,
     DomainRevisions, MonitorDomain, ProcessRowKind, ProcessRowProjection, ProcessTableSlice,
     ServiceRecord, ServiceState, ServicesSlice, StartupEntry, StartupImpact, StartupSlice,
-    UserSessionRecord, UserSessionState, UsersSlice,
+    UserSessionProcess, UserSessionRecord, UserSessionState, UsersSlice,
 };
 pub use time::Timestamp100Ns;
 

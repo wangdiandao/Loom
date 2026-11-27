@@ -85,6 +85,25 @@ pub enum EngineCommand {
     SearchOnline(String),
     /// Relaunches Loom elevated and restores the given route identifier.
     RelaunchElevated(String),
+    /// Starts an OS system service identified by its internal name.
+    StartService(String),
+    /// Stops an OS system service identified by its internal name.
+    StopService(String),
+    /// Restarts an OS system service identified by its internal name.
+    RestartService(String),
+    /// Launches the native OS services management console (e.g., `services.msc`).
+    OpenServicesConsole,
+    /// Enables or disables a registered startup application entry by its stable ID.
+    SetStartupEnabled {
+        /// Stable startup entry identifier from [`loom_types::StartupEntry::id`].
+        id: String,
+        /// Desired enabled state.
+        enabled: bool,
+    },
+    /// Disconnects the logged-in OS user session identified by `session_id`.
+    DisconnectSession(u32),
+    /// Clears persisted and live in-memory cumulative application usage history.
+    ClearAppHistory,
     /// Requests a clean shutdown of the engine coordinator threads.
     Shutdown,
 }
@@ -136,6 +155,20 @@ pub enum CommandKind {
     SearchOnline,
     /// [`EngineCommand::RelaunchElevated`]
     RelaunchElevated,
+    /// [`EngineCommand::StartService`]
+    StartService,
+    /// [`EngineCommand::StopService`]
+    StopService,
+    /// [`EngineCommand::RestartService`]
+    RestartService,
+    /// [`EngineCommand::OpenServicesConsole`]
+    OpenServicesConsole,
+    /// [`EngineCommand::SetStartupEnabled`]
+    SetStartupEnabled,
+    /// [`EngineCommand::DisconnectSession`]
+    DisconnectSession,
+    /// [`EngineCommand::ClearAppHistory`]
+    ClearAppHistory,
     /// [`EngineCommand::Shutdown`]
     Shutdown,
 }
@@ -167,6 +200,13 @@ impl EngineCommand {
             Self::ShowFileProperties(_) => CommandKind::ShowFileProperties,
             Self::SearchOnline(_) => CommandKind::SearchOnline,
             Self::RelaunchElevated(_) => CommandKind::RelaunchElevated,
+            Self::StartService(_) => CommandKind::StartService,
+            Self::StopService(_) => CommandKind::StopService,
+            Self::RestartService(_) => CommandKind::RestartService,
+            Self::OpenServicesConsole => CommandKind::OpenServicesConsole,
+            Self::SetStartupEnabled { .. } => CommandKind::SetStartupEnabled,
+            Self::DisconnectSession(_) => CommandKind::DisconnectSession,
+            Self::ClearAppHistory => CommandKind::ClearAppHistory,
             Self::Shutdown => CommandKind::Shutdown,
         }
     }
