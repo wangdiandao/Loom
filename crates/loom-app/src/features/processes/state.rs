@@ -177,6 +177,9 @@ mod tests {
             net_permille: 0,
             gpu_util_permille: 0,
             gpu_dedicated_bytes: 0,
+            parent_key: None,
+            leak_warning: None,
+            webview2_role: None,
         }
     }
 

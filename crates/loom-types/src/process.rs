@@ -345,3 +345,50 @@ pub struct ProcessColdMeta {
     /// Shared path-level static executable asset.
     pub asset: Option<Arc<ExeStaticAsset>>,
 }
+
+/// Classification of a suspected per-process resource leak anomaly.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LeakKind {
+    /// Sustained growth in open OS handles / file descriptors.
+    #[default]
+    Handles,
+    /// Sustained growth in spawned child processes.
+    Children,
+    /// Accumulation of orphaned helper processes whose parent exited.
+    Orphans,
+}
+
+/// Advisory resource-leak warning attached to a live process row.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LeakWarning {
+    /// Category of leak heuristic that triggered.
+    pub kind: LeakKind,
+    /// Human-readable summary of the anomaly.
+    pub summary: Arc<str>,
+    /// Latest observed metric value (e.g., current handle count).
+    pub current_value: u64,
+    /// Baseline metric value recorded when observation started.
+    pub baseline_value: u64,
+}
+
+/// Identified subprocess role for Microsoft Edge WebView2 (`msedgewebview2.exe`) instances.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WebView2Role {
+    /// Root browser / host controller process.
+    #[default]
+    Browser,
+    /// Web content renderer subprocess.
+    Renderer,
+    /// GPU acceleration and compositing subprocess.
+    Gpu,
+    /// Network service subprocess.
+    Network,
+    /// Storage service subprocess.
+    Storage,
+    /// Audio service subprocess.
+    Audio,
+    /// Generic sandboxed utility subprocess.
+    Utility,
+    /// Crashpad crash-reporting handler subprocess.
+    Crashpad,
+}

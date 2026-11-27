@@ -42,6 +42,14 @@ bitflags! {
         const DEBUGGER_ATTACH = 1 << 12;
         /// Supports registering a system-wide global wakeup hotkey.
         const GLOBAL_HOTKEY = 1 << 13;
+        /// Supports suspending and resuming non-critical user-space processes.
+        const SUSPEND_RESUME = 1 << 14;
+        /// Supports querying processes holding open locks on files or directories.
+        const FILE_LOCKS = 1 << 15;
+        /// Supports enumerating listening ports and per-process open network sockets.
+        const PROCESS_SOCKETS = 1 << 16;
+        /// Supports elevated per-process network byte attribution (e.g., real-time ETW).
+        const ELEVATED_PROCESS_NET = 1 << 17;
     }
 }
 
@@ -110,4 +118,54 @@ pub struct WaitChainNode {
     pub is_deadlocked: bool,
     /// Downstream wait-chain nodes blocking this node.
     pub children: Vec<WaitChainNode>,
+}
+
+/// Transport protocol and IP family for a process network socket endpoint.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum SocketProtocol {
+    /// IPv4 TCP socket.
+    #[default]
+    Tcp,
+    /// IPv6 TCP socket.
+    Tcp6,
+    /// IPv4 UDP socket.
+    Udp,
+    /// IPv6 UDP socket.
+    Udp6,
+}
+
+/// A single TCP or UDP network socket endpoint owned by a running process.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ProcessSocketRecord {
+    /// Transport protocol and IP version.
+    pub protocol: SocketProtocol,
+    /// Formatted local IP address string (e.g., `"0.0.0.0"`, `"::1"`).
+    pub local_addr: Arc<str>,
+    /// Local port number in host byte order.
+    pub local_port: u16,
+    /// Formatted remote IP address string, if connected.
+    pub remote_addr: Option<Arc<str>>,
+    /// Remote port number in host byte order, if connected.
+    pub remote_port: Option<u16>,
+    /// Connection state label (e.g., `"LISTEN"`, `"ESTABLISHED"`, `"UDP"`).
+    pub state: Arc<str>,
+    /// Numeric process identifier of the socket owner.
+    pub pid: u32,
+}
+
+/// Process or service currently holding an open lock on a queried file or directory.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FileLockHolder {
+    /// Numeric process identifier of the lock holder.
+    pub pid: u32,
+    /// Friendly application display name reported by the OS.
+    pub app_name: Arc<str>,
+    /// Optional service short name when the lock holder is a system service.
+    pub service_name: Option<Arc<str>>,
+    /// Classification label of the application (e.g., `"MainWindow"`, `"Service"`, `"Critical"`).
+    pub app_type: Arc<str>,
+    /// Whether the OS indicates the lock holder can be safely restarted automatically.
+    pub restartable: bool,
 }

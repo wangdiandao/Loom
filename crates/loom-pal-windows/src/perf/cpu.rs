@@ -177,6 +177,7 @@ pub fn probe_cpu_static_info() -> CpuStaticInfo {
         l1_cache_bytes,
         l2_cache_bytes,
         l3_cache_bytes,
+        core_kinds: Vec::new(),
     }
 }
 

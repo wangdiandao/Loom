@@ -72,10 +72,10 @@ const MINIDUMP_CANCEL_CALLBACK: u32 = 6;
 const HRESULT_ERROR_CANCELLED: u32 = 0x8007_04C7;
 
 /// RAII wrapper over a dynamically loaded Win32 DLL module (`FreeLibrary` on drop).
-struct OwnedModule(HMODULE);
+pub(crate) struct OwnedModule(HMODULE);
 
 impl OwnedModule {
-    fn load(dll_name: &str) -> Result<Self, PalError> {
+    pub(crate) fn load(dll_name: &str) -> Result<Self, PalError> {
         let wide = to_wide_null(dll_name);
         // SAFETY: `wide` is a valid null-terminated UTF-16 DLL name.
         let module = unsafe { LoadLibraryW(wide.as_ptr()) };
@@ -87,7 +87,7 @@ impl OwnedModule {
         Ok(Self(module))
     }
 
-    fn proc_addr(&self, symbol: &[u8]) -> Option<*const c_void> {
+    pub(crate) fn proc_addr(&self, symbol: &[u8]) -> Option<*const c_void> {
         debug_assert!(symbol.ends_with(b"\0"));
         // SAFETY: `self.0` is a loaded module and `symbol` is a null-terminated ASCII name.
         let addr = unsafe { GetProcAddress(self.0, symbol.as_ptr()) };

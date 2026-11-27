@@ -314,6 +314,7 @@ impl FastSystemSampler for MockFastSampler {
             dedicated_total_bytes: 8 * 1024 * 1024 * 1024,
             shared_used_bytes: 512 * 1024 * 1024,
             shared_total_bytes: 8 * 1024 * 1024 * 1024,
+            d3_asleep: false,
             engines: vec![
                 GpuEngineSample {
                     name: Arc::from("3D"),
@@ -403,6 +404,7 @@ impl SlowMetadataProber for MockSlowProber {
                 l1_cache_bytes: 512 * 1024,
                 l2_cache_bytes: 4 * 1024 * 1024,
                 l3_cache_bytes: 32 * 1024 * 1024,
+                core_kinds: Vec::new(),
             },
             memory: MemoryHardwareInfo {
                 speed_mt_s: Some(6000),

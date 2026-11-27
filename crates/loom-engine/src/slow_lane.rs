@@ -816,7 +816,8 @@ fn execute_priority_job<B: PlatformBackend>(
                     )),
                     MonitorDomain::Details
                     | MonitorDomain::Performance
-                    | MonitorDomain::PerCoreCpu => None,
+                    | MonitorDomain::PerCoreCpu
+                    | MonitorDomain::ProcessNetwork => None,
                 }
             } else {
                 None
@@ -848,7 +849,10 @@ fn execute_priority_job<B: PlatformBackend>(
                 MonitorDomain::AppHistory => {
                     SlowResult::AppHistoryPolled(backend.history_reader().read_history())
                 }
-                MonitorDomain::Details | MonitorDomain::Performance | MonitorDomain::PerCoreCpu => {
+                MonitorDomain::Details
+                | MonitorDomain::Performance
+                | MonitorDomain::PerCoreCpu
+                | MonitorDomain::ProcessNetwork => {
                     return;
                 }
             };

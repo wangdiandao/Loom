@@ -108,6 +108,10 @@ mod tests {
                 },
             ],
             global_hotkey: Some("Ctrl+Shift+L".to_owned()),
+            webview2_host_grouping: true,
+            show_leak_warnings: true,
+            leak_ignored_paths: Vec::new(),
+            hide_windows_system_processes: false,
         };
         for i in 0..MAX_RUN_TASK_HISTORY {
             settings.push_run_task_history(format!(r"C:\Windows\System32\tool_{i}.exe --flag"));
@@ -579,6 +583,10 @@ visible = true
                 },
             ],
             global_hotkey: Some("Ctrl+Shift+L".to_owned()),
+            webview2_host_grouping: true,
+            show_leak_warnings: true,
+            leak_ignored_paths: Vec::new(),
+            hide_windows_system_processes: false,
         };
 
         let parsed = migrate_toml_value(GOLDEN_V1_TOML).expect("golden v1 TOML must deserialize");
@@ -762,5 +770,45 @@ theme = "Dark"
                 max_supported: 1,
             })
         ));
+    }
+
+    #[test]
+    fn additive_v1_process_preferences_default_sanitize_and_roundtrip() {
+        // Legacy v1 TOML without the new optional keys inherits defaults cleanly.
+        let legacy_v1 = r#"
+            schema_version = 1
+            theme = "Dark"
+        "#;
+        let loaded = migrate_toml_value(legacy_v1).expect("load legacy v1 without new prefs");
+        assert!(loaded.webview2_host_grouping);
+        assert!(loaded.show_leak_warnings);
+        assert!(loaded.leak_ignored_paths.is_empty());
+        assert!(!loaded.hide_windows_system_processes);
+
+        // Non-default values and dirty `leak_ignored_paths` sanitize and round-trip via ConfigStore.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let store = ConfigStore::new(dir.path().join(CONFIG_FILE_NAME));
+        let custom = AppSettings {
+            webview2_host_grouping: false,
+            show_leak_warnings: false,
+            leak_ignored_paths: vec![
+                "  C:\\Tools\\worker.exe  ".to_owned(),
+                "".to_owned(),
+                "   ".to_owned(),
+                "C:\\Tools\\worker.exe".to_owned(),
+                "custom_agent.exe".to_owned(),
+            ],
+            hide_windows_system_processes: true,
+            ..AppSettings::default()
+        };
+        store.save(&custom).expect("save custom additive v1 prefs");
+        let reloaded = store.load().expect("reload custom additive v1 prefs");
+        assert!(!reloaded.webview2_host_grouping);
+        assert!(!reloaded.show_leak_warnings);
+        assert_eq!(
+            reloaded.leak_ignored_paths,
+            vec!["C:\\Tools\\worker.exe", "custom_agent.exe"]
+        );
+        assert!(reloaded.hide_windows_system_processes);
     }
 }
