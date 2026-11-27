@@ -1,5 +1,6 @@
 //! Formatting helpers and semantic intensity buckets for resource metrics.
 
+use gpui_kit::SharedString;
 use loom_types::ResourceDisplayMode;
 
 const KIB: u64 = 1024;
@@ -173,4 +174,95 @@ pub fn format_cpu_time(ticks_100ns: u64) -> String {
     let mins = (total_secs % 3_600) / 60;
     let secs = total_secs % 60;
     format!("{hours:02}:{mins:02}:{secs:02}")
+}
+
+/// Zero-allocation fast-path permille formatter returning a [`SharedString`].
+///
+/// Avoids heap allocations for the common `0.0%` and `100.0%` values in hot table cells.
+#[inline]
+pub fn format_permille_shared(permille: u16) -> SharedString {
+    match permille {
+        0 => SharedString::new_static("0.0%"),
+        1_000 => SharedString::new_static("100.0%"),
+        _ => format_permille(permille).into(),
+    }
+}
+
+/// Zero-allocation fast-path byte formatter returning a [`SharedString`].
+#[inline]
+pub fn format_bytes_shared(bytes: u64) -> SharedString {
+    if bytes == 0 {
+        SharedString::new_static("0 B")
+    } else {
+        format_bytes(bytes).into()
+    }
+}
+
+/// Zero-allocation fast-path throughput formatter returning a [`SharedString`].
+#[inline]
+pub fn format_rate_bytes_per_sec_shared(bytes_per_sec: u64) -> SharedString {
+    if bytes_per_sec == 0 {
+        SharedString::new_static("0 MB/s")
+    } else {
+        format_rate_bytes_per_sec(bytes_per_sec).into()
+    }
+}
+
+/// Zero-allocation fast-path network rate formatter returning a [`SharedString`].
+#[inline]
+pub fn format_network_rate_mbps_shared(bytes_per_sec: u64) -> SharedString {
+    if bytes_per_sec == 0 {
+        SharedString::new_static("0 Mbps")
+    } else {
+        format_network_rate_mbps(bytes_per_sec).into()
+    }
+}
+
+/// Formats a memory table cell as a [`SharedString`] with zero-value static fast paths.
+#[inline]
+pub fn format_memory_cell_shared(
+    bytes: u64,
+    permille: u16,
+    mode: ResourceDisplayMode,
+) -> SharedString {
+    match mode {
+        ResourceDisplayMode::Percent => format_permille_shared(permille),
+        ResourceDisplayMode::Values => format_bytes_shared(bytes),
+    }
+}
+
+/// Formats a disk throughput table cell as a [`SharedString`] with zero-value static fast paths.
+#[inline]
+pub fn format_disk_cell_shared(
+    bytes_per_sec: u64,
+    permille: u16,
+    mode: ResourceDisplayMode,
+) -> SharedString {
+    match mode {
+        ResourceDisplayMode::Percent => format_permille_shared(permille),
+        ResourceDisplayMode::Values => format_rate_bytes_per_sec_shared(bytes_per_sec),
+    }
+}
+
+/// Formats a network throughput table cell as a [`SharedString`] with zero-value static fast paths.
+#[inline]
+pub fn format_network_cell_shared(
+    bytes_per_sec: u64,
+    permille: u16,
+    mode: ResourceDisplayMode,
+) -> SharedString {
+    match mode {
+        ResourceDisplayMode::Percent => format_permille_shared(permille),
+        ResourceDisplayMode::Values => format_network_rate_mbps_shared(bytes_per_sec),
+    }
+}
+
+/// Zero-allocation fast-path cumulative CPU time formatter returning a [`SharedString`].
+#[inline]
+pub fn format_cpu_time_shared(ticks_100ns: u64) -> SharedString {
+    if ticks_100ns < TICKS_PER_SECOND {
+        SharedString::new_static("00:00:00")
+    } else {
+        format_cpu_time(ticks_100ns).into()
+    }
 }

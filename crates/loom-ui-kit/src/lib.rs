@@ -17,15 +17,17 @@ pub mod status_badge;
 pub mod theme;
 
 pub use format::{
-    HeatmapLevel, format_bytes, format_cpu_time, format_disk_cell, format_memory_cell,
-    format_network_cell, format_network_rate_mbps, format_permille, format_rate_bytes_per_sec,
-    format_uptime,
+    HeatmapLevel, format_bytes, format_bytes_shared, format_cpu_time, format_cpu_time_shared,
+    format_disk_cell, format_disk_cell_shared, format_memory_cell, format_memory_cell_shared,
+    format_network_cell, format_network_cell_shared, format_network_rate_mbps,
+    format_network_rate_mbps_shared, format_permille, format_permille_shared,
+    format_rate_bytes_per_sec, format_rate_bytes_per_sec_shared, format_uptime,
 };
 pub use heatmap::heatmap_cell;
 pub use icon::rgba_icon_to_render_image;
 pub use memory_bar::{MemoryBarLabels, MemoryBarSegments, memory_composition_bar};
 pub use sparkline::{SparklineCardProps, SparklinePoint, sparkline_card};
-pub use status_badge::{StatusLabels, status_badges};
+pub use status_badge::{ECO_LEAF_ICON_PATH, ECO_LEAF_SVG, StatusLabels, status_badges};
 pub use theme::LoomSemanticColors;
 
 #[cfg(test)]
@@ -114,6 +116,15 @@ mod tests {
         assert_eq!(format_permille(5), "0.5%");
         assert_eq!(format_permille(125), "12.5%");
         assert_eq!(format_permille(1000), "100.0%");
+
+        assert_eq!(format_permille_shared(0).as_ref(), "0.0%");
+        assert_eq!(format_permille_shared(125).as_ref(), "12.5%");
+        assert_eq!(format_permille_shared(1000).as_ref(), "100.0%");
+        assert_eq!(format_bytes_shared(0).as_ref(), "0 B");
+        assert_eq!(format_rate_bytes_per_sec_shared(0).as_ref(), "0 MB/s");
+        assert_eq!(format_network_rate_mbps_shared(0).as_ref(), "0 Mbps");
+        assert_eq!(format_cpu_time_shared(0).as_ref(), "00:00:00");
+        assert_eq!(format_cpu_time_shared(10_000_000).as_ref(), "00:00:01");
     }
 
     #[test]

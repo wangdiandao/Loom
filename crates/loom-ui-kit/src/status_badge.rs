@@ -10,11 +10,16 @@ use loom_types::ProcessStatusFlags;
 
 use crate::theme::LoomSemanticColors;
 
+/// Asset path registered by host applications to serve [`ECO_LEAF_SVG`] through
+/// GPUI's path-keyed SVG atlas cache.
+pub const ECO_LEAF_ICON_PATH: &str = "icons/loom-eco-leaf.svg";
+
 /// Embedded Lucide-style leaf vector used for Efficiency Mode (`EcoQoS`) badges.
 ///
-/// Embedded directly via [`Icon::data`] so the leaf badge always renders even
-/// when the host application registers only the lightweight default asset bundle.
-const ECO_LEAF_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 20a10 10 0 0 0 10-10 25.9 25.9 0 0 0-1.04-7.281 1 1 0 0 0-1.755-.325C15.833 5.5 13 5.5 9.8 6.1A7 7 0 0 0 11 20"/><path d="M2 21a5 5 0 0 1 2.911-4.544C7.613 15.212 8.351 15.24 11 13"/></svg>"#;
+/// Host applications should serve this slice for [`ECO_LEAF_ICON_PATH`] in their
+/// [`gpui_kit::AssetSource`] so GPUI caches the rasterized glyph across frames
+/// instead of copying raw SVG bytes on every render.
+pub const ECO_LEAF_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 20a10 10 0 0 0 10-10 25.9 25.9 0 0 0-1.04-7.281 1 1 0 0 0-1.755-.325C15.833 5.5 13 5.5 9.8 6.1A7 7 0 0 0 11 20"/><path d="M2 21a5 5 0 0 1 2.911-4.544C7.613 15.212 8.351 15.24 11 13"/></svg>"#;
 
 /// Localized accessible tooltip labels passed to [`status_badges`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,7 +101,7 @@ pub fn status_badges(
     if status.contains(ProcessStatusFlags::EFFICIENCY_MODE) {
         row = row.child(status_icon_badge(
             ("status-eco", row_id),
-            Icon::default().data(ECO_LEAF_SVG),
+            Icon::default().path(ECO_LEAF_ICON_PATH),
             labels.eco_mode.clone(),
             colors.status_eco_bg,
             colors.status_eco_fg,

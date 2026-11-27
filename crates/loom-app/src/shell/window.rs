@@ -223,11 +223,15 @@ impl AppShell {
         match route {
             Route::Processes => {
                 let store = store.clone();
-                ActivePage::Processes(cx.new(|cx| ProcessesView::new(store, shell_handle, cx)))
+                ActivePage::Processes(
+                    cx.new(|cx| ProcessesView::new(store, shell_handle, window, cx)),
+                )
             }
             Route::Details => {
                 let store = store.clone();
-                ActivePage::Details(cx.new(|cx| DetailsView::new(store, highlight_details, cx)))
+                ActivePage::Details(
+                    cx.new(|cx| DetailsView::new(store, highlight_details, window, cx)),
+                )
             }
             Route::Settings => {
                 let store = store.clone();
