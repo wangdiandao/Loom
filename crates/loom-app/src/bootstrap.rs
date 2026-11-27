@@ -251,35 +251,15 @@ pub(crate) fn run(args: LaunchArgs) {
             let initial_hotkey = settings.global_hotkey.clone();
             let store = cx.new(|cx| UiStore::new(coordinator, config_store, settings, cx));
 
-            let (tray, tray_signal) = match TrayController::new() {
-                Ok((controller, signal)) => (Some(controller), Some(signal)),
-                Err(err) => {
-                    tracing::warn!(%err, "failed to initialize system tray icon");
-                    (None, None)
-                }
-            };
-
-            let hotkey_signal = HotkeyWakeSignal::default();
-            let trigger_signal = hotkey_signal.clone();
-            let mut hotkey = GlobalHotkeyController::new(Arc::new(move || {
-                trigger_signal.trigger();
-            }));
-            if NativeBackend::CAPABILITIES.contains(CapabilityFlags::GLOBAL_HOTKEY)
-                && let Some(ref spec) = initial_hotkey
-                && let Err(err) = hotkey.set_hotkey(Some(spec))
-            {
-                tracing::warn!(%err, hotkey = %spec, "failed to register configured global wakeup hotkey");
-            }
-
             cx.set_global(AppRuntime {
                 store,
                 active_window: None,
                 active_route: initial_route,
                 hiding_to_tray: false,
                 explicit_exit: false,
-                tray,
-                hotkey: Some(hotkey),
-                hotkey_signal: Some(hotkey_signal.clone()),
+                tray: None,
+                hotkey: None,
+                hotkey_signal: None,
                 _window_closed_sub: None,
                 _single_instance: single_instance,
             });
@@ -291,15 +271,50 @@ pub(crate) fn run(args: LaunchArgs) {
                 runtime._window_closed_sub = Some(closed_sub);
             });
 
-            if let Some(signal) = tray_signal {
-                spawn_tray_event_loop(signal, cx);
-            }
-            spawn_hotkey_event_loop(hotkey_signal, cx);
-
+            // Open the main window first before registering Explorer tray icon / global hotkey
+            // so Shell_NotifyIconW IPC never delays first-frame window appearance.
             if let Err(err) = open_main_window(cx) {
                 tracing::error!(%err, "failed to open Loom main window");
                 cx.quit();
+                return;
             }
+
+            cx.defer(move |cx| {
+                if !cx.has_global::<AppRuntime>() || cx.global::<AppRuntime>().explicit_exit {
+                    return;
+                }
+
+                let (tray, tray_signal) = match TrayController::new() {
+                    Ok((controller, signal)) => (Some(controller), Some(signal)),
+                    Err(err) => {
+                        tracing::warn!(%err, "failed to initialize system tray icon");
+                        (None, None)
+                    }
+                };
+
+                let hotkey_signal = HotkeyWakeSignal::default();
+                let trigger_signal = hotkey_signal.clone();
+                let mut hotkey = GlobalHotkeyController::new(Arc::new(move || {
+                    trigger_signal.trigger();
+                }));
+                if NativeBackend::CAPABILITIES.contains(CapabilityFlags::GLOBAL_HOTKEY)
+                    && let Some(ref spec) = initial_hotkey
+                    && let Err(err) = hotkey.set_hotkey(Some(spec))
+                {
+                    tracing::warn!(%err, hotkey = %spec, "failed to register configured global wakeup hotkey");
+                }
+
+                cx.update_global::<AppRuntime, _>(|runtime, _| {
+                    runtime.tray = tray;
+                    runtime.hotkey = Some(hotkey);
+                    runtime.hotkey_signal = Some(hotkey_signal.clone());
+                });
+
+                if let Some(signal) = tray_signal {
+                    spawn_tray_event_loop(signal, cx);
+                }
+                spawn_hotkey_event_loop(hotkey_signal, cx);
+            });
         });
 }
 

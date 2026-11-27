@@ -9,10 +9,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use loom_config::AppSettings;
+use loom_config::{AppSettings, ConfigStore};
 use loom_engine::{EngineCommand, EngineCoordinator};
-use loom_pal::{NativeBackend, PlatformBackend};
-use loom_types::{MonitorDomain, ProcessKey, ProcessRowKind, ProcessViewMode};
+use loom_pal::{
+    FastSystemSampler, NativeBackend, PlatformBackend, ProcessSampleScratch, SystemOperator,
+};
+use loom_types::{MonitorDomain, ProcessKey, ProcessRowKind, ProcessViewMode, RefreshSpeed};
+use parking_lot::Mutex;
+
+/// Serializes real-OS E2E tests so concurrent coordinators in the same test binary
+/// do not cross-contaminate process-wide thread counts or CPU% budget measurements.
+static E2E_SERIAL: Mutex<()> = Mutex::new(());
 
 fn wait_until<F>(timeout: Duration, mut cond: F) -> bool
 where
@@ -26,6 +33,41 @@ where
         std::thread::sleep(Duration::from_millis(5));
     }
     cond()
+}
+
+fn wait_until_fast<F>(timeout: Duration, mut cond: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    cond()
+}
+
+fn sample_self_metrics(
+    sampler: &mut <NativeBackend as PlatformBackend>::FastSampler,
+    scratch: &mut ProcessSampleScratch<<NativeBackend as PlatformBackend>::ProcessExt>,
+    my_pid: u32,
+) -> (u32, u64, u64) {
+    scratch.clear();
+    sampler
+        .sample_processes(scratch)
+        .expect("sample_processes for self metrics");
+    let me = scratch
+        .samples
+        .iter()
+        .find(|s| s.key.pid == my_pid)
+        .expect("current test process must exist in SystemProcessInformation");
+    (
+        me.thread_count,
+        me.kernel_time_100ns.saturating_add(me.user_time_100ns),
+        me.private_working_set_bytes,
+    )
 }
 
 fn send_and_ack(coordinator: &EngineCoordinator<NativeBackend>, cmd: EngineCommand) {
@@ -45,6 +87,7 @@ fn send_and_ack(coordinator: &EngineCoordinator<NativeBackend>, cmd: EngineComma
 
 #[test]
 fn headless_windows_e2e_lifecycle() {
+    let _serial = E2E_SERIAL.lock();
     let my_pid = std::process::id();
 
     let backend = NativeBackend::initialize().expect("NativeBackend::initialize");
@@ -301,6 +344,261 @@ fn headless_windows_e2e_lifecycle() {
     );
 
     // 5. Clean shutdown completes swiftly without hanging.
+    let shutdown_start = Instant::now();
+    coordinator.shutdown();
+    let shutdown_elapsed = shutdown_start.elapsed();
+    assert!(
+        shutdown_elapsed < Duration::from_secs(2),
+        "EngineCoordinator::shutdown took too long: {shutdown_elapsed:?}"
+    );
+}
+
+#[test]
+fn headless_windows_engineering_budget_verification() {
+    let _serial = E2E_SERIAL.lock();
+    let my_pid = std::process::id();
+
+    // 1. Config load latency (cold first-open + warm < 5 ms debug / < 1 ms typical).
+    let temp_dir = tempfile::tempdir().expect("create temp dir for config budget test");
+    let config_path = temp_dir.path().join("settings.toml");
+    let seed_store = ConfigStore::new(config_path.clone());
+    seed_store
+        .save(&AppSettings::default())
+        .expect("seed settings.toml");
+
+    let cfg_cold_start = Instant::now();
+    let (loaded_settings, load_err) = ConfigStore::new(config_path.clone()).load_or_default();
+    let cfg_cold_elapsed = cfg_cold_start.elapsed();
+    assert!(
+        load_err.is_none(),
+        "seeded settings.toml should load cleanly: {load_err:?}"
+    );
+    assert_eq!(loaded_settings.refresh_speed, RefreshSpeed::Normal1S);
+
+    let cfg_warm_start = Instant::now();
+    let (warm_settings, warm_err) = ConfigStore::new(config_path).load_or_default();
+    let cfg_warm_elapsed = cfg_warm_start.elapsed();
+    assert!(warm_err.is_none());
+    assert_eq!(warm_settings, loaded_settings);
+
+    eprintln!(
+        "[budget] config load: cold={:.3} ms ({} us), warm={:.3} ms ({} us)",
+        cfg_cold_elapsed.as_secs_f64() * 1_000.0,
+        cfg_cold_elapsed.as_micros(),
+        cfg_warm_elapsed.as_secs_f64() * 1_000.0,
+        cfg_warm_elapsed.as_micros()
+    );
+    let cfg_warm_ceiling = if cfg!(debug_assertions) {
+        Duration::from_millis(10)
+    } else {
+        Duration::from_millis(5)
+    };
+    assert!(
+        cfg_warm_elapsed < cfg_warm_ceiling,
+        "warm config load exceeded budget ({cfg_warm_elapsed:?} >= {cfg_warm_ceiling:?})"
+    );
+
+    // Prepare a standalone probe sampler to measure warm fast-lane scan latency,
+    // baseline OS thread count, and self CPU% without interfering with EngineCoordinator.
+    let probe_backend = NativeBackend::initialize().expect("probe NativeBackend::initialize");
+    let logical_cpus = probe_backend.operator().logical_cpu_count().max(1);
+    let mut probe_sampler = probe_backend
+        .create_fast_sampler()
+        .expect("probe create_fast_sampler");
+    let mut probe_scratch = ProcessSampleScratch::with_capacity(512, 16 * 1024);
+
+    // Warm up standalone sampler once and measure steady-state warm sample_processes latency.
+    let _ = sample_self_metrics(&mut probe_sampler, &mut probe_scratch, my_pid);
+    let mut sample_total = Duration::ZERO;
+    let mut sample_max = Duration::ZERO;
+    const WARM_ITERS: u32 = 20;
+    for _ in 0..WARM_ITERS {
+        probe_scratch.clear();
+        let t0 = Instant::now();
+        probe_sampler
+            .sample_processes(&mut probe_scratch)
+            .expect("warm sample_processes");
+        let dt = t0.elapsed();
+        sample_total += dt;
+        if dt > sample_max {
+            sample_max = dt;
+        }
+    }
+    let avg_sample_ms = (sample_total.as_secs_f64() * 1_000.0) / f64::from(WARM_ITERS);
+    eprintln!(
+        "[budget] warm sample_processes ({} procs, {} iters): avg={:.3} ms, max={:.3} ms",
+        probe_scratch.samples.len(),
+        WARM_ITERS,
+        avg_sample_ms,
+        sample_max.as_secs_f64() * 1_000.0
+    );
+
+    // Record baseline self OS thread count immediately prior to EngineCoordinator::new.
+    let (threads_before, _, _) =
+        sample_self_metrics(&mut probe_sampler, &mut probe_scratch, my_pid);
+
+    // 2. Measure EngineCoordinator::<NativeBackend>::new time-to-first-non-empty-snapshot.
+    let cold_start = Instant::now();
+    let backend = NativeBackend::initialize().expect("NativeBackend::initialize");
+    let coordinator =
+        EngineCoordinator::new(backend, loaded_settings).expect("EngineCoordinator::new");
+    assert!(
+        wait_until_fast(Duration::from_secs(3), || {
+            let snap = coordinator.snapshot();
+            snap.revisions.processes >= 1 && !snap.processes.rows.is_empty()
+        }),
+        "Tick 0 must publish a non-empty snapshot"
+    );
+    let first_snap_elapsed = cold_start.elapsed();
+    let snap0 = coordinator.snapshot();
+    eprintln!(
+        "[budget] EngineCoordinator first non-empty snapshot ({} live procs): {:.3} ms",
+        snap0.processes.total_process_count,
+        first_snap_elapsed.as_secs_f64() * 1_000.0
+    );
+    let cold_ceiling = if cfg!(debug_assertions) {
+        Duration::from_millis(250)
+    } else {
+        Duration::from_millis(50)
+    };
+    assert!(
+        first_snap_elapsed < cold_ceiling,
+        "time-to-first-snapshot exceeded budget ({first_snap_elapsed:?} >= {cold_ceiling:?})"
+    );
+
+    // 3. Verify self process thread count delta caused by EngineCoordinator is strictly <= 3
+    //    (1 fast-lane thread + <= 2 slow-lane bulkhead workers).
+    let (threads_after_init, _, pws_bytes) =
+        sample_self_metrics(&mut probe_sampler, &mut probe_scratch, my_pid);
+    let thread_delta = threads_after_init.saturating_sub(threads_before);
+    eprintln!(
+        "[budget] OS threads: before={threads_before}, after_init={threads_after_init}, delta={thread_delta}, private_ws={:.2} MB",
+        pws_bytes as f64 / (1024.0 * 1024.0)
+    );
+    assert!(
+        thread_delta <= 3,
+        "EngineCoordinator must spawn at most 3 background threads (before={threads_before}, after={threads_after_init}, delta={thread_delta})"
+    );
+
+    // 4. Measure steady-state headless 1s-cadence CPU% after initial cold-cache warmup.
+    //    Allow Tick 1 (+250ms calibration) and initial slow-lane cold backfill to settle.
+    std::thread::sleep(Duration::from_millis(1_500));
+    let rev_before_steady = coordinator.snapshot().revisions.processes;
+    let wall_t0 = Instant::now();
+    let (_, cpu_t0, _) = sample_self_metrics(&mut probe_sampler, &mut probe_scratch, my_pid);
+    std::thread::sleep(Duration::from_millis(2_200));
+    let (_, cpu_t1, pws_steady) =
+        sample_self_metrics(&mut probe_sampler, &mut probe_scratch, my_pid);
+    let wall_elapsed = wall_t0.elapsed();
+    let rev_after_steady = coordinator.snapshot().revisions.processes;
+
+    let cpu_delta_100ns = cpu_t1.saturating_sub(cpu_t0);
+    let cpu_pct = (cpu_delta_100ns as f64
+        / (wall_elapsed.as_secs_f64() * 1e7 * f64::from(logical_cpus)))
+        * 100.0;
+    eprintln!(
+        "[budget] steady-state 1s headless ({} ticks over {:.2}s, {} logical CPUs): cpu={:.4}%, private_ws={:.2} MB",
+        rev_after_steady.saturating_sub(rev_before_steady),
+        wall_elapsed.as_secs_f64(),
+        logical_cpus,
+        cpu_pct,
+        pws_steady as f64 / (1024.0 * 1024.0)
+    );
+    assert!(
+        rev_after_steady > rev_before_steady,
+        "steady-state 1s cadence must continue publishing process snapshots"
+    );
+    let cpu_ceiling_pct = if cfg!(debug_assertions) { 5.0 } else { 1.0 };
+    assert!(
+        cpu_pct < cpu_ceiling_pct,
+        "steady-state headless CPU% ({cpu_pct:.4}%) exceeded test ceiling ({cpu_ceiling_pct:.2}%)"
+    );
+
+    // 5. Real WindowsBackend on-demand lease acquire/release cycle across Performance,
+    //    PerCoreCpu, Services, Startup, Users, and AppHistory without leaks or lingering polls.
+    let perf_lease = coordinator.acquire_lease(MonitorDomain::Performance);
+    let per_core_lease = coordinator.acquire_lease(MonitorDomain::PerCoreCpu);
+    let services_lease = coordinator.acquire_lease(MonitorDomain::Services);
+    let startup_lease = coordinator.acquire_lease(MonitorDomain::Startup);
+    let users_lease = coordinator.acquire_lease(MonitorDomain::Users);
+    let history_lease = coordinator.acquire_lease(MonitorDomain::AppHistory);
+
+    assert!(
+        wait_until(Duration::from_secs(6), || {
+            let snap = coordinator.snapshot();
+            snap.revisions.performance >= 1
+                && !snap.performance.per_core_permille.is_empty()
+                && snap.revisions.services >= 1
+                && snap.revisions.startup >= 1
+                && snap.revisions.users >= 1
+                && snap.revisions.app_history >= 1
+        }),
+        "all leased on-demand domains (Performance/PerCoreCpu/Services/Startup/Users/AppHistory) must populate"
+    );
+
+    let leased_snap = coordinator.snapshot();
+    eprintln!(
+        "[budget] leased domains populated: per_core={}, services={}, startup={}, users={}, app_history={}",
+        leased_snap.performance.per_core_permille.len(),
+        leased_snap.services.items.len(),
+        leased_snap.startup.items.len(),
+        leased_snap.users.sessions.len(),
+        leased_snap.app_history.items.len(),
+    );
+    assert!(
+        !leased_snap.services.items.is_empty(),
+        "real Windows SCM should enumerate active services"
+    );
+
+    // Drop all on-demand leases and run a synchronizing ForceRefresh barrier so any
+    // in-flight slow-lane polls finish before capturing frozen revisions.
+    drop(perf_lease);
+    drop(per_core_lease);
+    drop(services_lease);
+    drop(startup_lease);
+    drop(users_lease);
+    drop(history_lease);
+
+    send_and_ack(&coordinator, EngineCommand::ForceRefresh);
+    std::thread::sleep(Duration::from_millis(100));
+    send_and_ack(&coordinator, EngineCommand::ForceRefresh);
+
+    let frozen = coordinator.snapshot();
+    for _ in 0..2 {
+        send_and_ack(&coordinator, EngineCommand::ForceRefresh);
+    }
+    let after_release = coordinator.snapshot();
+
+    assert_eq!(
+        after_release.revisions.services, frozen.revisions.services,
+        "Services revision must not bump after lease drop"
+    );
+    assert!(Arc::ptr_eq(&frozen.services, &after_release.services));
+
+    assert_eq!(
+        after_release.revisions.startup, frozen.revisions.startup,
+        "Startup revision must not bump after lease drop"
+    );
+    assert!(Arc::ptr_eq(&frozen.startup, &after_release.startup));
+
+    assert_eq!(
+        after_release.revisions.users, frozen.revisions.users,
+        "Users revision must not bump after lease drop"
+    );
+    assert!(Arc::ptr_eq(&frozen.users, &after_release.users));
+
+    assert_eq!(
+        after_release.revisions.app_history, frozen.revisions.app_history,
+        "AppHistory revision must not bump after lease drop"
+    );
+    assert!(Arc::ptr_eq(&frozen.app_history, &after_release.app_history));
+
+    assert!(
+        after_release.performance.per_core_permille.is_empty(),
+        "PerCoreCpu slice must clear per-core vector once unleased"
+    );
+
+    // Clean shutdown completes swiftly.
     let shutdown_start = Instant::now();
     coordinator.shutdown();
     let shutdown_elapsed = shutdown_start.elapsed();
