@@ -21,7 +21,8 @@ use std::time::Instant;
 
 use loom_pal_api::{PalError, SlowMetadataProber};
 use loom_types::{
-    ExeIconRgba, ExeStaticAsset, ProcessArch, ProcessColdMeta, ProcessKey, UacVirtualization,
+    DiskDeviceSample, ExeIconRgba, ExeStaticAsset, HardwareStaticInfo, ProcessArch,
+    ProcessColdMeta, ProcessKey, UacVirtualization,
 };
 use parking_lot::RwLock;
 use windows_sys::Wdk::System::Threading::{
@@ -66,6 +67,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICO
 
 use crate::circuit_breaker::CircuitBreaker;
 use crate::handle::{OwnedHandle, null_wide_ptr, open_verified_process, to_wide_null};
+use crate::perf::cpu::probe_hardware_static_info as probe_win_hardware_static_info;
+use crate::perf::disk::DiskPerformanceProber;
 
 /// Target downsampled icon width and height in pixels (`20 x 20` RGBA8 = 1,600 bytes).
 const ICON_TARGET_DIM: u16 = 20;
@@ -158,6 +161,7 @@ pub struct WindowsSlowProber {
     circuit_breaker: CircuitBreaker,
     drive_type_cache: RwLock<HashMap<u8, u32>>,
     sid_cache: RwLock<HashMap<Vec<u8>, Arc<str>>>,
+    disk_prober: DiskPerformanceProber,
 }
 
 impl WindowsSlowProber {
@@ -172,6 +176,7 @@ impl WindowsSlowProber {
             circuit_breaker,
             drive_type_cache: RwLock::new(HashMap::new()),
             sid_cache: RwLock::new(HashMap::new()),
+            disk_prober: DiskPerformanceProber::new(),
         }
     }
 
@@ -355,6 +360,14 @@ impl SlowMetadataProber for WindowsSlowProber {
             icon,
             is_network_path: false,
         })
+    }
+
+    fn probe_hardware_static_info(&self) -> Result<HardwareStaticInfo, PalError> {
+        Ok(probe_win_hardware_static_info())
+    }
+
+    fn probe_disk_performance(&self) -> Result<Vec<DiskDeviceSample>, PalError> {
+        Ok(self.disk_prober.probe(&self.circuit_breaker))
     }
 }
 

@@ -1,6 +1,6 @@
 //! Caller-owned reusable scratch buffers for zero-allocation fast-lane sampling.
 
-use loom_types::{ProcessHotSample, SystemPerfSample};
+use loom_types::{GpuAdapterSample, NetAdapterSample, ProcessHotSample, SystemPerfSample};
 
 /// Reusable scratch buffer passed to [`crate::FastSystemSampler::sample_processes`].
 ///
@@ -99,6 +99,10 @@ pub struct PerfSampleScratch {
     pub sample: SystemPerfSample,
     /// Latest per-logical-CPU utilization values in permille (`0..=1000`).
     pub per_core_permille: Vec<u16>,
+    /// Latest per-network-adapter telemetry samples (Ethernet / Wi-Fi).
+    pub networks: Vec<NetAdapterSample>,
+    /// Latest per-GPU-adapter telemetry samples (`GPU 0..N`).
+    pub gpus: Vec<GpuAdapterSample>,
 }
 
 impl PerfSampleScratch {
@@ -108,10 +112,12 @@ impl PerfSampleScratch {
         Self::default()
     }
 
-    /// Resets counters and clears per-core metrics while retaining allocated capacity.
+    /// Resets counters and clears device vectors while retaining allocated capacity.
     #[inline]
     pub fn clear(&mut self) {
         self.sample = SystemPerfSample::default();
         self.per_core_permille.clear();
+        self.networks.clear();
+        self.gpus.clear();
     }
 }

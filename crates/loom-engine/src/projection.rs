@@ -10,10 +10,12 @@ use std::sync::Arc;
 
 use loom_pal_api::ProcessSampleScratch;
 use loom_types::{
-    DetailsRowProjection, DetailsSortColumn, DetailsTableSlice, DetailsViewMode, HistoryRing,
-    PerformanceSlice, PlatformKind, PlatformProfile, ProcessArch, ProcessCategory, ProcessKey,
-    ProcessPriority, ProcessRowKind, ProcessRowProjection, ProcessSortColumn, ProcessStatusFlags,
-    ProcessTableSlice, ProcessViewMode, SortDirection, SystemPerfSample, Timestamp100Ns,
+    DetailsRowProjection, DetailsSortColumn, DetailsTableSlice, DetailsViewMode, DiskDeviceSample,
+    DiskDeviceSlice, GpuAdapterSample, GpuAdapterSlice, GpuEngineSlice, HardwareStaticInfo,
+    HistoryRing, NetAdapterSample, NetAdapterSlice, PerformanceSlice, PlatformKind,
+    PlatformProfile, ProcessArch, ProcessCategory, ProcessKey, ProcessPriority, ProcessRowKind,
+    ProcessRowProjection, ProcessSortColumn, ProcessStatusFlags, ProcessTableSlice,
+    ProcessViewMode, SortDirection, SystemPerfSample, ThroughputRing, Timestamp100Ns,
     UacVirtualization,
 };
 
@@ -197,6 +199,12 @@ pub struct ProjectionEngine {
     mem_history: HistoryRing<60>,
     per_core_permille: Vec<u16>,
     per_core_history: Vec<HistoryRing<60>>,
+    hardware_info: HardwareStaticInfo,
+    disks: Vec<DiskDeviceSlice>,
+    networks: Vec<NetAdapterSlice>,
+    gpus: Vec<GpuAdapterSlice>,
+    latest_disk_read_bps: u64,
+    latest_disk_write_bps: u64,
 }
 
 impl Default for ProjectionEngine {
@@ -234,6 +242,12 @@ impl ProjectionEngine {
             mem_history: HistoryRing::new(),
             per_core_permille: Vec::new(),
             per_core_history: Vec::new(),
+            hardware_info: HardwareStaticInfo::default(),
+            disks: Vec::new(),
+            networks: Vec::new(),
+            gpus: Vec::new(),
+            latest_disk_read_bps: 0,
+            latest_disk_write_bps: 0,
         }
     }
 
@@ -369,10 +383,23 @@ impl ProjectionEngine {
 
         self.total_memory_permille = self.latest_perf.mem_util_permille();
 
-        let perf_disk_bps = scratch
-            .perf
+        if self.latest_perf.disk_read_bytes_per_sec == 0
+            && self.latest_perf.disk_write_bytes_per_sec == 0
+        {
+            self.latest_perf.disk_read_bytes_per_sec = self.latest_disk_read_bps;
+            self.latest_perf.disk_write_bytes_per_sec = self.latest_disk_write_bps;
+        }
+        if self.latest_perf.physical_core_count == 0 {
+            self.latest_perf.physical_core_count = self.hardware_info.cpu.physical_cores;
+        }
+        if self.latest_perf.cpu_base_freq_mhz == 0 {
+            self.latest_perf.cpu_base_freq_mhz = self.hardware_info.cpu.base_freq_mhz;
+        }
+
+        let perf_disk_bps = self
+            .latest_perf
             .disk_read_bytes_per_sec
-            .saturating_add(scratch.perf.disk_write_bytes_per_sec);
+            .saturating_add(self.latest_perf.disk_write_bytes_per_sec);
         self.total_disk_bytes_per_sec = if perf_disk_bps > 0 {
             perf_disk_bps
         } else {
@@ -415,6 +442,16 @@ impl ProjectionEngine {
             if sample.mem_total_bytes > 0 {
                 self.total_memory_permille = sample.mem_util_permille();
             }
+            if sample.disk_read_bytes_per_sec == 0 && sample.disk_write_bytes_per_sec == 0 {
+                sample.disk_read_bytes_per_sec = self.latest_disk_read_bps;
+                sample.disk_write_bytes_per_sec = self.latest_disk_write_bps;
+            }
+            if sample.physical_core_count == 0 {
+                sample.physical_core_count = self.hardware_info.cpu.physical_cores;
+            }
+            if sample.cpu_base_freq_mhz == 0 {
+                sample.cpu_base_freq_mhz = self.hardware_info.cpu.base_freq_mhz;
+            }
             self.latest_perf = sample;
         }
 
@@ -433,6 +470,190 @@ impl ProjectionEngine {
             for (ring, &val) in self.per_core_history.iter_mut().zip(cores.iter()) {
                 ring.push(val);
             }
+        }
+    }
+
+    /// Stores static CPU and SMBIOS memory hardware metadata probed on the slow lane.
+    pub fn set_hardware_static_info(&mut self, info: HardwareStaticInfo) {
+        if self.latest_perf.physical_core_count == 0 {
+            self.latest_perf.physical_core_count = info.cpu.physical_cores;
+        }
+        if self.latest_perf.cpu_base_freq_mhz == 0 {
+            self.latest_perf.cpu_base_freq_mhz = info.cpu.base_freq_mhz;
+        }
+        self.hardware_info = info;
+    }
+
+    /// Updates per-network-adapter and per-GPU-adapter 60-point histories, pruning stale devices.
+    pub fn record_network_and_gpu(
+        &mut self,
+        net_samples: &[NetAdapterSample],
+        gpu_samples: &[GpuAdapterSample],
+    ) {
+        // Reconcile network adapters by LUID.
+        let mut prev_nets: HashMap<u64, (ThroughputRing<60>, ThroughputRing<60>)> = self
+            .networks
+            .drain(..)
+            .map(|n| (n.luid, (n.recv_history, n.sent_history)))
+            .collect();
+
+        for sample in net_samples {
+            let (mut recv_history, mut sent_history) = prev_nets
+                .remove(&sample.luid)
+                .unwrap_or_else(|| (ThroughputRing::new(), ThroughputRing::new()));
+            recv_history.push(sample.recv_bytes_per_sec);
+            sent_history.push(sample.sent_bytes_per_sec);
+            self.networks.push(NetAdapterSlice {
+                luid: sample.luid,
+                name: Arc::clone(&sample.name),
+                description: Arc::clone(&sample.description),
+                connection_type: sample.connection_type,
+                link_speed_bps: sample.link_speed_bps,
+                ipv4: sample.ipv4.clone(),
+                ipv6: sample.ipv6.clone(),
+                dns_suffix: sample.dns_suffix.clone(),
+                recv_bytes_per_sec: sample.recv_bytes_per_sec,
+                sent_bytes_per_sec: sample.sent_bytes_per_sec,
+                recv_history,
+                sent_history,
+            });
+        }
+
+        // Reconcile GPU adapters by LUID and per-engine histories by engine name.
+        type PrevGpuRings = (
+            HistoryRing<60>,
+            HistoryRing<60>,
+            HistoryRing<60>,
+            HashMap<Arc<str>, HistoryRing<60>>,
+        );
+        let mut prev_gpus: HashMap<u64, PrevGpuRings> = self
+            .gpus
+            .drain(..)
+            .map(|g| {
+                let eng_map = g.engines.into_iter().map(|e| (e.name, e.history)).collect();
+                (
+                    g.luid,
+                    (
+                        g.util_history,
+                        g.dedicated_mem_history,
+                        g.shared_mem_history,
+                        eng_map,
+                    ),
+                )
+            })
+            .collect();
+
+        for sample in gpu_samples {
+            let (
+                mut util_history,
+                mut dedicated_mem_history,
+                mut shared_mem_history,
+                mut prev_engs,
+            ) = prev_gpus.remove(&sample.luid).unwrap_or_else(|| {
+                (
+                    HistoryRing::new(),
+                    HistoryRing::new(),
+                    HistoryRing::new(),
+                    HashMap::new(),
+                )
+            });
+
+            util_history.push(sample.util_permille);
+            dedicated_mem_history.push(ratio_permille(
+                sample.dedicated_used_bytes,
+                sample.dedicated_total_bytes,
+            ));
+            shared_mem_history.push(ratio_permille(
+                sample.shared_used_bytes,
+                sample.shared_total_bytes,
+            ));
+
+            let mut engines = Vec::with_capacity(sample.engines.len());
+            for eng in &sample.engines {
+                let mut history = prev_engs.remove(&eng.name).unwrap_or_else(HistoryRing::new);
+                history.push(eng.util_permille);
+                engines.push(GpuEngineSlice {
+                    name: Arc::clone(&eng.name),
+                    util_permille: eng.util_permille,
+                    history,
+                });
+            }
+
+            self.gpus.push(GpuAdapterSlice {
+                index: sample.index,
+                luid: sample.luid,
+                name: Arc::clone(&sample.name),
+                driver_version: sample.driver_version.clone(),
+                directx_version: sample.directx_version.clone(),
+                pci_location: sample.pci_location.clone(),
+                temperature_celsius: sample.temperature_celsius,
+                util_permille: sample.util_permille,
+                dedicated_used_bytes: sample.dedicated_used_bytes,
+                dedicated_total_bytes: sample.dedicated_total_bytes,
+                shared_used_bytes: sample.shared_used_bytes,
+                shared_total_bytes: sample.shared_total_bytes,
+                util_history,
+                dedicated_mem_history,
+                shared_mem_history,
+                engines,
+            });
+        }
+    }
+
+    /// Updates per-physical-disk 60-point histories (keyed by physical disk `index`), prunes
+    /// removed disks, and syncs aggregate disk read/write rates onto `latest_perf`.
+    pub fn record_disk_performance(&mut self, disk_samples: &[DiskDeviceSample]) {
+        type PrevDiskRings = (HistoryRing<60>, ThroughputRing<60>, ThroughputRing<60>);
+        let mut prev_disks: HashMap<u32, PrevDiskRings> = self
+            .disks
+            .drain(..)
+            .map(|d| (d.index, (d.active_history, d.read_history, d.write_history)))
+            .collect();
+
+        let mut total_read: u64 = 0;
+        let mut total_write: u64 = 0;
+
+        for sample in disk_samples {
+            let (mut active_history, mut read_history, mut write_history) =
+                prev_disks.remove(&sample.index).unwrap_or_else(|| {
+                    (
+                        HistoryRing::new(),
+                        ThroughputRing::new(),
+                        ThroughputRing::new(),
+                    )
+                });
+            active_history.push(sample.active_time_permille);
+            read_history.push(sample.read_bytes_per_sec);
+            write_history.push(sample.write_bytes_per_sec);
+
+            total_read = total_read.saturating_add(sample.read_bytes_per_sec);
+            total_write = total_write.saturating_add(sample.write_bytes_per_sec);
+
+            self.disks.push(DiskDeviceSlice {
+                index: sample.index,
+                model: Arc::clone(&sample.model),
+                media_type: sample.media_type,
+                drive_letters: Arc::clone(&sample.drive_letters),
+                capacity_bytes: sample.capacity_bytes,
+                active_time_permille: sample.active_time_permille,
+                read_bytes_per_sec: sample.read_bytes_per_sec,
+                write_bytes_per_sec: sample.write_bytes_per_sec,
+                avg_response_us: sample.avg_response_us,
+                circuit_open: sample.circuit_open,
+                active_history,
+                read_history,
+                write_history,
+            });
+        }
+
+        self.disks.sort_by_key(|d| d.index);
+        self.latest_disk_read_bps = total_read;
+        self.latest_disk_write_bps = total_write;
+        self.latest_perf.disk_read_bytes_per_sec = total_read;
+        self.latest_perf.disk_write_bytes_per_sec = total_write;
+        let combined = total_read.saturating_add(total_write);
+        if combined > 0 {
+            self.total_disk_bytes_per_sec = combined;
         }
     }
 
@@ -536,6 +757,11 @@ impl ProjectionEngine {
             } else {
                 Vec::new()
             },
+            cpu_info: self.hardware_info.cpu.clone(),
+            memory_info: self.hardware_info.memory.clone(),
+            disks: self.disks.clone(),
+            networks: self.networks.clone(),
+            gpus: self.gpus.clone(),
         }
     }
 
@@ -1846,6 +2072,14 @@ fn compute_throughput_permille(bytes_per_sec: u64, total_bytes_per_sec: u64) -> 
     }
     let total = u128::from(total_bytes_per_sec);
     ((u128::from(bytes_per_sec) * 1_000 + (total / 2)) / total).min(1_000) as u16
+}
+
+#[inline]
+fn ratio_permille(used: u64, total: u64) -> u16 {
+    if used == 0 || total == 0 {
+        return 0;
+    }
+    ((u128::from(used) * 1_000) / u128::from(total)).min(1_000) as u16
 }
 
 #[inline]

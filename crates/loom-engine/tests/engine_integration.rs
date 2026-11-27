@@ -18,8 +18,10 @@ use loom_pal_api::{
     SystemOperator,
 };
 use loom_types::{
-    AppHistoryRecord, CapabilityFlags, CpuAffinityMask, DetailsViewMode, ExeIconRgba,
-    ExeStaticAsset, MonitorDomain, PlatformProfile, ProcessArch, ProcessCategory, ProcessColdMeta,
+    AppHistoryRecord, CapabilityFlags, CpuAffinityMask, CpuStaticInfo, DetailsViewMode,
+    DiskDeviceSample, DiskMediaType, ExeIconRgba, ExeStaticAsset, GpuAdapterSample,
+    GpuEngineSample, HardwareStaticInfo, MemoryHardwareInfo, MonitorDomain, NetAdapterSample,
+    NetConnectionType, PlatformProfile, ProcessArch, ProcessCategory, ProcessColdMeta,
     ProcessHotSample, ProcessKey, ProcessPriority, ProcessRowKind, ProcessSortColumn,
     ProcessStatusFlags, ProcessViewMode, RefreshSpeed, RunTaskRequest, ServiceRecord,
     SortDirection, StartupEntry, SystemPerfSample, Timestamp100Ns, TreeKillItem, TreeKillReport,
@@ -70,6 +72,9 @@ struct MockState {
     sample_perf_calls: AtomicUsize,
     probe_proc_calls: AtomicUsize,
     probe_asset_calls: AtomicUsize,
+    probe_hw_calls: AtomicUsize,
+    probe_disk_calls: AtomicUsize,
+    disk_probe_sleep: Duration,
     slow_probe_block_pid: Option<u32>,
     slow_probe_sleep: Duration,
     slow_probe_release: Option<Receiver<()>>,
@@ -92,6 +97,9 @@ impl MockState {
             sample_perf_calls: AtomicUsize::new(0),
             probe_proc_calls: AtomicUsize::new(0),
             probe_asset_calls: AtomicUsize::new(0),
+            probe_hw_calls: AtomicUsize::new(0),
+            probe_disk_calls: AtomicUsize::new(0),
+            disk_probe_sleep: Duration::ZERO,
             slow_probe_block_pid: None,
             slow_probe_sleep: Duration::ZERO,
             slow_probe_release: None,
@@ -204,15 +212,61 @@ impl FastSystemSampler for MockFastSampler {
             timestamp: ts,
             cpu_total_permille: 320,
             cpu_kernel_permille: 80,
+            cpu_freq_mhz: 4200,
+            cpu_base_freq_mhz: 3600,
             logical_cpu_count: self.state.logical_cpus,
             mem_total_bytes: self.state.mem_total_bytes,
             mem_used_bytes: self.state.mem_total_bytes / 2,
+            net_recv_bytes_per_sec: 125_000 + calls * 1000,
+            net_sent_bytes_per_sec: 42_000 + calls * 500,
+            gpu_util_permille: 240,
+            gpu_dedicated_used_bytes: 2 * 1024 * 1024 * 1024,
+            gpu_dedicated_total_bytes: 8 * 1024 * 1024 * 1024,
+            gpu_shared_used_bytes: 512 * 1024 * 1024,
             ..SystemPerfSample::default()
         };
         scratch.per_core_permille.clear();
         scratch
             .per_core_permille
             .extend((0..self.state.logical_cpus).map(|i| 100 + (i as u16) * 50));
+        scratch.networks.clear();
+        scratch.networks.push(NetAdapterSample {
+            luid: 0x1001,
+            name: Arc::from("Ethernet"),
+            description: Arc::from("Mock Gigabit Adapter"),
+            connection_type: NetConnectionType::Ethernet,
+            link_speed_bps: 1_000_000_000,
+            ipv4: Some(Arc::from("192.168.1.50")),
+            ipv6: Some(Arc::from("fe80::1")),
+            dns_suffix: Some(Arc::from("local")),
+            recv_bytes_per_sec: 125_000 + calls * 1000,
+            sent_bytes_per_sec: 42_000 + calls * 500,
+        });
+        scratch.gpus.clear();
+        scratch.gpus.push(GpuAdapterSample {
+            index: 0,
+            luid: 0x2001,
+            name: Arc::from("Mock RTX GPU"),
+            driver_version: Some(Arc::from("32.0.15.6000")),
+            directx_version: Some(Arc::from("12 (WDDM 3.1)")),
+            pci_location: Some(Arc::from("PCI bus 1, device 0, function 0")),
+            temperature_celsius: Some(48),
+            util_permille: 240,
+            dedicated_used_bytes: 2 * 1024 * 1024 * 1024,
+            dedicated_total_bytes: 8 * 1024 * 1024 * 1024,
+            shared_used_bytes: 512 * 1024 * 1024,
+            shared_total_bytes: 8 * 1024 * 1024 * 1024,
+            engines: vec![
+                GpuEngineSample {
+                    name: Arc::from("3D"),
+                    util_permille: 240,
+                },
+                GpuEngineSample {
+                    name: Arc::from("Copy"),
+                    util_permille: 45,
+                },
+            ],
+        });
         Ok(ts)
     }
 }
@@ -266,6 +320,49 @@ impl SlowMetadataProber for MockSlowProber {
             }),
             is_network_path: false,
         })
+    }
+
+    fn probe_hardware_static_info(&self) -> Result<HardwareStaticInfo, PalError> {
+        self.state.probe_hw_calls.fetch_add(1, Ordering::AcqRel);
+        Ok(HardwareStaticInfo {
+            cpu: CpuStaticInfo {
+                brand_name: Arc::from("Mock Ryzen 9 9950X"),
+                base_freq_mhz: 3600,
+                sockets: 1,
+                physical_cores: self.state.logical_cpus / 2,
+                logical_processors: self.state.logical_cpus,
+                virtualization_enabled: Some(true),
+                l1_cache_bytes: 512 * 1024,
+                l2_cache_bytes: 4 * 1024 * 1024,
+                l3_cache_bytes: 32 * 1024 * 1024,
+            },
+            memory: MemoryHardwareInfo {
+                speed_mt_s: Some(6000),
+                slots_used: Some(2),
+                slots_total: Some(4),
+                form_factor: Some(Arc::from("DIMM")),
+                hardware_reserved_bytes: 128 * 1024 * 1024,
+            },
+        })
+    }
+
+    fn probe_disk_performance(&self) -> Result<Vec<DiskDeviceSample>, PalError> {
+        let n = self.state.probe_disk_calls.fetch_add(1, Ordering::AcqRel) as u64;
+        if !self.state.disk_probe_sleep.is_zero() {
+            std::thread::sleep(self.state.disk_probe_sleep);
+        }
+        Ok(vec![DiskDeviceSample {
+            index: 0,
+            model: Arc::from("Mock NVMe 1TB"),
+            media_type: DiskMediaType::Nvme,
+            drive_letters: Arc::from("C:"),
+            capacity_bytes: 1024 * 1024 * 1024 * 1024,
+            active_time_permille: 150,
+            read_bytes_per_sec: 10_000_000 + n * 1_000,
+            write_bytes_per_sec: 5_000_000 + n * 500,
+            avg_response_us: 350,
+            circuit_open: false,
+        }])
     }
 }
 
@@ -708,6 +805,9 @@ fn slow_disk_5s_fault_injection_never_blocks_fast_lane_or_shutdown() {
         sample_perf_calls: AtomicUsize::new(0),
         probe_proc_calls: AtomicUsize::new(0),
         probe_asset_calls: AtomicUsize::new(0),
+        probe_hw_calls: AtomicUsize::new(0),
+        probe_disk_calls: AtomicUsize::new(0),
+        disk_probe_sleep: Duration::ZERO,
         slow_probe_block_pid: Some(500),
         slow_probe_sleep: Duration::from_secs(5),
         slow_probe_release: Some(release_rx),
@@ -1231,4 +1331,203 @@ fn engine_coordinator_publishes_backend_platform_profile_in_snapshot() {
     let unknown_coord =
         EngineCoordinator::new(MockBackend::initialize().unwrap(), AppSettings::default()).unwrap();
     assert_eq!(unknown_coord.snapshot().platform, PlatformProfile::UNKNOWN);
+}
+
+#[test]
+fn performance_lease_gates_hardware_and_disk_polling_and_populates_60_point_histories() {
+    let state = MockState::new(vec![MockProcSpec::new(10, 100, 0, "app.exe")]);
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+
+    let coord = EngineCoordinator::new(backend, settings).unwrap();
+
+    // Run 3 fast-lane ticks without Performance or PerCoreCpu lease -> 0 disk / HW static probes.
+    for _ in 0..3 {
+        coord
+            .send_command_with_reply(EngineCommand::ForceRefresh)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+    }
+    assert_eq!(
+        state.probe_hw_calls.load(Ordering::Acquire),
+        0,
+        "hardware static info must not be probed when Performance is unleased"
+    );
+    assert_eq!(
+        state.probe_disk_calls.load(Ordering::Acquire),
+        0,
+        "disk performance must not be polled when Performance is unleased"
+    );
+    assert_eq!(state.sample_perf_calls.load(Ordering::Acquire), 0);
+
+    // Acquire both Performance and PerCoreCpu leases -> wakes coordinator immediately.
+    let perf_lease = coord.acquire_lease(MonitorDomain::Performance);
+    let core_lease = coord.acquire_lease(MonitorDomain::PerCoreCpu);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            let snap = coord.snapshot();
+            !snap.performance.cpu_info.brand_name.is_empty()
+                && !snap.performance.disks.is_empty()
+                && !snap.performance.networks.is_empty()
+                && !snap.performance.gpus.is_empty()
+                && !snap.performance.per_core_history.is_empty()
+        }),
+        "Performance + PerCoreCpu lease must populate static hardware, disk, network, GPU, and per-core slices"
+    );
+
+    // Drive 65 ticks so every 60-point ring wraps cleanly at capacity 60.
+    for _ in 0..65 {
+        let prev_disk_polls = state.probe_disk_calls.load(Ordering::Acquire);
+        coord
+            .send_command_with_reply(EngineCommand::ForceRefresh)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        // Wait for the slow-lane disk poll for this tick to settle so disk rings advance in lockstep.
+        let _ = wait_until(Duration::from_millis(200), || {
+            state.probe_disk_calls.load(Ordering::Acquire) > prev_disk_polls
+        });
+    }
+
+    // Wait for final disk result to be applied to snapshot.
+    assert!(wait_until(Duration::from_secs(1), || {
+        let snap = coord.snapshot();
+        snap.performance
+            .disks
+            .first()
+            .is_some_and(|d| d.active_history.len() == 60)
+    }));
+
+    let snap = coord.snapshot();
+    let perf = &snap.performance;
+
+    // Hardware static info probed exactly ONCE.
+    assert_eq!(state.probe_hw_calls.load(Ordering::Acquire), 1);
+    assert_eq!(perf.cpu_info.brand_name.as_ref(), "Mock Ryzen 9 9950X");
+    assert_eq!(perf.memory_info.speed_mt_s, Some(6000));
+    assert_eq!(perf.memory_info.slots_used, Some(2));
+    assert_eq!(perf.memory_info.slots_total, Some(4));
+    assert_eq!(perf.memory_info.form_factor.as_deref(), Some("DIMM"));
+
+    // 60-point histories populated for CPU, Memory, Per-Core CPU, Disk, Network, and GPU + engines.
+    assert_eq!(perf.cpu_history.len(), 60);
+    assert_eq!(perf.cpu_kernel_history.len(), 60);
+    assert_eq!(perf.mem_history.len(), 60);
+    assert_eq!(perf.per_core_history.len(), 4);
+    assert!(perf.per_core_history.iter().all(|r| r.len() == 60));
+
+    assert_eq!(perf.disks.len(), 1);
+    assert_eq!(perf.disks[0].active_history.len(), 60);
+    assert_eq!(perf.disks[0].read_history.len(), 60);
+    assert_eq!(perf.disks[0].write_history.len(), 60);
+    assert!(perf.latest.disk_read_bytes_per_sec >= 10_000_000);
+    assert!(perf.latest.disk_write_bytes_per_sec >= 5_000_000);
+
+    assert_eq!(perf.networks.len(), 1);
+    assert_eq!(perf.networks[0].recv_history.len(), 60);
+    assert_eq!(perf.networks[0].sent_history.len(), 60);
+    assert!(perf.networks[0].recv_history.max_value() >= 125_000);
+
+    assert_eq!(perf.gpus.len(), 1);
+    assert_eq!(perf.gpus[0].util_history.len(), 60);
+    assert_eq!(perf.gpus[0].dedicated_mem_history.len(), 60);
+    assert_eq!(perf.gpus[0].shared_mem_history.len(), 60);
+    assert_eq!(perf.gpus[0].engines.len(), 2);
+    assert!(perf.gpus[0].engines.iter().all(|e| e.history.len() == 60));
+
+    // Drop leases -> subsequent ticks stop disk and performance sampling.
+    drop(perf_lease);
+    drop(core_lease);
+    let disk_before = state.probe_disk_calls.load(Ordering::Acquire);
+    let perf_before = state.sample_perf_calls.load(Ordering::Acquire);
+    for _ in 0..3 {
+        coord
+            .send_command_with_reply(EngineCommand::ForceRefresh)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+    }
+    assert_eq!(state.probe_disk_calls.load(Ordering::Acquire), disk_before);
+    assert_eq!(state.sample_perf_calls.load(Ordering::Acquire), perf_before);
+}
+
+#[test]
+fn slow_disk_probe_400ms_never_blocks_fast_lane_and_deduplicates_polls() {
+    let state = Arc::new(MockState {
+        procs: vec![MockProcSpec::new(20, 100, 0, "worker.exe")],
+        current_ts: 100_000_000,
+        ts_step_100ns: 2_500_000,
+        logical_cpus: 4,
+        mem_total_bytes: 16 * 1024 * 1024 * 1024,
+        sample_proc_calls: AtomicUsize::new(0),
+        sample_perf_calls: AtomicUsize::new(0),
+        probe_proc_calls: AtomicUsize::new(0),
+        probe_asset_calls: AtomicUsize::new(0),
+        probe_hw_calls: AtomicUsize::new(0),
+        probe_disk_calls: AtomicUsize::new(0),
+        disk_probe_sleep: Duration::from_millis(400),
+        slow_probe_block_pid: None,
+        slow_probe_sleep: Duration::ZERO,
+        slow_probe_release: None,
+        recorded_tree_kills: Mutex::new(Vec::new()),
+        priorities: Mutex::new(HashMap::new()),
+        browse_result: Mutex::new(None),
+        terminate_error_elevation: AtomicBool::new(false),
+        is_elevated: AtomicBool::new(false),
+    });
+
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let config = EngineConfig {
+        slow_shutdown_timeout: Duration::from_millis(50),
+        ..EngineConfig::default()
+    };
+    let coord = EngineCoordinator::with_config(backend, settings, config).unwrap();
+    let _perf_lease = coord.acquire_lease(MonitorDomain::Performance);
+
+    // Wait for the slow worker to start executing the 400ms disk probe.
+    assert!(wait_until(Duration::from_millis(500), || {
+        state.probe_disk_calls.load(Ordering::Acquire) >= 1
+    }));
+
+    // While the 400ms disk probe is in flight, run 5 fast-lane ForceRefresh ticks rapidly.
+    let rev_before = coord.snapshot().revisions.processes;
+    let started = Instant::now();
+    for _ in 0..5 {
+        coord
+            .send_command_with_reply(EngineCommand::ForceRefresh)
+            .unwrap()
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap();
+    }
+    let fast_elapsed = started.elapsed();
+    let rev_after = coord.snapshot().revisions.processes;
+
+    assert!(
+        rev_after >= rev_before + 5,
+        "fast-lane ticks must keep advancing while 400ms disk probe runs"
+    );
+    assert!(
+        fast_elapsed < Duration::from_millis(200),
+        "5 fast-lane ticks should complete far faster than 400ms disk probe (took {fast_elapsed:?})"
+    );
+    // Deduplication via `pending_disk_perf`: still only 1 in-flight disk poll during the 400ms window!
+    assert_eq!(
+        state.probe_disk_calls.load(Ordering::Acquire),
+        1,
+        "pending_disk_perf must prevent queueing duplicate disk polls while one is in flight"
+    );
+
+    // Wait for the 400ms disk poll to finish and publish into PerformanceSlice.
+    assert!(wait_until(Duration::from_secs(2), || {
+        !coord.snapshot().performance.disks.is_empty()
+    }));
 }

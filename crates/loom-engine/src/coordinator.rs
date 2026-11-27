@@ -200,6 +200,10 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
                     last_perf_sampled_tick: 0,
                     last_per_core_sampled_tick: 0,
                     last_domain_poll_tick: [0; MonitorDomain::COUNT],
+                    hardware_info_probed: false,
+                    pending_hardware_info: false,
+                    pending_disk_perf: false,
+                    last_disk_poll_tick: 0,
                 };
                 runner.run();
             })
@@ -347,6 +351,10 @@ struct FastLaneRunner<B: PlatformBackend> {
     last_perf_sampled_tick: u64,
     last_per_core_sampled_tick: u64,
     last_domain_poll_tick: [u64; MonitorDomain::COUNT],
+    hardware_info_probed: bool,
+    pending_hardware_info: bool,
+    pending_disk_perf: bool,
+    last_disk_poll_tick: u64,
 }
 
 impl<B: PlatformBackend> FastLaneRunner<B> {
@@ -447,7 +455,8 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             self.projection.record_performance(None, None);
         }
 
-        // Trigger on-demand slow-domain refreshes for leased domains.
+        // Trigger on-demand slow-domain refreshes and slow-lane performance probes for leased domains.
+        self.enqueue_performance_slow_probes();
         self.enqueue_leased_slow_domains();
 
         // Project and publish snapshot, updating Details ONLY when leased.
@@ -469,6 +478,8 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                     None
                 };
                 self.projection.record_performance(Some(sample), per_core);
+                self.projection
+                    .record_network_and_gpu(&self.perf_scratch.networks, &self.perf_scratch.gpus);
                 self.last_perf_sampled_tick = self.tick_count;
                 if include_per_core {
                     self.last_per_core_sampled_tick = self.tick_count;
@@ -478,6 +489,31 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 tracing::warn!(%err, "fast-lane performance sampling failed");
                 self.projection.record_performance(None, None);
             }
+        }
+    }
+
+    fn enqueue_performance_slow_probes(&mut self) {
+        if !self.leases.is_active(MonitorDomain::Performance) {
+            return;
+        }
+        if !self.hardware_info_probed
+            && !self.pending_hardware_info
+            && self
+                .slow_pool
+                .try_enqueue_priority(SlowPriorityJob::ProbeHardwareStaticInfo)
+                .is_ok()
+        {
+            self.pending_hardware_info = true;
+        }
+        if !self.pending_disk_perf
+            && self.last_disk_poll_tick != self.tick_count
+            && self
+                .slow_pool
+                .try_enqueue_priority(SlowPriorityJob::PollDiskPerformance)
+                .is_ok()
+        {
+            self.pending_disk_perf = true;
+            self.last_disk_poll_tick = self.tick_count;
         }
     }
 
@@ -568,18 +604,30 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             self.publish_slices(false, need_details, need_perf, per_core_leased);
         }
 
+        self.enqueue_performance_slow_probes();
         self.enqueue_leased_slow_domains();
     }
 
     fn handle_slow_result_batch(&mut self, first: SlowResult) {
         let mut cold_updated = false;
+        let mut perf_updated = false;
         let mut snapshot_dirty = false;
 
-        self.apply_slow_result(first, &mut cold_updated, &mut snapshot_dirty);
+        self.apply_slow_result(
+            first,
+            &mut cold_updated,
+            &mut perf_updated,
+            &mut snapshot_dirty,
+        );
 
         for _ in 1..SLOW_RESULT_DRAIN_BATCH {
             match self.slow_pool.result_rx().try_recv() {
-                Ok(res) => self.apply_slow_result(res, &mut cold_updated, &mut snapshot_dirty),
+                Ok(res) => self.apply_slow_result(
+                    res,
+                    &mut cold_updated,
+                    &mut perf_updated,
+                    &mut snapshot_dirty,
+                ),
                 Err(_) => break,
             }
         }
@@ -588,9 +636,10 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             return;
         }
 
-        if cold_updated {
-            let details_leased = self.leases.is_active(MonitorDomain::Details);
-            self.publish_slices(true, details_leased, false, false);
+        if cold_updated || perf_updated {
+            let details_leased = cold_updated && self.leases.is_active(MonitorDomain::Details);
+            let per_core_leased = perf_updated && self.leases.is_active(MonitorDomain::PerCoreCpu);
+            self.publish_slices(cold_updated, details_leased, perf_updated, per_core_leased);
         } else if snapshot_dirty {
             self.snapshot_store
                 .store(Arc::new(self.current_snapshot.clone()));
@@ -601,6 +650,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         &mut self,
         res: SlowResult,
         cold_updated: &mut bool,
+        perf_updated: &mut bool,
         snapshot_dirty: &mut bool,
     ) {
         let now = Instant::now();
@@ -672,6 +722,33 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                             matches!(err, PalError::TimedOut(_) | PalError::CircuitOpen { .. });
                         self.circuit_breaker
                             .record_probe(&target_key, elapsed, timed_out, now);
+                    }
+                }
+            }
+            SlowResult::HardwareStaticInfo(result) => {
+                self.pending_hardware_info = false;
+                match result {
+                    Ok(info) => {
+                        self.hardware_info_probed = true;
+                        self.projection.set_hardware_static_info(info);
+                        *perf_updated = true;
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "slow-lane hardware static info probe failed");
+                    }
+                }
+            }
+            SlowResult::DiskPerformancePolled(result) => {
+                self.pending_disk_perf = false;
+                match result {
+                    Ok(disks) => {
+                        if self.leases.is_active(MonitorDomain::Performance) {
+                            self.projection.record_disk_performance(&disks);
+                            *perf_updated = true;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "slow-lane disk performance poll failed");
                     }
                 }
             }

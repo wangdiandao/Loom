@@ -17,6 +17,7 @@ pub mod circuit_breaker;
 pub mod fast_sampler;
 pub(crate) mod handle;
 pub mod operator;
+pub mod perf;
 pub mod slow_prober;
 pub mod window;
 
@@ -671,5 +672,169 @@ mod tests {
             ));
             assert!(!sys.status.contains(ProcessStatusFlags::SYSTEM_IDLE));
         }
+    }
+
+    #[test]
+    fn windows_hardware_static_info_and_disk_probe_with_circuit_breaker() {
+        let prober = WindowsSlowProber::new();
+
+        // 1. Static CPU & SMBIOS memory metadata.
+        let hw = prober
+            .probe_hardware_static_info()
+            .expect("probe_hardware_static_info");
+        eprintln!(
+            "[loom-pal-windows] CPU: '{}' ({} sockets, {} physical / {} logical, base={} MHz, L1={}K, L2={}K, L3={}K, virt={:?})",
+            hw.cpu.brand_name,
+            hw.cpu.sockets,
+            hw.cpu.physical_cores,
+            hw.cpu.logical_processors,
+            hw.cpu.base_freq_mhz,
+            hw.cpu.l1_cache_bytes / 1024,
+            hw.cpu.l2_cache_bytes / 1024,
+            hw.cpu.l3_cache_bytes / 1024,
+            hw.cpu.virtualization_enabled,
+        );
+        eprintln!(
+            "[loom-pal-windows] Memory SMBIOS: speed={:?} MT/s, slots={:?}/{:?}, form={:?}, hw_reserved={} MiB",
+            hw.memory.speed_mt_s,
+            hw.memory.slots_used,
+            hw.memory.slots_total,
+            hw.memory.form_factor,
+            hw.memory.hardware_reserved_bytes / (1024 * 1024),
+        );
+        assert!(hw.cpu.sockets >= 1);
+        assert!(hw.cpu.physical_cores >= 1);
+        assert!(hw.cpu.logical_processors >= hw.cpu.physical_cores);
+        assert!(
+            !hw.cpu.brand_name.is_empty(),
+            "CPU brand name should be populated from registry"
+        );
+
+        // 2. Physical disk IOCTL probe (baseline + delta).
+        let disks1 = prober
+            .probe_disk_performance()
+            .expect("baseline probe_disk_performance");
+        eprintln!(
+            "[loom-pal-windows] disks detected: {} ({:?})",
+            disks1.len(),
+            disks1
+                .iter()
+                .map(|d| (
+                    d.index,
+                    d.model.as_ref(),
+                    d.media_type,
+                    d.drive_letters.as_ref(),
+                    d.capacity_bytes / (1024 * 1024 * 1024)
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !disks1.is_empty(),
+            "Windows host should report at least one physical disk"
+        );
+        for d in &disks1 {
+            assert!(!d.model.is_empty());
+            assert!(d.active_time_permille <= 1000);
+            assert!(!d.circuit_open);
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+        let disks2 = prober
+            .probe_disk_performance()
+            .expect("delta probe_disk_performance");
+        assert_eq!(disks2.len(), disks1.len());
+        for d in &disks2 {
+            assert!(d.active_time_permille <= 1000);
+        }
+
+        // 3. Trip circuit breaker for disk:0 -> subsequent probe skips IOCTLs and sets circuit_open=true.
+        let first_idx = disks1[0].index;
+        prober.circuit_breaker().trip(&format!("disk:{first_idx}"));
+        let disks3 = prober
+            .probe_disk_performance()
+            .expect("circuit-open probe_disk_performance");
+        let tripped = disks3
+            .iter()
+            .find(|d| d.index == first_idx)
+            .expect("tripped disk should still emit cached static entry");
+        assert!(
+            tripped.circuit_open,
+            "tripped disk circuit breaker must emit circuit_open=true"
+        );
+        assert_eq!(tripped.model, disks1[0].model);
+        assert_eq!(tripped.read_bytes_per_sec, 0);
+        assert_eq!(tripped.write_bytes_per_sec, 0);
+    }
+
+    #[test]
+    fn fast_sampler_performance_captures_freq_memory_list_network_and_gpu_within_budget() {
+        let mut sampler = WindowsFastSampler::new();
+        let mut perf = PerfSampleScratch::new();
+
+        // Cold sample initializes DXGI/D3DKMT adapter cache and delta baselines.
+        sampler
+            .sample_performance(&mut perf)
+            .expect("cold sample_performance");
+        std::thread::sleep(Duration::from_millis(25));
+
+        let started = Instant::now();
+        sampler
+            .sample_performance(&mut perf)
+            .expect("warm sample_performance");
+        let elapsed = started.elapsed();
+        eprintln!(
+            "[loom-pal-windows] warm sample_performance: {:.3} ms | freq={} / {} MHz | mem mod={}M standby={}M free={}M | nets={} | gpus={}",
+            elapsed.as_secs_f64() * 1000.0,
+            perf.sample.cpu_freq_mhz,
+            perf.sample.cpu_base_freq_mhz,
+            perf.sample.mem_modified_bytes / (1024 * 1024),
+            perf.sample.mem_standby_bytes / (1024 * 1024),
+            perf.sample.mem_free_bytes / (1024 * 1024),
+            perf.networks.len(),
+            perf.gpus.len(),
+        );
+
+        assert!(perf.sample.mem_total_bytes > 0);
+        assert!(
+            perf.sample.mem_standby_bytes + perf.sample.mem_free_bytes > 0,
+            "memory list composition should populate standby/free bytes"
+        );
+        for net in &perf.networks {
+            assert_ne!(net.luid, 0);
+            assert!(!net.name.is_empty());
+        }
+        for gpu in &perf.gpus {
+            assert!(!gpu.name.is_empty());
+            assert!(gpu.util_permille <= 1000);
+            for eng in &gpu.engines {
+                assert!(!eng.name.is_empty());
+                assert!(eng.util_permille <= 1000);
+            }
+            eprintln!(
+                "  GPU {}: '{}' | util={:.1}% | vram={}/{} MiB | shared={}/{} MiB | temp={:?}C | drv={:?} | dx={:?} | pci={:?} | engines={}",
+                gpu.index,
+                gpu.name,
+                f32::from(gpu.util_permille) / 10.0,
+                gpu.dedicated_used_bytes / (1024 * 1024),
+                gpu.dedicated_total_bytes / (1024 * 1024),
+                gpu.shared_used_bytes / (1024 * 1024),
+                gpu.shared_total_bytes / (1024 * 1024),
+                gpu.temperature_celsius,
+                gpu.driver_version,
+                gpu.directx_version,
+                gpu.pci_location,
+                gpu.engines.len(),
+            );
+        }
+
+        #[cfg(debug_assertions)]
+        const PERF_BUDGET: Duration = Duration::from_millis(50);
+        #[cfg(not(debug_assertions))]
+        const PERF_BUDGET: Duration = Duration::from_millis(20);
+        assert!(
+            elapsed < PERF_BUDGET,
+            "warm sample_performance exceeded {:?} budget: {elapsed:?}",
+            PERF_BUDGET
+        );
     }
 }

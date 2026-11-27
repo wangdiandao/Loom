@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use loom_types::{
-    AppHistoryRecord, CapabilityFlags, CpuAffinityMask, ExeStaticAsset, PlatformProfile,
-    ProcessColdMeta, ProcessKey, ProcessPriority, RunTaskRequest, ServiceRecord, StartupEntry,
-    Timestamp100Ns, TreeKillReport, UserSessionRecord, WaitChainNode,
+    AppHistoryRecord, CapabilityFlags, CpuAffinityMask, DiskDeviceSample, ExeStaticAsset,
+    HardwareStaticInfo, PlatformProfile, ProcessColdMeta, ProcessKey, ProcessPriority,
+    RunTaskRequest, ServiceRecord, StartupEntry, Timestamp100Ns, TreeKillReport, UserSessionRecord,
+    WaitChainNode,
 };
 
 use crate::{PalError, PerfSampleScratch, ProcessSampleScratch};
@@ -122,6 +123,20 @@ pub trait SlowMetadataProber: Send + Sync {
     /// Extracts path-level static binary metadata (publisher, description, 20x20 RGBA icon)
     /// for `exe_path`, bypassing deep I/O for UNC / network-mapped drives.
     fn probe_exe_asset(&self, exe_path: &str) -> Result<ExeStaticAsset, PalError>;
+
+    /// Probes static CPU brand/topology/cache metadata and SMBIOS physical memory hardware info.
+    ///
+    /// Executed once on demand on the slow-lane bulkhead pool when `MonitorDomain::Performance`
+    /// is leased.
+    fn probe_hardware_static_info(&self) -> Result<HardwareStaticInfo, PalError> {
+        Ok(HardwareStaticInfo::default())
+    }
+
+    /// Probes physical disk devices (`0..N`) for active time, throughput, average response
+    /// latency, and media metadata behind per-device circuit-breaker isolation.
+    fn probe_disk_performance(&self) -> Result<Vec<DiskDeviceSample>, PalError> {
+        Ok(Vec::new())
+    }
 }
 
 /// On-demand system service enumeration and lifecycle control contract.

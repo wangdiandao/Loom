@@ -20,8 +20,8 @@ use loom_pal_api::{
     SlowMetadataProber, StartupManager, SystemOperator,
 };
 use loom_types::{
-    AppHistoryRecord, ExeStaticAsset, MonitorDomain, ProcessColdMeta, ProcessKey, RunTaskRequest,
-    ServiceRecord, StartupEntry, UserSessionRecord,
+    AppHistoryRecord, DiskDeviceSample, ExeStaticAsset, HardwareStaticInfo, MonitorDomain,
+    ProcessColdMeta, ProcessKey, RunTaskRequest, ServiceRecord, StartupEntry, UserSessionRecord,
 };
 use parking_lot::{Condvar, Mutex};
 
@@ -339,6 +339,8 @@ pub(crate) enum SlowPriorityJob {
         reply: Option<Sender<CommandEvent>>,
     },
     PollOnDemandDomain(MonitorDomain),
+    ProbeHardwareStaticInfo,
+    PollDiskPerformance,
 }
 
 /// Low-priority background metadata probe jobs.
@@ -365,6 +367,8 @@ pub(crate) enum SlowResult {
         result: Result<ExeStaticAsset, PalError>,
         elapsed: Duration,
     },
+    HardwareStaticInfo(Result<HardwareStaticInfo, PalError>),
+    DiskPerformancePolled(Result<Vec<DiskDeviceSample>, PalError>),
     ServicesPolled(Result<Vec<ServiceRecord>, PalError>),
     StartupPolled(Result<(Option<u64>, Vec<StartupEntry>), PalError>),
     UsersPolled(Result<Vec<UserSessionRecord>, PalError>),
@@ -528,7 +532,7 @@ fn slow_worker_loop<B: PlatformBackend>(
         select_biased! {
             recv(priority_rx) -> msg => {
                 match msg {
-                    Ok(job) => execute_priority_job(&*backend, &events, &result_tx, job),
+                    Ok(job) => execute_priority_job(&*backend, &*prober, &events, &result_tx, job),
                     Err(_) => break,
                 }
             }
@@ -544,6 +548,7 @@ fn slow_worker_loop<B: PlatformBackend>(
 
 fn execute_priority_job<B: PlatformBackend>(
     backend: &B,
+    prober: &B::SlowProber,
     events: &EventBus,
     result_tx: &Sender<SlowResult>,
     job: SlowPriorityJob,
@@ -645,6 +650,14 @@ fn execute_priority_job<B: PlatformBackend>(
                 }
             };
             let _ = result_tx.try_send(msg);
+        }
+        SlowPriorityJob::ProbeHardwareStaticInfo => {
+            let res = prober.probe_hardware_static_info();
+            let _ = result_tx.try_send(SlowResult::HardwareStaticInfo(res));
+        }
+        SlowPriorityJob::PollDiskPerformance => {
+            let res = prober.probe_disk_performance();
+            let _ = result_tx.try_send(SlowResult::DiskPerformancePolled(res));
         }
     }
 }
