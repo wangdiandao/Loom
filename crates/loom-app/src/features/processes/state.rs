@@ -1,113 +1,9 @@
-//! Pure state helpers, selection predicates, and bounded icon render cache for Processes view.
+//! Pure state helpers and selection predicates for Processes view.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Weak};
-
-use gpui_kit::RenderImage;
 use loom_types::{
-    CapabilityFlags, ExeIconRgba, ProcessCategory, ProcessKey, ProcessRowKind,
-    ProcessRowProjection, ProcessSortColumn, ProcessStatusFlags, ResourceDisplayMode,
-    SortDirection,
+    CapabilityFlags, ProcessCategory, ProcessKey, ProcessRowKind, ProcessRowProjection,
+    ProcessSortColumn, ProcessStatusFlags, ResourceDisplayMode, SortDirection,
 };
-use loom_ui_kit::rgba_icon_to_render_image;
-
-/// Maximum number of cached GPUI [`RenderImage`] icons retained by [`IconRenderCache`].
-pub(crate) const MAX_CACHED_ICONS: usize = 512;
-
-/// Unique key identifying an [`ExeIconRgba`] buffer by pointer address and dimensions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct IconCacheKey {
-    ptr: usize,
-    width: u16,
-    height: u16,
-    len: usize,
-}
-
-impl IconCacheKey {
-    #[inline]
-    fn from_icon(icon: &ExeIconRgba) -> Self {
-        Self {
-            ptr: icon.rgba.as_ptr() as usize,
-            width: icon.width,
-            height: icon.height,
-            len: icon.rgba.len(),
-        }
-    }
-}
-
-struct IconCacheEntry {
-    /// Weak reference to the originating `Arc<[u8]>` to guard against ABA address reuse.
-    source: Weak<[u8]>,
-    image: Arc<RenderImage>,
-}
-
-/// Bounded local cache mapping unique [`ExeIconRgba`] buffers to GPUI [`RenderImage`] handles.
-///
-/// Prevents re-swapping RGBA -> BGRA pixels and re-uploading textures on every frame.
-#[derive(Default)]
-pub(crate) struct IconRenderCache {
-    entries: HashMap<IconCacheKey, IconCacheEntry>,
-    max_entries: usize,
-}
-
-impl IconRenderCache {
-    /// Creates a new bounded [`IconRenderCache`] capped at [`MAX_CACHED_ICONS`].
-    pub(crate) fn new() -> Self {
-        Self::with_capacity(MAX_CACHED_ICONS)
-    }
-
-    /// Creates a new bounded [`IconRenderCache`] with a custom capacity ceiling.
-    pub(crate) fn with_capacity(max_entries: usize) -> Self {
-        Self {
-            entries: HashMap::new(),
-            max_entries: max_entries.max(1),
-        }
-    }
-
-    /// Returns a cached [`Arc<RenderImage>`] for `icon`, converting it once on cache miss.
-    pub(crate) fn get_or_insert(&mut self, icon: &ExeIconRgba) -> Option<Arc<RenderImage>> {
-        let key = IconCacheKey::from_icon(icon);
-        if let Some(entry) = self.entries.get(&key)
-            && entry
-                .source
-                .upgrade()
-                .is_some_and(|existing| Arc::ptr_eq(&existing, &icon.rgba))
-        {
-            return Some(Arc::clone(&entry.image));
-        }
-
-        let rendered = rgba_icon_to_render_image(icon)?;
-
-        if self.entries.len() >= self.max_entries {
-            self.prune();
-        }
-
-        self.entries.insert(
-            key,
-            IconCacheEntry {
-                source: Arc::downgrade(&icon.rgba),
-                image: Arc::clone(&rendered),
-            },
-        );
-        Some(rendered)
-    }
-
-    /// Reclaims entries whose underlying `ExeIconRgba` buffer was dropped, or clears
-    /// the cache if all live entries exceed `max_entries`.
-    fn prune(&mut self) {
-        self.entries
-            .retain(|_, entry| entry.source.strong_count() > 0);
-        if self.entries.len() >= self.max_entries {
-            self.entries.clear();
-        }
-    }
-
-    /// Returns the number of cached entries currently retained.
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
-}
 
 /// Resource columns whose formatting can be toggled between `Values` and `Percent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +139,8 @@ mod tests {
         ExeIconRgba, ProcessCategory, ProcessKey, ProcessRowKind, ProcessRowProjection,
         ProcessSortColumn, ProcessStatusFlags, ResourceDisplayMode, SortDirection,
     };
+
+    use crate::features::table_columns::IconRenderCache;
 
     use super::*;
 

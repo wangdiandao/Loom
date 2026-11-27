@@ -1,15 +1,12 @@
 //! On-demand Details vertical feature slice gated by an RAII [`ScopedMonitorLease`].
 //!
-//! Acquires `MonitorDomain::Details` upon construction and automatically releases it
-//! when unmounted so hidden views incur zero projection overhead. Provides the full-field
-//! sortable Flat/Tree process table, `ProcessKey`-anchored selection & `Delete` hotkey,
-//! cross-page `JumpToDetails(ProcessKey)` scroll-to-row & highlight, multi-level right-click
-//! context menu, and feature-local **Set Affinity** & confirmation dialogs.
+//! Splits the static toolbar + highlight banner ([`DetailsView`]) from the
+//! high-frequency 2D-virtualized `gpui-kit` `DataTable` (`Entity<TableState<DetailsTableDelegate>>`)
+//! so live snapshot ticks update only the table entity while `gpui-fast` reuses
+//! the surrounding shell and toolbar as retained subtrees.
 
 mod affinity_dialog;
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -18,40 +15,36 @@ use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableEvent, TableState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _,
     WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
-    App, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent,
-    MouseButton, ParentElement as _, Render, RenderImage, ScrollHandle, ScrollStrategy,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
-    UniformListScrollHandle, WeakEntity, Window, div, img, prelude::FluentBuilder as _, px,
-    uniform_list,
+    App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement as _, Render, ScrollStrategy,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window,
+    div, img, prelude::FluentBuilder as _, px,
 };
 use loom_types::{
-    CapabilityFlags, DetailsRowProjection, DetailsSortColumn, DetailsViewMode, MonitorDomain,
-    PlatformProfile, ProcessKey, ProcessPriority, ProcessStatusFlags, SortDirection,
+    CapabilityFlags, DetailsRowProjection, DetailsSortColumn, DetailsTableSlice, DetailsViewMode,
+    LanguagePreference, MonitorDomain, PlatformProfile, ProcessArch, ProcessKey, ProcessPriority,
+    ProcessStatusFlags, SortDirection, UacVirtualization,
 };
 use loom_ui_kit::{
-    HeatmapLevel, LoomSemanticColors, format_bytes, format_cpu_time, format_permille, heatmap_cell,
-    rgba_icon_to_render_image,
+    HeatmapLevel, LoomSemanticColors, format_bytes_shared, format_cpu_time_shared,
+    format_permille_shared, heatmap_cell,
 };
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
 use crate::features::table_columns::{
-    ColumnKey, ColumnSpec, ColumnToggleItem, HeaderColumnDescriptor, HeaderMenuAction,
-    TableColumnLayout, attach_header_reorder_handlers, attach_table_column_drag_handlers,
-    build_column_header_menu, open_select_columns_dialog, render_header_trailing_spacer,
-    render_interactive_header_cell,
+    ColumnKey, ColumnSpec, ColumnToggleItem, DataTablePane, HeaderMenuAction, IconRenderCache,
+    TableColumnLayout, build_column_header_menu, open_select_columns_dialog,
 };
 use crate::i18n;
 
-const DETAILS_ROW_HEIGHT: f32 = 30.0;
-const ICON_CACHE_MAX_ENTRIES: usize = 512;
-const TABLE_HORIZONTAL_PADDING: f32 = 16.0;
+const DETAILS_HEADER_HEIGHT: f32 = 32.0;
 
 // Default column widths (px) kept wide enough so horizontal scrolling prevents cramping.
 const COL_NAME_W: f32 = 240.0;
@@ -75,6 +68,9 @@ const COL_PUBLISHER_W: f32 = 164.0;
 const COL_DESCRIPTION_W: f32 = 200.0;
 const COL_EXE_PATH_W: f32 = 300.0;
 const COL_CMDLINE_W: f32 = 360.0;
+
+#[cfg(test)]
+const TABLE_HORIZONTAL_PADDING: f32 = 16.0;
 
 /// Logical columns supported by [`DetailsView`] (distinct diagnostic column set from Processes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,13 +260,21 @@ impl DetailsColumn {
                 | Self::GpuMemory
         )
     }
+
+    const fn is_heatmap(self) -> bool {
+        matches!(self, Self::Cpu | Self::Memory)
+    }
 }
 
 /// Total minimum default width of the Details table, adapting to advertised [`CapabilityFlags`].
 #[cfg(test)]
 pub(super) fn table_min_width(capabilities: CapabilityFlags) -> f32 {
     TableColumnLayout::new(DetailsColumn::default_specs(capabilities))
-        .total_width(TABLE_HORIZONTAL_PADDING)
+        .visible_columns()
+        .iter()
+        .map(|c| c.width)
+        .sum::<f32>()
+        + TABLE_HORIZONTAL_PADDING
 }
 
 /// Scheduling priority classes displayed in the `Set priority >` submenu (highest to lowest).
@@ -286,7 +290,13 @@ pub(super) const PRIORITY_MENU_ORDER: [ProcessPriority; 6] = [
 /// Fallback total physical memory (16 GiB) used only before the first performance sample arrives.
 const FALLBACK_TOTAL_RAM_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
-type IconCache = Rc<RefCell<HashMap<Arc<str>, Option<Arc<RenderImage>>>>>;
+#[inline]
+const fn to_column_sort(dir: SortDirection) -> ColumnSort {
+    match dir {
+        SortDirection::Ascending => ColumnSort::Ascending,
+        SortDirection::Descending => ColumnSort::Descending,
+    }
+}
 
 /// Snapshot of a process row needed by dialogs and right-click context menu handlers.
 #[derive(Debug, Clone)]
@@ -440,25 +450,89 @@ fn memory_heatmap_level(private_working_set_bytes: u64, total_ram_bytes: u64) ->
     HeatmapLevel::from_permille(permille)
 }
 
-/// Resolves or lazily caches a `20×20` GPUI [`RenderImage`] from a row's RGBA icon.
-fn resolve_cached_icon(cache: &IconCache, row: &DetailsRowProjection) -> Option<Arc<RenderImage>> {
-    let rgba = row.icon.as_ref()?;
-    let cache_key = row
-        .exe_path
-        .as_ref()
-        .map(Arc::clone)
-        .unwrap_or_else(|| Arc::clone(&row.name));
+/// Cached localized strings for [`DetailsTableDelegate`] to avoid per-frame `i18n::tr` allocations.
+struct DetailsLocaleCache {
+    running: SharedString,
+    suspended: SharedString,
+    elevated_yes: SharedString,
+    elevated_no: SharedString,
+    loading: SharedString,
+    empty_search: SharedString,
+    priority_idle: SharedString,
+    priority_below_normal: SharedString,
+    priority_normal: SharedString,
+    priority_above_normal: SharedString,
+    priority_high: SharedString,
+    priority_realtime: SharedString,
+    arch_x64: SharedString,
+    arch_x86: SharedString,
+    arch_arm64: SharedString,
+    arch_unknown: SharedString,
+    uac_enabled: SharedString,
+    uac_disabled: SharedString,
+    uac_not_allowed: SharedString,
+    uac_unknown: SharedString,
+}
 
-    let mut guard = cache.borrow_mut();
-    if let Some(existing) = guard.get(&cache_key) {
-        return existing.clone();
+impl DetailsLocaleCache {
+    fn build() -> Self {
+        Self {
+            running: i18n::tr("details.status_running").into(),
+            suspended: i18n::tr("details.status_suspended").into(),
+            elevated_yes: i18n::tr("details.elevated_yes").into(),
+            elevated_no: i18n::tr("details.elevated_no").into(),
+            loading: i18n::tr("details.loading").into(),
+            empty_search: i18n::tr("details.empty_search").into(),
+            priority_idle: i18n::process_priority_label(ProcessPriority::Idle).into(),
+            priority_below_normal: i18n::process_priority_label(ProcessPriority::BelowNormal)
+                .into(),
+            priority_normal: i18n::process_priority_label(ProcessPriority::Normal).into(),
+            priority_above_normal: i18n::process_priority_label(ProcessPriority::AboveNormal)
+                .into(),
+            priority_high: i18n::process_priority_label(ProcessPriority::High).into(),
+            priority_realtime: i18n::process_priority_label(ProcessPriority::Realtime).into(),
+            arch_x64: i18n::process_arch_label(ProcessArch::X64).into(),
+            arch_x86: i18n::process_arch_label(ProcessArch::X86).into(),
+            arch_arm64: i18n::process_arch_label(ProcessArch::Arm64).into(),
+            arch_unknown: i18n::process_arch_label(ProcessArch::Unknown).into(),
+            uac_enabled: i18n::uac_virtualization_label(UacVirtualization::Enabled).into(),
+            uac_disabled: i18n::uac_virtualization_label(UacVirtualization::Disabled).into(),
+            uac_not_allowed: i18n::uac_virtualization_label(UacVirtualization::NotAllowed).into(),
+            uac_unknown: i18n::uac_virtualization_label(UacVirtualization::Unknown).into(),
+        }
     }
-    if guard.len() >= ICON_CACHE_MAX_ENTRIES {
-        guard.clear();
+
+    #[inline]
+    fn priority_label(&self, p: ProcessPriority) -> SharedString {
+        match p {
+            ProcessPriority::Idle => self.priority_idle.clone(),
+            ProcessPriority::BelowNormal => self.priority_below_normal.clone(),
+            ProcessPriority::Normal => self.priority_normal.clone(),
+            ProcessPriority::AboveNormal => self.priority_above_normal.clone(),
+            ProcessPriority::High => self.priority_high.clone(),
+            ProcessPriority::Realtime => self.priority_realtime.clone(),
+        }
     }
-    let converted = rgba_icon_to_render_image(rgba);
-    guard.insert(cache_key, converted.clone());
-    converted
+
+    #[inline]
+    fn arch_label(&self, arch: ProcessArch) -> SharedString {
+        match arch {
+            ProcessArch::X64 => self.arch_x64.clone(),
+            ProcessArch::X86 => self.arch_x86.clone(),
+            ProcessArch::Arm64 => self.arch_arm64.clone(),
+            ProcessArch::Unknown => self.arch_unknown.clone(),
+        }
+    }
+
+    #[inline]
+    fn uac_label(&self, uac: UacVirtualization) -> SharedString {
+        match uac {
+            UacVirtualization::Enabled => self.uac_enabled.clone(),
+            UacVirtualization::Disabled => self.uac_disabled.clone(),
+            UacVirtualization::NotAllowed => self.uac_not_allowed.clone(),
+            UacVirtualization::Unknown => self.uac_unknown.clone(),
+        }
+    }
 }
 
 /// Terminates a process immediately for standard user processes, or opens a feature-local
@@ -630,110 +704,112 @@ fn open_end_process_tree_dialog(
     });
 }
 
-/// Live full-field Details table view holding an RAII `MonitorDomain::Details` lease.
-pub(crate) struct DetailsView {
+/// 2D-virtualized `gpui-kit` [`TableDelegate`] backing the live Details table.
+struct DetailsTableDelegate {
     store: Entity<UiStore>,
-    _details_lease: ScopedMonitorLease,
-    last_details_rev: u64,
+    details: Arc<DetailsTableSlice>,
+    capabilities: CapabilityFlags,
+    platform: PlatformProfile,
+    total_ram_bytes: u64,
+    last_rev: u64,
     selected_key: Option<ProcessKey>,
     highlighted_key: Option<ProcessKey>,
     pending_scroll_key: Option<ProcessKey>,
-    focus_handle: FocusHandle,
-    scroll_handle: UniformListScrollHandle,
-    h_scroll_handle: ScrollHandle,
     column_layout: TableColumnLayout<DetailsColumn>,
-    icon_cache: IconCache,
-    _subscriptions: Vec<Subscription>,
+    icon_cache: IconRenderCache,
+    locale: DetailsLocaleCache,
 }
 
-impl DetailsView {
-    /// Creates a new [`DetailsView`], acquiring `MonitorDomain::Details` immediately.
-    pub(crate) fn new(
-        store: Entity<UiStore>,
-        highlighted_key: Option<ProcessKey>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let lease = store.read(cx).acquire_lease(MonitorDomain::Details);
-        let (initial_rev, capabilities) = {
-            let snap = store.read(cx).snapshot();
-            (snap.revisions.details, snap.capabilities)
-        };
-        let mut column_layout = TableColumnLayout::new(DetailsColumn::default_specs(capabilities));
-        let saved_cols = store.read(cx).details_columns().to_vec();
-        if !saved_cols.is_empty() {
-            column_layout.apply_saved(&saved_cols);
-        }
-        let sub = cx.subscribe(&store, |this, _store, event, cx| match event {
-            UiStoreEvent::SnapshotUpdated(revs) => {
-                if revs.details != this.last_details_rev {
-                    this.last_details_rev = revs.details;
-                    this.try_scroll_to_pending(cx);
-                    cx.notify();
-                }
-            }
-            UiStoreEvent::SettingsChanged => cx.notify(),
-            UiStoreEvent::ElevationRequired { .. } | UiStoreEvent::CommandFailed { .. } => {}
-        });
+impl DetailsTableDelegate {
+    fn new(store: Entity<UiStore>, highlighted_key: Option<ProcessKey>, cx: &App) -> Self {
+        let store_ref = store.read(cx);
+        let snap = store_ref.snapshot();
+        let capabilities = snap.capabilities;
+        let platform = snap.platform;
+        let total_ram_bytes = snap.performance.latest.mem_total_bytes;
 
-        let mut view = Self {
-            store,
-            _details_lease: lease,
-            last_details_rev: initial_rev,
+        let mut column_layout = TableColumnLayout::new(DetailsColumn::default_specs(capabilities));
+        let saved_cols = store_ref.details_columns();
+        if !saved_cols.is_empty() {
+            column_layout.apply_saved(saved_cols);
+        }
+
+        Self {
+            store: store.clone(),
+            details: Arc::clone(&snap.details),
+            capabilities,
+            platform,
+            total_ram_bytes,
+            last_rev: snap.revisions.details,
             selected_key: highlighted_key,
             highlighted_key,
             pending_scroll_key: highlighted_key,
-            focus_handle: cx.focus_handle(),
-            scroll_handle: UniformListScrollHandle::new(),
-            h_scroll_handle: ScrollHandle::new(),
             column_layout,
-            icon_cache: Rc::new(RefCell::new(HashMap::new())),
-            _subscriptions: vec![sub],
-        };
-        view.try_scroll_to_pending(cx);
-        view
+            icon_cache: IconRenderCache::new(),
+            locale: DetailsLocaleCache::build(),
+        }
     }
 
-    fn persist_column_layout(&self, cx: &mut Context<Self>) {
+    fn persist_column_layout(&self, cx: &mut App) {
         let snapshot = self.column_layout.snapshot();
         UiCommands::set_details_columns(&self.store, snapshot, cx);
     }
 
-    fn hide_column(&mut self, col: DetailsColumn, cx: &mut Context<Self>) {
+    fn trigger_sort_col(&self, col_ix: usize, cx: &mut App) {
+        let Some(spec) = self.column_layout.visible_column(col_ix) else {
+            return;
+        };
+        let Some(target) = spec.id.sort_column() else {
+            return;
+        };
+        let next_dir = next_sort_direction(
+            self.details.sort_column,
+            self.details.sort_direction,
+            target,
+        );
+        UiCommands::set_details_sort(&self.store, target, next_dir, cx);
+    }
+
+    fn hide_column(&mut self, col: DetailsColumn, cx: &mut App) -> bool {
         if self.column_layout.hide_column(col) {
             self.persist_column_layout(cx);
-            cx.notify();
+            true
+        } else {
+            false
         }
     }
 
-    fn reset_columns_to_default(&mut self, cx: &mut Context<Self>) {
-        let capabilities = self.store.read(cx).snapshot().capabilities;
+    fn reset_columns(&mut self, cx: &mut App) {
         self.column_layout
-            .reset(DetailsColumn::default_specs(capabilities));
+            .reset(DetailsColumn::default_specs(self.capabilities));
         UiCommands::set_details_columns(&self.store, Vec::new(), cx);
-        cx.notify();
     }
 
-    fn open_select_columns_modal(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let (capabilities, platform) = {
-            let snap = self.store.read(cx).snapshot();
-            (snap.capabilities, snap.platform)
-        };
-        let items = DetailsColumn::selectable_order(capabilities)
+    fn open_select_columns_modal(
+        &self,
+        table_weak: WeakEntity<TableState<Self>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let items = DetailsColumn::selectable_order(self.capabilities)
             .into_iter()
             .map(|col| ColumnToggleItem {
                 slug: col.slug(),
-                label: col.label(platform),
+                label: col.label(self.platform),
                 visible: self.column_layout.is_visible(col),
             })
             .collect();
-        let view_weak = cx.entity().downgrade();
         open_select_columns_dialog(
             items,
             Rc::new(move |selected_slugs, cx| {
-                let _ = view_weak.update(cx, |this, cx| {
-                    if this.column_layout.apply_visible_slugs(&selected_slugs) {
-                        this.persist_column_layout(cx);
-                        cx.notify();
+                let _ = table_weak.update(cx, |table, cx| {
+                    let changed = table
+                        .delegate_mut()
+                        .column_layout
+                        .apply_visible_slugs(&selected_slugs);
+                    if changed {
+                        table.delegate().persist_column_layout(cx);
+                        table.refresh(cx);
                     }
                 });
             }),
@@ -745,31 +821,40 @@ impl DetailsView {
     fn build_header_context_menu(
         menu: PopupMenu,
         clicked_col: Option<DetailsColumn>,
-        view_weak: WeakEntity<Self>,
+        table_weak: WeakEntity<TableState<Self>>,
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
         let hide_action: Option<HeaderMenuAction> = clicked_col
             .filter(|&col| col != DetailsColumn::Name)
             .map(|col| {
-                let view_hide = view_weak.clone();
+                let weak = table_weak.clone();
                 Rc::new(move |_window: &mut Window, cx: &mut App| {
-                    let _ = view_hide.update(cx, |this, cx| this.hide_column(col, cx));
+                    let _ = weak.update(cx, |table, cx| {
+                        if table.delegate_mut().hide_column(col, cx) {
+                            table.refresh(cx);
+                        }
+                    });
                 }) as HeaderMenuAction
             });
 
-        let view_select = view_weak.clone();
+        let weak_select = table_weak.clone();
         let on_select_columns: HeaderMenuAction =
             Rc::new(move |window: &mut Window, cx: &mut App| {
-                let _ = view_select.update(cx, |this, cx| {
-                    this.open_select_columns_modal(window, cx);
+                let _ = weak_select.update(cx, |table, cx| {
+                    table
+                        .delegate()
+                        .open_select_columns_modal(weak_select.clone(), window, cx);
                 });
             });
 
-        let view_reset = view_weak;
+        let weak_reset = table_weak;
         let on_reset_defaults: HeaderMenuAction =
             Rc::new(move |_window: &mut Window, cx: &mut App| {
-                let _ = view_reset.update(cx, |this, cx| this.reset_columns_to_default(cx));
+                let _ = weak_reset.update(cx, |table, cx| {
+                    table.delegate_mut().reset_columns(cx);
+                    table.refresh(cx);
+                });
             });
 
         build_column_header_menu(
@@ -783,16 +868,827 @@ impl DetailsView {
         )
     }
 
+    fn selected_target(&self) -> Option<ProcessActionTarget> {
+        let sel = self.selected_key?;
+        find_row_index_by_key(&self.details.rows, sel)
+            .and_then(|idx| self.details.rows.get(idx))
+            .map(ProcessActionTarget::from_row)
+    }
+
+    fn has_valid_selection(&self) -> bool {
+        self.selected_key
+            .and_then(|sel| find_row_index_by_key(&self.details.rows, sel))
+            .is_some()
+    }
+}
+
+impl TableDelegate for DetailsTableDelegate {
+    fn columns_count(&self, _cx: &App) -> usize {
+        self.column_layout.visible_count()
+    }
+
+    fn rows_count(&self, _cx: &App) -> usize {
+        self.details.rows.len()
+    }
+
+    fn loading(&self, _cx: &App) -> bool {
+        self.details.revision == 0
+    }
+
+    fn column(&self, col_ix: usize, _cx: &App) -> Column {
+        let Some(spec) = self.column_layout.visible_column(col_ix) else {
+            return Column::default();
+        };
+        let col = spec.id;
+        let mut column = Column::new(col.slug(), col.label(self.platform))
+            .width(px(spec.width))
+            .min_width(px(spec.min_width))
+            .max_width(px(spec.max_width))
+            .selectable(false);
+
+        if spec.locked {
+            column = column.fixed_left().movable(false);
+        }
+        if col.right_aligned() {
+            column = column.text_right();
+        }
+        if col.is_heatmap() {
+            column = column.p_0();
+        }
+        if let Some(sort_col) = col.sort_column() {
+            if sort_col == self.details.sort_column {
+                column = column.sort(to_column_sort(self.details.sort_direction));
+            } else {
+                column = column.sortable();
+            }
+        }
+        column
+    }
+
+    fn perform_sort(
+        &mut self,
+        col_ix: usize,
+        _sort: ColumnSort,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        self.trigger_sort_col(col_ix, cx);
+    }
+
+    fn move_column(
+        &mut self,
+        col_ix: usize,
+        to_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        if self.column_layout.move_visible_column(col_ix, to_ix) {
+            self.persist_column_layout(cx);
+        }
+    }
+
+    fn render_header(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        let table_weak = cx.entity().downgrade();
+        let bg = cx.theme().secondary.opacity(0.45);
+        div()
+            .id("details-column-header")
+            .relative()
+            .bg(bg)
+            .text_xs()
+            .font_medium()
+            .child(
+                div()
+                    .id("details-header-bg-menu")
+                    .absolute()
+                    .inset_0()
+                    .context_menu(move |menu, window, cx| {
+                        Self::build_header_context_menu(menu, None, table_weak.clone(), window, cx)
+                    }),
+            )
+    }
+
+    fn render_th(
+        &mut self,
+        col_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let Some(spec) = self.column_layout.visible_column(col_ix) else {
+            return Empty.into_any_element();
+        };
+        let col = spec.id;
+        let is_active_sort = col.sort_column() == Some(self.details.sort_column);
+        let fg = cx.theme().foreground;
+        let muted_fg = cx.theme().muted_foreground;
+        let table_weak = cx.entity().downgrade();
+
+        h_flex()
+            .id(("details-th", col_ix))
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .items_center()
+            .when(col.is_heatmap(), |d| d.px_2())
+            .when(col.right_aligned(), |d| d.justify_end())
+            .text_xs()
+            .text_color(if is_active_sort { fg } else { muted_fg })
+            .when(is_active_sort, |d| d.font_semibold())
+            .cursor_pointer()
+            .on_click(cx.listener(move |table, _, _, cx| {
+                table.delegate().trigger_sort_col(col_ix, cx);
+            }))
+            .child(div().min_w_0().truncate().child(col.label(self.platform)))
+            .context_menu(move |menu, window, cx| {
+                Self::build_header_context_menu(menu, Some(col), table_weak.clone(), window, cx)
+            })
+            .into_any_element()
+    }
+
+    fn render_tr(
+        &mut self,
+        row_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        let Some(row) = self.details.rows.get(row_ix) else {
+            return div().id(("details-empty", row_ix));
+        };
+        let is_highlighted = self.highlighted_key == Some(row.key);
+        let primary = cx.theme().primary;
+
+        div()
+            .id(("details-row", process_key_element_id(row.key)))
+            .text_xs()
+            .when(is_highlighted, |s| {
+                s.bg(primary.opacity(0.24))
+                    .border_l_2()
+                    .border_color(primary)
+            })
+    }
+
+    fn render_td(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let Some(row) = self.details.rows.get(row_ix) else {
+            return Empty.into_any_element();
+        };
+        let Some(spec) = self.column_layout.visible_column(col_ix) else {
+            return Empty.into_any_element();
+        };
+
+        let theme = cx.theme();
+        let muted_fg = theme.muted_foreground;
+        let key = row.key;
+        let row_id = process_key_element_id(key);
+
+        match spec.id {
+            DetailsColumn::Name => {
+                let is_tree_mode = self.details.view_mode == DetailsViewMode::Tree;
+                let indent = if is_tree_mode {
+                    f32::from(row.depth.min(10)) * 16.0
+                } else {
+                    0.0
+                };
+                let has_children = is_tree_mode && row.has_children;
+                let is_expanded = row.is_expanded;
+                let icon_image = row
+                    .icon
+                    .as_ref()
+                    .and_then(|icon| self.icon_cache.get_or_insert(icon));
+                let toggle_store = self.store.clone();
+                let name = SharedString::from(Arc::clone(&row.name));
+
+                h_flex()
+                    .size_full()
+                    .items_center()
+                    .gap_1p5()
+                    .pl(px(indent))
+                    .overflow_hidden()
+                    .when(is_tree_mode, |el| {
+                        el.child(if has_children {
+                            div()
+                                .flex_shrink_0()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    Button::new(("details-expand", row_id))
+                                        .xsmall()
+                                        .ghost()
+                                        .icon(if is_expanded {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        })
+                                        .on_click(move |_, _, cx| {
+                                            UiCommands::toggle_details_expanded(
+                                                &toggle_store,
+                                                key,
+                                                cx,
+                                            );
+                                        }),
+                                )
+                                .into_any_element()
+                        } else {
+                            div().w(px(18.)).flex_shrink_0().into_any_element()
+                        })
+                    })
+                    .child(if let Some(image) = icon_image {
+                        img(image).size(px(18.)).flex_shrink_0().into_any_element()
+                    } else {
+                        h_flex()
+                            .size(px(18.))
+                            .flex_shrink_0()
+                            .items_center()
+                            .justify_center()
+                            .child(Icon::new(IconName::File).xsmall().text_color(muted_fg))
+                            .into_any_element()
+                    })
+                    .child(div().flex_1().min_w_0().truncate().text_xs().child(name))
+                    .into_any_element()
+            }
+            DetailsColumn::Pid => h_flex()
+                .size_full()
+                .items_center()
+                .justify_end()
+                .text_xs()
+                .font_family(theme.mono_font_family.clone())
+                .text_color(muted_fg)
+                .child(key.pid.to_string())
+                .into_any_element(),
+            DetailsColumn::Status => {
+                let status_text = if row.status.contains(ProcessStatusFlags::SUSPENDED) {
+                    self.locale.suspended.clone()
+                } else {
+                    self.locale.running.clone()
+                };
+                h_flex()
+                    .size_full()
+                    .items_center()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child(status_text),
+                    )
+                    .into_any_element()
+            }
+            DetailsColumn::UserName => {
+                let user_text = display_user_name(row.user_name.as_deref()).to_owned();
+                h_flex()
+                    .size_full()
+                    .items_center()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child(user_text),
+                    )
+                    .into_any_element()
+            }
+            DetailsColumn::SessionId => h_flex()
+                .size_full()
+                .items_center()
+                .justify_end()
+                .text_xs()
+                .font_family(theme.mono_font_family.clone())
+                .text_color(muted_fg)
+                .child(row.session_id.to_string())
+                .into_any_element(),
+            DetailsColumn::Cpu => heatmap_cell(
+                format_permille_shared(row.cpu_permille),
+                HeatmapLevel::from_permille(row.cpu_permille),
+                &LoomSemanticColors::from_theme(theme),
+            )
+            .into_any_element(),
+            DetailsColumn::CpuTime => h_flex()
+                .size_full()
+                .items_center()
+                .justify_end()
+                .text_xs()
+                .font_family(theme.mono_font_family.clone())
+                .text_color(muted_fg)
+                .child(format_cpu_time_shared(row.cpu_time_100ns))
+                .into_any_element(),
+            DetailsColumn::Memory => heatmap_cell(
+                format_bytes_shared(row.private_working_set_bytes),
+                memory_heatmap_level(row.private_working_set_bytes, self.total_ram_bytes),
+                &LoomSemanticColors::from_theme(theme),
+            )
+            .into_any_element(),
+            DetailsColumn::WorkingSet => h_flex()
+                .size_full()
+                .items_center()
+                .justify_end()
+                .text_xs()
+                .font_family(theme.mono_font_family.clone())
+                .text_color(muted_fg)
+                .child(format_bytes_shared(row.working_set_bytes))
+                .into_any_element(),
+            DetailsColumn::CommitSize => h_flex()
+                .size_full()
+                .items_center()
+                .justify_end()
+                .text_xs()
+                .font_family(theme.mono_font_family.clone())
+                .text_color(muted_fg)
+                .child(format_bytes_shared(row.commit_bytes))
+                .into_any_element(),
+            DetailsColumn::Priority => h_flex()
+                .size_full()
+                .items_center()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(muted_fg)
+                        .child(self.locale.priority_label(row.priority)),
+                )
+                .into_any_element(),
+            DetailsColumn::Handles => h_flex()
+                .size_full()
+                .items_center()
+                .justify_end()
+                .text_xs()
+                .font_family(theme.mono_font_family.clone())
+                .text_color(muted_fg)
+                .child(row.handle_count.to_string())
+                .into_any_element(),
+            DetailsColumn::Threads => h_flex()
+                .size_full()
+                .items_center()
+                .justify_end()
+                .text_xs()
+                .font_family(theme.mono_font_family.clone())
+                .text_color(muted_fg)
+                .child(row.thread_count.to_string())
+                .into_any_element(),
+            DetailsColumn::Platform => h_flex()
+                .size_full()
+                .items_center()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(muted_fg)
+                        .child(self.locale.arch_label(row.arch)),
+                )
+                .into_any_element(),
+            DetailsColumn::UacVirtualization => h_flex()
+                .size_full()
+                .items_center()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(muted_fg)
+                        .child(self.locale.uac_label(row.uac_virtualization)),
+                )
+                .into_any_element(),
+            DetailsColumn::Elevated => {
+                let text = if row.status.contains(ProcessStatusFlags::ELEVATED) {
+                    self.locale.elevated_yes.clone()
+                } else {
+                    self.locale.elevated_no.clone()
+                };
+                h_flex()
+                    .size_full()
+                    .items_center()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child(text),
+                    )
+                    .into_any_element()
+            }
+            DetailsColumn::GpuMemory => h_flex()
+                .size_full()
+                .items_center()
+                .justify_end()
+                .text_xs()
+                .font_family(theme.mono_font_family.clone())
+                .text_color(muted_fg)
+                .child(format_bytes_shared(row.gpu_dedicated_bytes))
+                .into_any_element(),
+            DetailsColumn::Publisher => {
+                let text = row
+                    .publisher
+                    .as_ref()
+                    .map(|p| SharedString::from(Arc::clone(p)))
+                    .unwrap_or_else(|| SharedString::new_static("—"));
+                h_flex()
+                    .size_full()
+                    .items_center()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child(text),
+                    )
+                    .into_any_element()
+            }
+            DetailsColumn::Description => {
+                let text = row
+                    .description
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| SharedString::from(Arc::clone(s)))
+                    .unwrap_or_else(|| SharedString::new_static("—"));
+                h_flex()
+                    .size_full()
+                    .items_center()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child(text),
+                    )
+                    .into_any_element()
+            }
+            DetailsColumn::ExePath => {
+                let path_arc = row
+                    .exe_path
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .map(Arc::clone);
+                let text = path_arc
+                    .as_ref()
+                    .map(|s| SharedString::from(Arc::clone(s)))
+                    .unwrap_or_else(|| SharedString::new_static("—"));
+
+                h_flex()
+                    .id(("details-exe", row_id))
+                    .size_full()
+                    .items_center()
+                    .overflow_hidden()
+                    .text_xs()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_color(muted_fg)
+                    .when_some(path_arc, |el, full_path| {
+                        let tip = SharedString::from(full_path);
+                        el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    })
+                    .child(div().min_w_0().truncate().child(text))
+                    .into_any_element()
+            }
+            DetailsColumn::CommandLine => {
+                let cmd_arc = row
+                    .command_line
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .map(Arc::clone);
+                let text = cmd_arc
+                    .as_ref()
+                    .map(|s| SharedString::from(Arc::clone(s)))
+                    .unwrap_or_else(|| SharedString::new_static("—"));
+
+                h_flex()
+                    .id(("details-cmd", row_id))
+                    .size_full()
+                    .items_center()
+                    .overflow_hidden()
+                    .text_xs()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_color(muted_fg)
+                    .when_some(cmd_arc, |el, full_cmd| {
+                        let tip = SharedString::from(full_cmd);
+                        el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    })
+                    .child(div().min_w_0().truncate().child(text))
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn context_menu(
+        &mut self,
+        row_ix: usize,
+        menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> PopupMenu {
+        let Some(row) = self.details.rows.get(row_ix) else {
+            return menu;
+        };
+        let target = ProcessActionTarget::from_row(row);
+        build_row_context_menu(menu, &self.store, &target, self.capabilities, window, cx)
+    }
+
+    fn row_label(&self, row_ix: usize, _cx: &App) -> Option<SharedString> {
+        let row = self.details.rows.get(row_ix)?;
+        Some(format!("{} (PID {})", row.name, row.key.pid).into())
+    }
+
+    fn render_loading(
+        &mut self,
+        _size: Size,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let muted_fg = cx.theme().muted_foreground;
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .p_8()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted_fg)
+                    .child(self.locale.loading.clone()),
+            )
+    }
+
+    fn render_empty(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let muted_fg = cx.theme().muted_foreground;
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_8()
+            .child(
+                Icon::new(IconName::Search)
+                    .size(px(24.))
+                    .text_color(muted_fg),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted_fg)
+                    .child(self.locale.empty_search.clone()),
+            )
+    }
+}
+
+/// Live full-field Details table view holding an RAII `MonitorDomain::Details` lease.
+///
+/// Splits the static toolbar/banner from the 2D-virtualized `DataTable` entity so
+/// live snapshot updates refresh only `self.table` without re-rendering the outer shell.
+pub(crate) struct DetailsView {
+    store: Entity<UiStore>,
+    _details_lease: ScopedMonitorLease,
+    table: Entity<TableState<DetailsTableDelegate>>,
+    table_pane: Entity<DataTablePane<DetailsTableDelegate>>,
+    view_mode: DetailsViewMode,
+    highlighted_key: Option<ProcessKey>,
+    has_selection: bool,
+    last_locale: LanguagePreference,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl Focusable for DetailsView {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.table.focus_handle(cx)
+    }
+}
+
+impl DetailsView {
+    /// Creates a new [`DetailsView`], acquiring `MonitorDomain::Details` immediately.
+    pub(crate) fn new(
+        store: Entity<UiStore>,
+        highlighted_key: Option<ProcessKey>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let lease = store.read(cx).acquire_lease(MonitorDomain::Details);
+        let (view_mode, last_locale) = {
+            let s = store.read(cx);
+            (s.snapshot().details.view_mode, s.settings().language)
+        };
+
+        let table = cx.new(|cx| {
+            let delegate = DetailsTableDelegate::new(store.clone(), highlighted_key, cx);
+            let mut state = TableState::new(delegate, window, cx)
+                .row_selectable(true)
+                .col_selectable(false)
+                .col_resizable(true)
+                .col_movable(true)
+                .sortable(true);
+            Self::try_scroll_to_pending_in_table(&mut state, cx);
+            state
+        });
+        let table_pane = cx.new(|_| {
+            DataTablePane::new(
+                table.clone(),
+                Size::Small,
+                px(DETAILS_HEADER_HEIGHT),
+                false,
+                i18n::tr("details.title"),
+            )
+        });
+        let has_selection = table.read(cx).delegate().has_valid_selection();
+
+        let mut subscriptions = Vec::with_capacity(2);
+
+        // Subscribe to UiStore: route live ticks directly to `self.table`.
+        let table_for_store = table.clone();
+        subscriptions.push(
+            cx.subscribe(&store, move |this, store, event, cx| match event {
+                UiStoreEvent::SnapshotUpdated(revs) => {
+                    let current_rev = table_for_store.read(cx).delegate().last_rev;
+                    if revs.details == current_rev {
+                        return;
+                    }
+                    let (next_details, next_caps, next_platform, next_ram) = {
+                        let snap = store.read(cx).snapshot();
+                        (
+                            Arc::clone(&snap.details),
+                            snap.capabilities,
+                            snap.platform,
+                            snap.performance.latest.mem_total_bytes,
+                        )
+                    };
+                    let (next_view_mode, next_has_sel) = table_for_store.update(cx, |table, cx| {
+                        let d = table.delegate_mut();
+                        let sort_changed = d.details.sort_column != next_details.sort_column
+                            || d.details.sort_direction != next_details.sort_direction;
+                        d.details = next_details;
+                        d.capabilities = next_caps;
+                        d.platform = next_platform;
+                        d.total_ram_bytes = next_ram;
+                        d.last_rev = revs.details;
+
+                        let view_mode = d.details.view_mode;
+                        let selected_idx = d
+                            .selected_key
+                            .and_then(|sel| find_row_index_by_key(&d.details.rows, sel));
+
+                        if let Some(idx) = selected_idx {
+                            if table.selected_row() != Some(idx) {
+                                table.set_selected_row(idx, cx);
+                            }
+                        } else if table.selected_row().is_some() {
+                            table.clear_selection(cx);
+                        }
+
+                        Self::try_scroll_to_pending_in_table(table, cx);
+                        if sort_changed {
+                            table.refresh(cx);
+                        }
+                        cx.notify();
+                        (view_mode, selected_idx.is_some())
+                    });
+
+                    if this.view_mode != next_view_mode || this.has_selection != next_has_sel {
+                        this.view_mode = next_view_mode;
+                        this.has_selection = next_has_sel;
+                        cx.notify();
+                    }
+                }
+                UiStoreEvent::SettingsChanged => {
+                    let next_locale = store.read(cx).settings().language;
+                    if this.last_locale != next_locale {
+                        this.last_locale = next_locale;
+                        table_for_store.update(cx, |table, cx| {
+                            table.delegate_mut().locale = DetailsLocaleCache::build();
+                            table.refresh(cx);
+                            cx.notify();
+                        });
+                        this.table_pane.update(cx, |pane, cx| {
+                            pane.set_accessibility_label(i18n::tr("details.title"), cx);
+                        });
+                        cx.notify();
+                    }
+                }
+                UiStoreEvent::ElevationRequired { .. } | UiStoreEvent::CommandFailed { .. } => {}
+            }),
+        );
+
+        // Subscribe to DataTable events: ProcessKey selection & column width persistence.
+        subscriptions.push(cx.subscribe(
+            &table,
+            |this, table, event: &TableEvent, cx| match event {
+                TableEvent::SelectRow(row_ix) => {
+                    let next_has_sel = table.update(cx, |table, _| {
+                        let d = table.delegate_mut();
+                        d.selected_key = d.details.rows.get(*row_ix).map(|r| r.key);
+                        d.selected_key.is_some()
+                    });
+                    if this.has_selection != next_has_sel {
+                        this.has_selection = next_has_sel;
+                        cx.notify();
+                    }
+                }
+                TableEvent::RightClickedRow(Some(row_ix)) => {
+                    let next_has_sel = table.update(cx, |table, cx| {
+                        let key_opt = table.delegate().details.rows.get(*row_ix).map(|r| r.key);
+                        table.delegate_mut().selected_key = key_opt;
+                        if key_opt.is_some() && table.selected_row() != Some(*row_ix) {
+                            table.set_selected_row(*row_ix, cx);
+                        }
+                        key_opt.is_some()
+                    });
+                    if this.has_selection != next_has_sel {
+                        this.has_selection = next_has_sel;
+                        cx.notify();
+                    }
+                }
+                TableEvent::ClearSelection => {
+                    table.update(cx, |table, _| {
+                        table.delegate_mut().selected_key = None;
+                    });
+                    if this.has_selection {
+                        this.has_selection = false;
+                        cx.notify();
+                    }
+                }
+                TableEvent::ColumnWidthsChanged(widths) => {
+                    table.update(cx, |table, cx| {
+                        if table
+                            .delegate_mut()
+                            .column_layout
+                            .apply_visible_widths(widths)
+                        {
+                            table.delegate().persist_column_layout(cx);
+                        }
+                    });
+                }
+                _ => {}
+            },
+        ));
+
+        Self {
+            store,
+            _details_lease: lease,
+            table,
+            table_pane,
+            view_mode,
+            highlighted_key,
+            has_selection,
+            last_locale,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    fn try_scroll_to_pending_in_table(
+        table: &mut TableState<DetailsTableDelegate>,
+        cx: &mut Context<TableState<DetailsTableDelegate>>,
+    ) {
+        let Some(target) = table.delegate().pending_scroll_key else {
+            return;
+        };
+        let found = find_row_index_by_key(&table.delegate().details.rows, target);
+        if let Some(idx) = found {
+            table
+                .vertical_scroll_handle
+                .scroll_to_item(idx, ScrollStrategy::Center);
+            table.set_selected_row(idx, cx);
+            table.delegate_mut().pending_scroll_key = None;
+        }
+    }
+
     /// Updates the highlighted target [`ProcessKey`] (e.g., from `NavigationIntent::JumpToDetails`).
     pub(crate) fn set_highlighted_key(&mut self, key: Option<ProcessKey>, cx: &mut Context<Self>) {
         self.highlighted_key = key;
-        if let Some(target) = key {
-            self.selected_key = Some(target);
-            self.pending_scroll_key = Some(target);
-            self.try_scroll_to_pending(cx);
-        } else {
-            self.pending_scroll_key = None;
-        }
+        let next_has_sel = self.table.update(cx, |table, cx| {
+            let d = table.delegate_mut();
+            d.highlighted_key = key;
+            if let Some(target) = key {
+                d.selected_key = Some(target);
+                d.pending_scroll_key = Some(target);
+                Self::try_scroll_to_pending_in_table(table, cx);
+            } else {
+                d.pending_scroll_key = None;
+            }
+            cx.notify();
+            table.delegate().has_valid_selection()
+        });
+        self.has_selection = next_has_sel;
         cx.notify();
     }
 
@@ -807,78 +1703,10 @@ impl DetailsView {
         self.set_highlighted_key(Some(key), cx);
     }
 
-    /// Attempts to scroll the virtualized table to `pending_scroll_key` once present in rows.
-    fn try_scroll_to_pending(&mut self, cx: &Context<Self>) {
-        let Some(target) = self.pending_scroll_key else {
-            return;
-        };
-        let rows = &self.store.read(cx).snapshot().details.rows;
-        if let Some(idx) = find_row_index_by_key(rows, target) {
-            self.scroll_handle
-                .scroll_to_item(idx, ScrollStrategy::Center);
-            self.pending_scroll_key = None;
-        }
-    }
-
-    fn select_row(&mut self, key: ProcessKey, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected_key = Some(key);
-        window.focus(&self.focus_handle, cx);
-        cx.notify();
-    }
-
-    fn handle_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let modifiers = &event.keystroke.modifiers;
-        if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
-            return;
-        }
-
-        let key_name = event.keystroke.key.as_str();
-        match key_name {
-            "delete" => {
-                let Some(selected) = self.selected_key else {
-                    return;
-                };
-                let target = {
-                    let rows = &self.store.read(cx).snapshot().details.rows;
-                    find_row_index_by_key(rows, selected)
-                        .and_then(|idx| rows.get(idx))
-                        .map(ProcessActionTarget::from_row)
-                };
-                if let Some(target) = target {
-                    request_end_task(&self.store, &target, window, cx);
-                }
-            }
-            "up" | "down" => {
-                let next = {
-                    let rows = &self.store.read(cx).snapshot().details.rows;
-                    if rows.is_empty() {
-                        None
-                    } else {
-                        let current = self
-                            .selected_key
-                            .and_then(|sel| find_row_index_by_key(rows, sel));
-                        let next_idx = match (current, key_name) {
-                            (Some(idx), "up") => idx.saturating_sub(1),
-                            (Some(idx), "down") => (idx + 1).min(rows.len() - 1),
-                            (None, _) => 0,
-                            _ => 0,
-                        };
-                        rows.get(next_idx).map(|row| (next_idx, row.key))
-                    }
-                };
-                if let Some((next_idx, next_key)) = next {
-                    self.selected_key = Some(next_key);
-                    self.scroll_handle
-                        .scroll_to_item(next_idx, ScrollStrategy::Nearest);
-                    cx.notify();
-                }
-            }
-            _ => {}
+    fn trigger_end_task_for_selected(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.table.read(cx).delegate().selected_target();
+        if let Some(target) = target {
+            request_end_task(&self.store, &target, window, cx);
         }
     }
 }
@@ -887,40 +1715,20 @@ impl Render for DetailsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         debug_assert_eq!(self._details_lease.domain(), MonitorDomain::Details);
 
-        let snapshot = self.store.read(cx).snapshot().clone();
-        let details = snapshot.details.clone();
-        let capabilities = snapshot.capabilities;
-        let platform = snapshot.platform;
-        let total_ram_bytes = snapshot.performance.latest.mem_total_bytes;
-        let view_mode = details.view_mode;
-        let sort_column = details.sort_column;
-        let sort_direction = details.sort_direction;
-        let row_count = details.rows.len();
-
-        let selected_key = self.selected_key;
+        let view_mode = self.view_mode;
         let highlighted_key = self.highlighted_key;
-        let selected_target = selected_key
-            .and_then(|sel| find_row_index_by_key(&details.rows, sel))
-            .and_then(|idx| details.rows.get(idx))
-            .map(ProcessActionTarget::from_row);
+        let has_selection = self.has_selection;
 
         let theme = cx.theme();
         let border = theme.border;
         let fg = theme.foreground;
-        let muted_fg = theme.muted_foreground;
         let muted_bg = theme.muted;
-        let secondary_bg = theme.secondary;
         let primary = theme.primary;
         let radius = theme.radius;
-        let mono_font = theme.mono_font_family.clone();
-        let semantic = LoomSemanticColors::from_theme(theme);
 
         let store_flat = self.store.clone();
         let store_tree = self.store.clone();
         let store_run_task = self.store.clone();
-        let store_end_task = self.store.clone();
-        let end_task_target = selected_target.clone();
-        let has_selection = selected_target.is_some();
 
         let flat_label = i18n::tr("details.view_flat");
         let tree_label = i18n::tr("details.view_tree");
@@ -1026,11 +1834,9 @@ impl Render for DetailsView {
                             .icon(IconName::CircleX)
                             .label(i18n::tr("details.end_task"))
                             .disabled(!has_selection)
-                            .on_click(move |_, window, cx| {
-                                if let Some(ref target) = end_task_target {
-                                    request_end_task(&store_end_task, target, window, cx);
-                                }
-                            }),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.trigger_end_task_for_selected(window, cx);
+                            })),
                     ),
             );
 
@@ -1069,784 +1875,45 @@ impl Render for DetailsView {
                 )
         });
 
-        let columns: Vec<ColumnSpec<DetailsColumn>> = self.column_layout.visible_columns();
-        let total_cols = columns.len();
-        let table_width = self.column_layout.total_width(TABLE_HORIZONTAL_PADDING);
-        let column_layout_snapshot = self.column_layout.clone();
-        let header_view_weak = cx.entity().downgrade();
-
-        let header_cells = columns.iter().enumerate().map(|(col_ix, spec)| {
-            let col = spec.id;
-            let sort_target = col.sort_column();
-            let is_active_sort = sort_target == Some(sort_column);
-            let next_dir = sort_target
-                .map(|target| next_sort_direction(sort_column, sort_direction, target))
-                .unwrap_or(SortDirection::Descending);
-            let store_for_sort = self.store.clone();
-            let menu_view = header_view_weak.clone();
-
-            render_interactive_header_cell(
-                col_ix,
-                total_cols,
-                HeaderColumnDescriptor {
-                    id: format!("details-col-{}", col.slug()).into(),
-                    label: col.label(platform).into(),
-                    width: spec.width,
-                    right_aligned: col.right_aligned(),
-                    sortable: sort_target.is_some(),
-                    is_active_sort,
-                    sort_direction,
-                },
-                &column_layout_snapshot,
-                cx,
-                |view: &mut Self| &mut view.column_layout,
-                move |_view, _window, cx| {
-                    if let Some(target) = sort_target {
-                        UiCommands::set_details_sort(&store_for_sort, target, next_dir, cx);
-                    }
-                },
-                |view: &mut Self, cx| view.persist_column_layout(cx),
-                move |menu, window, cx| {
-                    Self::build_header_context_menu(menu, Some(col), menu_view.clone(), window, cx)
-                },
+        v_flex()
+            .id("details-view-root")
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let modifiers = &event.keystroke.modifiers;
+                if !modifiers.control
+                    && !modifiers.alt
+                    && !modifiers.platform
+                    && !modifiers.function
+                    && !modifiers.shift
+                    && event.keystroke.key == "delete"
+                    && this.has_selection
+                {
+                    this.trigger_end_task_for_selected(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .size_full()
+            .min_h_0()
+            .child(toolbar)
+            .when_some(highlight_banner, |this, banner| this.child(banner))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(self.table_pane.clone()),
             )
-            .into_any_element()
-        });
-
-        let spacer_menu_view = header_view_weak.clone();
-        let header_trailing = render_header_trailing_spacer(
-            "details-column-header-spacer",
-            move |menu, window, cx| {
-                Self::build_header_context_menu(menu, None, spacer_menu_view.clone(), window, cx)
-            },
-        );
-
-        let column_header = attach_header_reorder_handlers(
-            h_flex()
-                .id("details-column-header")
-                .w_full()
-                .h(px(32.))
-                .flex_shrink_0()
-                .items_center()
-                .px_2()
-                .bg(secondary_bg.opacity(0.45))
-                .border_b_1()
-                .border_color(border)
-                .text_xs()
-                .font_medium()
-                .text_color(muted_fg)
-                .children(header_cells)
-                .child(header_trailing),
-            cx,
-            |view: &mut Self| &mut view.column_layout,
-            |view: &mut Self, cx| view.persist_column_layout(cx),
-        );
-
-        let table_area = if details.revision == 0 {
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .child(column_header)
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .items_center()
-                        .justify_center()
-                        .p_8()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(muted_fg)
-                                .child(i18n::tr("details.loading")),
-                        ),
-                )
-                .into_any_element()
-        } else if row_count == 0 {
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .child(column_header)
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .items_center()
-                        .justify_center()
-                        .gap_2()
-                        .p_8()
-                        .child(
-                            Icon::new(IconName::Search)
-                                .size(px(24.))
-                                .text_color(muted_fg),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(muted_fg)
-                                .child(i18n::tr("details.empty_search")),
-                        ),
-                )
-                .into_any_element()
-        } else {
-            let store_for_rows = self.store.clone();
-            let view_weak = cx.entity().downgrade();
-            let icon_cache = Rc::clone(&self.icon_cache);
-            let is_tree_mode = view_mode == DetailsViewMode::Tree;
-            let running_label: SharedString = i18n::tr("details.status_running").into();
-            let suspended_label: SharedString = i18n::tr("details.status_suspended").into();
-            let elevated_yes_label: SharedString = i18n::tr("details.elevated_yes").into();
-            let elevated_no_label: SharedString = i18n::tr("details.elevated_no").into();
-
-            div()
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .relative()
-                .child(
-                    div()
-                        .id("details-table-hscroll")
-                        .size_full()
-                        .overflow_x_scroll()
-                        .track_scroll(&self.h_scroll_handle)
-                        .child(
-                            v_flex()
-                                .min_w(px(table_width))
-                                .w_full()
-                                .h_full()
-                                .child(column_header)
-                                .child(
-                                    div().flex_1().min_h_0().w_full().child(
-                                        uniform_list(
-                                            "details-virtual-list",
-                                            row_count,
-                                            move |range, _window, cx| {
-                                                let theme = cx.theme();
-                                                let row_border = theme.border.opacity(0.45);
-                                                let row_hover = theme.accent.opacity(0.45);
-                                                let selected_bg = theme.primary.opacity(0.16);
-                                                let highlight_bg = theme.primary.opacity(0.24);
-                                                let highlight_border = theme.primary;
-
-                                                range
-                                                    .filter_map(|ix| {
-                                                        let row = details.rows.get(ix)?;
-                                                        let key = row.key;
-                                                        let row_id = process_key_element_id(key);
-                                                        let is_selected = selected_key == Some(key);
-                                                        let is_highlighted =
-                                                            highlighted_key == Some(key);
-                                                        let target =
-                                                            ProcessActionTarget::from_row(row);
-
-                                                        let icon_image =
-                                                            resolve_cached_icon(&icon_cache, row);
-                                                        let indent = if is_tree_mode {
-                                                            f32::from(row.depth.min(10)) * 16.0
-                                                        } else {
-                                                            0.0
-                                                        };
-                                                        let has_children =
-                                                            is_tree_mode && row.has_children;
-                                                        let is_expanded = row.is_expanded;
-
-                                                        let status_text = if row
-                                                            .status
-                                                            .contains(ProcessStatusFlags::SUSPENDED)
-                                                        {
-                                                            suspended_label.clone()
-                                                        } else {
-                                                            running_label.clone()
-                                                        };
-                                                        let user_text = display_user_name(
-                                                            row.user_name.as_deref(),
-                                                        )
-                                                        .to_owned();
-                                                        let publisher_text = row
-                                                            .publisher
-                                                            .as_deref()
-                                                            .unwrap_or("—")
-                                                            .to_owned();
-                                                        let description_text = row
-                                                            .description
-                                                            .as_deref()
-                                                            .filter(|s| !s.is_empty())
-                                                            .unwrap_or("—")
-                                                            .to_owned();
-                                                        let exe_path_text: SharedString = row
-                                                            .exe_path
-                                                            .as_deref()
-                                                            .filter(|s| !s.is_empty())
-                                                            .unwrap_or("—")
-                                                            .to_owned()
-                                                            .into();
-                                                        let exe_path_tooltip = row
-                                                            .exe_path
-                                                            .as_deref()
-                                                            .filter(|s| !s.is_empty())
-                                                            .map(str::to_owned);
-                                                        let elevated_text = if row
-                                                            .status
-                                                            .contains(ProcessStatusFlags::ELEVATED)
-                                                        {
-                                                            elevated_yes_label.clone()
-                                                        } else {
-                                                            elevated_no_label.clone()
-                                                        };
-                                                        let cmdline_text: SharedString = row
-                                                            .command_line
-                                                            .as_deref()
-                                                            .filter(|s| !s.is_empty())
-                                                            .unwrap_or("—")
-                                                            .to_owned()
-                                                            .into();
-                                                        let cmdline_tooltip = row
-                                                            .command_line
-                                                            .as_deref()
-                                                            .filter(|s| !s.is_empty())
-                                                            .map(str::to_owned);
-
-                                                        let toggle_store = store_for_rows.clone();
-                                                        let click_view = view_weak.clone();
-                                                        let rclick_view = view_weak.clone();
-                                                        let menu_store = store_for_rows.clone();
-                                                        let menu_target = target.clone();
-
-                                                        let row_a11y_label: SharedString =
-                                                            format!("{} (PID {})", row.name, key.pid)
-                                                                .into();
-
-                                                        let cells = columns.iter().map(|spec| {
-                                                            let w = px(spec.width);
-                                                            match spec.id {
-                                                                DetailsColumn::Name => {
-                                                                    let toggle_store = toggle_store.clone();
-                                                                    h_flex()
-                                                                        .w(w)
-                                                                        .h_full()
-                                                                        .flex_shrink_0()
-                                                                        .items_center()
-                                                                        .gap_1p5()
-                                                                        .px_2()
-                                                                        .pl(px(8.0 + indent))
-                                                                        .overflow_hidden()
-                                                                        .when(is_tree_mode, |el| {
-                                                                            el.child(if has_children {
-                                                                                Button::new((
-                                                                                    "details-expand",
-                                                                                    row_id,
-                                                                                ))
-                                                                                .xsmall()
-                                                                                .ghost()
-                                                                                .icon(if is_expanded {
-                                                                                    IconName::ChevronDown
-                                                                                } else {
-                                                                                    IconName::ChevronRight
-                                                                                })
-                                                                                .on_click(move |_, _, cx| {
-                                                                                    UiCommands::toggle_details_expanded(
-                                                                                        &toggle_store,
-                                                                                        key,
-                                                                                        cx,
-                                                                                    );
-                                                                                })
-                                                                                .into_any_element()
-                                                                            } else {
-                                                                                div()
-                                                                                    .w(px(18.))
-                                                                                    .flex_shrink_0()
-                                                                                    .into_any_element()
-                                                                            })
-                                                                        })
-                                                                        .child(if let Some(image) =
-                                                                            icon_image.clone()
-                                                                        {
-                                                                            img(image)
-                                                                                .size(px(20.))
-                                                                                .flex_shrink_0()
-                                                                                .into_any_element()
-                                                                        } else {
-                                                                            h_flex()
-                                                                                .size(px(20.))
-                                                                                .flex_shrink_0()
-                                                                                .items_center()
-                                                                                .justify_center()
-                                                                                .child(
-                                                                                    Icon::new(
-                                                                                        IconName::File,
-                                                                                    )
-                                                                                    .small()
-                                                                                    .text_color(
-                                                                                        muted_fg,
-                                                                                    ),
-                                                                                )
-                                                                                .into_any_element()
-                                                                        })
-                                                                        .child(
-                                                                            div()
-                                                                                .flex_1()
-                                                                                .min_w_0()
-                                                                                .truncate()
-                                                                                .child(
-                                                                                    row.name
-                                                                                        .to_string(),
-                                                                                ),
-                                                                        )
-                                                                        .into_any_element()
-                                                                }
-                                                                DetailsColumn::Pid => h_flex()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .justify_end()
-                                                                    .px_2()
-                                                                    .font_family(mono_font.clone())
-                                                                    .text_color(muted_fg)
-                                                                    .child(key.pid.to_string())
-                                                                    .into_any_element(),
-                                                                DetailsColumn::Status => h_flex()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .px_2()
-                                                                    .overflow_hidden()
-                                                                    .child(
-                                                                        div()
-                                                                            .min_w_0()
-                                                                            .truncate()
-                                                                            .text_color(muted_fg)
-                                                                            .child(status_text.clone()),
-                                                                    )
-                                                                    .into_any_element(),
-                                                                DetailsColumn::UserName => h_flex()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .px_2()
-                                                                    .overflow_hidden()
-                                                                    .child(
-                                                                        div()
-                                                                            .min_w_0()
-                                                                            .truncate()
-                                                                            .text_color(muted_fg)
-                                                                            .child(user_text.clone()),
-                                                                    )
-                                                                    .into_any_element(),
-                                                                DetailsColumn::SessionId => h_flex()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .justify_end()
-                                                                    .px_2()
-                                                                    .font_family(mono_font.clone())
-                                                                    .text_color(muted_fg)
-                                                                    .child(row.session_id.to_string())
-                                                                    .into_any_element(),
-                                                                DetailsColumn::Cpu => div()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .px_1()
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .child(heatmap_cell(
-                                                                        format_permille(
-                                                                            row.cpu_permille,
-                                                                        ),
-                                                                        HeatmapLevel::from_permille(
-                                                                            row.cpu_permille,
-                                                                        ),
-                                                                        &semantic,
-                                                                    ))
-                                                                    .into_any_element(),
-                                                                DetailsColumn::CpuTime => h_flex()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .justify_end()
-                                                                    .px_2()
-                                                                    .font_family(mono_font.clone())
-                                                                    .text_color(muted_fg)
-                                                                    .child(format_cpu_time(
-                                                                        row.cpu_time_100ns,
-                                                                    ))
-                                                                    .into_any_element(),
-                                                                DetailsColumn::Memory => div()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .px_1()
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .child(heatmap_cell(
-                                                                        format_bytes(
-                                                                            row.private_working_set_bytes,
-                                                                        ),
-                                                                        memory_heatmap_level(
-                                                                            row.private_working_set_bytes,
-                                                                            total_ram_bytes,
-                                                                        ),
-                                                                        &semantic,
-                                                                    ))
-                                                                    .into_any_element(),
-                                                                DetailsColumn::WorkingSet => h_flex()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .justify_end()
-                                                                    .px_2()
-                                                                    .font_family(mono_font.clone())
-                                                                    .text_color(muted_fg)
-                                                                    .child(format_bytes(
-                                                                        row.working_set_bytes,
-                                                                    ))
-                                                                    .into_any_element(),
-                                                                DetailsColumn::CommitSize => h_flex()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .justify_end()
-                                                                    .px_2()
-                                                                    .font_family(mono_font.clone())
-                                                                    .text_color(muted_fg)
-                                                                    .child(format_bytes(
-                                                                        row.commit_bytes,
-                                                                    ))
-                                                                    .into_any_element(),
-                                                                DetailsColumn::Priority => h_flex()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .px_2()
-                                                                    .overflow_hidden()
-                                                                    .child(
-                                                                        div()
-                                                                            .min_w_0()
-                                                                            .truncate()
-                                                                            .text_color(muted_fg)
-                                                                            .child(
-                                                                                i18n::process_priority_label(
-                                                                                    row.priority,
-                                                                                ),
-                                                                            ),
-                                                                    )
-                                                                    .into_any_element(),
-                                                                DetailsColumn::Handles => h_flex()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .justify_end()
-                                                                    .px_2()
-                                                                    .font_family(mono_font.clone())
-                                                                    .text_color(muted_fg)
-                                                                    .child(
-                                                                        row.handle_count.to_string(),
-                                                                    )
-                                                                    .into_any_element(),
-                                                                DetailsColumn::Threads => h_flex()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .justify_end()
-                                                                    .px_2()
-                                                                    .font_family(mono_font.clone())
-                                                                    .text_color(muted_fg)
-                                                                    .child(
-                                                                        row.thread_count.to_string(),
-                                                                    )
-                                                                    .into_any_element(),
-                                                                DetailsColumn::Platform => h_flex()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .px_2()
-                                                                    .overflow_hidden()
-                                                                    .child(
-                                                                        div()
-                                                                            .min_w_0()
-                                                                            .truncate()
-                                                                            .text_color(muted_fg)
-                                                                            .child(
-                                                                                i18n::process_arch_label(
-                                                                                    row.arch,
-                                                                                ),
-                                                                            ),
-                                                                    )
-                                                                    .into_any_element(),
-                                                                DetailsColumn::UacVirtualization => {
-                                                                    h_flex()
-                                                                        .w(w)
-                                                                        .h_full()
-                                                                        .flex_shrink_0()
-                                                                        .items_center()
-                                                                        .px_2()
-                                                                        .overflow_hidden()
-                                                                        .child(
-                                                                            div()
-                                                                                .min_w_0()
-                                                                                .truncate()
-                                                                                .text_color(muted_fg)
-                                                                                .child(
-                                                                                    i18n::uac_virtualization_label(
-                                                                                        row.uac_virtualization,
-                                                                                    ),
-                                                                                ),
-                                                                        )
-                                                                        .into_any_element()
-                                                                }
-                                                                DetailsColumn::Elevated => h_flex()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .px_2()
-                                                                    .overflow_hidden()
-                                                                    .child(
-                                                                        div()
-                                                                            .min_w_0()
-                                                                            .truncate()
-                                                                            .text_color(muted_fg)
-                                                                            .child(
-                                                                                elevated_text.clone(),
-                                                                            ),
-                                                                    )
-                                                                    .into_any_element(),
-                                                                DetailsColumn::GpuMemory => h_flex()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .justify_end()
-                                                                    .px_2()
-                                                                    .font_family(mono_font.clone())
-                                                                    .text_color(muted_fg)
-                                                                    .child(format_bytes(
-                                                                        row.gpu_dedicated_bytes,
-                                                                    ))
-                                                                    .into_any_element(),
-                                                                DetailsColumn::Publisher => h_flex()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .px_2()
-                                                                    .overflow_hidden()
-                                                                    .child(
-                                                                        div()
-                                                                            .min_w_0()
-                                                                            .truncate()
-                                                                            .text_color(muted_fg)
-                                                                            .child(publisher_text.clone()),
-                                                                    )
-                                                                    .into_any_element(),
-                                                                DetailsColumn::Description => h_flex()
-                                                                    .w(w)
-                                                                    .h_full()
-                                                                    .flex_shrink_0()
-                                                                    .items_center()
-                                                                    .px_2()
-                                                                    .overflow_hidden()
-                                                                    .child(
-                                                                        div()
-                                                                            .min_w_0()
-                                                                            .truncate()
-                                                                            .text_color(muted_fg)
-                                                                            .child(
-                                                                                description_text.clone(),
-                                                                            ),
-                                                                    )
-                                                                    .into_any_element(),
-                                                                DetailsColumn::ExePath => {
-                                                                    h_flex()
-                                                                        .id(("details-exe", row_id))
-                                                                        .w(w)
-                                                                        .h_full()
-                                                                        .flex_shrink_0()
-                                                                        .items_center()
-                                                                        .px_2()
-                                                                        .overflow_hidden()
-                                                                        .font_family(mono_font.clone())
-                                                                        .text_color(muted_fg)
-                                                                        .when_some(
-                                                                            exe_path_tooltip.clone(),
-                                                                            |el, full_path| {
-                                                                                el.tooltip(
-                                                                                    move |window, cx| {
-                                                                                        Tooltip::new(
-                                                                                            full_path
-                                                                                                .clone(),
-                                                                                        )
-                                                                                        .build(
-                                                                                            window, cx,
-                                                                                        )
-                                                                                    },
-                                                                                )
-                                                                            },
-                                                                        )
-                                                                        .child(
-                                                                            div()
-                                                                                .min_w_0()
-                                                                                .truncate()
-                                                                                .child(
-                                                                                    exe_path_text
-                                                                                        .clone(),
-                                                                                ),
-                                                                        )
-                                                                        .into_any_element()
-                                                                }
-                                                                DetailsColumn::CommandLine => {
-                                                                    h_flex()
-                                                                        .id(("details-cmd", row_id))
-                                                                        .w(w)
-                                                                        .h_full()
-                                                                        .flex_shrink_0()
-                                                                        .items_center()
-                                                                        .px_2()
-                                                                        .overflow_hidden()
-                                                                        .font_family(mono_font.clone())
-                                                                        .text_color(muted_fg)
-                                                                        .when_some(
-                                                                            cmdline_tooltip.clone(),
-                                                                            |el, full_cmd| {
-                                                                                el.tooltip(
-                                                                                    move |window, cx| {
-                                                                                        Tooltip::new(
-                                                                                            full_cmd
-                                                                                                .clone(),
-                                                                                        )
-                                                                                        .build(
-                                                                                            window, cx,
-                                                                                        )
-                                                                                    },
-                                                                                )
-                                                                            },
-                                                                        )
-                                                                        .child(
-                                                                            div()
-                                                                                .min_w_0()
-                                                                                .truncate()
-                                                                                .child(cmdline_text.clone()),
-                                                                        )
-                                                                        .into_any_element()
-                                                                }
-                                                            }
-                                                        });
-
-                                                        let row_element = h_flex()
-                                                            .id(("details-row", row_id))
-                                                            .role(gpui_kit::Role::ListItem)
-                                                            .aria_label(row_a11y_label)
-                                                            .aria_selected(is_selected)
-                                                            .w_full()
-                                                            .h(px(DETAILS_ROW_HEIGHT))
-                                                            .items_center()
-                                                            .px_2()
-                                                            .border_b_1()
-                                                            .border_color(row_border)
-                                                            .text_xs()
-                                                            .text_color(fg)
-                                                            .when(is_highlighted, |s| {
-                                                                s.bg(highlight_bg)
-                                                                    .border_l_2()
-                                                                    .border_color(highlight_border)
-                                                            })
-                                                            .when(
-                                                                is_selected && !is_highlighted,
-                                                                |s| s.bg(selected_bg),
-                                                            )
-                                                            .hover(move |s| s.bg(row_hover))
-                                                            .on_click(move |_, window, cx| {
-                                                                let _ = click_view.update(
-                                                                    cx,
-                                                                    |this, cx| {
-                                                                        this.select_row(
-                                                                            key, window, cx,
-                                                                        );
-                                                                    },
-                                                                );
-                                                            })
-                                                            .on_mouse_down(
-                                                                MouseButton::Right,
-                                                                move |_, window, cx| {
-                                                                    let _ = rclick_view.update(
-                                                                        cx,
-                                                                        |this, cx| {
-                                                                            this.select_row(
-                                                                                key, window, cx,
-                                                                            );
-                                                                        },
-                                                                    );
-                                                                },
-                                                            )
-                                                            .children(cells);
-
-                                                        Some(
-                                                            row_element
-                                                                .context_menu(
-                                                                    move |menu, window, cx| {
-                                                                        build_row_context_menu(
-                                                                            menu,
-                                                                            &menu_store,
-                                                                            &menu_target,
-                                                                            capabilities,
-                                                                            window,
-                                                                            cx,
-                                                                        )
-                                                                    },
-                                                                )
-                                                                .into_any_element(),
-                                                        )
-                                                    })
-                                                    .collect()
-                                            },
-                                        )
-                                        .size_full()
-                                        .track_scroll(&self.scroll_handle),
-                                    ),
-                                ),
-                        ),
-                )
-                .vertical_scrollbar(&self.scroll_handle)
-                .horizontal_scrollbar(&self.h_scroll_handle)
-                .into_any_element()
-        };
-
-        attach_table_column_drag_handlers(
-            v_flex()
-                .id("details-view-root")
-                .track_focus(&self.focus_handle)
-                .on_key_down(cx.listener(Self::handle_key_down))
-                .size_full()
-                .min_h_0()
-                .child(toolbar)
-                .when_some(highlight_banner, |this, banner| this.child(banner))
-                .child(table_area),
-            cx,
-            |view: &mut Self| &mut view.column_layout,
-            |view: &mut Self, cx| view.persist_column_layout(cx),
-        )
     }
 }
 
-/// Builds the multi-level right-click [`gpui_kit::component::menu::PopupMenu`]
-/// anchored strictly to `target.key`.
+/// Builds the multi-level right-click [`PopupMenu`] anchored strictly to `target.key`.
 fn build_row_context_menu(
-    menu: gpui_kit::component::menu::PopupMenu,
+    menu: PopupMenu,
     store: &Entity<UiStore>,
     target: &ProcessActionTarget,
     capabilities: CapabilityFlags,
     window: &mut Window,
-    cx: &mut Context<gpui_kit::component::menu::PopupMenu>,
-) -> gpui_kit::component::menu::PopupMenu {
+    cx: &mut Context<TableState<DetailsTableDelegate>>,
+) -> PopupMenu {
     let key = target.key;
     let current_priority = target.priority;
     let eco_supported = capabilities.contains(CapabilityFlags::ECO_MODE);
@@ -1878,6 +1945,21 @@ fn build_row_context_menu(
     let store_search = store.clone();
     let search_query = target.name.to_string();
 
+    let priority_submenu = PopupMenu::build(window, cx, move |mut submenu, _window, _cx| {
+        for level in PRIORITY_MENU_ORDER {
+            let store_level = store_priority.clone();
+            submenu = submenu.item(
+                PopupMenuItem::new(i18n::process_priority_label(level))
+                    .checked(current_priority == level)
+                    .disabled(!priority_allowed)
+                    .on_click(move |_, _, cx| {
+                        UiCommands::set_priority(&store_level, key, level, cx);
+                    }),
+            );
+        }
+        submenu
+    });
+
     let mut menu = menu
         .item(
             PopupMenuItem::new(i18n::tr("details.menu_end_task"))
@@ -1894,25 +1976,9 @@ fn build_row_context_menu(
                 }),
         )
         .separator()
-        .submenu_with_icon(
-            Some(Icon::new(IconName::ChevronsUpDown)),
-            i18n::tr("details.menu_set_priority"),
-            window,
-            cx,
-            move |mut submenu, _window, _cx| {
-                for level in PRIORITY_MENU_ORDER {
-                    let store_level = store_priority.clone();
-                    submenu = submenu.item(
-                        PopupMenuItem::new(i18n::process_priority_label(level))
-                            .checked(current_priority == level)
-                            .disabled(!priority_allowed)
-                            .on_click(move |_, _, cx| {
-                                UiCommands::set_priority(&store_level, key, level, cx);
-                            }),
-                    );
-                }
-                submenu
-            },
+        .item(
+            PopupMenuItem::submenu(i18n::tr("details.menu_set_priority"), priority_submenu)
+                .icon(IconName::ChevronsUpDown),
         )
         .item(
             PopupMenuItem::new(i18n::tr("details.menu_set_affinity"))

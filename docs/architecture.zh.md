@@ -227,7 +227,7 @@ crates/loom-app/src/
 - `services: Arc<ServicesSlice>` / `startup: Arc<StartupSlice>` / `users: Arc<UsersSlice>` / `app_history: Arc<AppHistorySlice>`（均受 `MonitorLease` 门控，未查看时无后台轮询与投影开销）
 - `settings: Arc<SettingsSlice>`（当前生效配置的只读投影）
 
-GPUI 主线程在虚拟表格 `TableDelegate::render_td` 中仅对视口可见的约 25~35 行做 `O(1)` 索引读取（UI 线程单帧目标 `< 0.5 ms`）。
+`loom-app` 启用 `gpui-kit` 的 `gpui-fast` 渲染后端（保留子树与局部 Splice、Taffy 布局节点跨帧复用、`NumberShaping` 数字快速整形、GPU Scroll Layers 瓦片缓存与 D3D11 状态去重），并将静态页面工具栏与高频刷新的二维虚拟化 `DataTable`（`Entity<TableState<D>>`）解耦。GPUI 主线程在 `TableDelegate::render_td` 中仅对视口可见行与可见列做 `O(1)` 索引读取（目标 UI 线程单帧 `< 0.5 ms`，交互滚动稳跑 `120 FPS`）。
 
 ### 5.2 `gpui-kit` 组件映射
 
@@ -235,7 +235,7 @@ GPUI 主线程在虚拟表格 `TableDelegate::render_td` 中仅对视口可见�
 | :--- | :--- | :--- |
 | **窗口顶栏与全局搜索** | `Root` + `TitleBar` + `Input` | 居中搜索框开启 `.cleanable(true)`，支持名称/发布者/PID 防抖过滤 |
 | **左侧导航与底部设置** | `Sidebar`、`SidebarMenu`、`SidebarMenuItem`、`SidebarFooter` | 汉堡按钮控制 `.collapsed(bool)` 展开/图标态，底部固定「设置」 |
-| **虚拟化业务表格与树表** | `Table` + `TableState<D>` + `TableDelegate` | 首列通过 `h_flex().pl(px(depth * 16.))` + 折叠箭头 `Button` + 降采样 `Img` 呈现进程树/用户树；热力图列按占用分档设置单元格背景色透明度 |
+| **虚拟化业务表格与树表** | `DataTable` + `TableState<D>` + `TableDelegate` | 首列左固定（`fixed_left`）通过 `h_flex().pl(px(depth * 16.))` + 折叠箭头 `Button` + 降采样 `Img` 呈现进程树/用户树；滚动列双向虚拟化；表级单一右键菜单；热力图列按占用分档设置单元格背景色透明度 |
 | **多级右键菜单** | `PopupMenu` / `.context_menu(...)` | 支持勾选标记（`✓ 效能模式`）、分隔线与二级子菜单（`设置优先级 >`、`资源值 >`） |
 | **性能页左栏设备微缩波形图** | `v_virtual_list` + `AreaChart` | 配置 `AreaChart::new(pts).linear().y_domain(0., 100.).point_count(60).x_axis(false).grid(false).interactive(false)` |
 | **CPU 总体+内核双层图 & 多核网格** | 多序列 `AreaChart` + 响应式网格容器 | 单一 `AreaChart` 挂载总利用率与内核时间双 `.y(...)` 渐变序列；多核模式按逻辑核数排列紧凑 `AreaChart` 单元 |

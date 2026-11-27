@@ -227,7 +227,7 @@ Feature-specific dialogs (such as `Set affinity` and `Analyze wait chain` inside
 - `services: Arc<ServicesSlice>` / `startup: Arc<StartupSlice>` / `users: Arc<UsersSlice>` / `app_history: Arc<AppHistorySlice>` (gated by `MonitorLease`; no polling overhead while unmounted)
 - `settings: Arc<SettingsSlice>` (read-only configuration projection)
 
-`TableDelegate::render_td` performs `O(1)` slice indexing across only the ~25–35 visible viewport rows (targeting `< 0.5 ms` per frame on the UI thread).
+`loom-app` enables `gpui-kit`'s `gpui-fast` rendering backend (Retained Subtrees + Splice, Taffy layout node retention, `NumberShaping`, GPU Scroll Layers, and D3D11 state deduplication) and isolates static page toolbars from high-frequency 2D-virtualized `DataTable` entities (`Entity<TableState<D>>`). `TableDelegate::render_td` performs `O(1)` slice indexing across only the visible viewport rows and columns (targeting `< 0.5 ms` per frame / smooth 120 FPS scrolling on the UI thread).
 
 ### 5.2 `gpui-kit` widget mapping
 
@@ -235,7 +235,7 @@ Feature-specific dialogs (such as `Set affinity` and `Analyze wait chain` inside
 | --- | --- | --- |
 | **Window chrome & global search** | `Root` + `TitleBar` + `Input` | Centered debounced `.cleanable(true)` input filtering by name, publisher, or PID |
 | **Collapsible navigation rail** | `Sidebar`, `SidebarMenu`, `SidebarMenuItem`, `SidebarFooter` | Hamburger toggle switches `.collapsed(bool)`; `Settings` pinned in `SidebarFooter` |
-| **Virtualized tables & tree tables** | `Table` + `TableState<D>` + `TableDelegate` | Column 0 composes `h_flex().pl(px(depth * 16.))` + chevron `Button` + cached `Img`; heatmap cells apply quantized theme background opacity |
+| **Virtualized tables & tree tables** | `DataTable` + `TableState<D>` + `TableDelegate` | Left-pinned `Name` column (`fixed_left`) composes `h_flex().pl(px(depth * 16.))` + chevron `Button` + cached `Img`; 2D virtualization across scrollable columns; single table-level row `ContextMenu`; heatmap cells apply quantized theme background opacity |
 | **Multi-level context menus** | `PopupMenu` / `.context_menu(...)` | Supports checkmarks (`✓ Efficiency mode`), separators, and nested submenus (`Set priority >`, `Resource values >`) |
 | **Performance left device sparklines** | `v_virtual_list` + `AreaChart` | Configures `AreaChart::new(pts).linear().y_domain(0., 100.).point_count(60).x_axis(false).grid(false).interactive(false)` |
 | **CPU kernel-time overlay & core grid** | Multi-series `AreaChart` + responsive grid | Dual `.y(...)` accessors render total + kernel utilization gradients; logical-core mode tiles compact `AreaChart` cells |

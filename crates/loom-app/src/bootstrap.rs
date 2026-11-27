@@ -27,6 +27,9 @@ struct LoomAssets;
 
 impl AssetSource for LoomAssets {
     fn load(&self, path: &str) -> gpui_kit::Result<Option<Cow<'static, [u8]>>> {
+        if path == loom_ui_kit::ECO_LEAF_ICON_PATH {
+            return Ok(Some(Cow::Borrowed(loom_ui_kit::ECO_LEAF_SVG)));
+        }
         if let Ok(Some(data)) = LoomExtraIcons.load(path) {
             return Ok(Some(data));
         }
@@ -36,6 +39,9 @@ impl AssetSource for LoomAssets {
     fn list(&self, path: &str) -> gpui_kit::Result<Vec<SharedString>> {
         let mut items = Assets.list(path)?;
         items.extend(LoomExtraIcons.list(path)?);
+        if path.is_empty() || path == "icons" || path == "icons/" {
+            items.push(SharedString::new_static(loom_ui_kit::ECO_LEAF_ICON_PATH));
+        }
         Ok(items)
     }
 }
