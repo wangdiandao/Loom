@@ -101,11 +101,11 @@ impl UiCommands {
         });
     }
 
-    /// Updates the global case-insensitive search query in the engine.
+    /// Updates the global case-insensitive search query in [`UiStore`] and the engine.
     pub(crate) fn set_search_query(store: &Entity<UiStore>, query: String, cx: &mut App) {
-        let _ = store
-            .read(cx)
-            .dispatch_command(EngineCommand::SetSearchQuery(query));
+        store.update(cx, |store, cx| {
+            store.set_search_query(query, cx);
+        });
     }
 
     /// Switches the Processes view between Grouped and Process Tree modes and persists it.
@@ -322,5 +322,59 @@ impl UiCommands {
         store.update(cx, |store, cx| {
             let _ = store.update_settings(|s| s.details_columns = columns, cx);
         });
+    }
+
+    /// Starts an OS system service identified by its internal name.
+    pub(crate) fn start_service(store: &Entity<UiStore>, name: String, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::StartService(name));
+    }
+
+    /// Stops an OS system service identified by its internal name.
+    pub(crate) fn stop_service(store: &Entity<UiStore>, name: String, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::StopService(name));
+    }
+
+    /// Restarts an OS system service identified by its internal name.
+    pub(crate) fn restart_service(store: &Entity<UiStore>, name: String, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::RestartService(name));
+    }
+
+    /// Launches the native OS services management console (e.g., `services.msc`).
+    pub(crate) fn open_services_console(store: &Entity<UiStore>, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::OpenServicesConsole);
+    }
+
+    /// Enables or disables a registered startup application entry by its stable ID.
+    pub(crate) fn set_startup_enabled(
+        store: &Entity<UiStore>,
+        id: String,
+        enabled: bool,
+        cx: &mut App,
+    ) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SetStartupEnabled { id, enabled });
+    }
+
+    /// Disconnects the logged-in OS user session identified by `session_id`.
+    pub(crate) fn disconnect_session(store: &Entity<UiStore>, session_id: u32, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::DisconnectSession(session_id));
+    }
+
+    /// Clears persisted and live in-memory cumulative application usage history.
+    pub(crate) fn clear_app_history(store: &Entity<UiStore>, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::ClearAppHistory);
     }
 }

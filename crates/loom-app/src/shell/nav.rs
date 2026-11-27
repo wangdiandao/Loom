@@ -131,24 +131,12 @@ impl Route {
         }
     }
 
-    /// Returns the scheduled milestone version for unimplemented P1 routes, or `None` for live views.
+    /// Returns the scheduled milestone version for unimplemented routes, or `None` for live views.
     #[inline]
+    #[cfg(test)]
     pub(crate) const fn milestone_version(self) -> Option<&'static str> {
-        match self {
-            Self::AppHistory | Self::Startup | Self::Users | Self::Services => Some("0.0.5"),
-            Self::Processes | Self::Performance | Self::Details | Self::Settings => None,
-        }
-    }
-
-    /// Returns the localized roadmap description for an unimplemented P1 route.
-    pub(crate) fn milestone_description(self) -> Option<String> {
-        match self {
-            Self::AppHistory => Some(i18n::tr("milestone.app_history_desc")),
-            Self::Startup => Some(i18n::tr("milestone.startup_desc")),
-            Self::Users => Some(i18n::tr("milestone.users_desc")),
-            Self::Services => Some(i18n::tr("milestone.services_desc")),
-            Self::Processes | Self::Performance | Self::Details | Self::Settings => None,
-        }
+        let _ = self;
+        None
     }
 }
 
@@ -162,7 +150,6 @@ pub(crate) enum NavigationIntent {
     /// Switch to [`Route::Details`] and highlight/scroll to the target [`ProcessKey`].
     JumpToDetails(ProcessKey),
     /// Switch to [`Route::Services`] and filter/highlight services hosted by the given PID.
-    #[allow(dead_code)]
     JumpToServices(u32),
 }
 
@@ -194,8 +181,12 @@ impl ShellHandle {
         self.send(NavigationIntent::JumpToDetails(key), window, cx);
     }
 
+    /// Navigates to [`Route::Services`] filtered to services hosted by `pid`.
+    pub(crate) fn jump_to_services(&self, pid: u32, window: &mut Window, cx: &mut App) {
+        self.send(NavigationIntent::JumpToServices(pid), window, cx);
+    }
+
     /// Navigates to `route`.
-    #[allow(dead_code)]
     pub(crate) fn navigate(&self, route: Route, window: &mut Window, cx: &mut App) {
         self.send(NavigationIntent::Navigate(route), window, cx);
     }
@@ -259,15 +250,13 @@ mod tests {
     }
 
     #[test]
-    fn live_routes_have_no_milestone_notice_while_p1_routes_do() {
-        assert_eq!(Route::Processes.milestone_version(), None);
-        assert_eq!(Route::Performance.milestone_version(), None);
-        assert_eq!(Route::Details.milestone_version(), None);
-        assert_eq!(Route::Settings.milestone_version(), None);
-
-        assert_eq!(Route::AppHistory.milestone_version(), Some("0.0.5"));
-        assert_eq!(Route::Startup.milestone_version(), Some("0.0.5"));
-        assert_eq!(Route::Users.milestone_version(), Some("0.0.5"));
-        assert_eq!(Route::Services.milestone_version(), Some("0.0.5"));
+    fn all_eight_routes_are_live_with_no_milestone_notice() {
+        for route in Route::ALL {
+            assert_eq!(
+                route.milestone_version(),
+                None,
+                "expected {route:?} to be live without a milestone notice"
+            );
+        }
     }
 }

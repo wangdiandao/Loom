@@ -18,6 +18,15 @@ See [versioning and releases](docs/release.md) for the version progression polic
   - **Users** (`WindowsSessionManager`): WTS session enumeration (`WTSEnumerateSessionsW` / `WTSQuerySessionInformationW`) skipping Session 0/listener rows and non-blocking `WTSDisconnectSession`.
   - **App History** (`WindowsAppHistoryReader`): crash-safe atomic local history persistence and clear store under `%LOCALAPPDATA%\Loom\app_history.dat`.
 
+### UI & UX
+
+- Implemented the four Milestone `0.0.5` on-demand system management vertical feature slices in `loom-app`, each gated by an RAII `ScopedMonitorLease` (`Services`, `Startup`, `Users`, `AppHistory`), composed exclusively with `gpui-kit` `DataTable`/`Dialog`/`PopupMenu` widgets and reactive to the TitleBar global search box via `UiStoreEvent::SearchQueryChanged`:
+  - **Services** (`ServicesView`): split static toolbar (`Start`, `Stop`, `Restart`, `Open Services`), clearable host-PID filter banner (`JumpToServices(pid)`), sortable `Name`/`PID`/`Description`/`Status`/`Group` table anchored by service name, and row context menu with `Go to details` resolving live `ProcessKey` by PID.
+  - **Startup Apps** (`StartupView`): split static toolbar (`Enable`, `Disable`, and right-aligned `Last BIOS time: X.X s`), sortable `Name`/`Publisher`/`Status`/`Startup impact` table anchored by entry ID, and row context menu with `Open file location`, `Properties`, and `Search online`.
+  - **Users** (`UsersView`): split static toolbar (`Disconnect` with confirmation `Dialog`, `Manage user accounts` launching `netplwiz`), expandable session-tree table with `heatmap_cell` CPU/Memory/Disk/Network columns, auto-expanding child search filtering, and child process `End task` & `Go to details` context actions.
+  - **App History** (`AppHistoryView`): split static toolbar (`Delete usage history` with confirmation `Dialog` and `Resource usage since YYYY-MM-DD HH:MM` indicator) and sortable `Name`/`CPU time`/`Network`/`Metered network` heatmap table.
+- Completed bidirectional **Details** <-> **Services** navigation by adding `ShellHandle::jump_to_services` and the **Go to service(s)** context menu action in `DetailsView`, retiring the temporary upcoming-milestone placeholder across all 8 routes, and adding full `en-US` and `zh-CN` localization.
+
 ## 0.0.4 - 2026-11-27
 
 ### Engine & PAL

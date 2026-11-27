@@ -43,6 +43,7 @@ use crate::features::table_columns::{
     TableColumnLayout, build_column_header_menu, open_select_columns_dialog,
 };
 use crate::i18n;
+use crate::shell::ShellHandle;
 
 const DETAILS_HEADER_HEIGHT: f32 = 32.0;
 
@@ -707,6 +708,7 @@ fn open_end_process_tree_dialog(
 /// 2D-virtualized `gpui-kit` [`TableDelegate`] backing the live Details table.
 struct DetailsTableDelegate {
     store: Entity<UiStore>,
+    shell_handle: ShellHandle,
     details: Arc<DetailsTableSlice>,
     capabilities: CapabilityFlags,
     platform: PlatformProfile,
@@ -721,7 +723,12 @@ struct DetailsTableDelegate {
 }
 
 impl DetailsTableDelegate {
-    fn new(store: Entity<UiStore>, highlighted_key: Option<ProcessKey>, cx: &App) -> Self {
+    fn new(
+        store: Entity<UiStore>,
+        highlighted_key: Option<ProcessKey>,
+        shell_handle: ShellHandle,
+        cx: &App,
+    ) -> Self {
         let store_ref = store.read(cx);
         let snap = store_ref.snapshot();
         let capabilities = snap.capabilities;
@@ -736,6 +743,7 @@ impl DetailsTableDelegate {
 
         Self {
             store: store.clone(),
+            shell_handle,
             details: Arc::clone(&snap.details),
             capabilities,
             platform,
@@ -1401,7 +1409,15 @@ impl TableDelegate for DetailsTableDelegate {
             return menu;
         };
         let target = ProcessActionTarget::from_row(row);
-        build_row_context_menu(menu, &self.store, &target, self.capabilities, window, cx)
+        build_row_context_menu(
+            menu,
+            &self.store,
+            &self.shell_handle,
+            &target,
+            self.capabilities,
+            window,
+            cx,
+        )
     }
 
     fn row_label(&self, row_ix: usize, _cx: &App) -> Option<SharedString> {
@@ -1482,6 +1498,7 @@ impl DetailsView {
     pub(crate) fn new(
         store: Entity<UiStore>,
         highlighted_key: Option<ProcessKey>,
+        shell_handle: ShellHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1492,7 +1509,8 @@ impl DetailsView {
         };
 
         let table = cx.new(|cx| {
-            let delegate = DetailsTableDelegate::new(store.clone(), highlighted_key, cx);
+            let delegate =
+                DetailsTableDelegate::new(store.clone(), highlighted_key, shell_handle, cx);
             let mut state = TableState::new(delegate, window, cx)
                 .row_selectable(true)
                 .col_selectable(false)
@@ -1585,7 +1603,9 @@ impl DetailsView {
                         cx.notify();
                     }
                 }
-                UiStoreEvent::ElevationRequired { .. } | UiStoreEvent::CommandFailed { .. } => {}
+                UiStoreEvent::SearchQueryChanged
+                | UiStoreEvent::ElevationRequired { .. }
+                | UiStoreEvent::CommandFailed { .. } => {}
             }),
         );
 
@@ -1909,6 +1929,7 @@ impl Render for DetailsView {
 fn build_row_context_menu(
     menu: PopupMenu,
     store: &Entity<UiStore>,
+    shell_handle: &ShellHandle,
     target: &ProcessActionTarget,
     capabilities: CapabilityFlags,
     window: &mut Window,
@@ -1944,6 +1965,8 @@ fn build_row_context_menu(
 
     let store_search = store.clone();
     let search_query = target.name.to_string();
+    let shell_services = shell_handle.clone();
+    let can_jump_services = key.pid > 0 && capabilities.contains(CapabilityFlags::SERVICES);
 
     let priority_submenu = PopupMenu::build(window, cx, move |mut submenu, _window, _cx| {
         for level in PRIORITY_MENU_ORDER {
@@ -2040,6 +2063,15 @@ fn build_row_context_menu(
                 .icon(IconName::Globe)
                 .on_click(move |_, _, cx| {
                     UiCommands::search_online(&store_search, search_query.clone(), cx);
+                }),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new(i18n::tr("details.menu_go_to_services"))
+                .icon(IconName::Settings2)
+                .disabled(!can_jump_services)
+                .on_click(move |_, window, cx| {
+                    shell_services.jump_to_services(key.pid, window, cx);
                 }),
         )
 }
