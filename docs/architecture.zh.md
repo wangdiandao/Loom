@@ -177,8 +177,8 @@ flowchart BT
 | Crate | 类型 | 核心职责 | 依赖约束与边界 |
 | :--- | :--- | :--- | :--- |
 | `loom-types` | lib | 跨平台紧凑领域模型（`ProcessKey`、`ProcessHotSample`、`ProcessColdMeta`、五大硬件快照、服务/启动项/用户/历史记录、`CapabilityFlags`） | 无 OS 依赖、无 UI 依赖；高频热结构使用 `Copy` 紧凑内存布局 |
-| `loom-config` | lib | 本地配置持久化（`settings.toml`：启动页、刷新周期、主题、语言、窗口几何、置顶/托盘行为、列偏好）、Schema 向前迁移与原子落盘 | 同步加载目标 `< 1 ms`，不依赖平台后端或 UI |
-| `loom-pal-api` | lib | 静态平台抽象 Trait 族（`PlatformBackend`、`FastSystemSampler`、`SlowMetadataProber` 等）、调用方复用缓冲 `SampleScratch` 与 `PalError` | 仅依赖 `loom-types`，不暴露特定操作系统句柄或头文件类型 |
+| `loom-config` | lib | 本地配置持久化（`settings.toml`：启动页、刷新周期、主题、语言、窗口几何、置顶/托盘行为、列偏好、全局热键）、冻结的 `v1`（`CONFIG_CONTRACT_VERSION = "1.0"`）向前迁移与原子落盘 | 同步加载目标 `< 1 ms`，不依赖平台后端或 UI；忽略未知未来可选键并结构化拒绝更高 `schema_version` |
+| `loom-pal-api` | lib | 冻结的 `v1`（`PAL_API_CONTRACT_VERSION = 1`）静态平台抽象 Trait 族（`PlatformBackend`、`FastSystemSampler`、`SlowMetadataProber`、`ServiceManager`、`StartupManager`、`SessionManager`、`AppHistoryReader`、`SystemOperator`）、调用方复用缓冲 `SampleScratch` 与 `PalError` | 仅依赖 `loom-types`，不暴露特定操作系统句柄或头文件类型 |
 | `loom-pal-windows` | lib | Windows 采集与系统控制实现（`ntdll` / `D3DKMT` / `IOCTL` / `SMBIOS` / `SCM` / `WTS` / `WCT` / `MiniDump`） | 仅 `cfg(windows)` 编译；采用 `windows-sys`，内部收敛 `unsafe` FFI，遵守六项防卡死约束 |
 | `loom-pal-macos` | lib | macOS 后端预留骨架（`Mach` / `libproc` / `IOKit` / `launchd` 映射位） | 仅 `cfg(target_os = "macos")` 编译；当前提供编译期契约占位桩，计划于 `0.3.0` 实现 |
 | `loom-pal-linux` | lib | Linux 后端预留骨架（`procfs` / `sysfs` / `netlink` / `drm` / `systemd` 映射位） | 仅 `cfg(target_os = "linux")` 编译；当前提供编译期契约占位桩，计划于 `0.2.0` 实现 |
@@ -280,9 +280,16 @@ Windows 内核会高频复用已退出进程的 `PID`。Loom 统一使用 `Proce
 
 ## 7. 核心静态扩展契约
 
+自 Loom `0.1.0` 起，以下两项契约边界正式冻结并由确定性单元测试守卫：
+
+- **`loom-pal-api`（`PAL_API_CONTRACT_VERSION = 1`）**：冻结 8 个零开销静态分派 PAL Trait（`PlatformBackend`、`FastSystemSampler`、`SlowMetadataProber`、`ServiceManager`、`StartupManager`、`SessionManager`、`AppHistoryReader`、`SystemOperator`）、关联类型与线程安全约束、热样本结构的 `Copy` 布局约束（`ProcessKey`、`ProcessHotSample<()>`、`SystemPerfSample`）以及调用方复用缓冲（`ProcessSampleScratch`、`PerfSampleScratch`），为 `loom-pal-windows` 与后续 `0.2.0`（`loom-pal-linux`）、`0.3.0`（`loom-pal-macos`）提供稳定接口边界。
+- **`loom-config`（`CONFIG_CONTRACT_VERSION = "1.0"`，`CURRENT_SCHEMA_VERSION = 1`）**：冻结 `settings.toml` v1 配置向前迁移保障——历史/部分 v0 配置可平滑迁移至 v1，未知未来可选键会被安全忽略（不启用 `deny_unknown_fields`），高于当前支持版本的 `schema_version`（如 `2`）会结构化返回 `ConfigError::UnsupportedSchemaVersion`。
+
 ```rust
-// crates/loom-pal-api: 编译期单态化平台后端总契约（无虚表、无装箱 Future）
-pub trait PlatformBackend: Send + 'static {
+// crates/loom-pal-api: 冻结的 v1 编译期单态化平台后端总契约（无虚表、无装箱 Future）
+pub const PAL_API_CONTRACT_VERSION: u32 = 1;
+
+pub trait PlatformBackend: Send + Sync + 'static {
     /// 平台专属紧凑进程扩展字段（Copy 语义；无需扩展的平台设为 `()` 占 0 字节）
     type ProcessExt: Copy + Default + Send + Sync + 'static;
 

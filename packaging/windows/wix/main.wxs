@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <?ifndef BinaryPath?>
+    <?define BinaryPath = "..\..\..\target\release\loom-app.exe"?>
+  <?endif?>
+  <?ifndef LicensePath?>
+    <?define LicensePath = "..\..\..\LICENSE"?>
+  <?endif?>
+
+  <Package
+    Name="Loom Task Manager"
+    Manufacturer="Loom Contributors"
+    Version="$(var.Version)"
+    UpgradeCode="7E9C4B12-8D51-4F3A-9C64-2B8E1A5F0D37"
+    Scope="perMachine"
+    Compressed="yes">
+    <SummaryInformation
+      Description="Loom Task Manager Installer"
+      Manufacturer="Loom Contributors" />
+
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of [ProductName] is already installed."
+      Schedule="afterInstallInitialize" />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="MainApplication" Title="Loom Task Manager" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentGroupRef Id="ShortcutComponents" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="Loom" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Loom" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="LoomExecutable">
+        <File
+          Id="LoomAppExe"
+          Source="$(var.BinaryPath)"
+          Name="loom-app.exe"
+          KeyPath="yes" />
+      </Component>
+      <Component Id="LoomLicense">
+        <File
+          Id="LicenseFile"
+          Source="$(var.LicensePath)"
+          Name="LICENSE"
+          KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="ShortcutComponents" Directory="ApplicationProgramsFolder">
+      <Component Id="StartMenuShortcut" Guid="4C1F8B29-3E74-4A12-B590-6D3E9F8A1C42">
+        <Shortcut
+          Id="ApplicationStartMenuShortcut"
+          Name="Loom Task Manager"
+          Description="Native Rust &amp; GPUI desktop task manager"
+          Target="[INSTALLFOLDER]loom-app.exe"
+          WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Loom\TaskManager"
+          Name="StartMenuShortcutInstalled"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Package>
+</Wix>

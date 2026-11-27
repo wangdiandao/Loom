@@ -4,7 +4,7 @@ English | [中文](README.zh.md)
 
 Loom is a native desktop Task Manager for Windows, macOS, and Linux built with **Rust** and **GPUI Kit (`gpui-kit` / `gpui-component`)**. Development targets **Windows** first—matching the core capabilities of the built-in Windows 11 Task Manager while addressing slow cold starts, high-load UI stutters, and startup hangs—with a static Platform Abstraction Layer (PAL) prepared for Linux and macOS backends.
 
-> **Status:** Early pre-release development (`0.0.x` in progress). Target milestones: daily-usable Windows process management (`P0`) at **`0.0.3`**, stable Windows release and contract freeze at **`0.1.0`**, followed by Linux (`0.2.0`) and macOS (`0.3.0`) backends. See [Versioning and releases](docs/release.md) for the full roadmap.
+> **Status:** **`0.1.0`** — First stable Windows release with frozen `loom-config` v1 (`CONFIG_CONTRACT_VERSION = "1.0"`) and `loom-pal-api` v1 (`PAL_API_CONTRACT_VERSION = 1`) contracts, WiX MSI + Portable ZIP packaging, and automated GitHub Releases. Next milestones: Linux (`0.2.0`) and macOS (`0.3.0`) backends. See [Versioning and releases](docs/release.md) for the full roadmap.
 
 ## Design goals
 
@@ -26,7 +26,7 @@ Development follows semantic version milestones:
 | `0.0.4` | `Performance` views without WMI/PDH: CPU (overall, logical core grid, kernel-time overlay), Memory (composition bar and SMBIOS metadata), Disk (NVMe/SATA detection, active time and transfer charts), Network, and GPU (`D3DKMT` multi-engine and VRAM/temperature). |
 | `0.0.5` | System management views: `Services` (SCM start/stop/restart), `Startup Apps` (Registry/Folder/UWP and Last BIOS time), `Users` (WTS session trees), and `App History`. |
 | `0.0.6` | Diagnostics and performance tuning: Wait Chain Traversal (`WCT` deadlock tree), `MiniDump` creation, UAC virtualization toggle, debugger attach, global hotkey, and fault-injection benchmarking. |
-| **`0.1.0`** | **First stable Windows release:** Freeze `loom-config` v1 migration guarantees and `loom-pal-api` cross-platform contracts, with signed automated GitHub Releases. |
+| **`0.1.0`** | **First stable Windows release:** Freeze `loom-config` v1 (`CONFIG_CONTRACT_VERSION = "1.0"`) migration guarantees and `loom-pal-api` v1 (`PAL_API_CONTRACT_VERSION = 1`) cross-platform static contracts, with Windows WiX MSI + Portable ZIP packaging, conditional Authenticode signing, and automated GitHub Releases. |
 | `0.2.0` / `0.3.0` | Cross-platform backend rollout: `loom-pal-linux` (`0.2.0`) and `loom-pal-macos` (`0.3.0`) without changing the engine or UI architecture. |
 
 ## Project documentation

@@ -4,12 +4,37 @@
 //! on `loom-types` and synchronous I/O so startup configuration loading stays
 //! well below the `< 1 ms` budget and writes are crash-safe via
 //! `tempfile -> sync_all -> atomic rename`.
+//!
+//! # Frozen `0.1.0` v1 Forward-Migration Contract
+//!
+//! Starting in Loom `0.1.0` ([`CONFIG_CONTRACT_VERSION`] `= "1.0"`), the persisted
+//! `settings.toml` v1 schema ([`CURRENT_SCHEMA_VERSION`] `= 1`) is frozen under
+//! the following compatibility guarantees:
+//!
+//! 1. **Golden v1 stability**: Existing v1 `settings.toml` files covering any subset
+//!    of [`AppSettings`] fields must deserialize cleanly and round-trip without data loss.
+//! 2. **Forward migration from legacy/partial configs**: Missing `schema_version` or
+//!    `schema_version = 0` files are migrated forward to v1 via [`migrate_toml_value`],
+//!    inheriting legacy `resource_display_mode` for omitted per-column display modes.
+//! 3. **Forward tolerance for unknown optional keys**: Deserialization intentionally
+//!    omits `#[serde(deny_unknown_fields)]` so future optional keys do not break v1
+//!    readers.
+//! 4. **Strict future-schema rejection**: Any `schema_version > CURRENT_SCHEMA_VERSION`
+//!    (e.g., `schema_version = 2`) fails cleanly with [`ConfigError::UnsupportedSchemaVersion`].
 
 #![warn(missing_docs)]
 
 mod error;
 mod schema;
 mod store;
+
+/// Frozen public configuration contract version established in Loom `0.1.0`.
+///
+/// Tracks the `settings.toml` v1 forward-migration and compatibility guarantee:
+/// legacy/partial v0 files migrate forward cleanly, unknown optional keys are
+/// ignored, and future incompatible `schema_version` values return
+/// [`ConfigError::UnsupportedSchemaVersion`].
+pub const CONFIG_CONTRACT_VERSION: &str = "1.0";
 
 pub use error::ConfigError;
 pub use schema::{
@@ -434,5 +459,308 @@ mod tests {
         store.save(&cleared).expect("save cleared hotkey settings");
         let reloaded_cleared = store.load().expect("reload cleared hotkey settings");
         assert_eq!(reloaded_cleared.global_hotkey, None);
+    }
+
+    #[test]
+    fn v1_contract_golden_toml_deserializes_and_roundtrips_identically() {
+        assert_eq!(CONFIG_CONTRACT_VERSION, "1.0");
+        assert_eq!(CURRENT_SCHEMA_VERSION, 1);
+
+        // Complete golden v1 settings.toml covering every persisted field in AppSettings.
+        const GOLDEN_V1_TOML: &str = r#"
+schema_version = 1
+startup_page = "Performance"
+refresh_speed = "High500Ms"
+theme = "Dark"
+language = "EnUs"
+process_view_mode = "Tree"
+resource_display_mode = "Percent"
+always_on_top = true
+minimize_to_tray = true
+close_to_tray = true
+sidebar_collapsed = true
+memory_display_mode = "Percent"
+disk_display_mode = "Values"
+network_display_mode = "Percent"
+global_hotkey = "Ctrl+Shift+L"
+run_task_history = [
+    "pwsh.exe",
+    "cmd.exe /k ver",
+    "notepad.exe",
+]
+
+[window_geometry]
+x = 120
+y = -40
+width = 1440
+height = 900
+maximized = true
+
+[[processes_columns]]
+id = "name"
+width = 260
+visible = true
+
+[[processes_columns]]
+id = "pid"
+width = 76
+visible = true
+
+[[processes_columns]]
+id = "publisher"
+width = 176
+visible = false
+
+[[details_columns]]
+id = "name"
+width = 240
+visible = true
+
+[[details_columns]]
+id = "threads"
+width = 72
+visible = true
+"#;
+
+        let expected = AppSettings {
+            schema_version: 1,
+            startup_page: StartupPage::Performance,
+            refresh_speed: RefreshSpeed::High500Ms,
+            theme: ThemePreference::Dark,
+            language: LanguagePreference::EnUs,
+            process_view_mode: ProcessViewMode::Tree,
+            resource_display_mode: ResourceDisplayMode::Percent,
+            always_on_top: true,
+            minimize_to_tray: true,
+            close_to_tray: true,
+            sidebar_collapsed: true,
+            memory_display_mode: ResourceDisplayMode::Percent,
+            disk_display_mode: ResourceDisplayMode::Values,
+            network_display_mode: ResourceDisplayMode::Percent,
+            window_geometry: Some(WindowGeometry {
+                x: 120,
+                y: -40,
+                width: 1440,
+                height: 900,
+                maximized: true,
+            }),
+            run_task_history: vec![
+                "pwsh.exe".to_owned(),
+                "cmd.exe /k ver".to_owned(),
+                "notepad.exe".to_owned(),
+            ],
+            processes_columns: vec![
+                TableColumnSetting {
+                    id: "name".to_owned(),
+                    width: 260,
+                    visible: true,
+                },
+                TableColumnSetting {
+                    id: "pid".to_owned(),
+                    width: 76,
+                    visible: true,
+                },
+                TableColumnSetting {
+                    id: "publisher".to_owned(),
+                    width: 176,
+                    visible: false,
+                },
+            ],
+            details_columns: vec![
+                TableColumnSetting {
+                    id: "name".to_owned(),
+                    width: 240,
+                    visible: true,
+                },
+                TableColumnSetting {
+                    id: "threads".to_owned(),
+                    width: 72,
+                    visible: true,
+                },
+            ],
+            global_hotkey: Some("Ctrl+Shift+L".to_owned()),
+        };
+
+        let parsed = migrate_toml_value(GOLDEN_V1_TOML).expect("golden v1 TOML must deserialize");
+        assert_eq!(parsed, expected);
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join(CONFIG_FILE_NAME);
+        let store = ConfigStore::new(path.clone());
+        store.save(&parsed).expect("save golden v1 settings");
+        let reloaded = store.load().expect("reload golden v1 settings");
+        assert_eq!(reloaded, expected);
+
+        let raw_saved = std::fs::read_to_string(&path).expect("read saved golden TOML");
+        let reparsed = migrate_toml_value(&raw_saved).expect("reparse saved golden TOML");
+        assert_eq!(reparsed, expected);
+    }
+
+    #[test]
+    fn v1_contract_legacy_v0_and_partial_configs_migrate_through_store() {
+        const LEGACY_V0_TOML: &str = r#"
+schema_version = 0
+startup_page = "Services"
+refresh_speed = "Low2S"
+theme = "Dark"
+resource_display_mode = "Percent"
+network_display_mode = "Values"
+minimize_to_tray = true
+"#;
+        const PARTIAL_TOML: &str = r#"
+theme = "Light"
+language = "EnUs"
+always_on_top = true
+"#;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        let v0_path = dir.path().join("legacy_v0.toml");
+        std::fs::write(&v0_path, LEGACY_V0_TOML).expect("write legacy v0");
+        let v0_store = ConfigStore::new(v0_path);
+        let migrated_v0 = v0_store.load().expect("load and migrate v0");
+        assert_eq!(migrated_v0.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(migrated_v0.startup_page, StartupPage::Services);
+        assert_eq!(migrated_v0.refresh_speed, RefreshSpeed::Low2S);
+        assert_eq!(migrated_v0.theme, ThemePreference::Dark);
+        assert_eq!(
+            migrated_v0.memory_display_mode,
+            ResourceDisplayMode::Percent
+        );
+        assert_eq!(migrated_v0.disk_display_mode, ResourceDisplayMode::Percent);
+        assert_eq!(
+            migrated_v0.network_display_mode,
+            ResourceDisplayMode::Values
+        );
+        assert!(migrated_v0.minimize_to_tray);
+        v0_store.save(&migrated_v0).expect("persist migrated v0");
+        assert_eq!(v0_store.load().expect("reload migrated v0"), migrated_v0);
+
+        let partial_path = dir.path().join("partial.toml");
+        std::fs::write(&partial_path, PARTIAL_TOML).expect("write partial");
+        let partial_store = ConfigStore::new(partial_path);
+        let migrated_partial = partial_store.load().expect("load and migrate partial");
+        assert_eq!(migrated_partial.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(migrated_partial.theme, ThemePreference::Light);
+        assert_eq!(migrated_partial.language, LanguagePreference::EnUs);
+        assert!(migrated_partial.always_on_top);
+        assert_eq!(migrated_partial.startup_page, StartupPage::default());
+        partial_store
+            .save(&migrated_partial)
+            .expect("persist migrated partial");
+        assert_eq!(
+            partial_store.load().expect("reload migrated partial"),
+            migrated_partial
+        );
+    }
+
+    #[test]
+    fn v1_contract_unknown_future_optional_keys_do_not_break_deserialization() {
+        const V1_WITH_UNKNOWN_FUTURE_KEYS: &str = r#"
+schema_version = 1
+startup_page = "Details"
+theme = "Light"
+language = "ZhCn"
+future_experimental_toggle = true
+future_accent_palette = "cobalt"
+future_tags = ["alpha", "beta"]
+
+[window_geometry]
+x = 64
+y = 48
+width = 1280
+height = 800
+maximized = false
+future_monitor_id = "DISPLAY1"
+
+[[processes_columns]]
+id = "cpu"
+width = 92
+visible = true
+future_pinned_side = "right"
+
+[future_section]
+enabled = true
+threshold_ms = 250
+"#;
+
+        let parsed = migrate_toml_value(V1_WITH_UNKNOWN_FUTURE_KEYS)
+            .expect("v1 TOML with unknown future optional keys must deserialize cleanly");
+        assert_eq!(parsed.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(parsed.startup_page, StartupPage::Details);
+        assert_eq!(parsed.theme, ThemePreference::Light);
+        assert_eq!(parsed.language, LanguagePreference::ZhCn);
+        assert_eq!(
+            parsed.window_geometry,
+            Some(WindowGeometry {
+                x: 64,
+                y: 48,
+                width: 1280,
+                height: 800,
+                maximized: false,
+            })
+        );
+        assert_eq!(
+            parsed.processes_columns,
+            vec![TableColumnSetting {
+                id: "cpu".to_owned(),
+                width: 92,
+                visible: true,
+            }]
+        );
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join(CONFIG_FILE_NAME);
+        std::fs::write(&path, V1_WITH_UNKNOWN_FUTURE_KEYS).expect("write forward-compat toml");
+        let store = ConfigStore::new(path);
+        assert_eq!(
+            store.load().expect("ConfigStore loads unknown keys"),
+            parsed
+        );
+    }
+
+    #[test]
+    fn v1_contract_rejects_future_schema_version_2_with_structured_error() {
+        const V2_TOML: &str = r#"
+schema_version = 2
+startup_page = "Processes"
+theme = "Dark"
+"#;
+
+        let err =
+            migrate_toml_value(V2_TOML).expect_err("schema_version = 2 must be rejected cleanly");
+        assert!(matches!(
+            err,
+            ConfigError::UnsupportedSchemaVersion {
+                found: 2,
+                max_supported: 1,
+            }
+        ));
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join(CONFIG_FILE_NAME);
+        std::fs::write(&path, V2_TOML).expect("write v2 toml");
+        let store = ConfigStore::new(path);
+
+        let load_err = store
+            .load()
+            .expect_err("ConfigStore::load must reject schema_version = 2");
+        assert!(matches!(
+            load_err,
+            ConfigError::UnsupportedSchemaVersion {
+                found: 2,
+                max_supported: 1,
+            }
+        ));
+
+        let (fallback, reported_err) = store.load_or_default();
+        assert_eq!(fallback, AppSettings::default());
+        assert!(matches!(
+            reported_err,
+            Some(ConfigError::UnsupportedSchemaVersion {
+                found: 2,
+                max_supported: 1,
+            })
+        ));
     }
 }

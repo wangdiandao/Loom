@@ -4,7 +4,7 @@
 
 Loom 是一款基于 **Rust** 与 **GPUI Kit (`gpui-kit` / `gpui-component`)** 构建的跨平台（Windows / macOS / Linux）原生桌面任务管理器。当前阶段聚焦 **Windows** 平台实现，对齐 Windows 11 自带任务管理器的核心功能，重点解决冷启动慢、高负载卡顿以及异常设备或未响应窗口导致的启动阻塞问题，并通过静态平台抽象层（PAL）为后续扩展 Linux 与 macOS 后端提供接口边界。
 
-> **当前状态**：`0.0.x` 早期开发中。计划在 **`0.0.3`** 达到日常可用的 P0 进程管理核心，在 **`0.1.0`** 发布对齐 Windows 11 任务管理器主要功能的首个稳定版，随后于 `0.2.0` / `0.3.0` 依次扩展 Linux 与 macOS 后端。完整版本路线见[版本与发布](docs/release.zh.md)。
+> **当前状态**：**`0.1.0`** —— 首个 Windows 稳定正式版，已冻结 `loom-config` v1（`CONFIG_CONTRACT_VERSION = "1.0"`）与 `loom-pal-api` v1（`PAL_API_CONTRACT_VERSION = 1`）跨平台契约，并提供 Windows WiX MSI 与便携 ZIP 自动化发布。下一阶段将依次扩展 Linux（`0.2.0`）与 macOS（`0.3.0`）后端。完整版本路线见[版本与发布](docs/release.zh.md)。
 
 ## 设计目标
 
@@ -26,7 +26,7 @@ Loom 是一款基于 **Rust** 与 **GPUI Kit (`gpui-kit` / `gpui-component`)** �
 | `0.0.4` | 无 WMI/PDH 的「性能」监控视图：CPU（总体 / 多逻辑核网格 / 内核时间叠加）、内存（四段比例条与 SMBIOS 信息）、磁盘（NVMe/SATA 识别与活动/速率图）、网络与 GPU（`D3DKMT` 多引擎与显存温度）。 |
 | `0.0.5` | 系统管理视图：「服务」（SCM 启停管理）、「启动应用」（含上次 BIOS 时间）、「用户」（WTS 会话树与断开连接）与「应用历史记录」。 |
 | `0.0.6` | 内核诊断与性能调优：分析等待链（`WCT` 阻塞树）、创建内存转储（`MiniDump`）、UAC 虚拟化切换、调试器附加、全局唤醒热键及故障注入压测调优。 |
-| **`0.1.0`** | **首个稳定契约与 Windows 正式版**：冻结 `loom-config` v1 迁移承诺与 `loom-pal-api` 跨平台抽象契约，提供签名与自动化安装包发布。 |
+| **`0.1.0`** | **首个稳定契约与 Windows 正式版**：冻结 `loom-config` v1（`CONFIG_CONTRACT_VERSION = "1.0"`）迁移承诺与 `loom-pal-api` v1（`PAL_API_CONTRACT_VERSION = 1`）跨平台静态契约，提供 Windows WiX MSI + 便携 ZIP 打包、条件 Authenticode 签名与自动化 GitHub Releases 发布。 |
 | `0.2.0` / `0.3.0` | 跨平台后端扩展：在不改动引擎与 UI 架构的前提下依次实现 `loom-pal-linux`（`0.2.0`）与 `loom-pal-macos`（`0.3.0`）。 |
 
 ## 项目文档
