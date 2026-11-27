@@ -2,8 +2,8 @@
 
 use loom_types::{
     DiskMediaType, LanguagePreference, NetConnectionType, PlatformKind, PlatformProfile,
-    ProcessArch, ProcessCategory, ProcessPriority, RefreshSpeed, StartupPage, ThemePreference,
-    UacVirtualization,
+    ProcessArch, ProcessCategory, ProcessPriority, RefreshSpeed, ServiceState, StartupImpact,
+    StartupPage, ThemePreference, UacVirtualization, UserSessionState,
 };
 
 /// Applies `preference` to `rust-i18n`'s active global locale immediately.
@@ -15,12 +15,6 @@ pub(crate) fn apply_locale(preference: LanguagePreference) {
 #[inline]
 pub(crate) fn tr(key: &str) -> String {
     rust_i18n::t!(key).into_owned()
-}
-
-/// Returns the localized milestone badge string for a scheduled version (e.g., `"0.0.4"`).
-#[inline]
-pub(crate) fn tr_milestone_badge(version: &str) -> String {
-    rust_i18n::t!("milestone.badge", version = version).into_owned()
 }
 
 /// Returns the localized label for a [`StartupPage`].
@@ -170,6 +164,53 @@ pub(crate) fn perf_time_offset_label(secs_ago: usize) -> String {
     } else {
         rust_i18n::t!("perf.seconds_ago", secs = secs_ago).into_owned()
     }
+}
+
+/// Returns the localized label for a [`ServiceState`].
+pub(crate) fn service_state_label(state: ServiceState) -> String {
+    match state {
+        ServiceState::Running => tr("services.state_running"),
+        ServiceState::Stopped => tr("services.state_stopped"),
+        ServiceState::StartPending => tr("services.state_start_pending"),
+        ServiceState::StopPending => tr("services.state_stop_pending"),
+        ServiceState::Paused => tr("services.state_paused"),
+        ServiceState::PausePending => tr("services.state_pause_pending"),
+        ServiceState::ContinuePending => tr("services.state_continue_pending"),
+        ServiceState::Unknown => tr("services.state_unknown"),
+    }
+}
+
+/// Returns the localized label for a [`StartupImpact`].
+pub(crate) fn startup_impact_label(impact: StartupImpact) -> String {
+    match impact {
+        StartupImpact::High => tr("startup.impact_high"),
+        StartupImpact::Medium => tr("startup.impact_medium"),
+        StartupImpact::Low => tr("startup.impact_low"),
+        StartupImpact::NotMeasured => tr("startup.impact_not_measured"),
+        StartupImpact::None => tr("startup.impact_none"),
+    }
+}
+
+/// Returns the localized label for a [`UserSessionState`].
+pub(crate) fn user_session_state_label(state: UserSessionState) -> String {
+    match state {
+        UserSessionState::Active => tr("users.state_active"),
+        UserSessionState::Disconnected => tr("users.state_disconnected"),
+        UserSessionState::Idle => tr("users.state_idle"),
+        UserSessionState::Unknown => tr("users.state_unknown"),
+    }
+}
+
+/// Formats the localized "Last BIOS time: X.X s" indicator for the Startup Apps toolbar.
+#[inline]
+pub(crate) fn startup_last_bios_time(seconds: &str) -> String {
+    rust_i18n::t!("startup.last_bios_time", seconds = seconds).into_owned()
+}
+
+/// Formats the localized "Resource usage since YYYY-MM-DD HH:MM" indicator for App History.
+#[inline]
+pub(crate) fn app_history_since(datetime: &str) -> String {
+    rust_i18n::t!("app_history.since", datetime = datetime).into_owned()
 }
 
 #[cfg(test)]
@@ -395,6 +436,91 @@ mod tests {
         "perf.gpu_directx_version",
         "perf.gpu_pci_location",
         "perf.gpu_select_engine",
+        "services.title",
+        "services.start",
+        "services.stop",
+        "services.restart",
+        "services.open_services",
+        "services.filtered_pid",
+        "services.clear_filter",
+        "services.col_name",
+        "services.col_pid",
+        "services.col_description",
+        "services.col_status",
+        "services.col_group",
+        "services.state_running",
+        "services.state_stopped",
+        "services.state_start_pending",
+        "services.state_stop_pending",
+        "services.state_paused",
+        "services.state_pause_pending",
+        "services.state_continue_pending",
+        "services.state_unknown",
+        "services.menu_start",
+        "services.menu_stop",
+        "services.menu_restart",
+        "services.menu_open_services",
+        "services.menu_go_to_details",
+        "services.menu_search_online",
+        "services.loading",
+        "services.empty",
+        "startup.title",
+        "startup.enable",
+        "startup.disable",
+        "startup.col_name",
+        "startup.col_publisher",
+        "startup.col_status",
+        "startup.col_impact",
+        "startup.status_enabled",
+        "startup.status_disabled",
+        "startup.impact_high",
+        "startup.impact_medium",
+        "startup.impact_low",
+        "startup.impact_not_measured",
+        "startup.impact_none",
+        "startup.menu_enable",
+        "startup.menu_disable",
+        "startup.menu_open_file_location",
+        "startup.menu_properties",
+        "startup.menu_search_online",
+        "startup.loading",
+        "startup.empty",
+        "users.title",
+        "users.disconnect",
+        "users.manage_accounts",
+        "users.col_user",
+        "users.col_status",
+        "users.col_cpu",
+        "users.col_memory",
+        "users.col_disk",
+        "users.col_network",
+        "users.state_active",
+        "users.state_disconnected",
+        "users.state_idle",
+        "users.state_unknown",
+        "users.menu_expand",
+        "users.menu_collapse",
+        "users.menu_disconnect",
+        "users.menu_manage_accounts",
+        "users.menu_end_task",
+        "users.menu_go_to_details",
+        "users.menu_search_online",
+        "users.confirm_disconnect_title",
+        "users.confirm_disconnect_action",
+        "users.loading",
+        "users.empty",
+        "app_history.title",
+        "app_history.delete_history",
+        "app_history.col_name",
+        "app_history.col_cpu_time",
+        "app_history.col_network",
+        "app_history.col_metered_network",
+        "app_history.menu_search_online",
+        "app_history.confirm_delete_title",
+        "app_history.confirm_delete_message",
+        "app_history.confirm_delete_action",
+        "app_history.loading",
+        "app_history.empty",
     ];
 
     use std::sync::Mutex;
@@ -426,14 +552,22 @@ mod tests {
         assert_eq!(tr("nav.settings"), "Settings");
         assert_eq!(tr("uac.action"), "Restart as Administrator");
         assert_eq!(tr("tray.show"), "Show Loom");
-        assert_eq!(tr_milestone_badge("0.0.4"), "Scheduled for v0.0.4");
+        assert_eq!(startup_last_bios_time("4.2"), "Last BIOS time: 4.2 s");
+        assert_eq!(
+            app_history_since("2026-11-27 10:30"),
+            "Resource usage since 2026-11-27 10:30"
+        );
 
         apply_locale(LanguagePreference::ZhCn);
         assert_eq!(tr("nav.processes"), "进程");
         assert_eq!(tr("nav.settings"), "设置");
         assert_eq!(tr("uac.action"), "以管理员身份重启");
         assert_eq!(tr("tray.show"), "显示 Loom");
-        assert_eq!(tr_milestone_badge("0.0.4"), "计划于 v0.0.4 交付");
+        assert_eq!(startup_last_bios_time("4.2"), "上次 BIOS 时间: 4.2 秒");
+        assert_eq!(
+            app_history_since("2026-11-27 10:30"),
+            "自 2026-11-27 10:30 起的资源使用情况"
+        );
     }
 
     #[test]

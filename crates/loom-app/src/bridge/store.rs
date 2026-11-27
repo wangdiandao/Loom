@@ -26,6 +26,8 @@ pub(crate) enum UiStoreEvent {
     SnapshotUpdated(DomainRevisions),
     /// User preferences in [`AppSettings`] were updated.
     SettingsChanged,
+    /// The global TitleBar search query changed.
+    SearchQueryChanged,
     /// An engine command failed with [`loom_pal::PalError::ElevationRequired`].
     ElevationRequired {
         /// The command that requested elevated privileges.
@@ -47,6 +49,7 @@ pub(crate) struct UiStore {
     settings: AppSettings,
     snapshot: Arc<AppSnapshot>,
     last_revisions: DomainRevisions,
+    search_query: String,
     event_rx: Receiver<CommandEvent>,
     dormant: bool,
     poll_task: Option<Task<()>>,
@@ -72,6 +75,7 @@ impl UiStore {
             settings,
             snapshot,
             last_revisions,
+            search_query: String::new(),
             event_rx,
             dormant: false,
             poll_task: None,
@@ -111,6 +115,24 @@ impl UiStore {
     #[inline]
     pub(crate) fn snapshot(&self) -> &Arc<AppSnapshot> {
         &self.snapshot
+    }
+
+    /// Returns the active global TitleBar search query.
+    #[inline]
+    pub(crate) fn search_query(&self) -> &str {
+        &self.search_query
+    }
+
+    /// Updates the global case-insensitive search query, dispatches it to the engine,
+    /// and notifies UI subscribers immediately.
+    pub(crate) fn set_search_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if self.search_query == query {
+            return;
+        }
+        self.search_query = query.clone();
+        let _ = self.dispatch_command(EngineCommand::SetSearchQuery(query));
+        cx.emit(UiStoreEvent::SearchQueryChanged);
+        cx.notify();
     }
 
     /// Returns the backing `settings.toml` path.

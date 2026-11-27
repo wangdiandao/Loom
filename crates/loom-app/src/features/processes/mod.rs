@@ -1032,7 +1032,9 @@ impl ProcessesView {
                         cx.notify();
                     }
                 }
-                UiStoreEvent::ElevationRequired { .. } | UiStoreEvent::CommandFailed { .. } => {}
+                UiStoreEvent::SearchQueryChanged
+                | UiStoreEvent::ElevationRequired { .. }
+                | UiStoreEvent::CommandFailed { .. } => {}
             }),
         );
 

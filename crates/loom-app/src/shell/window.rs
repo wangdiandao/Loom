@@ -23,7 +23,8 @@ use loom_types::{CapabilityFlags, LanguagePreference, ProcessKey, ThemePreferenc
 use crate::bootstrap;
 use crate::bridge::{UiCommands, UiStore, UiStoreEvent, apply_theme};
 use crate::features::{
-    DetailsView, PerformanceView, ProcessesView, SettingsView, render_upcoming_milestone,
+    AppHistoryView, DetailsView, PerformanceView, ProcessesView, ServicesView, SettingsView,
+    StartupView, UsersView,
 };
 use crate::i18n;
 use crate::shell::nav::{NavigationIntent, Route, ShellHandle};
@@ -36,14 +37,19 @@ struct ElevationNotice;
 
 /// Mounted page entity owned by [`AppShell`].
 ///
-/// Dropping on-demand views ([`ActivePage::Performance`] or [`ActivePage::Details`]) when
-/// switching away immediately releases their RAII [`crate::bridge::ScopedMonitorLease`]s.
+/// Dropping on-demand views ([`ActivePage::Performance`], [`ActivePage::AppHistory`],
+/// [`ActivePage::Startup`], [`ActivePage::Users`], [`ActivePage::Details`], or
+/// [`ActivePage::Services`]) when switching away immediately releases their RAII
+/// [`crate::bridge::ScopedMonitorLease`]s.
 enum ActivePage {
     Processes(Entity<ProcessesView>),
     Performance(Entity<PerformanceView>),
+    AppHistory(Entity<AppHistoryView>),
+    Startup(Entity<StartupView>),
+    Users(Entity<UsersView>),
     Details(Entity<DetailsView>),
+    Services(Entity<ServicesView>),
     Settings(Entity<SettingsView>),
-    Upcoming(Route),
 }
 
 /// Top-level application view wrapped by `gpui-kit`'s `Root` layer.
@@ -134,6 +140,7 @@ impl AppShell {
                     tracing::warn!(?command, %message, "surfacing command error notification");
                     window.push_notification(Notification::error(message.clone()), cx);
                 }
+                UiStoreEvent::SearchQueryChanged => {}
             },
         ));
 
@@ -191,7 +198,8 @@ impl AppShell {
         }
 
         let shell_handle = Self::make_shell_handle(cx);
-        let active_page = Self::mount_route(&store, initial_route, None, shell_handle, window, cx);
+        let active_page =
+            Self::mount_route(&store, initial_route, None, None, shell_handle, window, cx);
         bootstrap::record_active_route(initial_route, cx);
 
         Self {
@@ -219,6 +227,7 @@ impl AppShell {
         store: &Entity<UiStore>,
         route: Route,
         highlight_details: Option<ProcessKey>,
+        filter_services_pid: Option<u32>,
         shell_handle: ShellHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -234,17 +243,36 @@ impl AppShell {
                 let store = store.clone();
                 ActivePage::Performance(cx.new(|cx| PerformanceView::new(store, window, cx)))
             }
+            Route::AppHistory => {
+                let store = store.clone();
+                ActivePage::AppHistory(cx.new(|cx| AppHistoryView::new(store, window, cx)))
+            }
+            Route::Startup => {
+                let store = store.clone();
+                ActivePage::Startup(cx.new(|cx| StartupView::new(store, window, cx)))
+            }
+            Route::Users => {
+                let store = store.clone();
+                ActivePage::Users(cx.new(|cx| UsersView::new(store, shell_handle, window, cx)))
+            }
             Route::Details => {
                 let store = store.clone();
                 ActivePage::Details(
-                    cx.new(|cx| DetailsView::new(store, highlight_details, window, cx)),
+                    cx.new(|cx| {
+                        DetailsView::new(store, highlight_details, shell_handle, window, cx)
+                    }),
                 )
+            }
+            Route::Services => {
+                let store = store.clone();
+                ActivePage::Services(cx.new(|cx| {
+                    ServicesView::new(store, filter_services_pid, shell_handle, window, cx)
+                }))
             }
             Route::Settings => {
                 let store = store.clone();
                 ActivePage::Settings(cx.new(|cx| SettingsView::new(store, window, cx)))
             }
-            upcoming => ActivePage::Upcoming(upcoming),
         }
     }
 
@@ -252,6 +280,7 @@ impl AppShell {
         &mut self,
         route: Route,
         highlight_details: Option<ProcessKey>,
+        filter_services_pid: Option<u32>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -263,6 +292,13 @@ impl AppShell {
                     view.set_highlighted_key(highlight_details, cx);
                 });
             }
+            if let (Route::Services, ActivePage::Services(services)) = (route, &self.active_page)
+                && filter_services_pid.is_some()
+            {
+                services.update(cx, |view, cx| {
+                    view.set_filter_pid(filter_services_pid, cx);
+                });
+            }
             return;
         }
 
@@ -272,6 +308,7 @@ impl AppShell {
             &self.store,
             route,
             highlight_details,
+            filter_services_pid,
             shell_handle,
             window,
             cx,
@@ -288,13 +325,13 @@ impl AppShell {
     ) {
         match intent {
             NavigationIntent::Navigate(route) => {
-                self.navigate_to(route, None, window, cx);
+                self.navigate_to(route, None, None, window, cx);
             }
             NavigationIntent::JumpToDetails(key) => {
-                self.navigate_to(Route::Details, Some(key), window, cx);
+                self.navigate_to(Route::Details, Some(key), None, window, cx);
             }
-            NavigationIntent::JumpToServices(_pid) => {
-                self.navigate_to(Route::Services, None, window, cx);
+            NavigationIntent::JumpToServices(pid) => {
+                self.navigate_to(Route::Services, None, Some(pid), window, cx);
             }
         }
     }
@@ -450,9 +487,12 @@ impl Render for AppShell {
         let outlet = match &self.active_page {
             ActivePage::Processes(view) => view.clone().into_any_element(),
             ActivePage::Performance(view) => view.clone().into_any_element(),
+            ActivePage::AppHistory(view) => view.clone().into_any_element(),
+            ActivePage::Startup(view) => view.clone().into_any_element(),
+            ActivePage::Users(view) => view.clone().into_any_element(),
             ActivePage::Details(view) => view.clone().into_any_element(),
+            ActivePage::Services(view) => view.clone().into_any_element(),
             ActivePage::Settings(view) => view.clone().into_any_element(),
-            ActivePage::Upcoming(route) => render_upcoming_milestone(*route, cx).into_any_element(),
         };
 
         v_flex()
