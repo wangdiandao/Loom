@@ -8,6 +8,7 @@
 mod affinity_dialog;
 mod wait_chain_dialog;
 
+use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -23,25 +24,33 @@ use gpui_kit::component::{
     WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
-    App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement as _, Render, ScrollStrategy,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window,
+    App, AppContext as _, Bounds, ClipboardItem, Context, Empty, Entity, EntityInputHandler,
+    FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
+    ParentElement as _, Pixels, Point, Render, ScrollStrategy, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, UTF16Selection, WeakEntity, Window,
     div, img, prelude::FluentBuilder as _, px,
 };
+use loom_engine::{EngineCommand, EngineCoordinator};
+use loom_pal::NativeBackend;
 use loom_types::{
     CapabilityFlags, DetailsRowProjection, DetailsSortColumn, DetailsTableSlice, DetailsViewMode,
     LanguagePreference, MonitorDomain, PlatformProfile, ProcessArch, ProcessKey, ProcessPriority,
-    ProcessStatusFlags, SortDirection, UacVirtualization,
+    ProcessStatusFlags, SortDirection, UacVirtualization, WebView2Role,
 };
 use loom_ui_kit::{
-    HeatmapLevel, LoomSemanticColors, format_bytes_shared, format_cpu_time_shared,
-    format_permille_shared, heatmap_cell,
+    HeatmapLevel, LoomSemanticColors, format_bytes, format_bytes_shared, format_cpu_time,
+    format_cpu_time_shared, format_permille, format_permille_shared, heatmap_cell,
 };
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
 use crate::features::table_columns::{
-    ColumnKey, ColumnSpec, ColumnToggleItem, DataTablePane, HeaderMenuAction, IconRenderCache,
-    TableColumnLayout, build_column_header_menu, open_select_columns_dialog,
+    ColumnKey, ColumnSpec, ColumnToggleItem, CopyRowFields, DataTablePane, HeaderMenuAction,
+    IconRenderCache, OrderFreezeState, TableColumnLayout, TableInputBridge, TypeToSearchState,
+    build_column_header_menu, build_copy_submenu, can_suspend_or_resume_process,
+    dispatch_ignore_leak_path, dispatch_restart_explorer, dispatch_suspend_or_resume,
+    format_process_name_and_pid, is_explorer_image, leak_ignore_target, leak_warning_badge,
+    open_select_columns_dialog, sort_paused_indicator, spawn_csv_export, webview2_role_badge,
+    webview2_role_label,
 };
 use crate::i18n;
 use crate::shell::{ShellHandle, dialogs};
@@ -309,6 +318,7 @@ struct ProcessActionTarget {
     priority: ProcessPriority,
     uac_virtualization: UacVirtualization,
     exe_path: Option<Arc<str>>,
+    has_leak_warning: bool,
 }
 
 impl ProcessActionTarget {
@@ -320,8 +330,50 @@ impl ProcessActionTarget {
             priority: row.priority,
             uac_virtualization: row.uac_virtualization,
             exe_path: row.exe_path.clone(),
+            has_leak_warning: row.leak_warning.is_some(),
         }
     }
+}
+
+/// Formats the short `Ctrl+C` clipboard text (`"<name> (<pid>)"`) for a Details row.
+pub(super) fn format_details_copy_short(row: &DetailsRowProjection) -> String {
+    format_process_name_and_pid(row.name.trim(), row.key.pid)
+}
+
+/// Formats the structured multi-field `Ctrl+Shift+C` summary for a Details row.
+pub(super) fn format_details_row_summary(
+    row: &DetailsRowProjection,
+    status_text: &str,
+    priority_text: &str,
+    arch_text: &str,
+) -> String {
+    let user = display_user_name(row.user_name.as_deref());
+    let cpu = format_permille(row.cpu_permille);
+    let mem = format_bytes(row.private_working_set_bytes);
+    let gpu = format_bytes(row.gpu_dedicated_bytes);
+    let publisher = row
+        .publisher
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("—");
+    let exe_path = row
+        .exe_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("—");
+    let cmdline = row
+        .command_line
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("—");
+
+    format!(
+        "Name: {}\nPID: {}\nStatus: {status_text}\nUser: {user}\nCPU: {cpu}\nMemory: {mem}\nPriority: {priority_text}\nHandles: {}\nThreads: {}\nPlatform: {arch_text}\nGPU Memory: {gpu}\nPublisher: {publisher}\nPath: {exe_path}\nCommand Line: {cmdline}",
+        row.name, row.key.pid, row.handle_count, row.thread_count
+    )
 }
 
 /// Finds the current display row index of `target` by composite [`ProcessKey`].
@@ -476,6 +528,14 @@ struct DetailsLocaleCache {
     uac_disabled: SharedString,
     uac_not_allowed: SharedString,
     uac_unknown: SharedString,
+    wv2_browser: SharedString,
+    wv2_renderer: SharedString,
+    wv2_gpu: SharedString,
+    wv2_network: SharedString,
+    wv2_storage: SharedString,
+    wv2_audio: SharedString,
+    wv2_utility: SharedString,
+    wv2_crashpad: SharedString,
 }
 
 impl DetailsLocaleCache {
@@ -503,6 +563,28 @@ impl DetailsLocaleCache {
             uac_disabled: i18n::uac_virtualization_label(UacVirtualization::Disabled).into(),
             uac_not_allowed: i18n::uac_virtualization_label(UacVirtualization::NotAllowed).into(),
             uac_unknown: i18n::uac_virtualization_label(UacVirtualization::Unknown).into(),
+            wv2_browser: webview2_role_label(WebView2Role::Browser).into(),
+            wv2_renderer: webview2_role_label(WebView2Role::Renderer).into(),
+            wv2_gpu: webview2_role_label(WebView2Role::Gpu).into(),
+            wv2_network: webview2_role_label(WebView2Role::Network).into(),
+            wv2_storage: webview2_role_label(WebView2Role::Storage).into(),
+            wv2_audio: webview2_role_label(WebView2Role::Audio).into(),
+            wv2_utility: webview2_role_label(WebView2Role::Utility).into(),
+            wv2_crashpad: webview2_role_label(WebView2Role::Crashpad).into(),
+        }
+    }
+
+    #[inline]
+    fn webview2_label(&self, role: WebView2Role) -> SharedString {
+        match role {
+            WebView2Role::Browser => self.wv2_browser.clone(),
+            WebView2Role::Renderer => self.wv2_renderer.clone(),
+            WebView2Role::Gpu => self.wv2_gpu.clone(),
+            WebView2Role::Network => self.wv2_network.clone(),
+            WebView2Role::Storage => self.wv2_storage.clone(),
+            WebView2Role::Audio => self.wv2_audio.clone(),
+            WebView2Role::Utility => self.wv2_utility.clone(),
+            WebView2Role::Crashpad => self.wv2_crashpad.clone(),
         }
     }
 
@@ -720,6 +802,9 @@ struct DetailsTableDelegate {
     selected_key: Option<ProcessKey>,
     highlighted_key: Option<ProcessKey>,
     pending_scroll_key: Option<ProcessKey>,
+    last_right_clicked_col: Option<usize>,
+    order_freeze: OrderFreezeState,
+    menu_focus_subs: Vec<Subscription>,
     column_layout: TableColumnLayout<DetailsColumn>,
     icon_cache: IconRenderCache,
     locale: DetailsLocaleCache,
@@ -755,10 +840,151 @@ impl DetailsTableDelegate {
             selected_key: highlighted_key,
             highlighted_key,
             pending_scroll_key: highlighted_key,
+            last_right_clicked_col: None,
+            order_freeze: OrderFreezeState::default(),
+            menu_focus_subs: Vec::new(),
             column_layout,
             icon_cache: IconRenderCache::new(),
             locale: DetailsLocaleCache::build(),
         }
+    }
+
+    fn apply_order_freeze_transition(
+        &mut self,
+        transition: Option<bool>,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        if let Some(frozen) = transition {
+            let _ = self
+                .store
+                .read(cx)
+                .dispatch_command(EngineCommand::SetDetailsOrderFreeze(frozen));
+            cx.notify();
+        }
+    }
+
+    fn set_table_hovered(&mut self, hovered: bool, cx: &mut Context<TableState<Self>>) {
+        let transition = self.order_freeze.set_table_hovered(hovered);
+        self.apply_order_freeze_transition(transition, cx);
+    }
+
+    fn set_header_hovered(&mut self, hovered: bool, cx: &mut Context<TableState<Self>>) {
+        let transition = self.order_freeze.set_header_hovered(hovered);
+        self.apply_order_freeze_transition(transition, cx);
+    }
+
+    fn set_context_menu_open(&mut self, open: bool, cx: &mut Context<TableState<Self>>) {
+        let transition = self.order_freeze.set_context_menu_open(open);
+        self.apply_order_freeze_transition(transition, cx);
+    }
+
+    fn format_cell_text(&self, row: &DetailsRowProjection, col: DetailsColumn) -> String {
+        match col {
+            DetailsColumn::Name => row.name.to_string(),
+            DetailsColumn::Pid => row.key.pid.to_string(),
+            DetailsColumn::Status => {
+                if row.status.contains(ProcessStatusFlags::SUSPENDED) {
+                    self.locale.suspended.to_string()
+                } else {
+                    self.locale.running.to_string()
+                }
+            }
+            DetailsColumn::UserName => display_user_name(row.user_name.as_deref()).to_owned(),
+            DetailsColumn::SessionId => row.session_id.to_string(),
+            DetailsColumn::Cpu => format_permille(row.cpu_permille),
+            DetailsColumn::CpuTime => format_cpu_time(row.cpu_time_100ns),
+            DetailsColumn::Memory => format_bytes(row.private_working_set_bytes),
+            DetailsColumn::WorkingSet => format_bytes(row.working_set_bytes),
+            DetailsColumn::CommitSize => format_bytes(row.commit_bytes),
+            DetailsColumn::Priority => self.locale.priority_label(row.priority).to_string(),
+            DetailsColumn::Handles => row.handle_count.to_string(),
+            DetailsColumn::Threads => row.thread_count.to_string(),
+            DetailsColumn::Platform => self.locale.arch_label(row.arch).to_string(),
+            DetailsColumn::UacVirtualization => {
+                self.locale.uac_label(row.uac_virtualization).to_string()
+            }
+            DetailsColumn::Elevated => {
+                if row.status.contains(ProcessStatusFlags::ELEVATED) {
+                    self.locale.elevated_yes.to_string()
+                } else {
+                    self.locale.elevated_no.to_string()
+                }
+            }
+            DetailsColumn::GpuMemory => format_bytes(row.gpu_dedicated_bytes),
+            DetailsColumn::Publisher => row
+                .publisher
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("")
+                .to_owned(),
+            DetailsColumn::Description => row
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("")
+                .to_owned(),
+            DetailsColumn::ExePath => row
+                .exe_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("")
+                .to_owned(),
+            DetailsColumn::CommandLine => row
+                .command_line
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("")
+                .to_owned(),
+        }
+    }
+
+    fn format_row_summary(&self, row: &DetailsRowProjection) -> String {
+        let status_text = self.format_cell_text(row, DetailsColumn::Status);
+        let priority_text = self.locale.priority_label(row.priority);
+        let arch_text = self.locale.arch_label(row.arch);
+        format_details_row_summary(
+            row,
+            &status_text,
+            priority_text.as_ref(),
+            arch_text.as_ref(),
+        )
+    }
+
+    fn selected_row(&self) -> Option<&DetailsRowProjection> {
+        let sel = self.selected_key?;
+        find_row_index_by_key(&self.details.rows, sel).and_then(|idx| self.details.rows.get(idx))
+    }
+
+    fn selected_copy_short(&self) -> Option<String> {
+        self.selected_row().map(format_details_copy_short)
+    }
+
+    fn selected_copy_summary(&self) -> Option<String> {
+        self.selected_row().map(|row| self.format_row_summary(row))
+    }
+
+    fn export_visible_csv_payload(&self) -> (Vec<String>, Vec<Vec<String>>) {
+        let visible_cols = self.column_layout.visible_columns();
+        let headers: Vec<String> = visible_cols
+            .iter()
+            .map(|spec| spec.id.label(self.platform))
+            .collect();
+        let rows: Vec<Vec<String>> = self
+            .details
+            .rows
+            .iter()
+            .map(|row| {
+                visible_cols
+                    .iter()
+                    .map(|spec| self.format_cell_text(row, spec.id))
+                    .collect()
+            })
+            .collect();
+        (headers, rows)
     }
 
     fn persist_column_layout(&self, cx: &mut App) {
@@ -971,6 +1197,9 @@ impl TableDelegate for DetailsTableDelegate {
             .bg(bg)
             .text_xs()
             .font_medium()
+            .on_hover(cx.listener(|table, hovered: &bool, _, cx| {
+                table.delegate_mut().set_header_hovered(*hovered, cx);
+            }))
             .child(
                 div()
                     .id("details-header-bg-menu")
@@ -993,8 +1222,11 @@ impl TableDelegate for DetailsTableDelegate {
         };
         let col = spec.id;
         let is_active_sort = col.sort_column() == Some(self.details.sort_column);
-        let fg = cx.theme().foreground;
-        let muted_fg = cx.theme().muted_foreground;
+        let is_sort_paused = is_active_sort && self.order_freeze.is_frozen();
+        let theme = cx.theme();
+        let fg = theme.foreground;
+        let muted_fg = theme.muted_foreground;
+        let sort_paused_color = LoomSemanticColors::from_theme(theme).sort_paused;
         let table_weak = cx.entity().downgrade();
 
         h_flex()
@@ -1003,6 +1235,7 @@ impl TableDelegate for DetailsTableDelegate {
             .min_w_0()
             .h_full()
             .items_center()
+            .gap_1()
             .when(col.is_heatmap(), |d| d.px_2())
             .when(col.right_aligned(), |d| d.justify_end())
             .text_xs()
@@ -1012,7 +1245,19 @@ impl TableDelegate for DetailsTableDelegate {
             .on_click(cx.listener(move |table, _, _, cx| {
                 table.delegate().trigger_sort_col(col_ix, cx);
             }))
+            .when(is_sort_paused && col.right_aligned(), |d| {
+                d.child(sort_paused_indicator(
+                    ("details-sort-paused", col_ix),
+                    sort_paused_color,
+                ))
+            })
             .child(div().min_w_0().truncate().child(col.label(self.platform)))
+            .when(is_sort_paused && !col.right_aligned(), |d| {
+                d.child(sort_paused_indicator(
+                    ("details-sort-paused", col_ix),
+                    sort_paused_color,
+                ))
+            })
             .context_menu(move |menu, window, cx| {
                 Self::build_header_context_menu(menu, Some(col), table_weak.clone(), window, cx)
             })
@@ -1057,10 +1302,13 @@ impl TableDelegate for DetailsTableDelegate {
 
         let theme = cx.theme();
         let muted_fg = theme.muted_foreground;
+        let muted_bg = theme.muted;
+        let radius = theme.radius;
+        let semantic = LoomSemanticColors::from_theme(theme);
         let key = row.key;
         let row_id = process_key_element_id(key);
 
-        match spec.id {
+        let cell_content = match spec.id {
             DetailsColumn::Name => {
                 let is_tree_mode = self.details.view_mode == DetailsViewMode::Tree;
                 let indent = if is_tree_mode {
@@ -1076,6 +1324,9 @@ impl TableDelegate for DetailsTableDelegate {
                     .and_then(|icon| self.icon_cache.get_or_insert(icon));
                 let toggle_store = self.store.clone();
                 let name = SharedString::from(Arc::clone(&row.name));
+                let wv2_label = row
+                    .webview2_role
+                    .map(|role| self.locale.webview2_label(role));
 
                 h_flex()
                     .size_full()
@@ -1123,7 +1374,20 @@ impl TableDelegate for DetailsTableDelegate {
                             .child(Icon::new(IconName::File).xsmall().text_color(muted_fg))
                             .into_any_element()
                     })
-                    .child(div().flex_1().min_w_0().truncate().text_xs().child(name))
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap_1p5()
+                            .overflow_hidden()
+                            .child(div().min_w_0().truncate().text_xs().child(name))
+                            .when_some(wv2_label, |el, role_label| {
+                                el.child(webview2_role_badge(
+                                    role_label, muted_bg, muted_fg, radius,
+                                ))
+                            }),
+                    )
                     .into_any_element()
             }
             DetailsColumn::Pid => h_flex()
@@ -1144,6 +1408,7 @@ impl TableDelegate for DetailsTableDelegate {
                 h_flex()
                     .size_full()
                     .items_center()
+                    .gap_1()
                     .overflow_hidden()
                     .child(
                         div()
@@ -1153,6 +1418,13 @@ impl TableDelegate for DetailsTableDelegate {
                             .text_color(muted_fg)
                             .child(status_text),
                     )
+                    .when_some(row.leak_warning.as_ref(), |el, warning| {
+                        el.child(leak_warning_badge(
+                            ("details-leak", row_id),
+                            warning,
+                            semantic.leak_warning,
+                        ))
+                    })
                     .into_any_element()
             }
             DetailsColumn::UserName => {
@@ -1183,7 +1455,7 @@ impl TableDelegate for DetailsTableDelegate {
             DetailsColumn::Cpu => heatmap_cell(
                 format_permille_shared(row.cpu_permille),
                 HeatmapLevel::from_permille(row.cpu_permille),
-                &LoomSemanticColors::from_theme(theme),
+                &semantic,
             )
             .into_any_element(),
             DetailsColumn::CpuTime => h_flex()
@@ -1198,7 +1470,7 @@ impl TableDelegate for DetailsTableDelegate {
             DetailsColumn::Memory => heatmap_cell(
                 format_bytes_shared(row.private_working_set_bytes),
                 memory_heatmap_level(row.private_working_set_bytes, self.total_ram_bytes),
-                &LoomSemanticColors::from_theme(theme),
+                &semantic,
             )
             .into_any_element(),
             DetailsColumn::WorkingSet => h_flex()
@@ -1398,7 +1670,18 @@ impl TableDelegate for DetailsTableDelegate {
                     .child(div().min_w_0().truncate().child(text))
                     .into_any_element()
             }
-        }
+        };
+
+        div()
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |table, _, _, _| {
+                    table.delegate_mut().last_right_clicked_col = Some(col_ix);
+                }),
+            )
+            .child(cell_content)
+            .into_any_element()
     }
 
     fn context_menu(
@@ -1408,19 +1691,62 @@ impl TableDelegate for DetailsTableDelegate {
         window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
-        let Some(row) = self.details.rows.get(row_ix) else {
+        let Some(row) = self.details.rows.get(row_ix).cloned() else {
             return menu;
         };
-        let target = ProcessActionTarget::from_row(row);
-        build_row_context_menu(
+        let target = ProcessActionTarget::from_row(&row);
+        let clicked_column = self
+            .last_right_clicked_col
+            .and_then(|col_ix| self.column_layout.visible_column(col_ix))
+            .map(|spec| {
+                (
+                    spec.id.label(self.platform),
+                    self.format_cell_text(&row, spec.id),
+                )
+            });
+        let copy_fields = CopyRowFields {
+            name: row.name.to_string(),
+            pid: row.key.pid,
+            exe_path: row.exe_path.as_deref().map(str::to_owned),
+            command_line: row.command_line.as_deref().map(str::to_owned),
+            row_summary: self.format_row_summary(&row),
+            clicked_column,
+        };
+
+        self.set_context_menu_open(true, cx);
+
+        let root_focus = menu.focus_handle(cx);
+        let (built_menu, submenu_handles) = build_row_context_menu(
             menu,
             &self.store,
             &self.shell_handle,
             &target,
+            copy_fields,
             self.capabilities,
             window,
             cx,
-        )
+        );
+
+        let mut tracked_handles = Vec::with_capacity(1 + submenu_handles.len());
+        tracked_handles.push(root_focus);
+        tracked_handles.extend(submenu_handles);
+        let tracked = Rc::new(tracked_handles);
+
+        self.menu_focus_subs.clear();
+        for handle in tracked.iter() {
+            let all_handles = Rc::clone(&tracked);
+            let sub = cx.on_focus_out(handle, window, move |table, _, window, cx| {
+                let still_in_menu = all_handles
+                    .iter()
+                    .any(|h| h.is_focused(window) || h.contains_focused(window, cx));
+                if !still_in_menu {
+                    table.delegate_mut().set_context_menu_open(false, cx);
+                }
+            });
+            self.menu_focus_subs.push(sub);
+        }
+
+        built_menu
     }
 
     fn row_label(&self, row_ix: usize, _cx: &App) -> Option<SharedString> {
@@ -1480,6 +1806,7 @@ impl TableDelegate for DetailsTableDelegate {
 /// live snapshot updates refresh only `self.table` without re-rendering the outer shell.
 pub(crate) struct DetailsView {
     store: Entity<UiStore>,
+    coordinator: Arc<EngineCoordinator<NativeBackend>>,
     _details_lease: ScopedMonitorLease,
     table: Entity<TableState<DetailsTableDelegate>>,
     table_pane: Entity<DataTablePane<DetailsTableDelegate>>,
@@ -1487,12 +1814,129 @@ pub(crate) struct DetailsView {
     highlighted_key: Option<ProcessKey>,
     has_selection: bool,
     last_locale: LanguagePreference,
+    type_to_search: TypeToSearchState,
     _subscriptions: Vec<Subscription>,
+}
+
+impl Drop for DetailsView {
+    fn drop(&mut self) {
+        let _ = self
+            .coordinator
+            .send_command(EngineCommand::SetDetailsOrderFreeze(false));
+    }
 }
 
 impl Focusable for DetailsView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.table.focus_handle(cx)
+    }
+}
+
+impl EntityInputHandler for DetailsView {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let query = self.store.read(cx).search_query().to_owned();
+        self.type_to_search.sync_committed(&query);
+        let (adj, text) = self.type_to_search.text_for_utf16_range(range);
+        adjusted_range.replace(adj);
+        Some(text)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let query = self.store.read(cx).search_query().to_owned();
+        self.type_to_search.sync_committed(&query);
+        Some(UTF16Selection {
+            range: self.type_to_search.selected_utf16_range(),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.type_to_search.marked_utf16_range()
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.type_to_search.is_composing() {
+            self.type_to_search.unmark_text();
+            cx.notify();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let was_composing = self.type_to_search.is_composing();
+        let current = self.store.read(cx).search_query().to_owned();
+        if let Some(next_query) = self.type_to_search.replace_text(range, text, &current) {
+            UiCommands::set_search_query(&self.store, next_query, cx);
+        }
+        if was_composing {
+            cx.notify();
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.store.read(cx).search_query().to_owned();
+        self.type_to_search
+            .replace_and_mark(range, new_text, &current);
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(Bounds::new(
+            element_bounds.origin,
+            gpui_kit::size(px(1.0), px(20.0)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.type_to_search.utf16_len())
+    }
+
+    fn text_length_utf16(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<usize> {
+        let query = self.store.read(cx).search_query().to_owned();
+        self.type_to_search.sync_committed(&query);
+        Some(self.type_to_search.utf16_len())
+    }
+
+    fn accepts_text_input(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.table.focus_handle(cx).is_focused(window)
     }
 }
 
@@ -1506,9 +1950,14 @@ impl DetailsView {
         cx: &mut Context<Self>,
     ) -> Self {
         let lease = store.read(cx).acquire_lease(MonitorDomain::Details);
-        let (view_mode, last_locale) = {
+        let (coordinator, view_mode, last_locale, initial_query) = {
             let s = store.read(cx);
-            (s.snapshot().details.view_mode, s.settings().language)
+            (
+                Arc::clone(s.coordinator()),
+                s.snapshot().details.view_mode,
+                s.settings().language,
+                s.search_query().to_owned(),
+            )
         };
 
         let table = cx.new(|cx| {
@@ -1606,9 +2055,11 @@ impl DetailsView {
                         cx.notify();
                     }
                 }
-                UiStoreEvent::SearchQueryChanged
-                | UiStoreEvent::ElevationRequired { .. }
-                | UiStoreEvent::CommandFailed { .. } => {}
+                UiStoreEvent::SearchQueryChanged => {
+                    let query = store.read(cx).search_query().to_owned();
+                    this.type_to_search.sync_committed(&query);
+                }
+                UiStoreEvent::ElevationRequired { .. } | UiStoreEvent::CommandFailed { .. } => {}
             }),
         );
 
@@ -1665,8 +2116,12 @@ impl DetailsView {
             },
         ));
 
+        let mut type_to_search = TypeToSearchState::default();
+        type_to_search.sync_committed(&initial_query);
+
         Self {
             store,
+            coordinator,
             _details_lease: lease,
             table,
             table_pane,
@@ -1674,6 +2129,7 @@ impl DetailsView {
             highlighted_key,
             has_selection,
             last_locale,
+            type_to_search,
             _subscriptions: subscriptions,
         }
     }
@@ -1732,6 +2188,34 @@ impl DetailsView {
             request_end_task(&self.store, &target, window, cx);
         }
     }
+
+    fn trigger_export_csv(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let (headers, rows) = self.table.read(cx).delegate().export_visible_csv_payload();
+        spawn_csv_export(
+            self.store.clone(),
+            "loom-details",
+            headers,
+            rows,
+            window,
+            cx,
+        );
+    }
+
+    fn copy_selected_short(&self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self.table.read(cx).delegate().selected_copy_short() else {
+            return false;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
+    }
+
+    fn copy_selected_summary(&self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self.table.read(cx).delegate().selected_copy_summary() else {
+            return false;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
+    }
 }
 
 impl Render for DetailsView {
@@ -1741,6 +2225,10 @@ impl Render for DetailsView {
         let view_mode = self.view_mode;
         let highlighted_key = self.highlighted_key;
         let has_selection = self.has_selection;
+        let preedit_badge: Option<String> = self
+            .type_to_search
+            .preedit_text()
+            .map(|pre| format!("{}: {pre}", i18n::tr("proc_ux_ime_searching")));
 
         let theme = cx.theme();
         let border = theme.border;
@@ -1755,6 +2243,7 @@ impl Render for DetailsView {
 
         let flat_label = i18n::tr("details.view_flat");
         let tree_label = i18n::tr("details.view_tree");
+        let export_csv_label = i18n::tr("csv_export_button");
 
         let toolbar = h_flex()
             .w_full()
@@ -1827,7 +2316,19 @@ impl Render for DetailsView {
                                         );
                                     }),
                             ),
-                    ),
+                    )
+                    .when_some(preedit_badge, |el, text| {
+                        el.child(
+                            div()
+                                .px_2()
+                                .py_0p5()
+                                .rounded(radius)
+                                .bg(primary.opacity(0.14))
+                                .text_xs()
+                                .text_color(primary)
+                                .child(text),
+                        )
+                    }),
             )
             .child(
                 h_flex()
@@ -1835,6 +2336,17 @@ impl Render for DetailsView {
                     .items_center()
                     .gap_2()
                     .flex_shrink_0()
+                    .child(
+                        Button::new("details-export-csv")
+                            .small()
+                            .outline()
+                            .icon(Icon::new(AssetIconName::Download))
+                            .tooltip(export_csv_label.clone())
+                            .accessibility_label(export_csv_label)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.trigger_export_csv(window, cx);
+                            })),
+                    )
                     .child(
                         Button::new("details-run-new-task")
                             .small()
@@ -1898,20 +2410,53 @@ impl Render for DetailsView {
                 )
         });
 
+        let table_focus = self.table.focus_handle(cx);
+        let view_entity = cx.entity();
+
         v_flex()
             .id("details-view-root")
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                let modifiers = &event.keystroke.modifiers;
-                if !modifiers.control
-                    && !modifiers.alt
-                    && !modifiers.platform
-                    && !modifiers.function
-                    && !modifiers.shift
-                    && event.keystroke.key == "delete"
-                    && this.has_selection
-                {
+                let m = &event.keystroke.modifiers;
+                let primary_mod = m.control || m.platform;
+                let no_modifiers = !m.control && !m.alt && !m.platform && !m.function && !m.shift;
+
+                if primary_mod && !m.alt && event.keystroke.key.eq_ignore_ascii_case("c") {
+                    let copied = if m.shift {
+                        this.copy_selected_summary(cx)
+                    } else {
+                        this.copy_selected_short(cx)
+                    };
+                    if copied {
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+
+                if no_modifiers && event.keystroke.key == "delete" && this.has_selection {
                     this.trigger_end_task_for_selected(window, cx);
                     cx.stop_propagation();
+                    return;
+                }
+
+                if !m.control && !m.alt && !m.platform && event.keystroke.key == "backspace" {
+                    let current = this.store.read(cx).search_query().to_owned();
+                    if let Some(next) = this.type_to_search.handle_backspace(&current) {
+                        UiCommands::set_search_query(&this.store, next, cx);
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+
+                if no_modifiers && event.keystroke.key == "escape" {
+                    let was_composing = this.type_to_search.is_composing();
+                    let current = this.store.read(cx).search_query().to_owned();
+                    if let Some(next) = this.type_to_search.handle_escape(&current) {
+                        UiCommands::set_search_query(&this.store, next, cx);
+                        cx.stop_propagation();
+                    } else if was_composing {
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
                 }
             }))
             .size_full()
@@ -1920,36 +2465,55 @@ impl Render for DetailsView {
             .when_some(highlight_banner, |this, banner| this.child(banner))
             .child(
                 div()
+                    .id("details-table-hover-zone")
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .w_full()
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        this.table.update(cx, |table, cx| {
+                            table.delegate_mut().set_table_hovered(*hovered, cx);
+                        });
+                    }))
+                    .child(TableInputBridge::new(table_focus, view_entity))
                     .child(self.table_pane.clone()),
             )
     }
 }
 
 /// Builds the multi-level right-click [`PopupMenu`] anchored strictly to `target.key`.
+#[allow(clippy::too_many_arguments)]
 fn build_row_context_menu(
     menu: PopupMenu,
     store: &Entity<UiStore>,
     shell_handle: &ShellHandle,
     target: &ProcessActionTarget,
+    copy_fields: CopyRowFields,
     capabilities: CapabilityFlags,
     window: &mut Window,
     cx: &mut Context<TableState<DetailsTableDelegate>>,
-) -> PopupMenu {
+) -> (PopupMenu, Vec<FocusHandle>) {
     let key = target.key;
     let current_priority = target.priority;
     let is_kernel_or_idle = target
         .status
         .intersects(ProcessStatusFlags::SYSTEM_IDLE | ProcessStatusFlags::KERNEL);
     let eco_supported = capabilities.contains(CapabilityFlags::ECO_MODE);
+    let suspend_supported = capabilities.contains(CapabilityFlags::SUSPEND_RESUME);
     let wait_chain_supported = capabilities.contains(CapabilityFlags::WAIT_CHAIN);
     let minidump_supported = capabilities.contains(CapabilityFlags::MINIDUMP);
     let uac_supported = capabilities.contains(CapabilityFlags::UAC_VIRTUALIZATION);
     let debugger_supported = capabilities.contains(CapabilityFlags::DEBUGGER_ATTACH);
     let eco_enabled = target.status.contains(ProcessStatusFlags::EFFICIENCY_MODE);
     let eco_eligible = is_eco_mode_eligible(target.status, capabilities);
+    let is_suspended = target.status.contains(ProcessStatusFlags::SUSPENDED);
+    let suspend_eligible =
+        can_suspend_or_resume_process(key.pid, &target.name, target.status, capabilities);
+    let is_explorer = is_explorer_image(&target.name);
+    let leak_ignore = target
+        .has_leak_warning
+        .then(|| leak_ignore_target(target.exe_path.as_deref(), &target.name))
+        .flatten();
     let uac_enabled = target.uac_virtualization == UacVirtualization::Enabled;
     let uac_toggleable = matches!(
         target.uac_virtualization,
@@ -1982,6 +2546,7 @@ fn build_row_context_menu(
     let search_query = target.name.to_string();
     let shell_services = shell_handle.clone();
     let can_jump_services = key.pid > 0 && capabilities.contains(CapabilityFlags::SERVICES);
+    let mut submenu_handles = Vec::with_capacity(2);
 
     let priority_submenu = PopupMenu::build(window, cx, move |mut submenu, _window, _cx| {
         for level in PRIORITY_MENU_ORDER {
@@ -1997,6 +2562,10 @@ fn build_row_context_menu(
         }
         submenu
     });
+    submenu_handles.push(priority_submenu.focus_handle(cx));
+
+    let copy_submenu = build_copy_submenu(copy_fields, window, cx);
+    submenu_handles.push(copy_submenu.focus_handle(cx));
 
     let mut menu = menu
         .item(
@@ -2012,7 +2581,37 @@ fn build_row_context_menu(
                 .on_click(move |_, window, cx| {
                     open_end_process_tree_dialog(&store_tree, &target_tree, window, cx);
                 }),
-        )
+        );
+
+    if suspend_supported {
+        let store_suspend = store.clone();
+        let (label, icon) = if is_suspended {
+            (i18n::tr("proc_ux_menu_resume"), IconName::Play)
+        } else {
+            (i18n::tr("proc_ux_menu_suspend"), IconName::Pause)
+        };
+        menu = menu.item(
+            PopupMenuItem::new(label)
+                .icon(icon)
+                .disabled(!suspend_eligible)
+                .on_click(move |_, _, cx| {
+                    dispatch_suspend_or_resume(&store_suspend, key, is_suspended, cx);
+                }),
+        );
+
+        if is_explorer {
+            let store_restart = store.clone();
+            menu = menu.item(
+                PopupMenuItem::new(i18n::tr("proc_ux_menu_restart_explorer"))
+                    .icon(Icon::new(AssetIconName::RotateCw))
+                    .on_click(move |_, _, cx| {
+                        dispatch_restart_explorer(&store_restart, cx);
+                    }),
+            );
+        }
+    }
+
+    menu = menu
         .separator()
         .item(
             PopupMenuItem::submenu(i18n::tr("details.menu_set_priority"), priority_submenu)
@@ -2040,6 +2639,17 @@ fn build_row_context_menu(
                 .disabled(!eco_eligible)
                 .on_click(move |_, _, cx| {
                     UiCommands::set_efficiency_mode(&store_eco, key, !eco_enabled, cx);
+                }),
+        );
+    }
+
+    if let Some(ignore_target) = leak_ignore {
+        let store_leak = store.clone();
+        menu = menu.item(
+            PopupMenuItem::new(i18n::tr("leak_warning_ignore_menu"))
+                .icon(IconName::TriangleAlert)
+                .on_click(move |_, _, cx| {
+                    dispatch_ignore_leak_path(&store_leak, ignore_target.clone(), cx);
                 }),
         );
     }
@@ -2106,7 +2716,13 @@ fn build_row_context_menu(
         }
     }
 
-    menu.separator()
+    let built = menu
+        .separator()
+        .item(
+            PopupMenuItem::submenu(i18n::tr("proc_ux_copy_submenu"), copy_submenu)
+                .icon(Icon::new(AssetIconName::Copy)),
+        )
+        .separator()
         .item(
             PopupMenuItem::new(i18n::tr("details.menu_open_file_location"))
                 .icon(IconName::FolderOpen)
@@ -2150,7 +2766,8 @@ fn build_row_context_menu(
                 .on_click(move |_, window, cx| {
                     shell_services.jump_to_services(key.pid, window, cx);
                 }),
-        )
+        );
+    (built, submenu_handles)
 }
 
 #[cfg(test)]
@@ -2475,5 +3092,154 @@ mod tests {
         assert_eq!(display_user_name(Some("   ")), "—");
         assert_eq!(display_user_name(None), "—");
         assert_eq!(display_user_name(Some(r"DOMAIN\")), r"DOMAIN\");
+    }
+
+    #[test]
+    fn details_smart_copy_formats_short_and_structured_summary() {
+        let mut row = sample_row(7777, 123_456, "explorer.exe");
+        row.user_name = Some(Arc::from(r"WORKSTATION\Alice"));
+        row.cpu_permille = 55;
+        row.private_working_set_bytes = 128 * 1024 * 1024;
+        row.handle_count = 900;
+        row.thread_count = 32;
+        row.publisher = Some(Arc::from("Microsoft Windows"));
+        row.exe_path = Some(Arc::from(r"C:\Windows\explorer.exe"));
+        row.command_line = Some(Arc::from(r"C:\Windows\explorer.exe"));
+
+        assert_eq!(format_details_copy_short(&row), "explorer.exe (7777)");
+        let summary = format_details_row_summary(&row, "Running", "Normal", "64-bit");
+        assert!(summary.contains("Name: explorer.exe"));
+        assert!(summary.contains("PID: 7777"));
+        assert!(summary.contains("User: Alice"));
+        assert!(summary.contains("CPU: 5.5%"));
+        assert!(summary.contains("Memory: 128.0 MB"));
+        assert!(summary.contains("Handles: 900"));
+        assert!(summary.contains("Threads: 32"));
+        assert!(summary.contains("Publisher: Microsoft Windows"));
+        assert!(summary.contains(r"Path: C:\Windows\explorer.exe"));
+    }
+
+    #[gpui_kit::test]
+    fn details_view_hover_freeze_ime_search_copy_and_csv_payload(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::{AppContext as _, EntityInputHandler as _, VisualTestContext, px, size};
+        use loom_config::{AppSettings, ConfigStore};
+        use loom_engine::EngineCoordinator;
+        use loom_pal::{NativeBackend, PlatformBackend as _};
+        use loom_types::{LeakKind, LeakWarning, WebView2Role};
+
+        use crate::bridge::UiStore;
+        use crate::shell::ShellHandle;
+
+        cx.update(gpui_kit::init);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_store = ConfigStore::new(dir.path().join("settings.toml"));
+        let backend = NativeBackend::initialize().expect("native backend");
+        let coordinator =
+            Arc::new(EngineCoordinator::new(backend, AppSettings::default()).expect("coordinator"));
+        let coordinator_for_shutdown = Arc::clone(&coordinator);
+
+        let store =
+            cx.new(|cx| UiStore::new(coordinator, config_store, AppSettings::default(), cx));
+        let shell = ShellHandle::new(|_, _, _| {});
+
+        let store_for_window = store.clone();
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), move |window, cx| {
+                let view = cx.new(|cx| DetailsView::new(store_for_window, None, shell, window, cx));
+                cx.new(|cx| gpui_kit::base::Root::new(view, window, cx))
+            })
+            .expect("open window")
+        });
+        cx.simulate_window_resize(window.into(), size(px(1200.), px(720.)));
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let view = window
+            .read_with(&vcx, |root, _| {
+                root.view()
+                    .clone()
+                    .downcast::<DetailsView>()
+                    .expect("root wraps DetailsView")
+            })
+            .expect("read root");
+
+        let mut row = sample_row(8080, 555_000, "msedgewebview2.exe");
+        row.publisher = Some(Arc::from("Microsoft Corporation"));
+        row.webview2_role = Some(WebView2Role::Gpu);
+        row.leak_warning = Some(LeakWarning {
+            kind: LeakKind::Children,
+            summary: Arc::from("Sustained child process growth (18 live children, baseline 2)"),
+            current_value: 18,
+            baseline_value: 2,
+        });
+        let key = row.key;
+
+        let table = view.read_with(&vcx, |v, _| v.table.clone());
+        table.update(&mut vcx, |table, cx| {
+            let d = table.delegate_mut();
+            d.details = Arc::new(DetailsTableSlice {
+                revision: 42,
+                rows: vec![row],
+                ..Default::default()
+            });
+            d.selected_key = Some(key);
+            cx.notify();
+        });
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // Hover pause & header unfreeze transitions.
+        table.update(&mut vcx, |table, cx| {
+            table.delegate_mut().set_table_hovered(true, cx);
+            assert!(table.delegate().order_freeze.is_frozen());
+            table.delegate_mut().set_header_hovered(true, cx);
+            assert!(!table.delegate().order_freeze.is_frozen());
+            table.delegate_mut().set_header_hovered(false, cx);
+            assert!(table.delegate().order_freeze.is_frozen());
+            table.delegate_mut().set_table_hovered(false, cx);
+            assert!(!table.delegate().order_freeze.is_frozen());
+        });
+
+        // Direct type-to-search with CJK IME.
+        view.update_in(&mut vcx, |this, window, cx| {
+            this.replace_text_in_range(None, "gpu", window, cx);
+            this.replace_and_mark_text_in_range(None, "ce", None, window, cx);
+            this.replace_text_in_range(None, "", window, cx);
+        });
+        assert_eq!(
+            store.read_with(&vcx, |s, _| s.search_query().to_owned()),
+            "gpu"
+        );
+
+        // Smart copy short & summary.
+        view.update(&mut vcx, |this, cx| {
+            assert!(this.copy_selected_short(cx));
+        });
+        assert_eq!(
+            vcx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("msedgewebview2.exe (8080)")
+        );
+        view.update(&mut vcx, |this, cx| {
+            assert!(this.copy_selected_summary(cx));
+        });
+        assert!(
+            vcx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .contains("PID: 8080")
+        );
+
+        // Visible-column CSV payload.
+        let (headers, rows) =
+            table.read_with(&vcx, |t, _| t.delegate().export_visible_csv_payload());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), headers.len());
+        assert_eq!(rows[0][0], "msedgewebview2.exe");
+
+        coordinator_for_shutdown.shutdown();
     }
 }

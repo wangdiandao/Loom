@@ -4,6 +4,11 @@ use loom_types::{
     CapabilityFlags, ProcessCategory, ProcessKey, ProcessRowKind, ProcessRowProjection,
     ProcessSortColumn, ProcessStatusFlags, ResourceDisplayMode, SortDirection,
 };
+use loom_ui_kit::{
+    StatusLabels, format_disk_cell, format_memory_cell, format_network_cell, format_permille,
+};
+
+use crate::features::table_columns::format_process_name_and_pid;
 
 /// Resource columns whose formatting can be toggled between `Values` and `Percent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +134,85 @@ pub(crate) fn stable_row_id(key: ProcessKey) -> usize {
     let mixed = u64::from(key.pid).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ key.create_time_100ns.rotate_left(17);
     mixed as usize
+}
+
+/// Formats the short `Ctrl+C` clipboard text (`"<name> (<pid>)"`) for a process row.
+pub(crate) fn format_process_copy_short(row: &ProcessRowProjection) -> String {
+    let primary = if !row.name.trim().is_empty() {
+        row.name.trim()
+    } else {
+        row.display_name.trim()
+    };
+    format_process_name_and_pid(primary, row.key.pid)
+}
+
+/// Formats a human-readable status summary string for clipboard copy and CSV export.
+pub(crate) fn format_process_status_text(
+    status: ProcessStatusFlags,
+    labels: &StatusLabels,
+    elevated_label: &str,
+    running_label: &str,
+) -> String {
+    let mut parts: Vec<&str> = Vec::with_capacity(4);
+    if status.contains(ProcessStatusFlags::NOT_RESPONDING) {
+        parts.push(labels.not_responding.as_ref());
+    }
+    if status.contains(ProcessStatusFlags::SUSPENDED) {
+        parts.push(labels.suspended.as_ref());
+    }
+    if status.contains(ProcessStatusFlags::EFFICIENCY_MODE) {
+        parts.push(labels.eco_mode.as_ref());
+    }
+    if status.contains(ProcessStatusFlags::ELEVATED) {
+        parts.push(elevated_label);
+    }
+    if parts.is_empty() {
+        running_label.to_owned()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Formats the structured multi-field `Ctrl+Shift+C` summary for a Processes row.
+pub(crate) fn format_process_row_summary(
+    row: &ProcessRowProjection,
+    mem_mode: ResourceDisplayMode,
+    disk_mode: ResourceDisplayMode,
+    net_mode: ResourceDisplayMode,
+    status_text: &str,
+) -> String {
+    let display = row.display_name.trim();
+    let image = row.name.trim();
+    let name_line =
+        if !display.is_empty() && !image.is_empty() && !display.eq_ignore_ascii_case(image) {
+            format!("{display} ({image})")
+        } else if !display.is_empty() {
+            display.to_owned()
+        } else {
+            image.to_owned()
+        };
+    let cpu = format_permille(row.cpu_permille);
+    let mem = format_memory_cell(row.memory_bytes, row.memory_permille, mem_mode);
+    let disk = format_disk_cell(row.disk_bytes_per_sec, row.disk_permille, disk_mode);
+    let net = format_network_cell(row.net_bytes_per_sec, row.net_permille, net_mode);
+    let gpu = format_permille(row.gpu_util_permille);
+    let publisher = row
+        .publisher
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("—");
+    let cmdline = row
+        .command_line
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("—");
+
+    format!(
+        "Name: {name_line}\nPID: {}\nStatus: {status_text}\nCPU: {cpu}\nMemory: {mem}\nDisk: {disk}\nNetwork: {net}\nGPU: {gpu}\nPublisher: {publisher}\nCommand Line: {cmdline}",
+        row.key.pid
+    )
 }
 
 #[cfg(test)]
@@ -501,5 +585,46 @@ mod tests {
             ),
             SortDirection::Descending
         );
+    }
+
+    #[test]
+    fn smart_copy_formats_short_and_structured_process_summary() {
+        let mut row = sample_process_row(
+            1234,
+            99_000,
+            "chrome.exe",
+            "Google Chrome",
+            ProcessCategory::App,
+            ProcessStatusFlags::EFFICIENCY_MODE,
+        );
+        row.cpu_permille = 125;
+        row.memory_bytes = 512 * 1024 * 1024;
+        row.disk_bytes_per_sec = 1024 * 1024;
+        row.net_bytes_per_sec = 125_000;
+        row.gpu_util_permille = 40;
+        row.publisher = Some(Arc::from("Google LLC"));
+        row.command_line = Some(Arc::from(r#""C:\chrome.exe" --profile"#));
+
+        assert_eq!(format_process_copy_short(&row), "chrome.exe (1234)");
+
+        let labels = StatusLabels::new("Efficiency mode", "Suspended", "Not responding");
+        let status = format_process_status_text(row.status, &labels, "Elevated", "Running");
+        assert_eq!(status, "Efficiency mode");
+
+        let summary = format_process_row_summary(
+            &row,
+            ResourceDisplayMode::Values,
+            ResourceDisplayMode::Values,
+            ResourceDisplayMode::Values,
+            &status,
+        );
+        assert!(summary.contains("Name: Google Chrome (chrome.exe)"));
+        assert!(summary.contains("PID: 1234"));
+        assert!(summary.contains("Status: Efficiency mode"));
+        assert!(summary.contains("CPU: 12.5%"));
+        assert!(summary.contains("Memory: 512.0 MB"));
+        assert!(summary.contains("GPU: 4.0%"));
+        assert!(summary.contains("Publisher: Google LLC"));
+        assert!(summary.contains(r#"Command Line: "C:\chrome.exe" --profile"#));
     }
 }
