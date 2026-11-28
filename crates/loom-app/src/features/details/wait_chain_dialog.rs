@@ -246,13 +246,6 @@ impl Render for WaitChainDialogView {
         let danger = theme.danger;
         let radius = theme.radius;
 
-        let subtitle = rust_i18n::t!(
-            "details.wait_chain_subtitle",
-            name = self.name.as_str(),
-            pid = self.key.pid
-        )
-        .into_owned();
-
         let content = match &self.state {
             WaitChainLoadState::Loading => v_flex()
                 .w_full()
@@ -645,11 +638,7 @@ impl Render for WaitChainDialogView {
             }
         };
 
-        v_flex()
-            .w_full()
-            .gap_3()
-            .child(div().text_xs().text_color(muted_fg).child(subtitle))
-            .child(content)
+        v_flex().w_full().gap_3().child(content)
     }
 }
 
@@ -661,12 +650,18 @@ pub(super) fn open_wait_chain_dialog(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let dialog_title = format!(
+        "{} — {} (PID {})",
+        i18n::tr("details.wait_chain_title"),
+        name,
+        key.pid
+    );
     let dialog_view = cx.new(|cx| WaitChainDialogView::new(store, key, name, window, cx));
     window.open_dialog(cx, move |dialog, _window, _cx| {
         dialog
             .w(px(620.))
             .centered()
-            .title(i18n::tr("details.wait_chain_title"))
+            .title(dialog_title.clone())
             .child(dialog_view.clone())
     });
 }

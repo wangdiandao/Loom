@@ -324,13 +324,15 @@ mod tests {
             .expect("probe_exe_asset on current_exe must succeed");
         assert_eq!(asset.normalized_path.as_ref(), exe_str.as_ref());
         assert!(!asset.is_network_path);
+        let expected_dim = slow_prober::target_icon_dim();
+        let expected_len = usize::from(expected_dim) * usize::from(expected_dim) * 4;
         if let Some(icon) = &asset.icon {
-            assert_eq!(icon.width, 20);
-            assert_eq!(icon.height, 20);
-            assert_eq!(icon.rgba.len(), 20 * 20 * 4);
+            assert_eq!(icon.width, expected_dim);
+            assert_eq!(icon.height, expected_dim);
+            assert_eq!(icon.rgba.len(), expected_len);
         }
 
-        // Also verify PE VersionInfo + 20x20 RGBA8 icon extraction against a standard Windows binary.
+        // Also verify PE VersionInfo + DPI-matched RGBA8 icon extraction against a standard Windows binary.
         let system_cmd = std::path::Path::new(r"C:\Windows\System32\cmd.exe");
         if system_cmd.exists() {
             let cmd_asset = prober
@@ -348,10 +350,10 @@ mod tests {
             let icon = cmd_asset
                 .icon
                 .as_ref()
-                .expect("cmd.exe should produce a 20x20 RGBA8 icon");
-            assert_eq!(icon.width, 20);
-            assert_eq!(icon.height, 20);
-            assert_eq!(icon.rgba.len(), 20 * 20 * 4);
+                .expect("cmd.exe should produce a DPI-matched RGBA8 icon");
+            assert_eq!(icon.width, expected_dim);
+            assert_eq!(icon.height, expected_dim);
+            assert_eq!(icon.rgba.len(), expected_len);
         }
 
         // UNC path must bypass disk reads immediately and report is_network_path = true.

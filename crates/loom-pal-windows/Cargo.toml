@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
 loom-pal-api.workspace = true
 loom-types.workspace = true
 parking_lot.workspace = true

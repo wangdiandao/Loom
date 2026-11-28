@@ -22,7 +22,7 @@ use gpui_kit::component::{
 use gpui_kit::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
+    Styled as _, Subscription, Task, Window, div, img, prelude::FluentBuilder as _, px,
 };
 use loom_types::{
     CapabilityFlags, LanguagePreference, MonitorDomain, SortDirection, StartupEntry, StartupImpact,
@@ -31,7 +31,7 @@ use loom_types::{
 use loom_ui_kit::UNAVAILABLE_LABEL;
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
-use crate::features::table_columns::DataTablePane;
+use crate::features::table_columns::{DataTablePane, IconRenderCache};
 use crate::i18n;
 
 const STARTUP_HEADER_HEIGHT: f32 = 32.0;
@@ -170,6 +170,11 @@ pub(super) fn compute_startup_viewport_fingerprint(
             entry.id.hash(&mut hasher);
             entry.name.hash(&mut hasher);
             entry.publisher.as_deref().hash(&mut hasher);
+            entry
+                .icon
+                .as_ref()
+                .map(|ic| ic.rgba.as_ptr() as usize)
+                .hash(&mut hasher);
             entry.enabled.hash(&mut hasher);
             entry.impact.hash(&mut hasher);
         }
@@ -254,6 +259,7 @@ struct StartupTableDelegate {
     last_viewport_fp: Option<u64>,
     user_action_pending: bool,
     locale: StartupLocaleCache,
+    icon_cache: IconRenderCache,
 }
 
 impl StartupTableDelegate {
@@ -274,6 +280,7 @@ impl StartupTableDelegate {
             last_viewport_fp: None,
             user_action_pending: false,
             locale: StartupLocaleCache::build(),
+            icon_cache: IconRenderCache::new(),
         }
     }
 
@@ -454,7 +461,10 @@ impl TableDelegate for StartupTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let Some(entry) = self.row_at(row_ix) else {
+        let Some(&item_idx) = self.slice.visible_indices.get(row_ix) else {
+            return Empty.into_any_element();
+        };
+        let Some(entry) = self.slice.items.get(item_idx) else {
             return Empty.into_any_element();
         };
         let Some(&col) = STARTUP_COLUMNS.get(col_ix) else {
@@ -469,15 +479,41 @@ impl TableDelegate for StartupTableDelegate {
         let danger = theme.danger;
 
         match col {
-            StartupSortColumn::Name => h_flex()
-                .size_full()
-                .items_center()
-                .truncate()
-                .text_xs()
-                .font_medium()
-                .text_color(fg)
-                .child(SharedString::from(Arc::clone(&entry.name)))
-                .into_any_element(),
+            StartupSortColumn::Name => {
+                let name = SharedString::from(Arc::clone(&entry.name));
+                let rendered_icon = entry
+                    .icon
+                    .as_ref()
+                    .and_then(|icon| self.icon_cache.get_or_insert(icon));
+                let icon_el = if let Some(render_img) = rendered_icon {
+                    img(render_img)
+                        .size(px(16.0))
+                        .flex_shrink_0()
+                        .into_any_element()
+                } else {
+                    Icon::new(IconName::Frame)
+                        .size(px(15.0))
+                        .text_color(muted_fg.opacity(0.6))
+                        .into_any_element()
+                };
+                h_flex()
+                    .size_full()
+                    .items_center()
+                    .gap_2()
+                    .overflow_hidden()
+                    .child(icon_el)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(fg)
+                            .child(name),
+                    )
+                    .into_any_element()
+            }
             StartupSortColumn::Publisher => {
                 let text = entry
                     .publisher
@@ -1050,6 +1086,7 @@ mod tests {
             publisher: publisher.map(Arc::from),
             command: None,
             file_path: None,
+            icon: None,
             enabled,
             impact,
         }

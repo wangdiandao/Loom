@@ -281,7 +281,7 @@ Windows 内核会高频复用已退出进程的 `PID`。Loom 统一使用 `Proce
 | **生命周期主键 `ProcessKey`** | `(PID, CreateTime FILETIME)` | `(pid_t, /proc/[pid]/stat starttime)` | `(pid_t, pbi_start_tvsec)` |
 | **效能/节能模式 (`EcoMode`)** | `EcoQoS` (`PROCESS_POWER_THROTTLING`) | `SCHED_IDLE` / `nice` / cgroup weight | Task QoS / App Nap |
 | **系统服务 (`ServiceRecord`)** | Windows SCM (`EnumServicesStatusExW`) | `systemd` D-Bus Units | `launchd` Daemons & Agents |
-| **启动应用 (`StartupEntry`)** | 注册表 `Run`/`StartupApproved` + 启动目录 + UWP `StartupTask` | XDG Autostart (`~/.config/autostart/*.desktop`) | `SMAppService` / `LaunchAgents` |
+| **启动应用 (`StartupEntry`)** | 注册表 `Run`/`StartupApproved` + 启动目录 + UWP/MSIX `StartupTask`（解析 PE 描述、`AppxManifest.xml` + `SHLoadIndirectString` 与 DPI 匹配原生 RGBA 图标） | XDG Autostart (`~/.config/autostart/*.desktop`) | `SMAppService` / `LaunchAgents` |
 | **用户会话 (`UserSession`)** | WTS (`WTSEnumerateSessionsW`) | `systemd-logind` Sessions | `utmpx` / Console User |
 | **虚拟化/沙箱列** | UAC 虚拟化 (`TokenVirtualizationEnabled`) | Namespace / Flatpak / Snap | App Sandbox Entitlements |
 | **等待链诊断 (`WaitChain`)** | Win32 WCT (`GetThreadWaitChain`) | `/proc/[pid]/task/[tid]/wchan` | `proc_pidinfo` Thread `wchan` |

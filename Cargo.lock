@@ -4492,6 +4492,7 @@ dependencies = [
 name = "loom-pal-windows"
 version = "0.1.0"
 dependencies = [
+ "image",
  "loom-pal-api",
  "loom-types",
  "parking_lot",

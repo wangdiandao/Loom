@@ -467,8 +467,7 @@ impl AppShell {
         let summary = build_diagnostic_summary(store_ref.snapshot(), store_ref.settings());
         cx.write_to_clipboard(ClipboardItem::new_string(summary));
         window.push_notification(
-            Notification::success(i18n::tr("diag_summary.copied_message"))
-                .title(i18n::tr("diag_summary.copied_title")),
+            Notification::success(i18n::tr("diag_summary.copied_title")),
             cx,
         );
     }
@@ -658,21 +657,11 @@ impl Render for AppShell {
                     .w(px(360.))
                     .gap_2()
                     .child(
-                        v_flex()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(fg)
-                                    .child(i18n::tr("shell_hotkeys.search_help_title")),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted_fg)
-                                    .child(i18n::tr("shell_hotkeys.search_help_subtitle")),
-                            ),
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(fg)
+                            .child(i18n::tr("shell_hotkeys.search_help_title")),
                     )
                     .child(
                         v_flex()

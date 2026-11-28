@@ -1808,6 +1808,7 @@ fn system_mgmt_domains_enforce_strict_raii_lease_gating() {
         publisher: Some(Arc::from("Loom")),
         command: Some(Arc::from(r"C:\Loom\loom.exe")),
         file_path: Some(Arc::from(r"C:\Loom\loom.exe")),
+        icon: None,
         enabled: true,
         impact: StartupImpact::NotMeasured,
     });
@@ -2034,6 +2035,7 @@ fn system_mgmt_commands_refresh_leased_snapshots_and_propagate_elevation_require
         publisher: Some(Arc::from("Microsoft Corporation")),
         command: Some(Arc::from(r"C:\Windows\System32\SecurityHealthSystray.exe")),
         file_path: Some(Arc::from(r"C:\Windows\System32\SecurityHealthSystray.exe")),
+        icon: None,
         enabled: true,
         impact: StartupImpact::NotMeasured,
     });
@@ -3568,6 +3570,7 @@ fn offloaded_domain_sort_filter_expand_and_search_commands_are_lease_gated() {
             publisher: Some(Arc::from("Beta Corp")),
             command: None,
             file_path: None,
+            icon: None,
             enabled: false,
             impact: StartupImpact::Low,
         },
@@ -3577,6 +3580,7 @@ fn offloaded_domain_sort_filter_expand_and_search_commands_are_lease_gated() {
             publisher: Some(Arc::from("Acme Corp")),
             command: None,
             file_path: None,
+            icon: None,
             enabled: true,
             impact: StartupImpact::High,
         },

@@ -124,7 +124,7 @@ pub trait SlowMetadataProber: Send + Sync {
     /// for a live process validated by `key`.
     fn probe_process(&self, key: ProcessKey) -> Result<ProcessColdMeta, PalError>;
 
-    /// Extracts path-level static binary metadata (publisher, description, 20x20 RGBA icon)
+    /// Extracts path-level static binary metadata (publisher, description, DPI-matched RGBA icon)
     /// for `exe_path`, bypassing deep I/O for UNC / network-mapped drives.
     fn probe_exe_asset(&self, exe_path: &str) -> Result<ExeStaticAsset, PalError>;
 

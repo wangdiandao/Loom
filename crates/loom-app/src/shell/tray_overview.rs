@@ -471,13 +471,7 @@ impl Render for TrayOverviewView {
                     .border_t_1()
                     .border_color(border.opacity(0.6))
                     .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child(i18n::tr("tray_overview.click_hint")),
-                    )
+                    .justify_end()
                     .child(
                         Button::new("tray-overview-open-main")
                             .small()

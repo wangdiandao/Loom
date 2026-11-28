@@ -132,7 +132,6 @@ details:
   confirm_tree_action: "结束进程树"
   tree_kill_partial: "已结束 %{succeeded}/%{total} 个进程，%{failed} 个失败。"
   affinity_title: "处理器相关性"
-  affinity_subtitle: "选择允许“%{name}”(PID %{pid}) 运行的逻辑处理器。"
   affinity_all_cpus: "所有处理器"
   affinity_cpu_label: "CPU %{index}"
   affinity_group_label: "处理器组 %{group}"
@@ -140,7 +139,6 @@ details:
   affinity_loading: "正在读取当前处理器相关性..."
   affinity_apply: "应用"
   wait_chain_title: "分析等待链"
-  wait_chain_subtitle: "“%{name}”(PID %{pid}) 的线程等待依赖树。"
   wait_chain_loading: "正在分析线程等待链..."
   wait_chain_normal: "“%{name}”正在正常运行，未检测到阻塞线程或等待依赖。"
   wait_chain_deadlock_banner: "在线程等待链中检测到死锁。"
@@ -150,7 +148,6 @@ details:
 
 minidump:
   title: "创建内存转储文件"
-  subtitle: "正在为“%{name}”(PID %{pid}) 写入内存转储文件。"
   output_path_label: "转储文件路径"
   creating: "正在创建内存转储文件..."
   cancelling: "正在取消内存转储..."
@@ -160,7 +157,6 @@ minidump:
 
 run_task:
   title: "新建任务"
-  description: "输入程序、文件夹、文档或 Internet 资源的名称，Loom 将为您打开它。"
   open_label: "打开"
   placeholder: "输入应用程序名、命令或完整路径..."
   browse: "浏览..."
@@ -182,7 +178,6 @@ table:
   menu_select_columns: "选择列..."
   menu_reset_columns: "重置为默认列"
   select_columns_title: "选择列"
-  select_columns_subtitle: "选择将显示在表上的列。"
 
 settings:
   title: "设置"
@@ -248,15 +243,6 @@ tray:
   tooltip: "Loom 任务管理器"
   show: "显示 Loom"
   exit: "退出"
-
-milestone:
-  badge: "计划于 v%{version} 交付"
-  notice: "在原生采集器就绪前，本页面不展示模拟假数据，也不会产生任何后台轮询开销。"
-  performance_desc: "CPU、内存、磁盘、网络与 GPU 多设备实时性能图表计划于 v0.0.4 交付。"
-  app_history_desc: "应用累计 CPU 时间与网络流量历史统计计划于 v0.0.5 交付。"
-  startup_desc: "启动应用清单、上次 BIOS 耗时与启用/禁用管理计划于 v0.0.5 交付。"
-  users_desc: "登录用户会话资源聚合与会话进程查看计划于 v0.0.5 交付。"
-  services_desc: "按需系统服务管理与宿主 PID 双向联动计划于 v0.0.5 交付。"
 
 perf:
   cpu: "CPU"
@@ -466,7 +452,6 @@ shell_hotkeys:
   explorer_restarting: "正在重启 Windows 资源管理器..."
   search_help_tooltip: "搜索语法帮助"
   search_help_title: "结构化搜索语法"
-  search_help_subtitle: "点击示例即可立即填入搜索框："
   syntax_or_desc: "匹配任一关键词（或）"
   syntax_not_desc: "排除匹配的进程"
   syntax_pid_desc: "按精确 PID 筛选"
@@ -478,14 +463,12 @@ shell_hotkeys:
 
 file_locks:
   title: "查找文件占用"
-  description: "通过系统重启管理器检查正在占用指定文件或文件夹句柄的进程与服务。"
   path_label: "文件或文件夹路径"
   path_placeholder: "输入或浏览文件/文件夹路径..."
   browse: "浏览..."
   search: "查找占用"
   searching: "正在检查文件占用..."
   empty_path_error: "请先输入文件或文件夹路径。"
-  idle_hint: "在上方输入路径并点击“查找占用”以检查锁定进程。"
   no_locks: "当前没有进程占用该路径。"
   explorer_banner: "Windows 资源管理器正在占用此路径。"
   restart_explorer: "重启资源管理器"
@@ -495,14 +478,12 @@ file_locks:
 
 diag_summary:
   copied_title: "已复制诊断摘要"
-  copied_message: "不含个人隐私的系统与 Loom 配置摘要已复制到剪贴板。"
 
 tray_overview:
   menu_item: "快速概览"
   title: "Loom 快速概览"
   top_processes: "CPU 占用前 5 进程"
   empty_processes: "正在采样活动进程..."
-  click_hint: "点击进程查看详情"
   open_loom: "打开 Loom"
 
 # Processes & Details UX, CSV export, leak warnings, and WebView2 role labels

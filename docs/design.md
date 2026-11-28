@@ -72,7 +72,7 @@ Priority tiers:
 | **Details** | `Go to service(s)` (jumps to Services highlighting all services hosted in that `PID`) | **P1 (`0.0.5`)** | Bidirectional navigation with `Services`. |
 | **Details** | `Analyze wait chain` (WCT dialog), `UAC virtualization` toggle, `Create dump`, `Debug` | **P2 (`0.0.6`)** | Renders cross-process thread wait graphs inside `gpui-kit` `Tree`. |
 | **Services** | SCM table (`Name`, `PID`, `Description`, `Status`, `Group`), `Start` / `Stop` / `Restart`, `Open Services`, `Go to details` | **P1 (`0.0.5`)** | Gated by RAII `MonitorLease`; no SCM polling while inactive. |
-| **Startup Apps** | Top-right `Last BIOS time`, `Name`/`Publisher`/`Status`/`Startup impact`, `Enable`/`Disable`, `Properties`, `Open file location` | **P1 (`0.0.5`)** | Aggregates Registry `Run`/`StartupApproved`, Startup folders, and UWP `StartupTask`. |
+| **Startup Apps** | Top-right `Last BIOS time`, icon + localized `Name`/`Publisher`/`Status`/`Startup impact`, `Enable`/`Disable`, `Properties`, `Open file location` | **P1 (`0.0.5`)** | Aggregates Registry `Run`/`StartupApproved`, Startup folders, and UWP/MSIX `StartupTask` (resolving PE and `AppxManifest.xml` names, publishers, and icons). |
 | **Users** | Per-session CPU/Memory/Disk/Network totals, expandable user process list, `Disconnect`, `Manage user accounts` | **P1 (`0.0.5`)** | WTS session enumeration joined in-memory by `SessionId`. |
 | **App History** | Collection start date, `Name`/`CPU time`/`Network`/`Metered network` heatmap columns, `Delete usage history` | **P1 (`0.0.5`)** | Combines accessible OS usage counters with lightweight cumulative tracking. |
 
