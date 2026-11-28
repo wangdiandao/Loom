@@ -281,6 +281,7 @@ mod tests {
         "details.col_session_id",
         "details.col_cpu_time",
         "details.col_working_set",
+        "details.col_working_set_delta",
         "details.col_commit",
         "details.col_threads",
         "details.col_handles",

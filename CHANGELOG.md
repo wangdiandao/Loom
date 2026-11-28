@@ -33,6 +33,7 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ### UI & UX
 
+- Fixed the **Details** table's default private working set column label (`Memory (private working set)` / `内存（专用工作集）`, previously mislabeled as working set delta) and added a real signed **Working set delta (memory)** / **工作集增量（内存）** column (`DetailsRowProjection::working_set_delta_bytes`, `DetailsSortColumn::WorkingSetDelta`, `format_signed_bytes` / `format_signed_bytes_metric` / `RowTextCache::signed_bytes_metric_slot`) reporting positive, zero, and negative per-tick working set changes.
 - Removed redundant explanatory toast/dialog/popover captions across `loom-app` (diagnostic summary toast body, dialog descriptions/subtitles, search syntax subtitle, file-locks idle hint, and tray overview click hint) and rendered `16x16` cached application icons in the **Startup apps** table.
 
 - Migrated `UiStore` in `loom-app` from 20 Hz (`50 ms`) timer polling to zero-polling event-driven push wakeups via `EngineCoordinator::snapshot_wake_signal()` (cancelling cleanly in dormant tray mode), and exposed typed `UiCommands` bridge helpers (`toggle_pause_refresh` remembering prior active cadence, `force_refresh`, `set_temp_freeze`, `set_process_order_freeze`, `set_details_order_freeze`, `suspend_process`, `resume_process`, `restart_explorer`, `find_file_locks`, `set_webview2_host_grouping`, `set_show_leak_warnings`, `ignore_leak_path`, and `set_hide_system_processes`).

@@ -182,6 +182,7 @@ struct PrevProcCounters {
     cpu_time_100ns: u64,
     disk_bytes: u64,
     net_bytes: u64,
+    working_set_bytes: u64,
 }
 
 /// Double-buffered per-process delta calculator avoiding map reallocation across ticks.
@@ -209,30 +210,33 @@ impl DeltaTracker {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn compute_for_process(
         &mut self,
         key: ProcessKey,
         cpu_time_100ns: u64,
         disk_bytes: u64,
         net_bytes: u64,
+        working_set_bytes: u64,
         elapsed_100ns: u64,
         logical_cpus: u64,
-    ) -> (u16, u64, u64, u64, u64) {
+    ) -> (u16, u64, u64, u64, u64, i64) {
         self.next_counters.insert(
             key,
             PrevProcCounters {
                 cpu_time_100ns,
                 disk_bytes,
                 net_bytes,
+                working_set_bytes,
             },
         );
 
         if elapsed_100ns == 0 {
-            return (0, 0, 0, 0, 0);
+            return (0, 0, 0, 0, 0, 0);
         }
 
         let Some(&prev) = self.prev_counters.get(&key) else {
-            return (0, 0, 0, 0, 0);
+            return (0, 0, 0, 0, 0, 0);
         };
 
         let delta_cpu = cpu_time_100ns.saturating_sub(prev.cpu_time_100ns);
@@ -251,7 +255,18 @@ impl DeltaTracker {
             / u128::from(elapsed_100ns))
         .min(u128::from(u64::MAX)) as u64;
 
-        (cpu_permille, disk_bps, net_bps, delta_cpu, delta_net)
+        let working_set_delta_bytes =
+            (i128::from(working_set_bytes) - i128::from(prev.working_set_bytes))
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+
+        (
+            cpu_permille,
+            disk_bps,
+            net_bps,
+            delta_cpu,
+            delta_net,
+            working_set_delta_bytes,
+        )
     }
 
     fn finish_tick(&mut self, timestamp: Timestamp100Ns) {
@@ -302,6 +317,7 @@ struct ComputedProcess {
     cpu_permille: u16,
     private_working_set_bytes: u64,
     working_set_bytes: u64,
+    working_set_delta_bytes: i64,
     commit_bytes: u64,
     memory_permille: u16,
     disk_bytes_per_sec: u64,
@@ -811,11 +827,13 @@ impl ProjectionEngine {
                 net_bytes_per_sec,
                 delta_cpu_100ns,
                 delta_net_bytes,
+                working_set_delta_bytes,
             ) = self.delta_tracker.compute_for_process(
                 sample.key,
                 cpu_time_100ns,
                 disk_bytes,
                 net_bytes,
+                sample.working_set_bytes,
                 elapsed_100ns,
                 logical_cpus,
             );
@@ -857,6 +875,7 @@ impl ProjectionEngine {
                 cpu_permille,
                 private_working_set_bytes: sample.private_working_set_bytes,
                 working_set_bytes: sample.working_set_bytes,
+                working_set_delta_bytes,
                 commit_bytes: sample.commit_bytes,
                 memory_permille,
                 disk_bytes_per_sec,
@@ -3249,6 +3268,7 @@ fn build_details_row_from_parts(
         cpu_time_100ns: proc.cpu_time_100ns,
         private_working_set_bytes: proc.private_working_set_bytes,
         working_set_bytes: proc.working_set_bytes,
+        working_set_delta_bytes: proc.working_set_delta_bytes,
         commit_bytes: proc.commit_bytes,
         thread_count: proc.thread_count,
         handle_count: proc.handle_count,
@@ -3674,6 +3694,9 @@ fn sort_details_indices_slice(
                 .private_working_set_bytes
                 .cmp(&b.private_working_set_bytes),
             DetailsSortColumn::WorkingSet => a.working_set_bytes.cmp(&b.working_set_bytes),
+            DetailsSortColumn::WorkingSetDelta => {
+                a.working_set_delta_bytes.cmp(&b.working_set_delta_bytes)
+            }
             DetailsSortColumn::CommitSize => a.commit_bytes.cmp(&b.commit_bytes),
             DetailsSortColumn::Priority => a.priority.cmp(&b.priority),
             DetailsSortColumn::Handles => a.handle_count.cmp(&b.handle_count),
