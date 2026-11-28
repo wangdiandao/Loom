@@ -1,8 +1,8 @@
 //! Configuration schema definitions and forward migration helpers.
 
 use loom_types::{
-    LanguagePreference, ProcessViewMode, RefreshSpeed, ResourceDisplayMode, StartupPage,
-    ThemePreference,
+    AccentColorPreference, LanguagePreference, ProcessViewMode, RefreshSpeed, ResourceDisplayMode,
+    StartupPage, ThemePreference,
 };
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +59,9 @@ pub struct AppSettings {
     pub refresh_speed: RefreshSpeed,
     /// Visual theme preference.
     pub theme: ThemePreference,
+    /// Theme accent color preference (defaults to following the OS accent color).
+    #[serde(default)]
+    pub accent_color: AccentColorPreference,
     /// UI language preference.
     pub language: LanguagePreference,
     /// Default view mode on the Processes page.
@@ -113,6 +116,7 @@ impl Default for AppSettings {
             startup_page: StartupPage::default(),
             refresh_speed: RefreshSpeed::default(),
             theme: ThemePreference::default(),
+            accent_color: AccentColorPreference::default(),
             language: LanguagePreference::default(),
             process_view_mode: ProcessViewMode::default(),
             resource_display_mode: ResourceDisplayMode::default(),

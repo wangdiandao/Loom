@@ -52,8 +52,9 @@ pub use status_badge::{
     status_badges_with_a11y,
 };
 pub use theme::{
-    CachedSemanticColors, LoomSemanticColors, WCAG_AA_TEXT_CONTRAST, WCAG_AA_UI_CONTRAST,
-    WCAG_AAA_TEXT_CONTRAST, ensure_wcag_contrast, hsla_to_srgb, srgb_relative_luminance,
+    ACCENT_COLOR_PRESETS, CachedSemanticColors, DEFAULT_ACCENT_RGB, LoomSemanticColors,
+    WCAG_AA_TEXT_CONTRAST, WCAG_AA_UI_CONTRAST, WCAG_AAA_TEXT_CONTRAST, apply_accent_to_theme,
+    ensure_wcag_contrast, hsla_to_rgb_u8, hsla_to_srgb, rgb_to_hsla, srgb_relative_luminance,
     wcag_contrast_ratio,
 };
 
@@ -1464,5 +1465,77 @@ mod tests {
             &colors,
             true,
         );
+    }
+
+    #[test]
+    fn rgb_hsla_roundtrip_and_accent_theme_enforces_wcag_aa_across_extremes() {
+        let samples = [
+            DEFAULT_ACCENT_RGB,
+            (0x1D, 0xC5, 0xF4),
+            (0xFF, 0xFF, 0xFF),
+            (0x00, 0x00, 0x00),
+            (0xFF, 0xFF, 0x00),
+            (0x00, 0xFF, 0x00),
+            (0x87, 0x64, 0xB8),
+            (0xD1, 0x34, 0x38),
+            (0x0A, 0x0E, 0x2A),
+        ];
+
+        for rgb in samples
+            .into_iter()
+            .chain(ACCENT_COLOR_PRESETS.iter().map(|(_, c)| *c))
+        {
+            assert_eq!(hsla_to_rgb_u8(rgb_to_hsla(rgb)), rgb);
+
+            for mut theme in [light_theme(), dark_theme()] {
+                let is_dark = theme.is_dark();
+                let before_primary = theme.primary;
+                apply_accent_to_theme(&mut theme, rgb);
+
+                let surface_rgb = hsla_to_srgb(theme.background);
+                let primary_rgb = hsla_to_srgb(theme.primary);
+                let primary_fg_rgb = hsla_to_srgb(theme.primary_foreground);
+                let ring_rgb = hsla_to_srgb(theme.ring);
+                let link_rgb = hsla_to_srgb(theme.link);
+                let sidebar_bg = hsla_to_srgb(theme.sidebar);
+                let sidebar_fg = hsla_to_srgb(theme.sidebar_accent_foreground);
+
+                // Primary buttons & switches must keep >= 3.0:1 vs surface and >= 4.5:1 label contrast.
+                assert!(
+                    wcag_contrast_ratio(primary_rgb, surface_rgb) >= WCAG_AA_UI_CONTRAST - 1e-2,
+                    "primary vs surface < 3.0:1 for {rgb:?} (is_dark={is_dark})"
+                );
+                assert!(
+                    wcag_contrast_ratio(primary_fg_rgb, primary_rgb)
+                        >= WCAG_AA_TEXT_CONTRAST - 1e-2,
+                    "primary_fg vs primary < 4.5:1 for {rgb:?} (is_dark={is_dark})"
+                );
+                assert_eq!(theme.button_primary, theme.primary);
+                assert_eq!(theme.button_primary_foreground, theme.primary_foreground);
+
+                // Focus ring / active borders must keep >= 3.0:1 vs surface.
+                assert!(
+                    wcag_contrast_ratio(ring_rgb, surface_rgb) >= WCAG_AA_UI_CONTRAST - 1e-2,
+                    "ring vs surface < 3.0:1 for {rgb:?} (is_dark={is_dark})"
+                );
+
+                // Accent links & sidebar active foreground must keep >= 4.5:1 text contrast.
+                assert!(
+                    wcag_contrast_ratio(link_rgb, surface_rgb) >= WCAG_AA_TEXT_CONTRAST - 1e-2,
+                    "link vs surface < 4.5:1 for {rgb:?} (is_dark={is_dark})"
+                );
+                assert!(
+                    wcag_contrast_ratio(sidebar_fg, sidebar_bg) >= WCAG_AA_TEXT_CONTRAST - 1e-2,
+                    "sidebar_accent_foreground vs sidebar < 4.5:1 for {rgb:?} (is_dark={is_dark})"
+                );
+
+                // CachedSemanticColors must reflect updated primary & list_active tokens.
+                let mut cache = CachedSemanticColors::new();
+                let semantic = cache.get_copy(&theme);
+                assert_eq!(semantic.card_selected_border, theme.primary);
+                assert_eq!(semantic.card_selected_bg, theme.list_active);
+                let _ = before_primary;
+            }
+        }
     }
 }

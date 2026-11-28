@@ -47,6 +47,12 @@ pub mod window {
     pub fn restore_and_focus_main_window() {
         NativeBackend::restore_and_focus_main_window();
     }
+
+    /// Reads the operating system's active accent color as `(r, g, b)`, if available.
+    #[inline]
+    pub fn system_accent_color() -> Option<(u8, u8, u8)> {
+        NativeBackend::system_accent_color()
+    }
 }
 
 /// Cross-platform static facade for OS Task Manager replacement CLI & handshake integration.

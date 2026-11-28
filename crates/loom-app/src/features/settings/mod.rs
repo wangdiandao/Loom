@@ -4,6 +4,7 @@
 //! and persist atomically to `settings.toml` via [`UiCommands`] / [`UiStore`].
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::color_picker::{ColorPickerEvent, ColorPickerState, ColorSelect};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
@@ -19,12 +20,13 @@ use gpui_kit::{
 };
 use loom_engine::{CommandOutcome, CommandSuccess, EngineCommand};
 use loom_types::{
-    AdminStartupStatus, CapabilityFlags, LanguagePreference, RefreshSpeed, StartupPage,
-    TaskManagerReplacementState, TaskManagerReplacementStatus, ThemePreference,
+    AccentColorPreference, AdminStartupStatus, CapabilityFlags, LanguagePreference, RefreshSpeed,
+    StartupPage, TaskManagerReplacementState, TaskManagerReplacementStatus, ThemePreference,
 };
+use loom_ui_kit::{ACCENT_COLOR_PRESETS, hsla_to_rgb_u8, rgb_to_hsla};
 
 use crate::bootstrap;
-use crate::bridge::{UiCommands, UiStore, UiStoreEvent};
+use crate::bridge::{UiCommands, UiStore, UiStoreEvent, resolve_accent_rgb, system_accent_rgb};
 use crate::i18n;
 use crate::shell::Route;
 
@@ -181,6 +183,8 @@ pub(crate) struct SettingsView {
     refresh_speed_select: Entity<SelectState<Vec<SelectOption<RefreshSpeed>>>>,
     global_hotkey_select: Entity<SelectState<Vec<SelectOption<Option<String>>>>>,
     theme_select: Entity<SelectState<Vec<SelectOption<ThemePreference>>>>,
+    accent_color_picker: Entity<ColorPickerState>,
+    last_custom_accent: Option<(u8, u8, u8)>,
     language_select: Entity<SelectState<Vec<SelectOption<LanguagePreference>>>>,
     taskmgr_status: Option<TaskManagerReplacementStatus>,
     taskmgr_busy: bool,
@@ -224,6 +228,10 @@ impl SettingsView {
                 cx,
             )
         });
+        let initial_accent_rgb = resolve_accent_rgb(settings.accent_color);
+        let accent_color_picker = cx.new(|cx| {
+            ColorPickerState::new(window, cx).default_value(rgb_to_hsla(initial_accent_rgb))
+        });
         let language_select = cx.new(|cx| {
             SelectState::new(
                 language_options(),
@@ -233,7 +241,7 @@ impl SettingsView {
             )
         });
 
-        let mut subscriptions = Vec::with_capacity(6);
+        let mut subscriptions = Vec::with_capacity(7);
 
         subscriptions.push(cx.subscribe_in(
             &startup_page_select,
@@ -295,6 +303,24 @@ impl SettingsView {
         ));
 
         subscriptions.push(cx.subscribe_in(
+            &accent_color_picker,
+            window,
+            |this, _state, event: &ColorPickerEvent, window, cx| {
+                let ColorPickerEvent::Change(Some(color)) = event else {
+                    return;
+                };
+                let (r, g, b) = hsla_to_rgb_u8(*color);
+                this.last_custom_accent = Some((r, g, b));
+                UiCommands::set_accent_color(
+                    &this.store,
+                    AccentColorPreference::custom(r, g, b),
+                    Some(window),
+                    cx,
+                );
+            },
+        ));
+
+        subscriptions.push(cx.subscribe_in(
             &language_select,
             window,
             |this,
@@ -314,10 +340,24 @@ impl SettingsView {
                 if !matches!(event, UiStoreEvent::SettingsChanged) {
                     return;
                 }
-                let next_locale = store.read(cx).settings().language;
+                let (next_locale, next_accent) = {
+                    let s = store.read(cx).settings();
+                    (s.language, s.accent_color)
+                };
                 if this.last_locale != next_locale {
                     this.last_locale = next_locale;
                     this.refresh_select_labels(window, cx);
+                }
+                let resolved_rgb = resolve_accent_rgb(next_accent);
+                let picker_rgb = this
+                    .accent_color_picker
+                    .read(cx)
+                    .value()
+                    .map(hsla_to_rgb_u8);
+                if picker_rgb != Some(resolved_rgb) {
+                    this.accent_color_picker.update(cx, |state, cx| {
+                        state.set_value(rgb_to_hsla(resolved_rgb), window, cx);
+                    });
                 }
                 cx.notify();
             }),
@@ -330,6 +370,8 @@ impl SettingsView {
             refresh_speed_select,
             global_hotkey_select,
             theme_select,
+            accent_color_picker,
+            last_custom_accent: settings.accent_color.rgb(),
             language_select,
             taskmgr_status: None,
             taskmgr_busy: false,
@@ -574,6 +616,41 @@ impl SettingsView {
         });
     }
 
+    /// Updates and live-applies the theme accent color (`System` or custom hex),
+    /// keeping the inline color picker synchronized and persisting to `settings.toml`.
+    pub(crate) fn set_accent_color(
+        &mut self,
+        accent: AccentColorPreference,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(rgb) = accent.rgb() {
+            self.last_custom_accent = Some(rgb);
+        }
+        UiCommands::set_accent_color(&self.store, accent, Some(window), cx);
+        let resolved = resolve_accent_rgb(accent);
+        self.accent_color_picker.update(cx, |state, cx| {
+            state.set_value(rgb_to_hsla(resolved), window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Toggles whether Loom follows the operating system's active accent color.
+    pub(crate) fn set_follow_system_accent(
+        &mut self,
+        follow: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let next = if follow {
+            AccentColorPreference::System
+        } else {
+            let (r, g, b) = self.last_custom_accent.unwrap_or_else(system_accent_rgb);
+            AccentColorPreference::custom(r, g, b)
+        };
+        self.set_accent_color(next, window, cx);
+    }
+
     fn refresh_select_labels(&self, window: &mut Window, cx: &mut Context<Self>) {
         let current_hotkey = self.store.read(cx).settings().global_hotkey.clone();
         self.startup_page_select.update(cx, |state, cx| {
@@ -646,7 +723,72 @@ impl Render for SettingsView {
         let close_tray_label = i18n::tr("settings.close_to_tray_label");
         let global_hotkey_label = i18n::tr("settings.global_hotkey_label");
         let theme_label = i18n::tr("settings.theme_label");
+        let accent_follow_label = i18n::tr("settings.accent_follow_system_label");
+        let accent_custom_label = i18n::tr("settings.accent_custom_label");
+        let accent_picker_placeholder = i18n::tr("settings.accent_picker_placeholder");
         let language_label = i18n::tr("settings.language_label");
+        let sys_rgb = system_accent_rgb();
+        let sys_hex = AccentColorPreference::format_hex(sys_rgb.0, sys_rgb.1, sys_rgb.2);
+        let follow_system_accent = settings.accent_color.is_system();
+        let active_custom_rgb = settings.accent_color.rgb();
+        let featured_colors: Vec<gpui_kit::Hsla> = ACCENT_COLOR_PRESETS
+            .iter()
+            .map(|(_, rgb)| rgb_to_hsla(*rgb))
+            .collect();
+        let preset_swatches =
+            h_flex()
+                .items_center()
+                .gap_1()
+                .children(
+                    ACCENT_COLOR_PRESETS
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, (_slug, rgb))| {
+                            let (r, g, b) = *rgb;
+                            let hex = AccentColorPreference::format_hex(r, g, b);
+                            let is_selected = active_custom_rgb == Some((r, g, b));
+                            let swatch_color = rgb_to_hsla((r, g, b));
+                            let ring_color = if is_selected {
+                                fg
+                            } else {
+                                gpui_kit::transparent_black()
+                            };
+                            Button::new(("setting-accent-preset", idx))
+                                .ghost()
+                                .xsmall()
+                                .w(px(24.))
+                                .h(px(24.))
+                                .p_0()
+                                .rounded_full()
+                                .accessibility_label(hex.clone())
+                                .tooltip(hex)
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    view.set_accent_color(
+                                        AccentColorPreference::custom(r, g, b),
+                                        window,
+                                        cx,
+                                    );
+                                }))
+                                .child(
+                                    div()
+                                        .size(px(18.))
+                                        .rounded_full()
+                                        .border_2()
+                                        .border_color(ring_color)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            div()
+                                                .size(px(12.))
+                                                .rounded_full()
+                                                .bg(swatch_color)
+                                                .border_1()
+                                                .border_color(border),
+                                        ),
+                                )
+                        }),
+                );
         let taskmgr_replace_label = i18n::tr("settings.taskmgr_replace_label");
         let taskmgr_open_native_label = i18n::tr("settings.taskmgr_open_native_label");
         let admin_startup_label = i18n::tr("settings.admin_startup_label");
@@ -912,6 +1054,67 @@ impl Render for SettingsView {
                                     .small()
                                     .accessibility_label(theme_label),
                             ),
+                        ))
+                        .child(setting_row(
+                            accent_follow_label.clone(),
+                            fg,
+                            border,
+                            true,
+                            h_flex()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded(radius)
+                                        .border_1()
+                                        .border_color(border)
+                                        .child(
+                                            div()
+                                                .size(px(12.))
+                                                .rounded_full()
+                                                .bg(rgb_to_hsla(sys_rgb))
+                                                .border_1()
+                                                .border_color(border),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_family(mono_font.clone())
+                                                .text_color(muted_fg)
+                                                .child(sys_hex),
+                                        ),
+                                )
+                                .child(
+                                    Switch::new("setting-accent-follow-system")
+                                        .checked(follow_system_accent)
+                                        .accessibility_label(accent_follow_label)
+                                        .on_change(cx.listener(|view, checked, window, cx| {
+                                            view.set_follow_system_accent(*checked, window, cx);
+                                        })),
+                                ),
+                        ))
+                        .child(setting_row(
+                            accent_custom_label.clone(),
+                            fg,
+                            border,
+                            true,
+                            h_flex()
+                                .items_center()
+                                .gap_2p5()
+                                .child(preset_swatches)
+                                .child(
+                                    div().w(px(136.)).child(
+                                        ColorSelect::new(&self.accent_color_picker)
+                                            .small()
+                                            .featured_colors(featured_colors)
+                                            .placeholder(accent_picker_placeholder)
+                                            .accessibility_label(accent_custom_label),
+                                    ),
+                                ),
                         ))
                         .child(setting_row(
                             language_label.clone(),
@@ -1307,6 +1510,111 @@ mod tests {
             }
             vcx.update(|window, cx| window.draw(cx).clear(cx));
         }
+
+        drop(settings_view);
+        vcx.update(|window, _| window.remove_window());
+        vcx.run_until_parked();
+        coordinator.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn settings_view_accent_color_defaults_to_system_switches_live_and_persists(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::component::ActiveTheme as _;
+        use loom_types::{AccentColorPreference, ThemePreference};
+        use loom_ui_kit::hsla_to_rgb_u8;
+
+        cx.update(gpui_kit::init);
+
+        let dir = tempfile::tempdir().expect("create temp accent config dir");
+        let config_path = dir.path().join("settings.toml");
+        let config_store = ConfigStore::new(config_path.clone());
+        let settings = AppSettings {
+            theme: ThemePreference::Light,
+            ..AppSettings::default()
+        };
+        assert_eq!(settings.accent_color, AccentColorPreference::System);
+
+        let backend = NativeBackend::initialize().expect("initialize native backend");
+        let coordinator =
+            Arc::new(EngineCoordinator::new(backend, settings.clone()).expect("start coordinator"));
+        let store = cx.new(|cx| UiStore::new(coordinator.clone(), config_store, settings, cx));
+
+        let mut settings_view_handle = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                crate::bridge::apply_theme(
+                    ThemePreference::Light,
+                    AccentColorPreference::System,
+                    Some(window),
+                    cx,
+                );
+                let view = cx.new(|cx| SettingsView::new(store.clone(), window, cx));
+                settings_view_handle = Some(view.clone());
+                cx.new(|cx| gpui_kit::base::Root::new(view, window, cx))
+            })
+            .expect("open accent settings test window")
+        });
+        let settings_view = settings_view_handle.expect("SettingsView constructed");
+
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // Choose a custom violet accent color (#8764B8) and verify live theme + persistence.
+        let violet = AccentColorPreference::custom(0x87, 0x64, 0xB8);
+        vcx.update(|window, cx| {
+            settings_view.update(cx, |view, cx| {
+                view.set_accent_color(violet, window, cx);
+            });
+        });
+        vcx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(store.read(cx).settings().accent_color, violet);
+            let picker_rgb = settings_view
+                .read(cx)
+                .accent_color_picker
+                .read(cx)
+                .value()
+                .map(hsla_to_rgb_u8);
+            assert_eq!(picker_rgb, Some((0x87, 0x64, 0xB8)));
+            // Active GPUI theme primary must adopt the violet hue (~265 deg).
+            let primary_h_deg = cx.theme().primary.h * 360.0;
+            assert!(
+                (primary_h_deg - 265.0).abs() < 5.0,
+                "expected violet primary hue near 265 deg, got {primary_h_deg:.1}"
+            );
+        });
+
+        let reloaded_custom = ConfigStore::new(config_path.clone())
+            .load()
+            .expect("reload custom accent settings.toml");
+        assert_eq!(reloaded_custom.accent_color, violet);
+
+        // Toggle back to Follow System and verify persistence + remember last custom on re-disable.
+        vcx.update(|window, cx| {
+            settings_view.update(cx, |view, cx| {
+                view.set_follow_system_accent(true, window, cx);
+            });
+        });
+        vcx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                store.read(cx).settings().accent_color,
+                AccentColorPreference::System
+            );
+        });
+        let reloaded_sys = ConfigStore::new(config_path)
+            .load()
+            .expect("reload system accent settings.toml");
+        assert_eq!(reloaded_sys.accent_color, AccentColorPreference::System);
+
+        vcx.update(|window, cx| {
+            settings_view.update(cx, |view, cx| {
+                view.set_follow_system_accent(false, window, cx);
+            });
+            assert_eq!(store.read(cx).settings().accent_color, violet);
+        });
 
         drop(settings_view);
         vcx.update(|window, _| window.remove_window());

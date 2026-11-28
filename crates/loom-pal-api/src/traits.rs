@@ -64,6 +64,11 @@ pub trait PlatformBackend: Send + Sync + 'static {
     /// Restores Loom's primary native window (if minimized) and brings it to foreground focus.
     fn restore_and_focus_main_window() {}
 
+    /// Reads the operating system's active accent color as `(r, g, b)`, if available.
+    fn system_accent_color() -> Option<(u8, u8, u8)> {
+        None
+    }
+
     /// Initializes the platform backend and any lightweight static hardware caches.
     fn initialize() -> Result<Self, PalError>
     where

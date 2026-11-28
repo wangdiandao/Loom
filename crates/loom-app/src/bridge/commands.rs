@@ -11,23 +11,44 @@ use loom_config::TableColumnSetting;
 use loom_engine::{CommandEvent, EngineCommand, EngineCommandError};
 use loom_pal::PalError;
 use loom_types::{
-    AppHistorySortColumn, CpuAffinityMask, DetailsSortColumn, DetailsViewMode, LanguagePreference,
-    ProcessKey, ProcessPriority, ProcessSortColumn, ProcessViewMode, RefreshSpeed,
-    ResourceDisplayMode, RunTaskRequest, ServicesSortColumn, SortDirection, StartupPage,
-    StartupSortColumn, ThemePreference, UsersSortColumn,
+    AccentColorPreference, AppHistorySortColumn, CpuAffinityMask, DetailsSortColumn,
+    DetailsViewMode, LanguagePreference, ProcessKey, ProcessPriority, ProcessSortColumn,
+    ProcessViewMode, RefreshSpeed, ResourceDisplayMode, RunTaskRequest, ServicesSortColumn,
+    SortDirection, StartupPage, StartupSortColumn, ThemePreference, UsersSortColumn,
 };
+use loom_ui_kit::{DEFAULT_ACCENT_RGB, apply_accent_to_theme};
 
 use crate::bootstrap;
 use crate::bridge::UiStore;
 use crate::i18n;
 
-/// Applies a [`ThemePreference`] (`System` / `Light` / `Dark`) to GPUI Kit immediately.
-pub(crate) fn apply_theme(pref: ThemePreference, window: Option<&mut Window>, cx: &mut App) {
+/// Returns the operating system's current accent color, falling back to [`DEFAULT_ACCENT_RGB`].
+pub(crate) fn system_accent_rgb() -> (u8, u8, u8) {
+    loom_pal::window::system_accent_color().unwrap_or(DEFAULT_ACCENT_RGB)
+}
+
+/// Resolves an [`AccentColorPreference`] into a concrete sRGB `(r, g, b)` accent color.
+pub(crate) fn resolve_accent_rgb(accent: AccentColorPreference) -> (u8, u8, u8) {
+    accent.rgb().unwrap_or_else(system_accent_rgb)
+}
+
+/// Applies a [`ThemePreference`] (`System` / `Light` / `Dark`) and [`AccentColorPreference`]
+/// to GPUI Kit immediately.
+pub(crate) fn apply_theme(
+    pref: ThemePreference,
+    accent: AccentColorPreference,
+    window: Option<&mut Window>,
+    cx: &mut App,
+) {
     match pref {
         ThemePreference::System => Theme::sync_system_appearance(window, cx),
         ThemePreference::Light => Theme::change(ThemeMode::Light, window, cx),
         ThemePreference::Dark => Theme::change(ThemeMode::Dark, window, cx),
     }
+    let accent_rgb = resolve_accent_rgb(accent);
+    Theme::update(cx, |theme| {
+        apply_accent_to_theme(theme, accent_rgb);
+    });
 }
 
 /// Ergonomic namespace of typed UI command & preference mutation helpers.
@@ -88,10 +109,25 @@ impl UiCommands {
         window: Option<&mut Window>,
         cx: &mut App,
     ) {
-        store.update(cx, |store, cx| {
+        let accent = store.update(cx, |store, cx| {
             let _ = store.update_settings(|s| s.theme = theme, cx);
+            store.settings().accent_color
         });
-        apply_theme(theme, window, cx);
+        apply_theme(theme, accent, window, cx);
+    }
+
+    /// Updates and immediately applies the application theme accent color (`System` or custom hex).
+    pub(crate) fn set_accent_color(
+        store: &Entity<UiStore>,
+        accent: AccentColorPreference,
+        window: Option<&mut Window>,
+        cx: &mut App,
+    ) {
+        let theme = store.update(cx, |store, cx| {
+            let _ = store.update_settings(|s| s.accent_color = accent, cx);
+            store.settings().theme
+        });
+        apply_theme(theme, accent, window, cx);
     }
 
     /// Updates and immediately applies the UI and tray localization (`zh-CN` / `en-US`).

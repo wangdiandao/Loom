@@ -48,8 +48,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use loom_types::{
-        LanguagePreference, ProcessViewMode, RefreshSpeed, ResourceDisplayMode, StartupPage,
-        ThemePreference,
+        AccentColorPreference, LanguagePreference, ProcessViewMode, RefreshSpeed,
+        ResourceDisplayMode, StartupPage, ThemePreference,
     };
 
     use super::*;
@@ -60,6 +60,7 @@ mod tests {
             startup_page: StartupPage::Performance,
             refresh_speed: RefreshSpeed::High500Ms,
             theme: ThemePreference::Dark,
+            accent_color: AccentColorPreference::custom(0x1D, 0xC5, 0xF4),
             language: LanguagePreference::EnUs,
             process_view_mode: ProcessViewMode::Tree,
             resource_display_mode: ResourceDisplayMode::Percent,
@@ -531,6 +532,7 @@ visible = true
             startup_page: StartupPage::Performance,
             refresh_speed: RefreshSpeed::High500Ms,
             theme: ThemePreference::Dark,
+            accent_color: AccentColorPreference::System,
             language: LanguagePreference::EnUs,
             process_view_mode: ProcessViewMode::Tree,
             resource_display_mode: ResourceDisplayMode::Percent,
@@ -784,6 +786,32 @@ theme = "Dark"
         assert!(loaded.show_leak_warnings);
         assert!(loaded.leak_ignored_paths.is_empty());
         assert!(!loaded.hide_windows_system_processes);
+        assert_eq!(loaded.accent_color, AccentColorPreference::System);
+
+        // Custom hex accent color and System accent color round-trip cleanly via ConfigStore.
+        let custom_accent = migrate_toml_value(
+            r##"
+                schema_version = 1
+                accent_color = "#8764b8"
+            "##,
+        )
+        .expect("parse custom hex accent_color");
+        assert_eq!(
+            custom_accent.accent_color,
+            AccentColorPreference::custom(0x87, 0x64, 0xB8)
+        );
+        let dir_accent = tempfile::tempdir().expect("create accent temp dir");
+        let store_accent = ConfigStore::new(dir_accent.path().join(CONFIG_FILE_NAME));
+        store_accent
+            .save(&custom_accent)
+            .expect("save custom accent");
+        let raw_accent =
+            std::fs::read_to_string(store_accent.path()).expect("read saved accent toml");
+        assert!(raw_accent.contains("accent_color = \"#8764B8\""));
+        assert_eq!(
+            store_accent.load().expect("reload custom accent"),
+            custom_accent
+        );
 
         // Non-default values and dirty `leak_ignored_paths` sanitize and round-trip via ConfigStore.
         let dir = tempfile::tempdir().expect("create temp dir");

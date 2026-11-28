@@ -361,7 +361,7 @@ pub(crate) fn run(args: LaunchArgs, raw_args: Vec<String>) {
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
             gpui_kit::init(cx);
-            apply_theme(settings.theme, None, cx);
+            apply_theme(settings.theme, settings.accent_color, None, cx);
 
             let initial_hotkey = settings.global_hotkey.clone();
             let store = cx.new(|cx| UiStore::new(coordinator, config_store, settings, cx));
@@ -608,11 +608,11 @@ fn toggle_tray_overview_window(cx: &mut App) {
         return;
     }
 
-    let (store, theme) = {
+    let (store, theme, accent_color) = {
         let runtime = cx.global::<AppRuntime>();
         let store = runtime.store.clone();
-        let theme = store.read(cx).settings().theme;
-        (store, theme)
+        let settings = store.read(cx).settings();
+        (store, settings.theme, settings.accent_color)
     };
 
     // Wake sampling before opening the popover so vitals & top processes update immediately.
@@ -623,7 +623,7 @@ fn toggle_tray_overview_window(cx: &mut App) {
 
     let options = build_tray_overview_window_options(cx);
     match gpui_kit::open_window(options, cx, move |window, cx| {
-        apply_theme(theme, Some(window), cx);
+        apply_theme(theme, accent_color, Some(window), cx);
         cx.new(|cx| TrayOverviewView::new(store, window, cx))
     }) {
         Ok((handle, _view)) => {
@@ -650,7 +650,7 @@ fn open_main_window(cx: &mut App) -> gpui_kit::Result<()> {
 
     let options = build_window_options(&settings);
     let (window_handle, shell) = gpui_kit::open_window(options, cx, move |window, cx| {
-        apply_theme(settings.theme, Some(window), cx);
+        apply_theme(settings.theme, settings.accent_color, Some(window), cx);
         cx.new(|cx| AppShell::new_with_highlight(store, route, pending_highlight, window, cx))
     })?;
 

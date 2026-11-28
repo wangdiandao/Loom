@@ -234,6 +234,118 @@ pub enum ThemePreference {
     Dark,
 }
 
+/// Application theme accent color preference.
+///
+/// Defaults to [`AccentColorPreference::System`], following the operating system's
+/// active accent color. When set to [`AccentColorPreference::Custom`], Loom derives
+/// its primary and highlight tokens from the chosen sRGB color.
+///
+/// Serializes as `"System"` or uppercase `"#RRGGBB"` in `settings.toml`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccentColorPreference {
+    /// Follow the operating-system accent color automatically.
+    #[default]
+    System,
+    /// Use an explicit user-selected sRGB accent color.
+    Custom {
+        /// Red channel (`0..=255`).
+        r: u8,
+        /// Green channel (`0..=255`).
+        g: u8,
+        /// Blue channel (`0..=255`).
+        b: u8,
+    },
+}
+
+impl AccentColorPreference {
+    /// Constructs a custom sRGB accent color preference.
+    #[inline]
+    pub const fn custom(r: u8, g: u8, b: u8) -> Self {
+        Self::Custom { r, g, b }
+    }
+
+    /// Returns `true` when following the operating-system accent color.
+    #[inline]
+    pub const fn is_system(self) -> bool {
+        matches!(self, Self::System)
+    }
+
+    /// Returns the explicit `(r, g, b)` tuple when set to [`Self::Custom`].
+    #[inline]
+    pub const fn rgb(self) -> Option<(u8, u8, u8)> {
+        match self {
+            Self::System => None,
+            Self::Custom { r, g, b } => Some((r, g, b)),
+        }
+    }
+
+    /// Formats an `(r, g, b)` tuple as an uppercase `#RRGGBB` hex string.
+    #[inline]
+    pub fn format_hex(r: u8, g: u8, b: u8) -> String {
+        format!("#{r:02X}{g:02X}{b:02X}")
+    }
+
+    /// Returns the uppercase `#RRGGBB` hex string when set to [`Self::Custom`].
+    #[inline]
+    pub fn to_hex(self) -> Option<String> {
+        self.rgb().map(|(r, g, b)| Self::format_hex(r, g, b))
+    }
+
+    /// Parses a `#RRGGBB`, `RRGGBB`, `#RGB`, or `RGB` hex color string into `(r, g, b)`.
+    pub fn parse_hex(raw: &str) -> Option<(u8, u8, u8)> {
+        let trimmed = raw.trim();
+        let hex = trimmed.strip_prefix('#').unwrap_or(trimmed);
+        let bytes = hex.as_bytes();
+        match bytes.len() {
+            6 if bytes.iter().all(u8::is_ascii_hexdigit) => {
+                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                Some((r, g, b))
+            }
+            3 if bytes.iter().all(u8::is_ascii_hexdigit) => {
+                let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
+                let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
+                let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
+                Some((r, g, b))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for AccentColorPreference {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match *self {
+            Self::System => serializer.serialize_str("System"),
+            Self::Custom { r, g, b } => serializer.serialize_str(&Self::format_hex(r, g, b)),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AccentColorPreference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("system") {
+            return Ok(Self::System);
+        }
+        Self::parse_hex(trimmed)
+            .map(|(r, g, b)| Self::Custom { r, g, b })
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "expected \"System\" or a hex color such as \"#0078D4\", found \"{raw}\""
+                ))
+            })
+    }
+}
+
 /// Application UI localization preference.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LanguagePreference {

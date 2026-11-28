@@ -33,6 +33,7 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ### UI & UX
 
+- Added a live theme accent color system defaulting to following the OS system accent color (Windows DWM `HKCU\Software\Microsoft\Windows\DWM\AccentColor` with `DwmGetColorizationColor` fallback via defaulted `PlatformBackend::system_accent_color`), with custom `#RRGGBB` hex picker (`ColorSelect` with palette, HSLA sliders, and hex input), 8 quick-pick preset swatches, and WCAG 2.1 AA contrast-enforced light/dark theme token derivation in `loom-ui-kit::theme::apply_accent_to_theme`.
 - Streamlined **Performance** view header controls in `loom-app`: removed the redundant CPU view/kernel-time toggle bar under the `CPU` header (keeping all controls in the right-click context menu) and replaced the GPU `2×2` / single-engine toggle buttons with an engine-graph count `Select` dropdown supporting `1`–`8` engine panes (capped dynamically by available adapter engines, with matching context-menu submenu).
 - Fixed the **Details** table's default private working set column label (`Memory (private working set)` / `内存（专用工作集）`, previously mislabeled as working set delta) and added a real signed **Working set delta (memory)** / **工作集增量（内存）** column (`DetailsRowProjection::working_set_delta_bytes`, `DetailsSortColumn::WorkingSetDelta`, `format_signed_bytes` / `format_signed_bytes_metric` / `RowTextCache::signed_bytes_metric_slot`) reporting positive, zero, and negative per-tick working set changes.
 - Removed redundant explanatory toast/dialog/popover captions across `loom-app` (diagnostic summary toast body, dialog descriptions/subtitles, search syntax subtitle, file-locks idle hint, and tray overview click hint) and rendered `16x16` cached application icons in the **Startup apps** table.
@@ -63,7 +64,7 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ### Config & Localization
 
-- Added backward-compatible `#[serde(default)]` v1 optional preferences to `loom-config` (`AppSettings::{webview2_host_grouping, show_leak_warnings, leak_ignored_paths, hide_windows_system_processes}`) while keeping `CONFIG_CONTRACT_VERSION = "1.0"` and `CURRENT_SCHEMA_VERSION = 1` intact.
+- Added backward-compatible `#[serde(default)]` v1 optional preferences to `loom-config` (`AppSettings::{accent_color, webview2_host_grouping, show_leak_warnings, leak_ignored_paths, hide_windows_system_processes}`) and `AccentColorPreference` (`"System"` / `"#RRGGBB"`) in `loom-types` while keeping `CONFIG_CONTRACT_VERSION = "1.0"` and `CURRENT_SCHEMA_VERSION = 1` intact.
 
 ## 0.1.0 - 2026-11-27
 
