@@ -1,6 +1,5 @@
-//! GPU detail pane for the Performance view (`2×2` multi-engine / single-engine, VRAM charts, honest D3 sleep & specs).
+//! GPU detail pane for the Performance view (configurable `1..=8` engine charts, VRAM charts, honest D3 sleep & specs).
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::select::{Select, SelectItem, SelectState};
 use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex, v_flex};
@@ -18,10 +17,29 @@ use crate::features::performance::charts::{
     MetricStat, SpecRow, build_percent_area_chart, chart_frame, device_header,
     history_ring_to_points, metrics_two_column_panel,
 };
-use crate::features::performance::state::GpuViewMode;
+use crate::features::performance::state::MAX_GPU_ENGINE_PANES;
 use crate::i18n;
 
-/// Selectable GPU execution engine option backing each [`SelectState`].
+/// Selectable GPU engine-pane count option (`1..=N`) backing the count dropdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GpuPaneCountOption {
+    pub(crate) count: usize,
+    pub(crate) label: SharedString,
+}
+
+impl SelectItem for GpuPaneCountOption {
+    type Value = usize;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.count
+    }
+}
+
+/// Selectable GPU execution engine option backing each per-pane [`SelectState`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GpuEngineOption {
     pub(crate) index: usize,
@@ -44,11 +62,11 @@ impl SelectItem for GpuEngineOption {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_gpu_detail(
     gpu: &GpuAdapterSlice,
-    view_mode: GpuViewMode,
-    grid_indices: [usize; 4],
-    single_index: usize,
-    grid_selects: &[Entity<SelectState<Vec<GpuEngineOption>>>; 4],
-    single_select: &Entity<SelectState<Vec<GpuEngineOption>>>,
+    effective_count: usize,
+    max_panes: usize,
+    engine_indices: [usize; MAX_GPU_ENGINE_PANES],
+    pane_count_select: &Entity<SelectState<Vec<GpuPaneCountOption>>>,
+    engine_selects: &[Entity<SelectState<Vec<GpuEngineOption>>>; MAX_GPU_ENGINE_PANES],
     colors: &LoomSemanticColors,
     cx: &mut Context<PerformanceView>,
 ) -> impl IntoElement {
@@ -73,45 +91,20 @@ pub(crate) fn render_gpu_detail(
             .into_any_element()
     });
 
-    let grid_btn = Button::new("perf-gpu-mode-grid")
-        .small()
-        .label(i18n::tr("perf.gpu_view_grid"))
-        .map(|btn| {
-            if view_mode == GpuViewMode::Grid2x2 {
-                btn.primary()
-            } else {
-                btn.outline()
-            }
-        })
-        .on_click(cx.listener(|view, _, _window, cx| {
-            view.set_gpu_view_mode(GpuViewMode::Grid2x2, cx);
-        }));
-
-    let single_btn = Button::new("perf-gpu-mode-single")
-        .small()
-        .label(i18n::tr("perf.gpu_view_single"))
-        .map(|btn| {
-            if view_mode == GpuViewMode::SingleEngine {
-                btn.primary()
-            } else {
-                btn.outline()
-            }
-        })
-        .on_click(cx.listener(|view, _, _window, cx| {
-            view.set_gpu_view_mode(GpuViewMode::SingleEngine, cx);
-        }));
-
-    let controls_bar = h_flex()
-        .w_full()
-        .items_center()
-        .gap_1p5()
-        .child(grid_btn)
-        .child(single_btn);
+    let controls_bar = (max_panes > 0).then(|| {
+        h_flex().w_full().items_center().child(
+            div().w(px(148.)).child(
+                Select::new(pane_count_select)
+                    .small()
+                    .accessibility_label(i18n::tr("perf.gpu_engine_count")),
+            ),
+        )
+    });
 
     let engine_charts_area = div()
         .id(SharedString::from(format!("perf-gpu-engines-{}", gpu.luid)))
         .w_full()
-        .child(if gpu.engines.is_empty() {
+        .child(if gpu.engines.is_empty() || effective_count == 0 {
             let points = history_ring_to_points(&gpu.util_history);
             let chart = build_percent_area_chart(
                 SharedString::from(format!("perf-gpu-overall-{}", gpu.luid)),
@@ -130,16 +123,12 @@ pub(crate) fn render_gpu_detail(
                 colors,
             )
             .into_any_element()
+        } else if effective_count == 1 {
+            render_gpu_single_engine(gpu, engine_indices[0], &engine_selects[0], colors)
+                .into_any_element()
         } else {
-            match view_mode {
-                GpuViewMode::Grid2x2 => {
-                    render_gpu_2x2_grid(gpu, grid_indices, grid_selects, colors).into_any_element()
-                }
-                GpuViewMode::SingleEngine => {
-                    render_gpu_single_engine(gpu, single_index, single_select, colors)
-                        .into_any_element()
-                }
-            }
+            render_gpu_engine_grid(gpu, effective_count, engine_indices, engine_selects, colors)
+                .into_any_element()
         });
 
     // Dedicated & Shared VRAM 60s charts side by side.
@@ -242,34 +231,38 @@ pub(crate) fn render_gpu_detail(
         .w_full()
         .gap_4()
         .child(device_header(title, name, sleep_badge, colors))
-        .child(controls_bar)
+        .when_some(controls_bar, |this, bar| this.child(bar))
         .child(engine_charts_area)
         .child(vram_row)
         .child(metrics_two_column_panel(left_stats, right_specs, colors))
-        .context_menu(move |menu, _window, _cx| {
-            let weak_grid = weak_ctx.clone();
-            let weak_single = weak_ctx.clone();
+        .context_menu(move |mut menu, window, cx| {
+            let weak_count = weak_ctx.clone();
             let weak_copy = weak_ctx.clone();
+            if max_panes > 0 {
+                menu = menu
+                    .submenu(
+                        i18n::tr("perf.gpu_engine_count"),
+                        window,
+                        cx,
+                        move |mut sub, _window, _cx| {
+                            for count in 1..=max_panes {
+                                let weak_item = weak_count.clone();
+                                sub = sub.item(
+                                    PopupMenuItem::new(i18n::perf_gpu_engine_count_label(count))
+                                        .checked(count == effective_count)
+                                        .on_click(move |_, window, cx| {
+                                            let _ = weak_item.update(cx, |view, cx| {
+                                                view.set_gpu_engine_count(count, window, cx);
+                                            });
+                                        }),
+                                );
+                            }
+                            sub
+                        },
+                    )
+                    .separator();
+            }
             menu.item(
-                PopupMenuItem::new(i18n::tr("perf.gpu_view_grid"))
-                    .checked(view_mode == GpuViewMode::Grid2x2)
-                    .on_click(move |_, _, cx| {
-                        let _ = weak_grid.update(cx, |view, cx| {
-                            view.set_gpu_view_mode(GpuViewMode::Grid2x2, cx);
-                        });
-                    }),
-            )
-            .item(
-                PopupMenuItem::new(i18n::tr("perf.gpu_view_single"))
-                    .checked(view_mode == GpuViewMode::SingleEngine)
-                    .on_click(move |_, _, cx| {
-                        let _ = weak_single.update(cx, |view, cx| {
-                            view.set_gpu_view_mode(GpuViewMode::SingleEngine, cx);
-                        });
-                    }),
-            )
-            .separator()
-            .item(
                 PopupMenuItem::new(i18n::tr("perf.perf_polish_copy_summary")).on_click(
                     move |_, window, cx| {
                         let _ = weak_copy.update(cx, |view, cx| {
@@ -281,15 +274,19 @@ pub(crate) fn render_gpu_detail(
         })
 }
 
-fn render_gpu_2x2_grid(
+fn render_gpu_engine_grid(
     gpu: &GpuAdapterSlice,
-    grid_indices: [usize; 4],
-    grid_selects: &[Entity<SelectState<Vec<GpuEngineOption>>>; 4],
+    pane_count: usize,
+    engine_indices: [usize; MAX_GPU_ENGINE_PANES],
+    engine_selects: &[Entity<SelectState<Vec<GpuEngineOption>>>; MAX_GPU_ENGINE_PANES],
     colors: &LoomSemanticColors,
 ) -> impl IntoElement {
+    let visible_count = pane_count.min(MAX_GPU_ENGINE_PANES);
+    let chart_height = if visible_count <= 2 { 150.0 } else { 110.0 };
     let select_a11y = i18n::tr("perf.gpu_select_engine");
+
     let make_pane = |slot: usize| {
-        let engine_ix = grid_indices[slot].min(gpu.engines.len().saturating_sub(1));
+        let engine_ix = engine_indices[slot].min(gpu.engines.len().saturating_sub(1));
         let engine = &gpu.engines[engine_ix];
         let chart = build_percent_area_chart(
             SharedString::from(format!("perf-gpu-{}-pane-{slot}", gpu.luid)),
@@ -313,7 +310,7 @@ fn render_gpu_2x2_grid(
                     .gap_2()
                     .child(
                         div().w(px(160.)).max_w_full().child(
-                            Select::new(&grid_selects[slot])
+                            Select::new(&engine_selects[slot])
                                 .xsmall()
                                 .accessibility_label(select_a11y.clone()),
                         ),
@@ -330,7 +327,7 @@ fn render_gpu_2x2_grid(
             .child(
                 div()
                     .w_full()
-                    .h(px(110.))
+                    .h(px(chart_height))
                     .rounded_md()
                     .border_1()
                     .border_color(colors.chart_gpu.opacity(0.45))
@@ -340,23 +337,18 @@ fn render_gpu_2x2_grid(
             )
     };
 
-    v_flex()
-        .w_full()
-        .gap_3()
-        .child(
-            h_flex()
-                .w_full()
-                .gap_3()
-                .child(make_pane(0))
-                .child(make_pane(1)),
-        )
-        .child(
-            h_flex()
-                .w_full()
-                .gap_3()
-                .child(make_pane(2))
-                .child(make_pane(3)),
-        )
+    let mut grid = v_flex().w_full().gap_3();
+    for row_start in (0..visible_count).step_by(2) {
+        let mut row = h_flex().w_full().gap_3().child(make_pane(row_start));
+        if row_start + 1 < visible_count {
+            row = row.child(make_pane(row_start + 1));
+        } else {
+            // Pad incomplete trailing row so pane widths remain uniform.
+            row = row.child(div().flex_1().min_w_0());
+        }
+        grid = grid.child(row);
+    }
+    grid
 }
 
 fn render_gpu_single_engine(
