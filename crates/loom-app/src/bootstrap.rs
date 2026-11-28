@@ -34,6 +34,7 @@ icon_assets!(
     [
         Activity,
         CircleQuestionMark,
+        Download,
         FileLock,
         LayoutList,
         List,
@@ -813,5 +814,35 @@ mod tests {
 
         let empty = LaunchArgs::parse_from(Vec::<&str>::new());
         assert_eq!(empty, LaunchArgs::default());
+    }
+
+    #[test]
+    fn loom_assets_loads_all_extra_and_feature_icons() {
+        use gpui_kit::AssetSource as _;
+        use gpui_kit::assets::IconName as AssetIconName;
+
+        let icons = [
+            AssetIconName::Activity,
+            AssetIconName::CircleQuestionMark,
+            AssetIconName::Copy,
+            AssetIconName::Download,
+            AssetIconName::EyeOff,
+            AssetIconName::FileLock,
+            AssetIconName::LayoutList,
+            AssetIconName::List,
+            AssetIconName::ListTree,
+            AssetIconName::RotateCw,
+        ];
+
+        for icon in icons {
+            let path = icon.path();
+            let loaded = super::LoomAssets
+                .load(path.as_ref())
+                .expect("asset load should not error");
+            assert!(
+                loaded.as_ref().is_some_and(|bytes| !bytes.is_empty()),
+                "icon `{path}` must resolve from LoomAssets"
+            );
+        }
     }
 }
