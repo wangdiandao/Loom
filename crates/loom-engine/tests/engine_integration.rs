@@ -4055,15 +4055,15 @@ fn startup_tick0_defers_per_process_gpu_and_prioritizes_app_slow_probes() {
     );
     assert_eq!(
         probed[1], small_app.key,
-        "remaining App process must be probed before Background/System"
+        "remaining App process must be probed before non-App processes"
     );
     assert_eq!(
-        probed[2], bg_proc.key,
-        "Background process must be probed before System"
+        probed[2], sys_proc.key,
+        "non-App processes must preserve their deterministic relative order"
     );
     assert_eq!(
-        probed[3], sys_proc.key,
-        "System process must be probed last"
+        probed[3], bg_proc.key,
+        "non-App processes must preserve their deterministic relative order"
     );
 
     coord.shutdown();

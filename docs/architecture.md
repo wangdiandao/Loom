@@ -54,7 +54,7 @@ sequenceDiagram
     end
     Note over Main: Strictly after first frame paint (window.on_next_frame): start WM_COPYDATA receiver, tray icon & global hotkey
     Fast->>Fast: T = +250 ms calibration tick enables cooldown-cached D3DKMT per-process GPU telemetry, then enters 1s cadence
-    Fast-)Slow: Prioritize cold metadata probes (App > Background > System, descending private WS)
+    Fast-)Slow: Prioritize foreground App cold probes (descending private WS) ahead of background/system processes
     Slow-->>Main: Backfill icons & descriptions asynchronously without blocking UI
 ```
 

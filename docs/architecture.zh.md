@@ -54,7 +54,7 @@ sequenceDiagram
     end
     Note over Main: 首帧绘制完成后 (window.on_next_frame) 挂载 WM_COPYDATA 接收窗、托盘图标与全局热键
     Fast->>Fast: T = +250 ms 二次校准采样，启用带负缓存冷却的 D3DKMT 每进程 GPU 遥测后切入 1s 稳态周期
-    Fast-)Slow: 按 App > Background > System 与专用工作集降序优先投递冷元数据探测任务
+    Fast-)Slow: 前台 App 进程按专用工作集降序优先投递冷元数据探测，其余进程保持顺序回填
     Slow-->>Main: 分批异步回填 20x20 图标、PE 发布者、SMBIOS 与磁盘型号
 ```
 

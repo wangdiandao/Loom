@@ -14,7 +14,7 @@ See [versioning and releases](docs/release.md) for the version progression polic
 - Accelerated Tick 0 boot snapshots, steady-state fast-lane scans, and icon backfill:
   - Added defaulted additive `FastSystemSampler::set_per_process_gpu_enabled` in `loom-pal-api` so `EngineCoordinator` bypasses cold DXGI/D3DKMT per-process GPU discovery on Tick 0 and enables it on Tick 1 (`+250 ms`).
   - Added `ProcessGpuProbeState` negative-probe & active-adapter caching (`AccessDenied`, staggered `NoGpuContext` cooldown with immediate `App`-category promotion re-probe, and active adapter bitmask) in `loom-pal-windows::perf::gpu`, cutting warm `sample_processes` latency well below the `10 ms` release budget on 450+ process hosts.
-  - Prioritized slow-lane cold metadata probing (`App` -> `Background` -> `System`, descending private working set) in `loom-engine` so visible foreground apps receive icons and descriptions first.
+  - Prioritized slow-lane cold metadata probing for foreground `App` processes (descending private working set) ahead of background/system processes in `loom-engine` so visible apps receive icons and descriptions first.
 - Added zero-overhead opt-in `--startup-trace` / `--startup-trace=<path>` phase instrumentation in `loom-app` for measuring cold-start milestones from `main_start` to `first_frame_painted` and `tick0_snapshot_ready`.
 
 ### Engine & PAL

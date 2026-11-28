@@ -902,19 +902,19 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             {
                 continue;
             }
-            let tier = match category {
-                ProcessCategory::App => 0,
-                ProcessCategory::Background => 1,
-                ProcessCategory::System => 2,
+            let (tier, weight) = if category == ProcessCategory::App {
+                (0u8, private_ws_bytes)
+            } else {
+                (1u8, 0u64)
             };
-            self.probe_candidates_scratch
-                .push((tier, private_ws_bytes, key));
+            self.probe_candidates_scratch.push((tier, weight, key));
         }
 
-        // Prioritize foreground `App` processes (and heavier memory footprints first) so visible
-        // top rows backfill icons and descriptions ahead of background/system services.
+        // Prioritize foreground `App` processes (descending by private working set) so visible
+        // top rows backfill icons and descriptions first while preserving deterministic relative
+        // order across background and system processes.
         self.probe_candidates_scratch
-            .sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+            .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
 
         for &(_, _, key) in &self.probe_candidates_scratch {
             if self
