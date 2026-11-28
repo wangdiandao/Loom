@@ -1,18 +1,16 @@
 //! Progressive startup pipeline, window lifecycle orchestration, tray residency, and PAL window helpers.
 
-use std::borrow::Cow;
-use std::future::Future;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context as TaskContext, Poll, Waker};
+mod assets;
+mod cli;
+mod signals;
 
-use gpui_kit::assets::{Assets, icon_assets};
+use std::sync::Arc;
+
 use gpui_kit::component::TitleBar;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, AssetSource, BorrowAppContext as _, Bounds, Entity,
-    Global, QuitMode, SharedString, Subscription, Window, WindowBounds, WindowDecorations,
-    WindowKind, WindowOptions, point, px, size,
+    AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Bounds, Entity, Global, QuitMode,
+    Subscription, Window, WindowBounds, WindowDecorations, WindowKind, WindowOptions, point, px,
+    size,
 };
 use loom_config::{AppSettings, ConfigStore, WindowGeometry};
 use loom_engine::{EngineCommand, EngineCoordinator};
@@ -20,7 +18,6 @@ use loom_pal::{
     GlobalHotkeyController, NativeBackend, PalError, PlatformBackend, SingleInstanceGuard,
 };
 use loom_types::{CapabilityFlags, ProcessKey};
-use parking_lot::Mutex;
 
 use crate::bridge::{UiStore, apply_theme};
 use crate::i18n;
@@ -28,45 +25,11 @@ use crate::shell::{
     AppShell, NavigationIntent, Route, TRAY_OVERVIEW_HEIGHT, TRAY_OVERVIEW_WIDTH, TrayAction,
     TrayController, TrayEventSignal, TrayOverviewView,
 };
-use crate::startup_trace::{self, StartupTraceTarget};
+use crate::startup_trace;
 
-icon_assets!(
-    LoomExtraIcons,
-    [
-        Activity,
-        CircleQuestionMark,
-        Download,
-        FileLock,
-        LayoutList,
-        List,
-        ListTree,
-    ]
-);
-
-/// Application asset source combining `gpui-kit`'s default component bundle with
-/// Loom's additional shell & view-mode icons.
-struct LoomAssets;
-
-impl AssetSource for LoomAssets {
-    fn load(&self, path: &str) -> gpui_kit::Result<Option<Cow<'static, [u8]>>> {
-        if path == loom_ui_kit::ECO_LEAF_ICON_PATH {
-            return Ok(Some(Cow::Borrowed(loom_ui_kit::ECO_LEAF_SVG)));
-        }
-        if let Ok(Some(data)) = LoomExtraIcons.load(path) {
-            return Ok(Some(data));
-        }
-        Assets.load(path)
-    }
-
-    fn list(&self, path: &str) -> gpui_kit::Result<Vec<SharedString>> {
-        let mut items = Assets.list(path)?;
-        items.extend(LoomExtraIcons.list(path)?);
-        if path.is_empty() || path == "icons" || path == "icons/" {
-            items.push(SharedString::new_static(loom_ui_kit::ECO_LEAF_ICON_PATH));
-        }
-        Ok(items)
-    }
-}
+use self::assets::LoomAssets;
+pub(crate) use self::cli::LaunchArgs;
+use self::signals::{ActivationWakeSignal, HotkeyWakeSignal};
 
 /// Single-instance OS mutex identifier shared across normal launches of Loom.
 const SINGLE_INSTANCE_ID: &str = "io.github.wangdiandao.loom.single-instance";
@@ -75,207 +38,6 @@ const DEFAULT_WINDOW_WIDTH: f32 = 1120.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 720.0;
 const MIN_WINDOW_WIDTH: f32 = 760.0;
 const MIN_WINDOW_HEIGHT: f32 = 500.0;
-
-/// Parsed command-line launch arguments for `loom-app`.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct LaunchArgs {
-    /// Optional route slug requested via `--restore-route=<slug>` (e.g., after elevated relaunch).
-    pub(crate) restore_route: Option<Route>,
-    /// Optional explicit `settings.toml` path via `--config=<path>` (useful for isolated tests).
-    pub(crate) config_path: Option<PathBuf>,
-    /// Skip the OS single-instance lock when `--allow-multiple` is passed (testing / automation).
-    pub(crate) allow_multiple: bool,
-    /// Optional opt-in startup phase trace destination via `--startup-trace[=<path>]`.
-    pub(crate) startup_trace: Option<StartupTraceTarget>,
-}
-
-impl LaunchArgs {
-    /// Parses CLI arguments from an iterator (typically `std::env::args().skip(1)`).
-    pub(crate) fn parse_from<I, S>(args: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let mut parsed = Self::default();
-        let mut iter = args.into_iter().peekable();
-        while let Some(raw) = iter.next() {
-            let arg = raw.as_ref();
-            if let Some(val) = arg.strip_prefix("--restore-route=") {
-                parsed.restore_route = Route::parse(val);
-            } else if arg == "--restore-route" {
-                if let Some(next) = iter.next() {
-                    parsed.restore_route = Route::parse(next.as_ref());
-                }
-            } else if let Some(val) = arg.strip_prefix("--config=") {
-                if !val.trim().is_empty() {
-                    parsed.config_path = Some(PathBuf::from(val));
-                }
-            } else if arg == "--config" {
-                if let Some(next) = iter.next()
-                    && !next.as_ref().trim().is_empty()
-                {
-                    parsed.config_path = Some(PathBuf::from(next.as_ref()));
-                }
-            } else if arg == "--allow-multiple" {
-                parsed.allow_multiple = true;
-            } else if let Some(val) = arg.strip_prefix("--startup-trace=") {
-                let trimmed = val.trim();
-                parsed.startup_trace = Some(if trimmed.is_empty() {
-                    StartupTraceTarget::Stderr
-                } else {
-                    StartupTraceTarget::File(PathBuf::from(trimmed))
-                });
-            } else if arg == "--startup-trace" {
-                let next_is_path = iter.peek().is_some_and(|next| {
-                    !next.as_ref().starts_with("--") && !next.as_ref().trim().is_empty()
-                });
-                if next_is_path && let Some(next) = iter.next() {
-                    parsed.startup_trace = Some(StartupTraceTarget::File(PathBuf::from(
-                        next.as_ref().trim(),
-                    )));
-                } else {
-                    parsed.startup_trace = Some(StartupTraceTarget::Stderr);
-                }
-            }
-        }
-        parsed
-    }
-}
-
-#[derive(Default)]
-struct HotkeySignalState {
-    pending: bool,
-    waker: Option<Waker>,
-    closed: bool,
-}
-
-/// Zero-polling waker-backed wakeup signal delivering global hotkey presses onto the GPUI loop.
-#[derive(Clone, Default)]
-struct HotkeyWakeSignal {
-    inner: Arc<Mutex<HotkeySignalState>>,
-}
-
-impl HotkeyWakeSignal {
-    fn trigger(&self) {
-        let waker = {
-            let mut state = self.inner.lock();
-            if state.closed {
-                return;
-            }
-            state.pending = true;
-            state.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-
-    fn close(&self) {
-        let waker = {
-            let mut state = self.inner.lock();
-            state.closed = true;
-            state.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-
-    fn next(&self) -> NextHotkeyWake {
-        NextHotkeyWake {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-struct NextHotkeyWake {
-    inner: Arc<Mutex<HotkeySignalState>>,
-}
-
-impl Future for NextHotkeyWake {
-    type Output = bool;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
-        let mut state = self.inner.lock();
-        if state.pending {
-            state.pending = false;
-            return Poll::Ready(true);
-        }
-        if state.closed {
-            return Poll::Ready(false);
-        }
-        state.waker = Some(cx.waker().clone());
-        Poll::Pending
-    }
-}
-
-#[derive(Default)]
-struct ActivationSignalState {
-    pending: Vec<Vec<String>>,
-    waker: Option<Waker>,
-    closed: bool,
-}
-
-/// Zero-polling waker-backed signal delivering single-instance activation payloads onto the GPUI loop.
-#[derive(Clone, Default)]
-struct ActivationWakeSignal {
-    inner: Arc<Mutex<ActivationSignalState>>,
-}
-
-impl ActivationWakeSignal {
-    fn push(&self, args: Vec<String>) {
-        let waker = {
-            let mut state = self.inner.lock();
-            if state.closed {
-                return;
-            }
-            if state.pending.len() < 16 {
-                state.pending.push(args);
-            }
-            state.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-
-    fn close(&self) {
-        let waker = {
-            let mut state = self.inner.lock();
-            state.closed = true;
-            state.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-
-    fn next(&self) -> NextActivationWake {
-        NextActivationWake {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-struct NextActivationWake {
-    inner: Arc<Mutex<ActivationSignalState>>,
-}
-
-impl Future for NextActivationWake {
-    type Output = Option<Vec<String>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
-        let mut state = self.inner.lock();
-        if !state.pending.is_empty() {
-            return Poll::Ready(Some(state.pending.remove(0)));
-        }
-        if state.closed {
-            return Poll::Ready(None);
-        }
-        state.waker = Some(cx.waker().clone());
-        Poll::Pending
-    }
-}
 
 /// Application-wide GPUI global managing the active windows, tray icon, global hotkey, and exit policy.
 struct AppRuntime {
@@ -741,7 +503,14 @@ fn open_main_window(cx: &mut App) -> gpui_kit::Result<()> {
 fn show_or_reopen_main_window(cx: &mut App) {
     close_tray_overview_window(cx);
 
-    let existing = cx.global::<AppRuntime>().active_window;
+    let (existing, was_visible, store) = {
+        let runtime = cx.global::<AppRuntime>();
+        (
+            runtime.active_window,
+            runtime.main_window_visible,
+            runtime.store.clone(),
+        )
+    };
     if let Some(handle) = existing {
         loom_pal::window::restore_and_focus_main_window();
         let updated = handle.update(cx, |_, window, _| {
@@ -752,11 +521,13 @@ fn show_or_reopen_main_window(cx: &mut App) {
                 runtime.main_window_visible = true;
             });
             sync_dormancy(cx);
+            if !was_visible {
+                let _ = store.read(cx).dispatch_command(EngineCommand::ForceRefresh);
+            }
             return;
         }
     }
 
-    let store = cx.global::<AppRuntime>().store.clone();
     store.update(cx, |store, cx| {
         store.set_window_dormant(false, cx);
         let _ = store.dispatch_command(EngineCommand::ForceRefresh);
@@ -917,6 +688,15 @@ pub(crate) fn record_active_route(route: Route, cx: &mut App) {
     }
 }
 
+/// Returns the active shell [`Route`] tracked by [`AppRuntime`], if initialized.
+pub(crate) fn active_route(cx: &App) -> Option<Route> {
+    if cx.has_global::<AppRuntime>() {
+        Some(cx.global::<AppRuntime>().active_route)
+    } else {
+        None
+    }
+}
+
 /// Updates the main window visibility state and reconciles engine dormancy across all shell windows.
 ///
 /// Returns `true` when [`AppRuntime`] handled dormancy orchestration, or `false` in standalone tests.
@@ -950,7 +730,7 @@ pub(crate) fn refresh_localized_shell_chrome(cx: &mut App) {
     }
 }
 
-/// Persists the current window bounds into `AppSettings::window_geometry`.
+/// Persists the current window bounds into `AppSettings::window_geometry` when changed.
 pub(crate) fn persist_window_geometry(store: &Entity<UiStore>, window: &Window, cx: &mut App) {
     let bounds = window.window_bounds();
     let maximized = matches!(bounds, WindowBounds::Maximized(_));
@@ -964,6 +744,9 @@ pub(crate) fn persist_window_geometry(store: &Entity<UiStore>, window: &Window, 
         height,
         maximized,
     };
+    if store.read(cx).settings().window_geometry == Some(geometry) {
+        return;
+    }
     store.update(cx, |store, cx| {
         let _ = store.update_settings(|s| s.window_geometry = Some(geometry), cx);
     });
@@ -983,6 +766,7 @@ pub(crate) fn apply_global_hotkey(spec: Option<&str>, cx: &mut App) -> Result<()
     if let Some(controller) = runtime.hotkey.as_mut() {
         controller.set_hotkey(spec)
     } else {
+        runtime.initial_hotkey = spec.map(str::to_owned);
         Ok(())
     }
 }
@@ -990,96 +774,4 @@ pub(crate) fn apply_global_hotkey(spec: Option<&str>, cx: &mut App) -> Result<()
 /// Returns `true` when Loom's native main window is currently minimized.
 pub(crate) fn is_main_window_minimized() -> bool {
     loom_pal::window::is_main_window_minimized()
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use crate::shell::Route;
-    use crate::startup_trace::StartupTraceTarget;
-
-    use super::LaunchArgs;
-
-    #[test]
-    fn launch_args_parses_restore_route_config_and_allow_multiple() {
-        // Inline `--flag=value` syntax with a POSIX-style path.
-        let posix_args = LaunchArgs::parse_from([
-            "--restore-route=details",
-            "--config=/var/lib/loom/settings.toml",
-            "--allow-multiple",
-            "--startup-trace=/tmp/loom-startup.log",
-        ]);
-        assert_eq!(posix_args.restore_route, Some(Route::Details));
-        assert_eq!(
-            posix_args.config_path,
-            Some(PathBuf::from("/var/lib/loom/settings.toml"))
-        );
-        assert!(posix_args.allow_multiple);
-        assert_eq!(
-            posix_args.startup_trace,
-            Some(StartupTraceTarget::File(PathBuf::from(
-                "/tmp/loom-startup.log"
-            )))
-        );
-
-        // Split `--flag value` syntax with a Windows-style path and bare `--startup-trace`.
-        let windows_args = LaunchArgs::parse_from([
-            "--restore-route",
-            "settings",
-            "--config",
-            r"C:\ProgramData\Loom\settings.toml",
-            "--startup-trace",
-            "--allow-multiple",
-        ]);
-        assert_eq!(windows_args.restore_route, Some(Route::Settings));
-        assert_eq!(
-            windows_args.config_path,
-            Some(PathBuf::from(r"C:\ProgramData\Loom\settings.toml"))
-        );
-        assert!(windows_args.allow_multiple);
-        assert_eq!(windows_args.startup_trace, Some(StartupTraceTarget::Stderr));
-
-        // Split `--startup-trace <path>` syntax.
-        let split_trace = LaunchArgs::parse_from(["--startup-trace", r"C:\Temp\startup_trace.txt"]);
-        assert_eq!(
-            split_trace.startup_trace,
-            Some(StartupTraceTarget::File(PathBuf::from(
-                r"C:\Temp\startup_trace.txt"
-            )))
-        );
-
-        let empty = LaunchArgs::parse_from(Vec::<&str>::new());
-        assert_eq!(empty, LaunchArgs::default());
-    }
-
-    #[test]
-    fn loom_assets_loads_all_extra_and_feature_icons() {
-        use gpui_kit::AssetSource as _;
-        use gpui_kit::assets::IconName as AssetIconName;
-
-        let icons = [
-            AssetIconName::Activity,
-            AssetIconName::CircleQuestionMark,
-            AssetIconName::Copy,
-            AssetIconName::Download,
-            AssetIconName::EyeOff,
-            AssetIconName::FileLock,
-            AssetIconName::LayoutList,
-            AssetIconName::List,
-            AssetIconName::ListTree,
-            AssetIconName::RotateCw,
-        ];
-
-        for icon in icons {
-            let path = icon.path();
-            let loaded = super::LoomAssets
-                .load(path.as_ref())
-                .expect("asset load should not error");
-            assert!(
-                loaded.as_ref().is_some_and(|bytes| !bytes.is_empty()),
-                "icon `{path}` must resolve from LoomAssets"
-            );
-        }
-    }
 }

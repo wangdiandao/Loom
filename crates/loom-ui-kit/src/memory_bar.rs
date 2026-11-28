@@ -155,3 +155,48 @@ pub fn memory_composition_bar(
 
     bar
 }
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::component::{Theme, ThemeColor, ThemeMode};
+
+    use crate::theme::LoomSemanticColors;
+
+    use super::{MemoryBarLabels, MemoryBarSegments, memory_composition_bar};
+
+    #[test]
+    fn memory_bar_segment_proportions_and_construction() {
+        let empty = MemoryBarSegments::default();
+        assert_eq!(empty.total_bytes(), 0);
+        assert_eq!(empty.normalized_weights(), [0.0, 0.0, 0.0, 1.0]);
+
+        let segments = MemoryBarSegments {
+            in_use_bytes: 50,
+            modified_bytes: 10,
+            standby_bytes: 25,
+            free_bytes: 15,
+        };
+        assert_eq!(segments.total_bytes(), 100);
+        let weights = segments.normalized_weights();
+        assert!((weights[0] - 0.50).abs() < 1e-6);
+        assert!((weights[1] - 0.10).abs() < 1e-6);
+        assert!((weights[2] - 0.25).abs() < 1e-6);
+        assert!((weights[3] - 0.15).abs() < 1e-6);
+        let sum: f32 = weights.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+
+        let huge = MemoryBarSegments {
+            in_use_bytes: u64::MAX,
+            modified_bytes: 100,
+            standby_bytes: 0,
+            free_bytes: 0,
+        };
+        assert_eq!(huge.total_bytes(), u64::MAX);
+
+        let mut theme = Theme::from(ThemeColor::dark().as_ref());
+        theme.mode = ThemeMode::Dark;
+        let colors = LoomSemanticColors::from_theme(&theme);
+        let labels = MemoryBarLabels::new("In use", "Modified", "Standby", "Free");
+        let _bar = memory_composition_bar("mem-bar", segments, &labels, &colors);
+    }
+}
