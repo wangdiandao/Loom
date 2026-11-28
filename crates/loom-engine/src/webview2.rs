@@ -57,16 +57,26 @@ fn classify_utility_sub_type(sub_type: Option<&str>) -> WebView2Role {
     let Some(sub) = sub_type else {
         return WebView2Role::Utility;
     };
-    let lower = sub.to_ascii_lowercase();
-    if lower.contains("network") {
+    if contains_ascii_ignore_case(sub, b"network") {
         WebView2Role::Network
-    } else if lower.contains("storage") {
+    } else if contains_ascii_ignore_case(sub, b"storage") {
         WebView2Role::Storage
-    } else if lower.contains("audio") {
+    } else if contains_ascii_ignore_case(sub, b"audio") {
         WebView2Role::Audio
     } else {
         WebView2Role::Utility
     }
+}
+
+#[inline]
+fn contains_ascii_ignore_case(haystack: &str, needle_lower_ascii: &[u8]) -> bool {
+    let bytes = haystack.as_bytes();
+    if needle_lower_ascii.len() > bytes.len() {
+        return false;
+    }
+    bytes
+        .windows(needle_lower_ascii.len())
+        .any(|window| window.eq_ignore_ascii_case(needle_lower_ascii))
 }
 
 /// Extracts the value immediately following a Chromium `--flag=` switch from a Windows
