@@ -2,11 +2,15 @@
 //!
 //! Splits the static toolbar + Last BIOS time indicator ([`StartupView`]) from the
 //! 2D-virtualized `gpui-kit` `DataTable` (`Entity<TableState<StartupTableDelegate>>`)
-//! so hidden routes incur zero registry/folder/UWP polling overhead.
+//! so hidden routes incur zero registry/folder/UWP polling overhead. Filtering and
+//! sorting are offloaded completely to `loom-engine`.
 
-use std::cmp::Ordering;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash as _, Hasher as _};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
@@ -18,76 +22,65 @@ use gpui_kit::component::{
 use gpui_kit::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
+    Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use loom_types::{
     CapabilityFlags, LanguagePreference, MonitorDomain, SortDirection, StartupEntry, StartupImpact,
-    StartupSlice,
+    StartupSlice, StartupSortColumn,
 };
+use loom_ui_kit::UNAVAILABLE_LABEL;
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
 use crate::features::table_columns::DataTablePane;
 use crate::i18n;
 
 const STARTUP_HEADER_HEIGHT: f32 = 32.0;
+const SCROLL_COALESCE_QUIET_WINDOW: Duration = Duration::from_millis(150);
+const SCROLL_COALESCE_MAX_DEFER: Duration = Duration::from_millis(500);
+const DEFAULT_FINGERPRINT_WINDOW: usize = 64;
 
-/// Sortable columns displayed by [`StartupView`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StartupSortColumn {
-    Name,
-    Publisher,
-    Status,
-    Impact,
+const STARTUP_COLUMNS: [StartupSortColumn; 4] = [
+    StartupSortColumn::Name,
+    StartupSortColumn::Publisher,
+    StartupSortColumn::Status,
+    StartupSortColumn::Impact,
+];
+
+#[inline]
+const fn column_slug(col: StartupSortColumn) -> &'static str {
+    match col {
+        StartupSortColumn::Name => "name",
+        StartupSortColumn::Publisher => "publisher",
+        StartupSortColumn::Status => "status",
+        StartupSortColumn::Impact => "impact",
+    }
 }
 
-impl StartupSortColumn {
-    const ALL: [Self; 4] = [Self::Name, Self::Publisher, Self::Status, Self::Impact];
-
-    #[inline]
-    const fn slug(self) -> &'static str {
-        match self {
-            Self::Name => "name",
-            Self::Publisher => "publisher",
-            Self::Status => "status",
-            Self::Impact => "impact",
-        }
+#[inline]
+const fn column_width(col: StartupSortColumn) -> f32 {
+    match col {
+        StartupSortColumn::Name => 280.0,
+        StartupSortColumn::Publisher => 220.0,
+        StartupSortColumn::Status => 120.0,
+        StartupSortColumn::Impact => 150.0,
     }
+}
 
-    #[inline]
-    const fn width(self) -> f32 {
-        match self {
-            Self::Name => 280.0,
-            Self::Publisher => 220.0,
-            Self::Status => 120.0,
-            Self::Impact => 150.0,
-        }
+#[inline]
+const fn column_min_width(col: StartupSortColumn) -> f32 {
+    match col {
+        StartupSortColumn::Name => 140.0,
+        StartupSortColumn::Publisher => 110.0,
+        StartupSortColumn::Status => 84.0,
+        StartupSortColumn::Impact => 96.0,
     }
+}
 
-    #[inline]
-    const fn min_width(self) -> f32 {
-        match self {
-            Self::Name => 140.0,
-            Self::Publisher => 110.0,
-            Self::Status => 84.0,
-            Self::Impact => 96.0,
-        }
-    }
-
-    #[inline]
-    const fn default_direction(self) -> SortDirection {
-        match self {
-            Self::Status | Self::Impact => SortDirection::Descending,
-            Self::Name | Self::Publisher => SortDirection::Ascending,
-        }
-    }
-
-    fn label(self) -> String {
-        match self {
-            Self::Name => i18n::tr("startup.col_name"),
-            Self::Publisher => i18n::tr("startup.col_publisher"),
-            Self::Status => i18n::tr("startup.col_status"),
-            Self::Impact => i18n::tr("startup.col_impact"),
-        }
+#[inline]
+const fn column_default_direction(col: StartupSortColumn) -> SortDirection {
+    match col {
+        StartupSortColumn::Status | StartupSortColumn::Impact => SortDirection::Descending,
+        StartupSortColumn::Name | StartupSortColumn::Publisher => SortDirection::Ascending,
     }
 }
 
@@ -99,17 +92,6 @@ const fn to_column_sort(dir: SortDirection) -> ColumnSort {
     }
 }
 
-#[inline]
-const fn startup_impact_rank(impact: StartupImpact) -> u8 {
-    match impact {
-        StartupImpact::High => 4,
-        StartupImpact::Medium => 3,
-        StartupImpact::Low => 2,
-        StartupImpact::NotMeasured => 1,
-        StartupImpact::None => 0,
-    }
-}
-
 /// Formats firmware POST duration in milliseconds into a tenths-of-second decimal string
 /// (e.g., `4250` -> `"4.3"`, `0` -> `"0.0"`).
 #[inline]
@@ -118,101 +100,82 @@ pub(super) fn format_bios_time_seconds(ms: u64) -> String {
     format!("{}.{}", tenths / 10, tenths % 10)
 }
 
-#[inline]
-fn contains_icase(haystack: &str, needle_lower: &str) -> bool {
-    if needle_lower.is_empty() {
-        return true;
-    }
-    if haystack.is_ascii() && needle_lower.is_ascii() {
-        let h = haystack.as_bytes();
-        let n = needle_lower.as_bytes();
-        if n.len() > h.len() {
-            return false;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoalesceDecision {
+    ApplyNow,
+    Defer(Duration),
+}
+
+#[derive(Debug, Default)]
+struct ScrollCoalescer {
+    deferred_since: Option<Instant>,
+}
+
+impl ScrollCoalescer {
+    fn decide(
+        &mut self,
+        now: Instant,
+        last_scroll_at: Option<Instant>,
+        bypass: bool,
+    ) -> CoalesceDecision {
+        if bypass {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
         }
-        return h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n));
-    }
-    haystack.to_lowercase().contains(needle_lower)
-}
-
-#[inline]
-fn cmp_icase(a: &str, b: &str) -> Ordering {
-    if a.is_ascii() && b.is_ascii() {
-        for (&ab, &bb) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
-            let c = ab.to_ascii_lowercase().cmp(&bb.to_ascii_lowercase());
-            if c != Ordering::Equal {
-                return c;
-            }
+        let Some(scrolled_at) = last_scroll_at else {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
+        };
+        let since_scroll = now.saturating_duration_since(scrolled_at);
+        if since_scroll >= SCROLL_COALESCE_QUIET_WINDOW {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
         }
-        return a.len().cmp(&b.len());
+        let first_deferred = *self.deferred_since.get_or_insert(now);
+        let since_defer = now.saturating_duration_since(first_deferred);
+        if since_defer >= SCROLL_COALESCE_MAX_DEFER {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
+        }
+        let quiet_remaining = SCROLL_COALESCE_QUIET_WINDOW - since_scroll;
+        let cap_remaining = SCROLL_COALESCE_MAX_DEFER - since_defer;
+        CoalesceDecision::Defer(quiet_remaining.min(cap_remaining))
     }
-    a.to_lowercase().cmp(&b.to_lowercase())
 }
 
-/// Returns `true` when `entry` matches the case-insensitive search query across
-/// `name`, `publisher`, and `command`.
-pub(super) fn matches_startup_query(entry: &StartupEntry, query_lower: &str) -> bool {
-    if query_lower.is_empty() {
-        return true;
-    }
-    if contains_icase(&entry.name, query_lower) {
-        return true;
-    }
-    if entry
-        .publisher
-        .as_deref()
-        .is_some_and(|p| contains_icase(p, query_lower))
-    {
-        return true;
-    }
-    if entry
-        .command
-        .as_deref()
-        .is_some_and(|c| contains_icase(c, query_lower))
-    {
-        return true;
-    }
-    false
-}
+/// Computes a lightweight content fingerprint over only the currently visible startup rows.
+pub(super) fn compute_startup_viewport_fingerprint(
+    slice: &StartupSlice,
+    visible_rows: &Range<usize>,
+    selected_row: Option<usize>,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let total = slice.visible_indices.len();
+    (slice.revision == 0).hash(&mut hasher);
+    total.hash(&mut hasher);
+    slice.sort_column.hash(&mut hasher);
+    slice.sort_direction.hash(&mut hasher);
+    selected_row.hash(&mut hasher);
 
-/// Filters and sorts startup entries into visible item indices.
-pub(super) fn filter_and_sort_startup(
-    items: &[StartupEntry],
-    search_query: &str,
-    sort_col: StartupSortColumn,
-    sort_dir: SortDirection,
-) -> Vec<usize> {
-    let query_lower = search_query.trim().to_lowercase();
-    let mut indices: Vec<usize> = items
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| matches_startup_query(entry, &query_lower))
-        .map(|(idx, _)| idx)
-        .collect();
+    let range = if visible_rows.is_empty() {
+        0..total.min(DEFAULT_FINGERPRINT_WINDOW)
+    } else {
+        visible_rows.start.min(total)..visible_rows.end.min(total)
+    };
+    range.start.hash(&mut hasher);
+    range.end.hash(&mut hasher);
 
-    indices.sort_by(|&a_idx, &b_idx| {
-        let a = &items[a_idx];
-        let b = &items[b_idx];
-        let ord = match sort_col {
-            StartupSortColumn::Name => cmp_icase(&a.name, &b.name),
-            StartupSortColumn::Publisher => cmp_icase(
-                a.publisher.as_deref().unwrap_or(""),
-                b.publisher.as_deref().unwrap_or(""),
-            ),
-            StartupSortColumn::Status => a.enabled.cmp(&b.enabled),
-            StartupSortColumn::Impact => {
-                startup_impact_rank(a.impact).cmp(&startup_impact_rank(b.impact))
-            }
-        };
-        let ordered = match sort_dir {
-            SortDirection::Ascending => ord,
-            SortDirection::Descending => ord.reverse(),
-        };
-        ordered
-            .then_with(|| cmp_icase(&a.name, &b.name))
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    for &item_idx in &slice.visible_indices[range] {
+        if let Some(entry) = slice.items.get(item_idx) {
+            entry.id.hash(&mut hasher);
+            entry.name.hash(&mut hasher);
+            entry.publisher.as_deref().hash(&mut hasher);
+            entry.enabled.hash(&mut hasher);
+            entry.impact.hash(&mut hasher);
+        }
+    }
 
-    indices
+    hasher.finish()
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +186,10 @@ struct StartupToolbarState {
 
 /// Cached localized strings for [`StartupTableDelegate`].
 struct StartupLocaleCache {
+    col_name: SharedString,
+    col_publisher: SharedString,
+    col_status: SharedString,
+    col_impact: SharedString,
     enabled: SharedString,
     disabled: SharedString,
     impact_high: SharedString,
@@ -237,6 +204,10 @@ struct StartupLocaleCache {
 impl StartupLocaleCache {
     fn build() -> Self {
         Self {
+            col_name: i18n::tr("startup.col_name").into(),
+            col_publisher: i18n::tr("startup.col_publisher").into(),
+            col_status: i18n::tr("startup.col_status").into(),
+            col_impact: i18n::tr("startup.col_impact").into(),
             enabled: i18n::tr("startup.status_enabled").into(),
             disabled: i18n::tr("startup.status_disabled").into(),
             impact_high: i18n::startup_impact_label(StartupImpact::High).into(),
@@ -246,6 +217,16 @@ impl StartupLocaleCache {
             impact_none: i18n::startup_impact_label(StartupImpact::None).into(),
             loading: i18n::tr("startup.loading").into(),
             empty: i18n::tr("startup.empty").into(),
+        }
+    }
+
+    #[inline]
+    fn column_label(&self, col: StartupSortColumn) -> SharedString {
+        match col {
+            StartupSortColumn::Name => self.col_name.clone(),
+            StartupSortColumn::Publisher => self.col_publisher.clone(),
+            StartupSortColumn::Status => self.col_status.clone(),
+            StartupSortColumn::Impact => self.col_impact.clone(),
         }
     }
 
@@ -267,11 +248,11 @@ struct StartupTableDelegate {
     slice: Arc<StartupSlice>,
     capabilities: CapabilityFlags,
     last_rev: u64,
-    search_query: String,
-    sort_col: StartupSortColumn,
-    sort_dir: SortDirection,
-    visible_indices: Vec<usize>,
     selected_id: Option<Arc<str>>,
+    visible_rows: Range<usize>,
+    last_scroll_at: Option<Instant>,
+    last_viewport_fp: Option<u64>,
+    user_action_pending: bool,
     locale: StartupLocaleCache,
 }
 
@@ -281,57 +262,56 @@ impl StartupTableDelegate {
         let snap = store_ref.snapshot();
         let slice = Arc::clone(&snap.startup);
         let capabilities = snap.capabilities;
-        let search_query = store_ref.search_query().to_owned();
-        let sort_col = StartupSortColumn::Name;
-        let sort_dir = SortDirection::Ascending;
-        let visible_indices =
-            filter_and_sort_startup(&slice.items, &search_query, sort_col, sort_dir);
 
         Self {
             store: store.clone(),
             last_rev: snap.revisions.startup,
             slice,
             capabilities,
-            search_query,
-            sort_col,
-            sort_dir,
-            visible_indices,
             selected_id: None,
+            visible_rows: 0..0,
+            last_scroll_at: None,
+            last_viewport_fp: None,
+            user_action_pending: false,
             locale: StartupLocaleCache::build(),
         }
     }
 
-    fn rebuild_rows(&mut self) {
-        self.visible_indices = filter_and_sort_startup(
-            &self.slice.items,
-            &self.search_query,
-            self.sort_col,
-            self.sort_dir,
-        );
-    }
-
+    #[inline]
     fn row_at(&self, row_ix: usize) -> Option<&StartupEntry> {
-        let item_idx = *self.visible_indices.get(row_ix)?;
+        let item_idx = *self.slice.visible_indices.get(row_ix)?;
         self.slice.items.get(item_idx)
     }
 
-    fn find_visible_index_by_id(&self, id: &str) -> Option<usize> {
-        self.visible_indices
-            .iter()
-            .position(|&idx| self.slice.items[idx].id.as_ref() == id)
+    /// Locates `id` in `slice.visible_indices`, checking `hint_row` in O(1) before scanning.
+    #[inline]
+    fn find_visible_index_by_id(&self, id: &str, hint_row: Option<usize>) -> Option<usize> {
+        if let Some(hint) = hint_row
+            && self
+                .row_at(hint)
+                .is_some_and(|entry| entry.id.as_ref() == id)
+        {
+            return Some(hint);
+        }
+        self.slice.visible_indices.iter().position(|&idx| {
+            self.slice
+                .items
+                .get(idx)
+                .is_some_and(|entry| entry.id.as_ref() == id)
+        })
     }
 
-    fn selected_entry(&self) -> Option<&StartupEntry> {
+    fn selected_entry(&self, hint_row: Option<usize>) -> Option<&StartupEntry> {
         let id = self.selected_id.as_deref()?;
-        let row_ix = self.find_visible_index_by_id(id)?;
+        let row_ix = self.find_visible_index_by_id(id, hint_row)?;
         self.row_at(row_ix)
     }
 
-    fn toolbar_state(&self) -> StartupToolbarState {
+    fn toolbar_state(&self, hint_row: Option<usize>) -> StartupToolbarState {
         if !self.capabilities.contains(CapabilityFlags::STARTUP_APPS) {
             return StartupToolbarState::default();
         }
-        let Some(entry) = self.selected_entry() else {
+        let Some(entry) = self.selected_entry(hint_row) else {
             return StartupToolbarState::default();
         };
         StartupToolbarState {
@@ -340,48 +320,65 @@ impl StartupTableDelegate {
         }
     }
 
-    fn toggle_sort(&mut self, col_ix: usize) {
-        let Some(&target) = StartupSortColumn::ALL.get(col_ix) else {
+    fn trigger_sort(&mut self, col_ix: usize, cx: &mut Context<TableState<Self>>) {
+        let Some(&target) = STARTUP_COLUMNS.get(col_ix) else {
             return;
         };
-        if self.sort_col == target {
-            self.sort_dir = self.sort_dir.toggle();
+        let next_dir = if self.slice.sort_column == target {
+            self.slice.sort_direction.toggle()
         } else {
-            self.sort_col = target;
-            self.sort_dir = target.default_direction();
-        }
-        self.rebuild_rows();
+            column_default_direction(target)
+        };
+        self.user_action_pending = true;
+        let store = self.store.clone();
+        UiCommands::set_startup_sort(&store, target, next_dir, cx);
     }
 }
 
 impl TableDelegate for StartupTableDelegate {
     fn columns_count(&self, _cx: &App) -> usize {
-        StartupSortColumn::ALL.len()
+        STARTUP_COLUMNS.len()
     }
 
     fn rows_count(&self, _cx: &App) -> usize {
-        self.visible_indices.len()
+        self.slice.visible_indices.len()
     }
 
     fn loading(&self, _cx: &App) -> bool {
         self.slice.revision == 0
     }
 
+    fn visible_rows_changed(
+        &mut self,
+        visible_range: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) {
+        if self.visible_rows != visible_range {
+            let scrolled = !self.visible_rows.is_empty();
+            self.visible_rows = visible_range;
+            self.last_viewport_fp = None;
+            if scrolled {
+                self.last_scroll_at = Some(Instant::now());
+            }
+        }
+    }
+
     fn column(&self, col_ix: usize, _cx: &App) -> Column {
-        let Some(&col) = StartupSortColumn::ALL.get(col_ix) else {
+        let Some(&col) = STARTUP_COLUMNS.get(col_ix) else {
             return Column::default();
         };
-        let mut column = Column::new(col.slug(), col.label())
-            .width(px(col.width()))
-            .min_width(px(col.min_width()))
+        let mut column = Column::new(column_slug(col), self.locale.column_label(col))
+            .width(px(column_width(col)))
+            .min_width(px(column_min_width(col)))
             .selectable(false)
             .movable(false);
 
         if col == StartupSortColumn::Name {
             column = column.fixed_left();
         }
-        if col == self.sort_col {
-            column = column.sort(to_column_sort(self.sort_dir));
+        if col == self.slice.sort_column {
+            column = column.sort(to_column_sort(self.slice.sort_direction));
         } else {
             column = column.sortable();
         }
@@ -395,8 +392,7 @@ impl TableDelegate for StartupTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) {
-        self.toggle_sort(col_ix);
-        cx.notify();
+        self.trigger_sort(col_ix, cx);
     }
 
     fn render_header(
@@ -417,12 +413,13 @@ impl TableDelegate for StartupTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let Some(&col) = StartupSortColumn::ALL.get(col_ix) else {
+        let Some(&col) = STARTUP_COLUMNS.get(col_ix) else {
             return Empty.into_any_element();
         };
-        let is_active = col == self.sort_col;
+        let is_active = col == self.slice.sort_column;
         let fg = cx.theme().foreground;
         let muted_fg = cx.theme().muted_foreground;
+        let label = self.locale.column_label(col);
 
         h_flex()
             .id(("startup-th", col_ix))
@@ -435,21 +432,9 @@ impl TableDelegate for StartupTableDelegate {
             .when(is_active, |d| d.font_semibold())
             .cursor_pointer()
             .on_click(cx.listener(move |table, _, _, cx| {
-                table.delegate_mut().toggle_sort(col_ix);
-                let sel = table
-                    .delegate()
-                    .selected_id
-                    .as_deref()
-                    .and_then(|id| table.delegate().find_visible_index_by_id(id));
-                if let Some(idx) = sel {
-                    table.set_selected_row(idx, cx);
-                } else {
-                    table.clear_selection(cx);
-                }
-                table.refresh(cx);
-                cx.notify();
+                table.delegate_mut().trigger_sort(col_ix, cx);
             }))
-            .child(div().min_w_0().truncate().child(col.label()))
+            .child(div().min_w_0().truncate().child(label))
             .into_any_element()
     }
 
@@ -472,7 +457,7 @@ impl TableDelegate for StartupTableDelegate {
         let Some(entry) = self.row_at(row_ix) else {
             return Empty.into_any_element();
         };
-        let Some(&col) = StartupSortColumn::ALL.get(col_ix) else {
+        let Some(&col) = STARTUP_COLUMNS.get(col_ix) else {
             return Empty.into_any_element();
         };
 
@@ -487,16 +472,11 @@ impl TableDelegate for StartupTableDelegate {
             StartupSortColumn::Name => h_flex()
                 .size_full()
                 .items_center()
-                .overflow_hidden()
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .font_medium()
-                        .text_color(fg)
-                        .child(SharedString::from(Arc::clone(&entry.name))),
-                )
+                .truncate()
+                .text_xs()
+                .font_medium()
+                .text_color(fg)
+                .child(SharedString::from(Arc::clone(&entry.name)))
                 .into_any_element(),
             StartupSortColumn::Publisher => {
                 let text = entry
@@ -504,19 +484,14 @@ impl TableDelegate for StartupTableDelegate {
                     .as_ref()
                     .filter(|s| !s.is_empty())
                     .map(|s| SharedString::from(Arc::clone(s)))
-                    .unwrap_or_else(|| SharedString::new_static("—"));
+                    .unwrap_or_else(|| SharedString::new_static(UNAVAILABLE_LABEL));
                 h_flex()
                     .size_full()
                     .items_center()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child(text),
-                    )
+                    .truncate()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child(text)
                     .into_any_element()
             }
             StartupSortColumn::Status => {
@@ -528,15 +503,10 @@ impl TableDelegate for StartupTableDelegate {
                 h_flex()
                     .size_full()
                     .items_center()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(color)
-                            .child(label),
-                    )
+                    .truncate()
+                    .text_xs()
+                    .text_color(color)
+                    .child(label)
                     .into_any_element()
             }
             StartupSortColumn::Impact => {
@@ -550,15 +520,10 @@ impl TableDelegate for StartupTableDelegate {
                 h_flex()
                     .size_full()
                     .items_center()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(color)
-                            .child(self.locale.impact_label(entry.impact)),
-                    )
+                    .truncate()
+                    .text_xs()
+                    .text_color(color)
+                    .child(self.locale.impact_label(entry.impact))
                     .into_any_element()
             }
         }
@@ -716,6 +681,8 @@ pub(crate) struct StartupView {
     last_bios_time_ms: Option<u64>,
     toolbar_state: StartupToolbarState,
     last_locale: LanguagePreference,
+    scroll_coalescer: ScrollCoalescer,
+    coalesce_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -755,7 +722,10 @@ impl StartupView {
                 i18n::tr("startup.title"),
             )
         });
-        let toolbar_state = table.read(cx).delegate().toolbar_state();
+        let toolbar_state = {
+            let t = table.read(cx);
+            t.delegate().toolbar_state(t.selected_row())
+        };
 
         let mut subscriptions = Vec::with_capacity(2);
 
@@ -767,48 +737,21 @@ impl StartupView {
                     if revs.startup == current_rev {
                         return;
                     }
-                    let (next_slice, next_caps) = {
-                        let snap = store.read(cx).snapshot();
-                        (Arc::clone(&snap.startup), snap.capabilities)
-                    };
-                    let next_bios = next_slice.last_bios_time_ms;
-                    let next_toolbar = table_for_store.update(cx, |table, cx| {
-                        let d = table.delegate_mut();
-                        d.slice = next_slice;
-                        d.capabilities = next_caps;
-                        d.last_rev = revs.startup;
-                        d.rebuild_rows();
-                        Self::sync_table_selection(table, cx);
-                        cx.notify();
-                        table.delegate().toolbar_state()
-                    });
-                    if this.toolbar_state != next_toolbar || this.last_bios_time_ms != next_bios {
-                        this.toolbar_state = next_toolbar;
-                        this.last_bios_time_ms = next_bios;
-                        cx.notify();
-                    }
+                    this.handle_snapshot_updated(cx);
                 }
                 UiStoreEvent::SearchQueryChanged => {
-                    let next_query = store.read(cx).search_query().to_owned();
-                    let next_toolbar = table_for_store.update(cx, |table, cx| {
-                        let d = table.delegate_mut();
-                        d.search_query = next_query;
-                        d.rebuild_rows();
-                        Self::sync_table_selection(table, cx);
-                        cx.notify();
-                        table.delegate().toolbar_state()
+                    table_for_store.update(cx, |table, _| {
+                        table.delegate_mut().user_action_pending = true;
                     });
-                    if this.toolbar_state != next_toolbar {
-                        this.toolbar_state = next_toolbar;
-                        cx.notify();
-                    }
                 }
                 UiStoreEvent::SettingsChanged => {
                     let next_locale = store.read(cx).settings().language;
                     if this.last_locale != next_locale {
                         this.last_locale = next_locale;
                         table_for_store.update(cx, |table, cx| {
-                            table.delegate_mut().locale = StartupLocaleCache::build();
+                            let d = table.delegate_mut();
+                            d.locale = StartupLocaleCache::build();
+                            d.last_viewport_fp = None;
                             table.refresh(cx);
                             cx.notify();
                         });
@@ -828,8 +771,10 @@ impl StartupView {
                 TableEvent::SelectRow(row_ix) => {
                     let next_toolbar = table.update(cx, |table, _| {
                         let id = table.delegate().row_at(*row_ix).map(|e| Arc::clone(&e.id));
-                        table.delegate_mut().selected_id = id;
-                        table.delegate().toolbar_state()
+                        let d = table.delegate_mut();
+                        d.selected_id = id;
+                        d.last_viewport_fp = None;
+                        d.toolbar_state(Some(*row_ix))
                     });
                     if this.toolbar_state != next_toolbar {
                         this.toolbar_state = next_toolbar;
@@ -839,11 +784,15 @@ impl StartupView {
                 TableEvent::RightClickedRow(Some(row_ix)) => {
                     let next_toolbar = table.update(cx, |table, cx| {
                         let id = table.delegate().row_at(*row_ix).map(|e| Arc::clone(&e.id));
-                        table.delegate_mut().selected_id = id.clone();
+                        {
+                            let d = table.delegate_mut();
+                            d.selected_id = id.clone();
+                            d.last_viewport_fp = None;
+                        }
                         if id.is_some() && table.selected_row() != Some(*row_ix) {
                             table.set_selected_row(*row_ix, cx);
                         }
-                        table.delegate().toolbar_state()
+                        table.delegate().toolbar_state(table.selected_row())
                     });
                     if this.toolbar_state != next_toolbar {
                         this.toolbar_state = next_toolbar;
@@ -852,8 +801,10 @@ impl StartupView {
                 }
                 TableEvent::ClearSelection => {
                     let next_toolbar = table.update(cx, |table, _| {
-                        table.delegate_mut().selected_id = None;
-                        table.delegate().toolbar_state()
+                        let d = table.delegate_mut();
+                        d.selected_id = None;
+                        d.last_viewport_fp = None;
+                        d.toolbar_state(None)
                     });
                     if this.toolbar_state != next_toolbar {
                         this.toolbar_state = next_toolbar;
@@ -872,7 +823,92 @@ impl StartupView {
             last_bios_time_ms,
             toolbar_state,
             last_locale,
+            scroll_coalescer: ScrollCoalescer::default(),
+            coalesce_task: None,
             _subscriptions: subscriptions,
+        }
+    }
+
+    fn handle_snapshot_updated(&mut self, cx: &mut Context<Self>) {
+        let (next_rev, next_slice, next_caps) = {
+            let snap = self.store.read(cx).snapshot();
+            (
+                snap.revisions.startup,
+                Arc::clone(&snap.startup),
+                snap.capabilities,
+            )
+        };
+
+        let (bypass, last_scroll_at) = {
+            let d = self.table.read(cx).delegate();
+            if next_rev == d.last_rev {
+                return;
+            }
+            let bypass = d.slice.revision == 0
+                || d.user_action_pending
+                || d.slice.sort_column != next_slice.sort_column
+                || d.slice.sort_direction != next_slice.sort_direction;
+            (bypass, d.last_scroll_at)
+        };
+
+        match self
+            .scroll_coalescer
+            .decide(Instant::now(), last_scroll_at, bypass)
+        {
+            CoalesceDecision::Defer(wait) => {
+                if self.coalesce_task.is_none() {
+                    self.coalesce_task = Some(cx.spawn(async move |weak, cx| {
+                        cx.background_executor().timer(wait).await;
+                        let _ = weak.update(cx, |this, cx| {
+                            this.coalesce_task = None;
+                            this.handle_snapshot_updated(cx);
+                        });
+                    }));
+                }
+            }
+            CoalesceDecision::ApplyNow => {
+                self.coalesce_task = None;
+                let next_bios = next_slice.last_bios_time_ms;
+                let next_toolbar = self.table.update(cx, |table, cx| {
+                    let prev_fp = table.delegate().last_viewport_fp;
+                    let sort_changed = {
+                        let d = table.delegate_mut();
+                        let changed = d.slice.sort_column != next_slice.sort_column
+                            || d.slice.sort_direction != next_slice.sort_direction;
+                        d.slice = next_slice;
+                        d.capabilities = next_caps;
+                        d.last_rev = next_rev;
+                        d.user_action_pending = false;
+                        changed
+                    };
+
+                    Self::sync_table_selection(table, cx);
+
+                    let selected_row = table.selected_row();
+                    let next_fp = {
+                        let d = table.delegate();
+                        compute_startup_viewport_fingerprint(
+                            &d.slice,
+                            &d.visible_rows,
+                            selected_row,
+                        )
+                    };
+                    table.delegate_mut().last_viewport_fp = Some(next_fp);
+
+                    if sort_changed {
+                        table.refresh(cx);
+                    }
+                    if sort_changed || prev_fp != Some(next_fp) {
+                        cx.notify();
+                    }
+                    table.delegate().toolbar_state(selected_row)
+                });
+                if self.toolbar_state != next_toolbar || self.last_bios_time_ms != next_bios {
+                    self.toolbar_state = next_toolbar;
+                    self.last_bios_time_ms = next_bios;
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -880,25 +916,26 @@ impl StartupView {
         table: &mut TableState<StartupTableDelegate>,
         cx: &mut Context<TableState<StartupTableDelegate>>,
     ) {
+        let hint_row = table.selected_row();
         let selected_idx = table
             .delegate()
             .selected_id
             .as_deref()
-            .and_then(|id| table.delegate().find_visible_index_by_id(id));
+            .and_then(|id| table.delegate().find_visible_index_by_id(id, hint_row));
         if let Some(idx) = selected_idx {
-            if table.selected_row() != Some(idx) {
+            if hint_row != Some(idx) {
                 table.set_selected_row(idx, cx);
             }
-        } else if table.selected_row().is_some() {
+        } else if hint_row.is_some() {
             table.clear_selection(cx);
         }
     }
 
     fn selected_entry_id(&self, cx: &App) -> Option<String> {
-        self.table
-            .read(cx)
+        let table = self.table.read(cx);
+        table
             .delegate()
-            .selected_entry()
+            .selected_entry(table.selected_row())
             .map(|e| e.id.to_string())
     }
 }
@@ -988,12 +1025,15 @@ impl Render for StartupView {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use gpui_kit::{TestAppContext, VisualTestContext};
     use loom_config::{AppSettings, ConfigStore};
     use loom_engine::EngineCoordinator;
     use loom_pal::{NativeBackend, PlatformBackend};
-    use loom_types::{MonitorDomain, SortDirection, StartupEntry, StartupImpact};
+    use loom_types::{
+        MonitorDomain, SortDirection, StartupEntry, StartupImpact, StartupSlice, StartupSortColumn,
+    };
 
     use super::*;
 
@@ -1001,7 +1041,6 @@ mod tests {
         id: &str,
         name: &str,
         publisher: Option<&str>,
-        command: Option<&str>,
         enabled: bool,
         impact: StartupImpact,
     ) -> StartupEntry {
@@ -1009,8 +1048,8 @@ mod tests {
             id: Arc::from(id),
             name: Arc::from(name),
             publisher: publisher.map(Arc::from),
-            command: command.map(Arc::from),
-            file_path: command.map(Arc::from),
+            command: None,
+            file_path: None,
             enabled,
             impact,
         }
@@ -1028,90 +1067,79 @@ mod tests {
     }
 
     #[test]
-    fn startup_filter_and_sort_cover_name_publisher_command_status_and_impact() {
-        let items = vec![
-            sample_entry(
-                "hkcu:onedrive",
-                "OneDrive",
-                Some("Microsoft Corporation"),
-                Some(r"C:\Program Files\Microsoft OneDrive\OneDrive.exe /background"),
-                true,
-                StartupImpact::High,
-            ),
-            sample_entry(
-                "hkcu:discord",
-                "Discord",
-                Some("Discord Inc."),
-                Some(r"C:\Users\me\AppData\Local\Discord\Update.exe --processStart Discord.exe"),
-                false,
-                StartupImpact::Low,
-            ),
-            sample_entry(
-                "hklm:security",
-                "SecurityHealth",
-                Some("Microsoft Corporation"),
-                Some(r"C:\Windows\System32\SecurityHealthSystray.exe"),
-                true,
-                StartupImpact::NotMeasured,
-            ),
-        ];
+    fn startup_viewport_fingerprint_detects_visible_changes_and_ignores_offscreen() {
+        let mut slice = StartupSlice {
+            revision: 1,
+            sort_column: StartupSortColumn::Name,
+            sort_direction: SortDirection::Ascending,
+            items: vec![
+                sample_entry(
+                    "id:1",
+                    "Discord",
+                    Some("Discord Inc."),
+                    false,
+                    StartupImpact::Low,
+                ),
+                sample_entry(
+                    "id:2",
+                    "OneDrive",
+                    Some("Microsoft"),
+                    true,
+                    StartupImpact::High,
+                ),
+                sample_entry(
+                    "id:3",
+                    "Security",
+                    Some("Microsoft"),
+                    true,
+                    StartupImpact::NotMeasured,
+                ),
+            ],
+            visible_indices: vec![0, 1, 2],
+            ..StartupSlice::default()
+        };
 
-        // Sort by Name ascending.
+        let fp_initial = compute_startup_viewport_fingerprint(&slice, &(0..2), Some(0));
+
+        // Off-screen row toggle (index 2) keeps visible fingerprint identical.
+        slice.items[2].enabled = false;
         assert_eq!(
-            filter_and_sort_startup(
-                &items,
-                "",
-                StartupSortColumn::Name,
-                SortDirection::Ascending
-            ),
-            vec![1, 0, 2]
+            fp_initial,
+            compute_startup_viewport_fingerprint(&slice, &(0..2), Some(0))
         );
 
-        // Sort by Impact descending (High -> Low -> NotMeasured).
-        assert_eq!(
-            filter_and_sort_startup(
-                &items,
-                "",
-                StartupSortColumn::Impact,
-                SortDirection::Descending
-            ),
-            vec![0, 1, 2]
+        // Visible row toggle (index 0) updates the fingerprint.
+        slice.items[0].enabled = true;
+        assert_ne!(
+            fp_initial,
+            compute_startup_viewport_fingerprint(&slice, &(0..2), Some(0))
         );
+    }
 
-        // Sort by Status descending (Enabled first, tie-broken by Name).
+    #[test]
+    fn startup_scroll_coalescer_enforces_quiet_window_cap_and_bypass() {
+        let mut coalescer = ScrollCoalescer::default();
+        let t0 = Instant::now();
         assert_eq!(
-            filter_and_sort_startup(
-                &items,
-                "",
-                StartupSortColumn::Status,
-                SortDirection::Descending
-            ),
-            vec![0, 2, 1]
-        );
-
-        // Filter across publisher and command line.
-        assert_eq!(
-            filter_and_sort_startup(
-                &items,
-                "microsoft",
-                StartupSortColumn::Name,
-                SortDirection::Ascending
-            ),
-            vec![0, 2]
+            coalescer.decide(t0 + Duration::from_millis(50), Some(t0), false),
+            CoalesceDecision::Defer(Duration::from_millis(100))
         );
         assert_eq!(
-            filter_and_sort_startup(
-                &items,
-                "processStart",
-                StartupSortColumn::Name,
-                SortDirection::Ascending
+            coalescer.decide(
+                t0 + Duration::from_millis(550),
+                Some(t0 + Duration::from_millis(540)),
+                false
             ),
-            vec![1]
+            CoalesceDecision::ApplyNow
+        );
+        assert_eq!(
+            coalescer.decide(t0 + Duration::from_millis(10), Some(t0), true),
+            CoalesceDecision::ApplyNow
         );
     }
 
     #[gpui_kit::test]
-    fn startup_view_acquires_and_releases_monitor_lease_on_mount_and_drop(cx: &mut TestAppContext) {
+    fn startup_view_acquires_lease_dispatches_sort_and_releases_on_drop(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().expect("tempdir");
         let config_store = ConfigStore::new(dir.path().join("settings.toml"));
@@ -1142,6 +1170,13 @@ mod tests {
             coordinator.leases().is_active(MonitorDomain::Startup),
             "mounting StartupView must acquire MonitorDomain::Startup lease"
         );
+
+        view.update(&mut vcx, |view, cx| {
+            view.table.update(cx, |table, cx| {
+                table.delegate_mut().trigger_sort(3, cx);
+            });
+        });
+        vcx.run_until_parked();
 
         drop(view);
         vcx.update(|window, _| window.remove_window());

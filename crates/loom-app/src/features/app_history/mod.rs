@@ -3,9 +3,13 @@
 //! Splits the static toolbar + collection start date indicator ([`AppHistoryView`])
 //! from the 2D-virtualized `gpui-kit` `DataTable` (`Entity<TableState<AppHistoryTableDelegate>>`)
 //! so hidden routes incur zero background polling or history aggregation overhead.
+//! Filtering and sorting are offloaded completely to `loom-engine`.
 
-use std::cmp::Ordering;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash as _, Hasher as _};
+use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
@@ -18,14 +22,15 @@ use gpui_kit::component::{
 use gpui_kit::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
+    Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use loom_types::{
-    AppHistoryRecord, AppHistorySlice, CapabilityFlags, LanguagePreference, MonitorDomain,
-    SortDirection,
+    AppHistoryRecord, AppHistorySlice, AppHistorySortColumn, CapabilityFlags, LanguagePreference,
+    MonitorDomain, SortDirection,
 };
 use loom_ui_kit::{
-    HeatmapLevel, LoomSemanticColors, format_bytes_shared, format_cpu_time_shared, heatmap_cell,
+    CachedSemanticColors, HeatmapLevel, format_bytes_metric, format_cpu_time_shared,
+    heatmap_cell_metric, heatmap_cell_mono, quantize_bytes_display, quantize_cpu_time_secs,
 };
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
@@ -33,79 +38,74 @@ use crate::features::table_columns::DataTablePane;
 use crate::i18n;
 
 const APP_HISTORY_HEADER_HEIGHT: f32 = 32.0;
+const SCROLL_COALESCE_QUIET_WINDOW: Duration = Duration::from_millis(150);
+const SCROLL_COALESCE_MAX_DEFER: Duration = Duration::from_millis(500);
+const DEFAULT_FINGERPRINT_WINDOW: usize = 64;
 
-/// Sortable columns displayed by [`AppHistoryView`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AppHistorySortColumn {
-    Name,
-    CpuTime,
-    Network,
-    MeteredNetwork,
+const APP_HISTORY_COLUMNS: [AppHistorySortColumn; 4] = [
+    AppHistorySortColumn::Name,
+    AppHistorySortColumn::CpuTime,
+    AppHistorySortColumn::Network,
+    AppHistorySortColumn::MeteredNetwork,
+];
+
+#[inline]
+const fn column_slug(col: AppHistorySortColumn) -> &'static str {
+    match col {
+        AppHistorySortColumn::Name => "name",
+        AppHistorySortColumn::CpuTime => "cpu_time",
+        AppHistorySortColumn::Network => "network",
+        AppHistorySortColumn::MeteredNetwork => "metered_network",
+    }
 }
 
-impl AppHistorySortColumn {
-    const ALL: [Self; 4] = [
-        Self::Name,
-        Self::CpuTime,
-        Self::Network,
-        Self::MeteredNetwork,
-    ];
-
-    #[inline]
-    const fn slug(self) -> &'static str {
-        match self {
-            Self::Name => "name",
-            Self::CpuTime => "cpu_time",
-            Self::Network => "network",
-            Self::MeteredNetwork => "metered_network",
-        }
+#[inline]
+const fn column_width(col: AppHistorySortColumn) -> f32 {
+    match col {
+        AppHistorySortColumn::Name => 320.0,
+        AppHistorySortColumn::CpuTime => 150.0,
+        AppHistorySortColumn::Network => 150.0,
+        AppHistorySortColumn::MeteredNetwork => 170.0,
     }
+}
 
-    #[inline]
-    const fn width(self) -> f32 {
-        match self {
-            Self::Name => 320.0,
-            Self::CpuTime => 150.0,
-            Self::Network => 150.0,
-            Self::MeteredNetwork => 170.0,
-        }
+#[inline]
+const fn column_min_width(col: AppHistorySortColumn) -> f32 {
+    match col {
+        AppHistorySortColumn::Name => 150.0,
+        AppHistorySortColumn::CpuTime => 100.0,
+        AppHistorySortColumn::Network => 100.0,
+        AppHistorySortColumn::MeteredNetwork => 116.0,
     }
+}
 
-    #[inline]
-    const fn min_width(self) -> f32 {
-        match self {
-            Self::Name => 150.0,
-            Self::CpuTime => 100.0,
-            Self::Network => 100.0,
-            Self::MeteredNetwork => 116.0,
-        }
-    }
+#[inline]
+const fn column_right_aligned(col: AppHistorySortColumn) -> bool {
+    matches!(
+        col,
+        AppHistorySortColumn::CpuTime
+            | AppHistorySortColumn::Network
+            | AppHistorySortColumn::MeteredNetwork
+    )
+}
 
-    #[inline]
-    const fn right_aligned(self) -> bool {
-        matches!(self, Self::CpuTime | Self::Network | Self::MeteredNetwork)
-    }
+#[inline]
+const fn column_is_heatmap(col: AppHistorySortColumn) -> bool {
+    matches!(
+        col,
+        AppHistorySortColumn::CpuTime
+            | AppHistorySortColumn::Network
+            | AppHistorySortColumn::MeteredNetwork
+    )
+}
 
-    #[inline]
-    const fn is_heatmap(self) -> bool {
-        matches!(self, Self::CpuTime | Self::Network | Self::MeteredNetwork)
-    }
-
-    #[inline]
-    const fn default_direction(self) -> SortDirection {
-        match self {
-            Self::CpuTime | Self::Network | Self::MeteredNetwork => SortDirection::Descending,
-            Self::Name => SortDirection::Ascending,
-        }
-    }
-
-    fn label(self) -> String {
-        match self {
-            Self::Name => i18n::tr("app_history.col_name"),
-            Self::CpuTime => i18n::tr("app_history.col_cpu_time"),
-            Self::Network => i18n::tr("app_history.col_network"),
-            Self::MeteredNetwork => i18n::tr("app_history.col_metered_network"),
-        }
+#[inline]
+const fn column_default_direction(col: AppHistorySortColumn) -> SortDirection {
+    match col {
+        AppHistorySortColumn::CpuTime
+        | AppHistorySortColumn::Network
+        | AppHistorySortColumn::MeteredNetwork => SortDirection::Descending,
+        AppHistorySortColumn::Name => SortDirection::Ascending,
     }
 }
 
@@ -171,76 +171,85 @@ pub(super) const fn cumulative_bytes_heatmap_level(bytes: u64) -> HeatmapLevel {
     }
 }
 
-#[inline]
-fn contains_icase(haystack: &str, needle_lower: &str) -> bool {
-    if needle_lower.is_empty() {
-        return true;
-    }
-    if haystack.is_ascii() && needle_lower.is_ascii() {
-        let h = haystack.as_bytes();
-        let n = needle_lower.as_bytes();
-        if n.len() > h.len() {
-            return false;
-        }
-        return h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n));
-    }
-    haystack.to_lowercase().contains(needle_lower)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoalesceDecision {
+    ApplyNow,
+    Defer(Duration),
 }
 
-#[inline]
-fn cmp_icase(a: &str, b: &str) -> Ordering {
-    if a.is_ascii() && b.is_ascii() {
-        for (&ab, &bb) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
-            let c = ab.to_ascii_lowercase().cmp(&bb.to_ascii_lowercase());
-            if c != Ordering::Equal {
-                return c;
-            }
-        }
-        return a.len().cmp(&b.len());
-    }
-    a.to_lowercase().cmp(&b.to_lowercase())
+#[derive(Debug, Default)]
+struct ScrollCoalescer {
+    deferred_since: Option<Instant>,
 }
 
-/// Filters and sorts cumulative application history records into visible item indices.
-pub(super) fn filter_and_sort_app_history(
-    items: &[AppHistoryRecord],
-    search_query: &str,
-    sort_col: AppHistorySortColumn,
-    sort_dir: SortDirection,
-) -> Vec<usize> {
-    let query_lower = search_query.trim().to_lowercase();
-    let mut indices: Vec<usize> = items
-        .iter()
-        .enumerate()
-        .filter(|(_, record)| {
-            query_lower.is_empty()
-                || contains_icase(&record.name, &query_lower)
-                || contains_icase(&record.app_id, &query_lower)
-        })
-        .map(|(idx, _)| idx)
-        .collect();
-
-    indices.sort_by(|&a_idx, &b_idx| {
-        let a = &items[a_idx];
-        let b = &items[b_idx];
-        let ord = match sort_col {
-            AppHistorySortColumn::Name => cmp_icase(&a.name, &b.name),
-            AppHistorySortColumn::CpuTime => a.cpu_time_100ns.cmp(&b.cpu_time_100ns),
-            AppHistorySortColumn::Network => a.network_bytes.cmp(&b.network_bytes),
-            AppHistorySortColumn::MeteredNetwork => {
-                a.metered_network_bytes.cmp(&b.metered_network_bytes)
-            }
+impl ScrollCoalescer {
+    fn decide(
+        &mut self,
+        now: Instant,
+        last_scroll_at: Option<Instant>,
+        bypass: bool,
+    ) -> CoalesceDecision {
+        if bypass {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
+        }
+        let Some(scrolled_at) = last_scroll_at else {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
         };
-        let ordered = match sort_dir {
-            SortDirection::Ascending => ord,
-            SortDirection::Descending => ord.reverse(),
-        };
-        ordered
-            .then_with(|| cmp_icase(&a.name, &b.name))
-            .then_with(|| a.app_id.cmp(&b.app_id))
-    });
+        let since_scroll = now.saturating_duration_since(scrolled_at);
+        if since_scroll >= SCROLL_COALESCE_QUIET_WINDOW {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
+        }
+        let first_deferred = *self.deferred_since.get_or_insert(now);
+        let since_defer = now.saturating_duration_since(first_deferred);
+        if since_defer >= SCROLL_COALESCE_MAX_DEFER {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
+        }
+        let quiet_remaining = SCROLL_COALESCE_QUIET_WINDOW - since_scroll;
+        let cap_remaining = SCROLL_COALESCE_MAX_DEFER - since_defer;
+        CoalesceDecision::Defer(quiet_remaining.min(cap_remaining))
+    }
+}
 
-    indices
+/// Computes a lightweight content fingerprint over only the currently visible rows using
+/// display-quantized CPU seconds and byte buckets.
+pub(super) fn compute_app_history_viewport_fingerprint(
+    slice: &AppHistorySlice,
+    visible_rows: &Range<usize>,
+    selected_row: Option<usize>,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let total = slice.visible_indices.len();
+    (slice.revision == 0).hash(&mut hasher);
+    total.hash(&mut hasher);
+    slice.sort_column.hash(&mut hasher);
+    slice.sort_direction.hash(&mut hasher);
+    selected_row.hash(&mut hasher);
+
+    let range = if visible_rows.is_empty() {
+        0..total.min(DEFAULT_FINGERPRINT_WINDOW)
+    } else {
+        visible_rows.start.min(total)..visible_rows.end.min(total)
+    };
+    range.start.hash(&mut hasher);
+    range.end.hash(&mut hasher);
+
+    for &item_idx in &slice.visible_indices[range] {
+        if let Some(record) = slice.items.get(item_idx) {
+            record.app_id.hash(&mut hasher);
+            record.name.hash(&mut hasher);
+            quantize_cpu_time_secs(record.cpu_time_100ns).hash(&mut hasher);
+            quantize_bytes_display(record.network_bytes).hash(&mut hasher);
+            cumulative_bytes_heatmap_level(record.network_bytes).hash(&mut hasher);
+            quantize_bytes_display(record.metered_network_bytes).hash(&mut hasher);
+            cumulative_bytes_heatmap_level(record.metered_network_bytes).hash(&mut hasher);
+        }
+    }
+
+    hasher.finish()
 }
 
 /// Opens a confirmation dialog before clearing cumulative application usage history.
@@ -305,6 +314,10 @@ fn open_clear_history_dialog(store: &Entity<UiStore>, window: &mut Window, cx: &
 
 /// Cached localized strings for [`AppHistoryTableDelegate`].
 struct AppHistoryLocaleCache {
+    col_name: SharedString,
+    col_cpu_time: SharedString,
+    col_network: SharedString,
+    col_metered_network: SharedString,
     loading: SharedString,
     empty: SharedString,
 }
@@ -312,8 +325,22 @@ struct AppHistoryLocaleCache {
 impl AppHistoryLocaleCache {
     fn build() -> Self {
         Self {
+            col_name: i18n::tr("app_history.col_name").into(),
+            col_cpu_time: i18n::tr("app_history.col_cpu_time").into(),
+            col_network: i18n::tr("app_history.col_network").into(),
+            col_metered_network: i18n::tr("app_history.col_metered_network").into(),
             loading: i18n::tr("app_history.loading").into(),
             empty: i18n::tr("app_history.empty").into(),
+        }
+    }
+
+    #[inline]
+    fn column_label(&self, col: AppHistorySortColumn) -> SharedString {
+        match col {
+            AppHistorySortColumn::Name => self.col_name.clone(),
+            AppHistorySortColumn::CpuTime => self.col_cpu_time.clone(),
+            AppHistorySortColumn::Network => self.col_network.clone(),
+            AppHistorySortColumn::MeteredNetwork => self.col_metered_network.clone(),
         }
     }
 }
@@ -323,11 +350,12 @@ struct AppHistoryTableDelegate {
     store: Entity<UiStore>,
     slice: Arc<AppHistorySlice>,
     last_rev: u64,
-    search_query: String,
-    sort_col: AppHistorySortColumn,
-    sort_dir: SortDirection,
-    visible_indices: Vec<usize>,
     selected_app_id: Option<Arc<str>>,
+    visible_rows: Range<usize>,
+    last_scroll_at: Option<Instant>,
+    last_viewport_fp: Option<u64>,
+    user_action_pending: bool,
+    semantic_colors: CachedSemanticColors,
     locale: AppHistoryLocaleCache,
 }
 
@@ -336,93 +364,110 @@ impl AppHistoryTableDelegate {
         let store_ref = store.read(cx);
         let snap = store_ref.snapshot();
         let slice = Arc::clone(&snap.app_history);
-        let search_query = store_ref.search_query().to_owned();
-        let sort_col = AppHistorySortColumn::CpuTime;
-        let sort_dir = SortDirection::Descending;
-        let visible_indices =
-            filter_and_sort_app_history(&slice.items, &search_query, sort_col, sort_dir);
 
         Self {
             store: store.clone(),
             last_rev: snap.revisions.app_history,
             slice,
-            search_query,
-            sort_col,
-            sort_dir,
-            visible_indices,
             selected_app_id: None,
+            visible_rows: 0..0,
+            last_scroll_at: None,
+            last_viewport_fp: None,
+            user_action_pending: false,
+            semantic_colors: CachedSemanticColors::new(),
             locale: AppHistoryLocaleCache::build(),
         }
     }
 
-    fn rebuild_rows(&mut self) {
-        self.visible_indices = filter_and_sort_app_history(
-            &self.slice.items,
-            &self.search_query,
-            self.sort_col,
-            self.sort_dir,
-        );
-    }
-
+    #[inline]
     fn row_at(&self, row_ix: usize) -> Option<&AppHistoryRecord> {
-        let item_idx = *self.visible_indices.get(row_ix)?;
+        let item_idx = *self.slice.visible_indices.get(row_ix)?;
         self.slice.items.get(item_idx)
     }
 
-    fn find_visible_index_by_id(&self, app_id: &str) -> Option<usize> {
-        self.visible_indices
-            .iter()
-            .position(|&idx| self.slice.items[idx].app_id.as_ref() == app_id)
+    /// Locates `app_id` in `slice.visible_indices`, checking `hint_row` in O(1) before scanning.
+    #[inline]
+    fn find_visible_index_by_id(&self, app_id: &str, hint_row: Option<usize>) -> Option<usize> {
+        if let Some(hint) = hint_row
+            && self
+                .row_at(hint)
+                .is_some_and(|record| record.app_id.as_ref() == app_id)
+        {
+            return Some(hint);
+        }
+        self.slice.visible_indices.iter().position(|&idx| {
+            self.slice
+                .items
+                .get(idx)
+                .is_some_and(|record| record.app_id.as_ref() == app_id)
+        })
     }
 
-    fn toggle_sort(&mut self, col_ix: usize) {
-        let Some(&target) = AppHistorySortColumn::ALL.get(col_ix) else {
+    fn trigger_sort(&mut self, col_ix: usize, cx: &mut Context<TableState<Self>>) {
+        let Some(&target) = APP_HISTORY_COLUMNS.get(col_ix) else {
             return;
         };
-        if self.sort_col == target {
-            self.sort_dir = self.sort_dir.toggle();
+        let next_dir = if self.slice.sort_column == target {
+            self.slice.sort_direction.toggle()
         } else {
-            self.sort_col = target;
-            self.sort_dir = target.default_direction();
-        }
-        self.rebuild_rows();
+            column_default_direction(target)
+        };
+        self.user_action_pending = true;
+        let store = self.store.clone();
+        UiCommands::set_app_history_sort(&store, target, next_dir, cx);
     }
 }
 
 impl TableDelegate for AppHistoryTableDelegate {
     fn columns_count(&self, _cx: &App) -> usize {
-        AppHistorySortColumn::ALL.len()
+        APP_HISTORY_COLUMNS.len()
     }
 
     fn rows_count(&self, _cx: &App) -> usize {
-        self.visible_indices.len()
+        self.slice.visible_indices.len()
     }
 
     fn loading(&self, _cx: &App) -> bool {
         self.slice.revision == 0
     }
 
+    fn visible_rows_changed(
+        &mut self,
+        visible_range: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) {
+        if self.visible_rows != visible_range {
+            let scrolled = !self.visible_rows.is_empty();
+            self.visible_rows = visible_range;
+            self.last_viewport_fp = None;
+            if scrolled {
+                self.last_scroll_at = Some(Instant::now());
+            }
+        }
+    }
+
     fn column(&self, col_ix: usize, _cx: &App) -> Column {
-        let Some(&col) = AppHistorySortColumn::ALL.get(col_ix) else {
+        let Some(&col) = APP_HISTORY_COLUMNS.get(col_ix) else {
             return Column::default();
         };
-        let mut column = Column::new(col.slug(), col.label())
-            .width(px(col.width()))
-            .min_width(px(col.min_width()))
+        let mut column = Column::new(column_slug(col), self.locale.column_label(col))
+            .width(px(column_width(col)))
+            .min_width(px(column_min_width(col)))
             .selectable(false)
             .movable(false);
 
         if col == AppHistorySortColumn::Name {
             column = column.fixed_left();
         }
-        if col.right_aligned() {
+        if column_right_aligned(col) {
             column = column.text_right();
         }
-        if col.is_heatmap() {
+        if column_is_heatmap(col) {
             column = column.p_0();
         }
-        if col == self.sort_col {
-            column = column.sort(to_column_sort(self.sort_dir));
+        if col == self.slice.sort_column {
+            column = column.sort(to_column_sort(self.slice.sort_direction));
         } else {
             column = column.sortable();
         }
@@ -436,8 +481,7 @@ impl TableDelegate for AppHistoryTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) {
-        self.toggle_sort(col_ix);
-        cx.notify();
+        self.trigger_sort(col_ix, cx);
     }
 
     fn render_header(
@@ -458,12 +502,13 @@ impl TableDelegate for AppHistoryTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let Some(&col) = AppHistorySortColumn::ALL.get(col_ix) else {
+        let Some(&col) = APP_HISTORY_COLUMNS.get(col_ix) else {
             return Empty.into_any_element();
         };
-        let is_active = col == self.sort_col;
+        let is_active = col == self.slice.sort_column;
         let fg = cx.theme().foreground;
         let muted_fg = cx.theme().muted_foreground;
+        let label = self.locale.column_label(col);
 
         h_flex()
             .id(("app-history-th", col_ix))
@@ -471,28 +516,16 @@ impl TableDelegate for AppHistoryTableDelegate {
             .min_w_0()
             .h_full()
             .items_center()
-            .when(col.is_heatmap(), |d| d.px_2())
-            .when(col.right_aligned(), |d| d.justify_end())
+            .when(column_is_heatmap(col), |d| d.px_2())
+            .when(column_right_aligned(col), |d| d.justify_end())
             .text_xs()
             .text_color(if is_active { fg } else { muted_fg })
             .when(is_active, |d| d.font_semibold())
             .cursor_pointer()
             .on_click(cx.listener(move |table, _, _, cx| {
-                table.delegate_mut().toggle_sort(col_ix);
-                let sel = table
-                    .delegate()
-                    .selected_app_id
-                    .as_deref()
-                    .and_then(|id| table.delegate().find_visible_index_by_id(id));
-                if let Some(idx) = sel {
-                    table.set_selected_row(idx, cx);
-                } else {
-                    table.clear_selection(cx);
-                }
-                table.refresh(cx);
-                cx.notify();
+                table.delegate_mut().trigger_sort(col_ix, cx);
             }))
-            .child(div().min_w_0().truncate().child(col.label()))
+            .child(div().min_w_0().truncate().child(label))
             .into_any_element()
     }
 
@@ -512,48 +545,51 @@ impl TableDelegate for AppHistoryTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let Some(record) = self.row_at(row_ix) else {
+        let Some(&col) = APP_HISTORY_COLUMNS.get(col_ix) else {
             return Empty.into_any_element();
         };
-        let Some(&col) = AppHistorySortColumn::ALL.get(col_ix) else {
+        let Some(&item_idx) = self.slice.visible_indices.get(row_ix) else {
             return Empty.into_any_element();
         };
+        if item_idx >= self.slice.items.len() {
+            return Empty.into_any_element();
+        }
 
         let theme = cx.theme();
-        let colors = LoomSemanticColors::from_theme(theme);
+        let colors = self.semantic_colors.get_copy(theme);
         let fg = theme.foreground;
+        let mono_font = theme.mono_font_family.clone();
+        let record = &self.slice.items[item_idx];
 
         match col {
             AppHistorySortColumn::Name => h_flex()
                 .size_full()
                 .items_center()
-                .overflow_hidden()
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .font_medium()
-                        .text_color(fg)
-                        .child(SharedString::from(Arc::clone(&record.name))),
-                )
+                .truncate()
+                .text_xs()
+                .font_medium()
+                .text_color(fg)
+                .child(SharedString::from(Arc::clone(&record.name)))
                 .into_any_element(),
-            AppHistorySortColumn::CpuTime => heatmap_cell(
+            AppHistorySortColumn::CpuTime => heatmap_cell_mono(
                 format_cpu_time_shared(record.cpu_time_100ns),
                 cpu_time_heatmap_level(record.cpu_time_100ns),
                 &colors,
+                mono_font,
             )
             .into_any_element(),
-            AppHistorySortColumn::Network => heatmap_cell(
-                format_bytes_shared(record.network_bytes),
+            AppHistorySortColumn::Network => heatmap_cell_metric(
+                format_bytes_metric(record.network_bytes),
                 cumulative_bytes_heatmap_level(record.network_bytes),
                 &colors,
+                mono_font,
             )
             .into_any_element(),
-            AppHistorySortColumn::MeteredNetwork => heatmap_cell(
-                format_bytes_shared(record.metered_network_bytes),
+            AppHistorySortColumn::MeteredNetwork => heatmap_cell_metric(
+                format_bytes_metric(record.metered_network_bytes),
                 cumulative_bytes_heatmap_level(record.metered_network_bytes),
                 &colors,
+                mono_font,
             )
             .into_any_element(),
         }
@@ -648,6 +684,8 @@ pub(crate) struct AppHistoryView {
     since_epoch_secs: Option<u64>,
     history_supported: bool,
     last_locale: LanguagePreference,
+    scroll_coalescer: ScrollCoalescer,
+    coalesce_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -700,38 +738,11 @@ impl AppHistoryView {
                     if revs.app_history == current_rev {
                         return;
                     }
-                    let (next_slice, next_supported) = {
-                        let snap = store.read(cx).snapshot();
-                        (
-                            Arc::clone(&snap.app_history),
-                            snap.capabilities.contains(CapabilityFlags::APP_HISTORY),
-                        )
-                    };
-                    let next_since = next_slice.since_epoch_secs;
-                    table_for_store.update(cx, |table, cx| {
-                        let d = table.delegate_mut();
-                        d.slice = next_slice;
-                        d.last_rev = revs.app_history;
-                        d.rebuild_rows();
-                        Self::sync_table_selection(table, cx);
-                        cx.notify();
-                    });
-                    if this.since_epoch_secs != next_since
-                        || this.history_supported != next_supported
-                    {
-                        this.since_epoch_secs = next_since;
-                        this.history_supported = next_supported;
-                        cx.notify();
-                    }
+                    this.handle_snapshot_updated(cx);
                 }
                 UiStoreEvent::SearchQueryChanged => {
-                    let next_query = store.read(cx).search_query().to_owned();
-                    table_for_store.update(cx, |table, cx| {
-                        let d = table.delegate_mut();
-                        d.search_query = next_query;
-                        d.rebuild_rows();
-                        Self::sync_table_selection(table, cx);
-                        cx.notify();
+                    table_for_store.update(cx, |table, _| {
+                        table.delegate_mut().user_action_pending = true;
                     });
                 }
                 UiStoreEvent::SettingsChanged => {
@@ -739,7 +750,9 @@ impl AppHistoryView {
                     if this.last_locale != next_locale {
                         this.last_locale = next_locale;
                         table_for_store.update(cx, |table, cx| {
-                            table.delegate_mut().locale = AppHistoryLocaleCache::build();
+                            let d = table.delegate_mut();
+                            d.locale = AppHistoryLocaleCache::build();
+                            d.last_viewport_fp = None;
                             table.refresh(cx);
                             cx.notify();
                         });
@@ -762,7 +775,9 @@ impl AppHistoryView {
                             .delegate()
                             .row_at(*row_ix)
                             .map(|r| Arc::clone(&r.app_id));
-                        table.delegate_mut().selected_app_id = id;
+                        let d = table.delegate_mut();
+                        d.selected_app_id = id;
+                        d.last_viewport_fp = None;
                     });
                 }
                 TableEvent::RightClickedRow(Some(row_ix)) => {
@@ -771,7 +786,11 @@ impl AppHistoryView {
                             .delegate()
                             .row_at(*row_ix)
                             .map(|r| Arc::clone(&r.app_id));
-                        table.delegate_mut().selected_app_id = id.clone();
+                        {
+                            let d = table.delegate_mut();
+                            d.selected_app_id = id.clone();
+                            d.last_viewport_fp = None;
+                        }
                         if id.is_some() && table.selected_row() != Some(*row_ix) {
                             table.set_selected_row(*row_ix, cx);
                         }
@@ -779,7 +798,9 @@ impl AppHistoryView {
                 }
                 TableEvent::ClearSelection => {
                     table.update(cx, |table, _| {
-                        table.delegate_mut().selected_app_id = None;
+                        let d = table.delegate_mut();
+                        d.selected_app_id = None;
+                        d.last_viewport_fp = None;
                     });
                 }
                 _ => {}
@@ -794,7 +815,90 @@ impl AppHistoryView {
             since_epoch_secs,
             history_supported,
             last_locale,
+            scroll_coalescer: ScrollCoalescer::default(),
+            coalesce_task: None,
             _subscriptions: subscriptions,
+        }
+    }
+
+    fn handle_snapshot_updated(&mut self, cx: &mut Context<Self>) {
+        let (next_rev, next_slice, next_supported) = {
+            let snap = self.store.read(cx).snapshot();
+            (
+                snap.revisions.app_history,
+                Arc::clone(&snap.app_history),
+                snap.capabilities.contains(CapabilityFlags::APP_HISTORY),
+            )
+        };
+
+        let (bypass, last_scroll_at) = {
+            let d = self.table.read(cx).delegate();
+            if next_rev == d.last_rev {
+                return;
+            }
+            let bypass = d.slice.revision == 0
+                || d.user_action_pending
+                || d.slice.sort_column != next_slice.sort_column
+                || d.slice.sort_direction != next_slice.sort_direction;
+            (bypass, d.last_scroll_at)
+        };
+
+        match self
+            .scroll_coalescer
+            .decide(Instant::now(), last_scroll_at, bypass)
+        {
+            CoalesceDecision::Defer(wait) => {
+                if self.coalesce_task.is_none() {
+                    self.coalesce_task = Some(cx.spawn(async move |weak, cx| {
+                        cx.background_executor().timer(wait).await;
+                        let _ = weak.update(cx, |this, cx| {
+                            this.coalesce_task = None;
+                            this.handle_snapshot_updated(cx);
+                        });
+                    }));
+                }
+            }
+            CoalesceDecision::ApplyNow => {
+                self.coalesce_task = None;
+                let next_since = next_slice.since_epoch_secs;
+                self.table.update(cx, |table, cx| {
+                    let prev_fp = table.delegate().last_viewport_fp;
+                    let sort_changed = {
+                        let d = table.delegate_mut();
+                        let changed = d.slice.sort_column != next_slice.sort_column
+                            || d.slice.sort_direction != next_slice.sort_direction;
+                        d.slice = next_slice;
+                        d.last_rev = next_rev;
+                        d.user_action_pending = false;
+                        changed
+                    };
+
+                    Self::sync_table_selection(table, cx);
+
+                    let selected_row = table.selected_row();
+                    let next_fp = {
+                        let d = table.delegate();
+                        compute_app_history_viewport_fingerprint(
+                            &d.slice,
+                            &d.visible_rows,
+                            selected_row,
+                        )
+                    };
+                    table.delegate_mut().last_viewport_fp = Some(next_fp);
+
+                    if sort_changed {
+                        table.refresh(cx);
+                    }
+                    if sort_changed || prev_fp != Some(next_fp) {
+                        cx.notify();
+                    }
+                });
+                if self.since_epoch_secs != next_since || self.history_supported != next_supported {
+                    self.since_epoch_secs = next_since;
+                    self.history_supported = next_supported;
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -802,16 +906,17 @@ impl AppHistoryView {
         table: &mut TableState<AppHistoryTableDelegate>,
         cx: &mut Context<TableState<AppHistoryTableDelegate>>,
     ) {
+        let hint_row = table.selected_row();
         let selected_idx = table
             .delegate()
             .selected_app_id
             .as_deref()
-            .and_then(|id| table.delegate().find_visible_index_by_id(id));
+            .and_then(|id| table.delegate().find_visible_index_by_id(id, hint_row));
         if let Some(idx) = selected_idx {
-            if table.selected_row() != Some(idx) {
+            if hint_row != Some(idx) {
                 table.set_selected_row(idx, cx);
             }
-        } else if table.selected_row().is_some() {
+        } else if hint_row.is_some() {
             table.clear_selection(cx);
         }
     }
@@ -888,12 +993,15 @@ impl Render for AppHistoryView {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use gpui_kit::{TestAppContext, VisualTestContext};
     use loom_config::{AppSettings, ConfigStore};
     use loom_engine::EngineCoordinator;
     use loom_pal::{NativeBackend, PlatformBackend};
-    use loom_types::{AppHistoryRecord, MonitorDomain, SortDirection};
+    use loom_types::{
+        AppHistoryRecord, AppHistorySlice, AppHistorySortColumn, MonitorDomain, SortDirection,
+    };
 
     use super::*;
 
@@ -923,60 +1031,64 @@ mod tests {
     }
 
     #[test]
-    fn app_history_filter_and_sort_cover_all_columns() {
-        let items = vec![
-            sample_record("app.alpha", "Alpha", 120, 10_000, 500),
-            sample_record("app.beta", "Beta", 3_600, 500_000, 10_000),
-            sample_record("app.gamma", "Gamma", 30, 2_000_000, 0),
-        ];
+    fn app_history_viewport_fingerprint_quantizes_metrics_and_ignores_offscreen() {
+        let mut slice = AppHistorySlice {
+            revision: 1,
+            sort_column: AppHistorySortColumn::CpuTime,
+            sort_direction: SortDirection::Descending,
+            items: vec![
+                sample_record("app.alpha", "Alpha", 120, 10 * 1024 * 1024, 0),
+                sample_record("app.beta", "Beta", 3_600, 500_000, 10_000),
+                sample_record("app.gamma", "Gamma", 30, 2_000_000, 0),
+            ],
+            visible_indices: vec![1, 0, 2],
+            ..AppHistorySlice::default()
+        };
 
-        // CPU time descending: Beta -> Alpha -> Gamma.
+        let fp_initial = compute_app_history_viewport_fingerprint(&slice, &(0..2), Some(0));
+
+        // Sub-second CPU tick delta stays in the same whole-second bucket.
+        slice.items[1].cpu_time_100ns += 5_000_000;
         assert_eq!(
-            filter_and_sort_app_history(
-                &items,
-                "",
-                AppHistorySortColumn::CpuTime,
-                SortDirection::Descending,
-            ),
-            vec![1, 0, 2]
+            fp_initial,
+            compute_app_history_viewport_fingerprint(&slice, &(0..2), Some(0))
         );
 
-        // Network descending: Gamma -> Beta -> Alpha.
+        // Off-screen row update (visible index 2 -> item 2) does not invalidate fingerprint.
+        slice.items[2].network_bytes += 100 * 1024 * 1024;
         assert_eq!(
-            filter_and_sort_app_history(
-                &items,
-                "",
-                AppHistorySortColumn::Network,
-                SortDirection::Descending,
-            ),
-            vec![2, 1, 0]
+            fp_initial,
+            compute_app_history_viewport_fingerprint(&slice, &(0..2), Some(0))
         );
 
-        // Metered network descending: Beta -> Alpha -> Gamma.
-        assert_eq!(
-            filter_and_sort_app_history(
-                &items,
-                "",
-                AppHistorySortColumn::MeteredNetwork,
-                SortDirection::Descending,
-            ),
-            vec![1, 0, 2]
+        // Whole-second visible CPU delta invalidates the fingerprint.
+        slice.items[1].cpu_time_100ns += 10_000_000;
+        assert_ne!(
+            fp_initial,
+            compute_app_history_viewport_fingerprint(&slice, &(0..2), Some(0))
         );
+    }
 
-        // Search matches across name and app_id.
+    #[test]
+    fn app_history_scroll_coalescer_enforces_quiet_window_cap_and_bypass() {
+        let mut coalescer = ScrollCoalescer::default();
+        let t0 = Instant::now();
         assert_eq!(
-            filter_and_sort_app_history(
-                &items,
-                "gam",
-                AppHistorySortColumn::Name,
-                SortDirection::Ascending,
-            ),
-            vec![2]
+            coalescer.decide(t0 + Duration::from_millis(30), Some(t0), false),
+            CoalesceDecision::Defer(Duration::from_millis(120))
+        );
+        assert_eq!(
+            coalescer.decide(t0 + Duration::from_millis(180), Some(t0), false),
+            CoalesceDecision::ApplyNow
+        );
+        assert_eq!(
+            coalescer.decide(t0 + Duration::from_millis(10), Some(t0), true),
+            CoalesceDecision::ApplyNow
         );
     }
 
     #[gpui_kit::test]
-    fn app_history_view_acquires_and_releases_monitor_lease_on_mount_and_drop(
+    fn app_history_view_acquires_lease_dispatches_sort_and_releases_on_drop(
         cx: &mut TestAppContext,
     ) {
         cx.update(gpui_kit::init);
@@ -1009,6 +1121,13 @@ mod tests {
             coordinator.leases().is_active(MonitorDomain::AppHistory),
             "mounting AppHistoryView must acquire MonitorDomain::AppHistory lease"
         );
+
+        view.update(&mut vcx, |view, cx| {
+            view.table.update(cx, |table, cx| {
+                table.delegate_mut().trigger_sort(2, cx);
+            });
+        });
+        vcx.run_until_parked();
 
         drop(view);
         vcx.update(|window, _| window.remove_window());
