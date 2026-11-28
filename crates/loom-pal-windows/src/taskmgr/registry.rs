@@ -318,7 +318,9 @@ pub(crate) fn describe_in(root: HKEY, path: &str) -> Result<ConflictReport, Stri
         if code != ERROR_SUCCESS {
             return Err(format_reg_error("RegEnumKeyExW", code));
         }
-        subkeys.push(String::from_utf16_lossy(&name_buf[..name_len as usize]));
+        subkeys.push(String::from_utf16_lossy(
+            &name_buf[..(name_len as usize).min(name_buf.len())],
+        ));
     }
 
     Ok(ConflictReport {

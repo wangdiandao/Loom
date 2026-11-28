@@ -1,8 +1,9 @@
 //! Windows kernel diagnostics: Wait Chain Traversal (WCT) and cancellable streaming MiniDump.
 //!
 //! Both `advapi32.dll` WCT entry points and `dbghelp.dll` `MiniDumpWriteDump` are loaded
-//! dynamically via `LoadLibraryW` / `GetProcAddress` with RAII guards so Loom carries no
-//! static link dependency on `dbghelp.dll` and never leaks sessions or kernel handles.
+//! dynamically via `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)` / `GetProcAddress`
+//! with RAII guards so Loom carries no static link dependency on `dbghelp.dll` and never
+//! leaks sessions or kernel handles.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -16,14 +17,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use loom_pal_api::PalError;
 use loom_types::{ProcessKey, WaitChainNode};
-use windows_sys::Win32::Foundation::{
-    ERROR_CANCELLED, FALSE, FILETIME, FreeLibrary, GetLastError, HANDLE, HMODULE,
-};
+use windows_sys::Win32::Foundation::{ERROR_CANCELLED, FALSE, FILETIME, GetLastError, HANDLE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-};
-use windows_sys::Win32::System::LibraryLoader::{
-    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -31,8 +27,9 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::core::BOOL;
 
+pub(crate) use crate::handle::OwnedModule;
 use crate::handle::{
-    OwnedHandle, filetime_to_u64, map_win32_error, open_verified_process, to_wide_null,
+    OwnedHandle, decode_wide_nul_nonempty, filetime_to_u64, map_win32_error, open_verified_process,
 };
 
 /// Maximum WCT chain length per Win32 `WCT_MAX_NODE_COUNT`.
@@ -72,43 +69,6 @@ const MINIDUMP_CANCEL_CALLBACK: u32 = 6;
 
 /// `HRESULT_FROM_WIN32(ERROR_CANCELLED)` (`0x800704C7`).
 const HRESULT_ERROR_CANCELLED: u32 = 0x8007_04C7;
-
-/// RAII wrapper over a dynamically loaded Win32 DLL module (`FreeLibrary` on drop).
-pub(crate) struct OwnedModule(HMODULE);
-
-impl OwnedModule {
-    pub(crate) fn load(dll_name: &str) -> Result<Self, PalError> {
-        let wide = to_wide_null(dll_name);
-        // SAFETY: `wide` is a valid null-terminated UTF-16 system DLL name loaded strictly from
-        // `%SystemRoot%\System32` to prevent DLL sideloading from user-writable directories.
-        let module =
-            unsafe { LoadLibraryExW(wide.as_ptr(), ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
-        if module.is_null() {
-            // SAFETY: Reads thread-local Win32 error set by `LoadLibraryExW`.
-            let err = unsafe { GetLastError() };
-            return Err(map_win32_error(err, None, dll_name));
-        }
-        Ok(Self(module))
-    }
-
-    pub(crate) fn proc_addr(&self, symbol: &[u8]) -> Option<*const c_void> {
-        debug_assert!(symbol.ends_with(b"\0"));
-        // SAFETY: `self.0` is a loaded module and `symbol` is a null-terminated ASCII name.
-        let addr = unsafe { GetProcAddress(self.0, symbol.as_ptr()) };
-        addr.map(|f| f as *const c_void)
-    }
-}
-
-impl Drop for OwnedModule {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: `self.0` is an exclusively owned `HMODULE` acquired via `LoadLibraryW`.
-            unsafe {
-                FreeLibrary(self.0);
-            }
-        }
-    }
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -339,7 +299,7 @@ fn convert_wct_node(
     } else {
         // SAFETY: All non-thread `WCT_OBJECT_TYPE` variants select `data.lock_object`.
         let lock = unsafe { info.data.lock_object };
-        let object_name = decode_wide_z(&lock.object_name).map(Arc::<str>::from);
+        let object_name = decode_wide_nul_nonempty(&lock.object_name).map(Arc::<str>::from);
         WaitChainNode {
             thread_id: 0,
             process_key: None,
@@ -368,21 +328,6 @@ pub(crate) fn wct_object_type_label(object_type: i32) -> &'static str {
         WCT_SMB_IO_TYPE => "SmbIo",
         WCT_UNKNOWN_TYPE => "Unknown",
         _ => "Unknown",
-    }
-}
-
-/// Decodes a null-terminated UTF-16 slice, returning `None` for empty/whitespace-only strings.
-fn decode_wide_z(buf: &[u16]) -> Option<String> {
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    if len == 0 {
-        return None;
-    }
-    let decoded = String::from_utf16_lossy(&buf[..len]);
-    let trimmed = decoded.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_owned())
     }
 }
 

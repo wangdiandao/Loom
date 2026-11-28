@@ -10,7 +10,7 @@
 //!   stops the ETW controller session via `ControlTraceW(EVENT_TRACE_CONTROL_STOP)`,
 //!   joins the consumer thread, and releases the session cleanly.
 //! - **Zero external crate additions**: dynamically loads `advapi32.dll` (falling back
-//!   to `sechost.dll`) via `LoadLibraryW` / `GetProcAddress`.
+//!   to `sechost.dll`) via `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)` / `GetProcAddress`.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -26,8 +26,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
 };
 
-use crate::diagnostics::OwnedModule;
-use crate::handle::{map_win32_error, to_wide_null};
+use crate::handle::{OwnedModule, map_win32_error, to_wide_null};
 
 /// `Microsoft-Windows-Kernel-Network` ETW provider GUID:
 /// `{7dd42a49-5329-4832-8dfd-43d979153a88}`.
@@ -592,10 +591,12 @@ impl EtwProcessNetCollector {
         self.prev_totals.clear();
     }
 
-    /// Returns a cloned snapshot of cumulative `(recv_bytes, sent_bytes)` counters per PID.
-    #[allow(dead_code)]
-    pub(crate) fn snapshot_totals(&self) -> HashMap<u32, (u64, u64)> {
-        self.shared.totals.lock().clone()
+    /// Copies cumulative `(recv_bytes, sent_bytes)` counters per PID into caller-owned `dst`
+    /// so steady-state fast ticks perform zero `HashMap` allocations.
+    pub(crate) fn snapshot_totals_into(&self, dst: &mut HashMap<u32, (u64, u64)>) {
+        dst.clear();
+        let guard = self.shared.totals.lock();
+        dst.extend(guard.iter().map(|(&k, &v)| (k, v)));
     }
 
     /// Computes per-PID `(recv_bytes_per_sec, sent_bytes_per_sec)` deltas since the previous call

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, FALSE, FILETIME, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0,
+    ERROR_ALREADY_EXISTS, FALSE, FILETIME, GetLastError, HANDLE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
@@ -36,7 +36,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
-use crate::handle::{OwnedHandle, to_wide_null};
+use crate::handle::{LocalAllocGuard, OwnedHandle, to_wide_null};
 
 /// `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` (`0x0002_0000`).
 const PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: usize = 0x0002_0000;
@@ -144,14 +144,13 @@ pub(crate) fn token_user_sid(token: HANDLE) -> Result<String, String> {
         let code = unsafe { GetLastError() };
         return Err(format!("ConvertSidToStringSidW failed (os error {code})"));
     }
+    let _sid_guard = LocalAllocGuard::new(sid_str.cast::<c_void>());
     let sid = unsafe {
         let mut len = 0usize;
         while *sid_str.add(len) != 0 {
             len += 1;
         }
-        let s = String::from_utf16_lossy(std::slice::from_raw_parts(sid_str, len));
-        LocalFree(sid_str.cast::<c_void>());
-        s
+        String::from_utf16_lossy(std::slice::from_raw_parts(sid_str, len))
     };
     Ok(sid)
 }

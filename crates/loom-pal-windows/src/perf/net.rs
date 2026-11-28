@@ -7,7 +7,7 @@ use std::mem::{offset_of, size_of};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ptr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use loom_types::{NetAdapterSample, NetConnectionType};
 use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS, NO_ERROR};
@@ -20,6 +20,14 @@ use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
 };
+
+use crate::handle::decode_wide_nul;
+
+/// Refresh `GetAdaptersAddresses` metadata at most every 5 seconds (or immediately when an
+/// unseen interface LUID appears in `GetIfTable2`).
+const ADDR_CACHE_TTL: Duration = Duration::from_secs(5);
+/// Initial byte capacity (16 KiB) lazily allocated for `GetAdaptersAddresses`.
+const INITIAL_ADDR_BUF_U64S: usize = 2048;
 
 /// `MIB_IF_ROW2.InterfaceAndOperStatusFlags` bit 0: `HardwareInterface`.
 const MIB_FLAG_HARDWARE_INTERFACE: u8 = 1 << 0;
@@ -60,10 +68,12 @@ struct AdapterAddressMeta {
 
 /// Fast-lane Windows network interface sampler owned by [`crate::WindowsFastSampler`].
 pub(crate) struct NetworkPerfSampler {
-    /// Reusable aligned buffer for `GetAdaptersAddresses`.
+    /// Lazily-allocated reusable aligned buffer for `GetAdaptersAddresses`.
     addr_buf: Vec<u64>,
     /// Reusable `LUID -> AdapterAddressMeta` lookup map.
     addr_map: HashMap<u64, AdapterAddressMeta>,
+    /// Last timestamp when `addr_map` was refreshed from `GetAdaptersAddresses`.
+    last_addr_refresh: Option<Instant>,
     /// Previous `(InOctets, OutOctets, Instant)` per `InterfaceLuid`.
     prev_counters: HashMap<u64, PrevNetCounters>,
     /// Reusable set of currently observed LUIDs for stale-entry pruning.
@@ -77,13 +87,14 @@ impl Default for NetworkPerfSampler {
 }
 
 impl NetworkPerfSampler {
-    /// Creates a network sampler with pre-allocated reusable buffers.
+    /// Creates a lightweight network sampler with zero cold-start heap allocation.
     pub(crate) fn new() -> Self {
         Self {
-            addr_buf: vec![0u64; 2048], // 16 KiB initial buffer
-            addr_map: HashMap::with_capacity(16),
-            prev_counters: HashMap::with_capacity(16),
-            live_luids: HashSet::with_capacity(16),
+            addr_buf: Vec::new(),
+            addr_map: HashMap::new(),
+            last_addr_refresh: None,
+            prev_counters: HashMap::new(),
+            live_luids: HashSet::new(),
         }
     }
 
@@ -91,7 +102,16 @@ impl NetworkPerfSampler {
     /// `(total_recv_bytes_per_sec, total_sent_bytes_per_sec)`.
     pub(crate) fn sample(&mut self, out: &mut Vec<NetAdapterSample>) -> (u64, u64) {
         out.clear();
-        self.refresh_adapter_addresses();
+        let now = Instant::now();
+        let mut refreshed_this_tick = false;
+        if self
+            .last_addr_refresh
+            .is_none_or(|t| now.saturating_duration_since(t) >= ADDR_CACHE_TTL)
+        {
+            self.refresh_adapter_addresses();
+            self.last_addr_refresh = Some(now);
+            refreshed_this_tick = true;
+        }
 
         let mut table_ptr: *mut MIB_IF_TABLE2 = ptr::null_mut();
         // SAFETY: `GetIfTable2` writes an OS-allocated table pointer into `table_ptr`.
@@ -101,7 +121,6 @@ impl NetworkPerfSampler {
         }
         let guard = MibTableGuard(table_ptr);
 
-        let now = Instant::now();
         self.live_luids.clear();
 
         // SAFETY: `guard.0` points to a valid `MIB_IF_TABLE2` header.
@@ -163,6 +182,12 @@ impl NetworkPerfSampler {
                 total_recv_bps = total_recv_bps.saturating_add(recv_bps);
                 total_sent_bps = total_sent_bps.saturating_add(sent_bps);
 
+                if !refreshed_this_tick && !self.addr_map.contains_key(&luid) {
+                    self.refresh_adapter_addresses();
+                    self.last_addr_refresh = Some(now);
+                    refreshed_this_tick = true;
+                }
+
                 let addr_meta = self.addr_map.get(&luid);
                 let name = addr_meta
                     .and_then(|m| m.friendly_name.as_ref().map(Arc::clone))
@@ -207,6 +232,9 @@ impl NetworkPerfSampler {
     /// Queries `GetAdaptersAddresses` into `self.addr_buf` and populates `self.addr_map`.
     fn refresh_adapter_addresses(&mut self) {
         self.addr_map.clear();
+        if self.addr_buf.is_empty() {
+            self.addr_buf.resize(INITIAL_ADDR_BUF_U64S, 0);
+        }
 
         let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
         for _ in 0..3 {
@@ -355,12 +383,6 @@ fn extract_unicast_ips(
     }
 
     (ipv4, ipv6.or(ipv6_link_local))
-}
-
-/// Decodes a NUL-terminated UTF-16 fixed array to a trimmed `String`.
-fn decode_wide_nul(buf: &[u16]) -> String {
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    String::from_utf16_lossy(&buf[..len]).trim().to_owned()
 }
 
 /// Decodes a nullable Win32 `PWSTR` pointer to a trimmed `String`.

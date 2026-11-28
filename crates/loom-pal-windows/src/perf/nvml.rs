@@ -16,12 +16,11 @@ use std::mem::transmute;
 use std::path::PathBuf;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{
-    GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 
-use crate::handle::{os_str_to_wide_null, to_wide_null};
+use crate::handle::{OwnedModule, os_str_to_wide_null};
 
 /// PCI Vendor ID for NVIDIA Corporation (`0x10DE`).
 pub(crate) const PCI_VENDOR_NVIDIA: u32 = 0x10DE;
@@ -102,8 +101,11 @@ impl NvmlState {
 }
 
 /// Active dynamically-loaded `nvml.dll` session calling `nvmlShutdown` + `FreeLibrary` on drop.
+///
+/// Field drop order matters: `shutdown` runs in `Drop::drop` BEFORE `_module` drops and calls
+/// `FreeLibrary`, ensuring `nvmlShutdown` executes while `nvml.dll` is still mapped.
 pub(crate) struct NvmlSession {
-    module: HMODULE,
+    _module: OwnedModule,
     shutdown: Option<FnNvmlShutdown>,
     get_handle_by_pci: FnNvmlDeviceGetHandleByPciBusIdV2,
     get_power_usage: Option<FnNvmlDeviceGetPowerUsage>,
@@ -121,48 +123,28 @@ impl NvmlSession {
     fn init() -> Option<Self> {
         let module = load_trusted_nvml_dll()?;
 
-        let init_ptr = unsafe { GetProcAddress(module, c"nvmlInit_v2".as_ptr().cast()) }
-            .or_else(|| unsafe { GetProcAddress(module, c"nvmlInit".as_ptr().cast()) });
-        let Some(init_ptr) = init_ptr else {
-            unsafe {
-                FreeLibrary(module);
-            }
-            return None;
-        };
+        let init_ptr = module
+            .proc_raw(b"nvmlInit_v2\0")
+            .or_else(|| module.proc_raw(b"nvmlInit\0"))?;
+        let pci_ptr = module
+            .proc_raw(b"nvmlDeviceGetHandleByPciBusId_v2\0")
+            .or_else(|| module.proc_raw(b"nvmlDeviceGetHandleByPciBusId\0"))?;
 
-        let pci_ptr =
-            unsafe { GetProcAddress(module, c"nvmlDeviceGetHandleByPciBusId_v2".as_ptr().cast()) }
-                .or_else(|| unsafe {
-                    GetProcAddress(module, c"nvmlDeviceGetHandleByPciBusId".as_ptr().cast())
-                });
-        let Some(pci_ptr) = pci_ptr else {
-            unsafe {
-                FreeLibrary(module);
-            }
-            return None;
-        };
-
-        let shutdown_ptr = unsafe { GetProcAddress(module, c"nvmlShutdown".as_ptr().cast()) };
-        let power_ptr =
-            unsafe { GetProcAddress(module, c"nvmlDeviceGetPowerUsage".as_ptr().cast()) };
-        let fan_ptr = unsafe { GetProcAddress(module, c"nvmlDeviceGetFanSpeed".as_ptr().cast()) };
-        let clock_ptr =
-            unsafe { GetProcAddress(module, c"nvmlDeviceGetClockInfo".as_ptr().cast()) };
-        let temp_ptr =
-            unsafe { GetProcAddress(module, c"nvmlDeviceGetTemperature".as_ptr().cast()) };
+        let shutdown_ptr = module.proc_raw(b"nvmlShutdown\0");
+        let power_ptr = module.proc_raw(b"nvmlDeviceGetPowerUsage\0");
+        let fan_ptr = module.proc_raw(b"nvmlDeviceGetFanSpeed\0");
+        let clock_ptr = module.proc_raw(b"nvmlDeviceGetClockInfo\0");
+        let temp_ptr = module.proc_raw(b"nvmlDeviceGetTemperature\0");
 
         // SAFETY: All symbols match the official NVIDIA NVML C ABI (`extern "C"`).
         let init_fn: FnNvmlInitV2 = unsafe { transmute::<FarProc, FnNvmlInitV2>(init_ptr) };
         if unsafe { init_fn() } != NVML_SUCCESS {
-            unsafe {
-                FreeLibrary(module);
-            }
             return None;
         }
 
         unsafe {
             Some(Self {
-                module,
+                _module: module,
                 shutdown: shutdown_ptr.map(|p| transmute::<FarProc, FnNvmlShutdown>(p)),
                 get_handle_by_pci: transmute::<FarProc, FnNvmlDeviceGetHandleByPciBusIdV2>(pci_ptr),
                 get_power_usage: power_ptr
@@ -249,15 +231,9 @@ impl NvmlSession {
 impl Drop for NvmlSession {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown {
-            // SAFETY: Paired with `nvmlInit_v2` in `NvmlSession::init`.
+            // SAFETY: Paired with `nvmlInit_v2` in `NvmlSession::init`; `_module` is dropped after `Drop::drop`.
             unsafe {
                 let _ = shutdown();
-            }
-        }
-        if !self.module.is_null() {
-            // SAFETY: Paired with `LoadLibraryExW` in `load_trusted_nvml_dll`.
-            unsafe {
-                FreeLibrary(self.module);
             }
         }
     }
@@ -265,18 +241,9 @@ impl Drop for NvmlSession {
 
 /// Loads `nvml.dll` strictly from `%SystemRoot%\System32` or the protected NVIDIA Program Files
 /// installation folder—never from the executable or current working directory.
-fn load_trusted_nvml_dll() -> Option<HMODULE> {
-    let sys_name = to_wide_null("nvml.dll");
-    // SAFETY: Loads `nvml.dll` strictly from `%SystemRoot%\System32`.
-    let m = unsafe {
-        LoadLibraryExW(
-            sys_name.as_ptr(),
-            ptr::null_mut(),
-            LOAD_LIBRARY_SEARCH_SYSTEM32,
-        )
-    };
-    if !m.is_null() {
-        return Some(m);
+fn load_trusted_nvml_dll() -> Option<OwnedModule> {
+    if let Ok(module) = OwnedModule::load("nvml.dll") {
+        return Some(module);
     }
 
     // Legacy non-DCH driver fallback in protected `%ProgramFiles%\NVIDIA Corporation\NVSMI\nvml.dll`.
@@ -297,7 +264,7 @@ fn load_trusted_nvml_dll() -> Option<HMODULE> {
             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
         )
     };
-    (!m2.is_null()).then_some(m2)
+    OwnedModule::from_raw(m2)
 }
 
 /// Formats a `(bus, device, function)` tuple into NVML's canonical `"0000:BB:DD.F"` PCI ID.
