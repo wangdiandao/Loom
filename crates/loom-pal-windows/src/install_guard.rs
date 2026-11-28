@@ -11,7 +11,7 @@ use std::mem::size_of;
 use std::path::Path;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
 };
@@ -24,7 +24,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_WRITE_EA, GetDriveTypeW, WRITE_DAC, WRITE_OWNER,
 };
 
-use crate::handle::to_wide_null;
+use crate::handle::{LocalAllocGuard, to_wide_null};
 
 /// `ACCESS_ALLOWED_ACE_TYPE` (`0x00`).
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -73,20 +73,6 @@ const PARENT_DIR_FORBIDDEN_MASK: u32 = FILE_WRITE_DATA
 /// (prevents folder swap while permitting Windows' standard `C:\` `Authenticated Users:(AD)`).
 const ANCESTOR_DIR_FORBIDDEN_MASK: u32 =
     FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
-
-/// RAII guard releasing a Win32 `LocalAlloc` security descriptor or SID string.
-struct LocalAllocGuard(*mut c_void);
-
-impl Drop for LocalAllocGuard {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: Paired with `GetNamedSecurityInfoW` or `ConvertSidToStringSidW`.
-            unsafe {
-                LocalFree(self.0);
-            }
-        }
-    }
-}
 
 /// Reason why an executable path is not considered administrator-protected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,7 +200,7 @@ fn verify_object_security(
             &mut sd,
         )
     };
-    let _sd_guard = LocalAllocGuard(sd);
+    let _sd_guard = LocalAllocGuard::new(sd);
 
     if rc != ERROR_SUCCESS {
         return Err(UnprotectedReason::InspectionFailed(format!(
@@ -299,7 +285,7 @@ fn sid_to_string(sid: PSID) -> Option<String> {
     if ok == 0 || sid_str.is_null() {
         return None;
     }
-    let _guard = LocalAllocGuard(sid_str.cast::<c_void>());
+    let _guard = LocalAllocGuard::new(sid_str.cast::<c_void>());
     // SAFETY: `sid_str` is a NUL-terminated UTF-16 buffer allocated by `ConvertSidToStringSidW`.
     let text = unsafe {
         let mut len = 0usize;

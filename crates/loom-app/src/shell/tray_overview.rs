@@ -12,13 +12,13 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent,
-    ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
-    div, px,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Window, div, px,
 };
 use loom_types::{AppSnapshot, MonitorDomain, ProcessKey, ProcessRowKind};
 use loom_ui_kit::{
-    LoomSemanticColors, format_bytes, format_network_rate_mbps, format_permille,
-    format_rate_bytes_per_sec,
+    CachedSemanticColors, format_bytes, format_bytes_shared, format_network_rate_mbps_shared,
+    format_permille_shared, format_rate_bytes_per_sec_shared,
 };
 
 use crate::bootstrap;
@@ -91,6 +91,9 @@ pub(crate) struct TrayOverviewView {
     store: Entity<UiStore>,
     focus_handle: FocusHandle,
     has_been_active: bool,
+    last_perf_rev: u64,
+    last_proc_rev: u64,
+    semantic_colors: CachedSemanticColors,
     _perf_lease: ScopedMonitorLease,
     _processes_lease: ScopedMonitorLease,
     _subscriptions: Vec<Subscription>,
@@ -105,26 +108,34 @@ impl TrayOverviewView {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
-        let (perf_lease, processes_lease) = {
+        let (perf_lease, processes_lease, initial_revs) = {
             let s = store.read(cx);
             (
                 s.acquire_lease(MonitorDomain::Performance),
                 s.acquire_lease(MonitorDomain::Processes),
+                s.snapshot().revisions,
             )
         };
 
         let mut subscriptions = Vec::with_capacity(2);
-        subscriptions.push(
-            cx.subscribe(
-                &store,
-                |_this, _store, event: &UiStoreEvent, cx| match event {
-                    UiStoreEvent::SnapshotUpdated(_) | UiStoreEvent::SettingsChanged => {
+        subscriptions.push(cx.subscribe(
+            &store,
+            |this, _store, event: &UiStoreEvent, cx| match event {
+                UiStoreEvent::SnapshotUpdated(revs) => {
+                    if revs.performance != this.last_perf_rev
+                        || revs.processes != this.last_proc_rev
+                    {
+                        this.last_perf_rev = revs.performance;
+                        this.last_proc_rev = revs.processes;
                         cx.notify();
                     }
-                    _ => {}
-                },
-            ),
-        );
+                }
+                UiStoreEvent::SettingsChanged => {
+                    cx.notify();
+                }
+                _ => {}
+            },
+        ));
 
         // Destroy the popover window immediately on focus loss to guarantee 0% GPU dormancy.
         let has_been_active = window.is_window_active();
@@ -140,6 +151,9 @@ impl TrayOverviewView {
             store,
             focus_handle,
             has_been_active,
+            last_perf_rev: initial_revs.performance,
+            last_proc_rev: initial_revs.processes,
+            semantic_colors: CachedSemanticColors::new(),
             _perf_lease: perf_lease,
             _processes_lease: processes_lease,
             _subscriptions: subscriptions,
@@ -173,10 +187,10 @@ impl Render for TrayOverviewView {
         } else {
             procs.total_memory_permille
         };
-        let mem_detail = if mem_total > 0 {
-            format!("{} / {}", format_bytes(mem_used), format_bytes(mem_total))
+        let mem_detail: SharedString = if mem_total > 0 {
+            format!("{} / {}", format_bytes(mem_used), format_bytes(mem_total)).into()
         } else {
-            format_permille(mem_permille)
+            format_permille_shared(mem_permille)
         };
 
         let disk_rate = if perf.revision > 0 {
@@ -204,7 +218,7 @@ impl Render for TrayOverviewView {
         let top_processes = top_busy_processes(&snapshot, MAX_TOP_PROCESSES);
 
         let theme = cx.theme();
-        let colors = LoomSemanticColors::from_theme(theme);
+        let colors = self.semantic_colors.get_copy(theme);
         let bg = theme.popover;
         let fg = theme.foreground;
         let muted_fg = theme.muted_foreground;
@@ -212,6 +226,7 @@ impl Render for TrayOverviewView {
         let border = theme.border;
         let radius = theme.radius;
         let hover_bg = theme.list_hover;
+        let mono_font = theme.mono_font_family.clone();
 
         v_flex()
             .id("tray-overview-root")
@@ -224,9 +239,12 @@ impl Render for TrayOverviewView {
             .rounded(radius)
             .p_3()
             .gap_3()
-            .on_key_down(cx.listener(|_this, event: &KeyDownEvent, window, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     window.remove_window();
+                    cx.stop_propagation();
+                } else if event.keystroke.key == "enter" {
+                    this.open_main_window(None, window, cx);
                     cx.stop_propagation();
                 }
             }))
@@ -299,8 +317,9 @@ impl Render for TrayOverviewView {
                                 div()
                                     .text_base()
                                     .font_semibold()
+                                    .font_family(mono_font.clone())
                                     .text_color(fg)
-                                    .child(format_permille(cpu_permille)),
+                                    .child(format_permille_shared(cpu_permille)),
                             ),
                     )
                     .child(
@@ -333,12 +352,14 @@ impl Render for TrayOverviewView {
                                 div()
                                     .text_base()
                                     .font_semibold()
+                                    .font_family(mono_font.clone())
                                     .text_color(fg)
-                                    .child(format_permille(mem_permille)),
+                                    .child(format_permille_shared(mem_permille)),
                             )
                             .child(
                                 div()
                                     .text_xs()
+                                    .font_family(mono_font.clone())
                                     .text_color(muted_fg)
                                     .truncate()
                                     .child(mem_detail),
@@ -352,33 +373,36 @@ impl Render for TrayOverviewView {
                     .gap_2()
                     .child(vital_mini_tile(
                         i18n::tr("processes.col_disk"),
-                        format_rate_bytes_per_sec(disk_rate),
+                        format_rate_bytes_per_sec_shared(disk_rate),
                         colors.chart_disk,
                         card_bg,
                         border,
                         muted_fg,
                         fg,
                         radius,
+                        mono_font.clone(),
                     ))
                     .child(vital_mini_tile(
                         i18n::tr("processes.col_network"),
-                        format_network_rate_mbps(net_rate),
+                        format_network_rate_mbps_shared(net_rate),
                         colors.chart_network,
                         card_bg,
                         border,
                         muted_fg,
                         fg,
                         radius,
+                        mono_font.clone(),
                     ))
                     .child(vital_mini_tile(
                         i18n::tr("processes.col_gpu"),
-                        format_permille(gpu_permille),
+                        format_permille_shared(gpu_permille),
                         colors.chart_gpu,
                         card_bg,
                         border,
                         muted_fg,
                         fg,
                         radius,
+                        mono_font.clone(),
                     )),
             )
             .child(
@@ -405,11 +429,14 @@ impl Render for TrayOverviewView {
                             .text_color(muted_fg)
                             .child(i18n::tr("tray_overview.empty_processes"))
                     } else {
-                        v_flex().w_full().gap_1().children(
-                            top_processes.into_iter().enumerate().map(|(ix, item)| {
+                        v_flex()
+                            .w_full()
+                            .gap_1()
+                            .children(top_processes.into_iter().map(|item| {
                                 let key = item.key;
+                                let mono_row = mono_font.clone();
                                 h_flex()
-                                    .id(("tray-overview-proc", ix))
+                                    .id(("tray-overview-proc", key.pid as usize))
                                     .w_full()
                                     .items_center()
                                     .justify_between()
@@ -417,7 +444,6 @@ impl Render for TrayOverviewView {
                                     .px_2()
                                     .py_1p5()
                                     .rounded(radius)
-                                    .cursor_pointer()
                                     .hover(move |s| s.bg(hover_bg))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.open_main_window(Some(key), window, cx);
@@ -436,11 +462,12 @@ impl Render for TrayOverviewView {
                                                     .font_medium()
                                                     .text_color(fg)
                                                     .truncate()
-                                                    .child(item.display_name.to_string()),
+                                                    .child(SharedString::from(item.display_name)),
                                             )
                                             .child(
                                                 div()
                                                     .text_xs()
+                                                    .font_family(mono_row.clone())
                                                     .text_color(muted_fg)
                                                     .flex_shrink_0()
                                                     .child(format!("({})", item.pid)),
@@ -454,8 +481,9 @@ impl Render for TrayOverviewView {
                                             .child(
                                                 div()
                                                     .text_xs()
+                                                    .font_family(mono_row.clone())
                                                     .text_color(muted_fg)
-                                                    .child(format_bytes(item.memory_bytes)),
+                                                    .child(format_bytes_shared(item.memory_bytes)),
                                             )
                                             .child(
                                                 div()
@@ -463,12 +491,14 @@ impl Render for TrayOverviewView {
                                                     .text_right()
                                                     .text_xs()
                                                     .font_semibold()
+                                                    .font_family(mono_row)
                                                     .text_color(colors.chart_cpu)
-                                                    .child(format_permille(item.cpu_permille)),
+                                                    .child(format_permille_shared(
+                                                        item.cpu_permille,
+                                                    )),
                                             ),
                                     )
-                            }),
-                        )
+                            }))
                     }),
             )
             .child(
@@ -497,13 +527,14 @@ impl Render for TrayOverviewView {
 #[allow(clippy::too_many_arguments)]
 fn vital_mini_tile(
     label: String,
-    value: String,
+    value: SharedString,
     accent: gpui_kit::Hsla,
     bg: gpui_kit::Hsla,
     border: gpui_kit::Hsla,
     muted_fg: gpui_kit::Hsla,
     fg: gpui_kit::Hsla,
     radius: gpui_kit::Pixels,
+    mono_font: SharedString,
 ) -> impl IntoElement {
     v_flex()
         .flex_1()
@@ -526,6 +557,7 @@ fn vital_mini_tile(
             div()
                 .text_xs()
                 .font_semibold()
+                .font_family(mono_font)
                 .text_color(fg)
                 .truncate()
                 .child(value),

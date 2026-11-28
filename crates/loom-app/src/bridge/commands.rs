@@ -154,6 +154,9 @@ impl UiCommands {
 
     /// Updates and persists the default startup navigation page.
     pub(crate) fn set_startup_page(store: &Entity<UiStore>, page: StartupPage, cx: &mut App) {
+        if store.read(cx).settings().startup_page == page {
+            return;
+        }
         store.update(cx, |store, cx| {
             let _ = store.update_settings(|s| s.startup_page = page, cx);
         });
@@ -162,6 +165,9 @@ impl UiCommands {
     /// Updates, persists, and live-applies the native window Always-on-Top state.
     #[allow(dead_code)]
     pub(crate) fn set_always_on_top(store: &Entity<UiStore>, enabled: bool, cx: &mut App) {
+        if store.read(cx).settings().always_on_top == enabled {
+            return;
+        }
         store.update(cx, |store, cx| {
             let _ = store.update_settings(|s| s.always_on_top = enabled, cx);
         });
@@ -170,6 +176,9 @@ impl UiCommands {
 
     /// Updates and persists whether minimizing hides Loom to the system tray.
     pub(crate) fn set_minimize_to_tray(store: &Entity<UiStore>, enabled: bool, cx: &mut App) {
+        if store.read(cx).settings().minimize_to_tray == enabled {
+            return;
+        }
         store.update(cx, |store, cx| {
             let _ = store.update_settings(|s| s.minimize_to_tray = enabled, cx);
         });
@@ -177,6 +186,9 @@ impl UiCommands {
 
     /// Updates and persists whether closing the window keeps Loom resident in the system tray.
     pub(crate) fn set_close_to_tray(store: &Entity<UiStore>, enabled: bool, cx: &mut App) {
+        if store.read(cx).settings().close_to_tray == enabled {
+            return;
+        }
         store.update(cx, |store, cx| {
             let _ = store.update_settings(|s| s.close_to_tray = enabled, cx);
         });
@@ -184,6 +196,9 @@ impl UiCommands {
 
     /// Updates and persists whether the left navigation sidebar is collapsed.
     pub(crate) fn set_sidebar_collapsed(store: &Entity<UiStore>, collapsed: bool, cx: &mut App) {
+        if store.read(cx).settings().sidebar_collapsed == collapsed {
+            return;
+        }
         store.update(cx, |store, cx| {
             let _ = store.update_settings(|s| s.sidebar_collapsed = collapsed, cx);
         });

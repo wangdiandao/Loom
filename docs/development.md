@@ -17,9 +17,9 @@ English | [中文](development.zh.md)
 Loom uses a 10-crate unidirectional Cargo Workspace DAG documented in [System architecture](architecture.md#workspace-module-layout-and-dependency-dag):
 
 - **Domain types & config (`crates/loom-{types,config}`)** provide pure POD models and fast (`< 1 ms` target) local configuration persistence without OS or UI dependencies.
-- **Static PAL & OS backends (`crates/loom-{pal-api,pal-windows,pal-macos,pal-linux,pal}`)** define monomorphized contracts and reusable scratch arenas in `loom-pal-api`, isolate per-OS FFI in dedicated backend crates, and re-export `NativeBackend` statically in `loom-pal`.
-- **Headless sampling engine (`crates/loom-engine`)** drives the dual-lane scheduler, 60-point quantized history rings, anti-PID-reuse process tree, pre-sorted view projections, and RAII `MonitorLease` ref-counting—**without GPUI or multi-thread Tokio dependencies**.
-- **Composable UI kit & desktop app (`crates/loom-{ui-kit,app}`)** wrap standard `gpui-kit` composites in `loom-ui-kit` and follow a **Shell + Feature Slices** layout (`shell/` + `features/{processes,performance,app_history,startup,users,details,services,settings}/`) in `loom-app`.
+- **Static PAL & OS backends (`crates/loom-{pal-api,pal-windows,pal-macos,pal-linux,pal}`)** define monomorphized contracts and reusable scratch arenas in `loom-pal-api`, isolate per-OS FFI into focused submodules inside dedicated backend crates (e.g. `loom-pal-windows/src/{fast_sampler,slow_prober,operator,startup,filelock,perf/{disk,gpu},taskmgr,admin}/`), and re-export `NativeBackend` statically in `loom-pal`.
+- **Headless sampling engine (`crates/loom-engine`)** organizes the dual-lane scheduler (`coordinator/`), pre-sorted view projections (`projection/`), bulkhead probe pool (`slow_lane/`), anti-PID-reuse process tree, structured query engine, and RAII `MonitorLease` ref-counting—**without GPUI or multi-thread Tokio dependencies**.
+- **Composable UI kit & desktop app (`crates/loom-{ui-kit,app}`)** organize `gpui-kit` composites into focused modules (`theme/`, `format/`, `heatmap`, `sparkline`, `logic`) in `loom-ui-kit` and follow a **Bootstrap + Shell + Feature Slices** layout (`bootstrap/`, `shell/{window,dialogs}/`, and `features/{table_columns,processes,performance,app_history,startup,users,details,services,settings}/`) in `loom-app`.
 
 <a id="coding-conventions"></a>
 
@@ -54,6 +54,7 @@ Select the lowest effective test tier for the behavior being verified:
 Testing guidelines:
 
 - Prefer plain `#[test]` whenever GPUI `App` / `Window` is not required.
+- Hold `i18n::locale_test_lock()` in any `loom-app` test that mutates global `rust_i18n` locale or asserts locale-dependent output so parallel `cargo test` runs remain deterministic.
 - Add deterministic regression tests for anti-hang invariants (`CircuitBreaker` trips, PID reuse edge cases).
 - Clean up temporary dump files, logs, and screenshots immediately after verification.
 

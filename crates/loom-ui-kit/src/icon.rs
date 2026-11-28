@@ -35,3 +35,68 @@ pub fn rgba_icon_to_render_image(icon: &ExeIconRgba) -> Option<Arc<RenderImage>>
     let frame = Frame::new(buffer);
     Some(Arc::new(RenderImage::new([frame])))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui_kit::{DevicePixels, Size};
+    use loom_types::ExeIconRgba;
+
+    use super::rgba_icon_to_render_image;
+
+    #[test]
+    fn rgba_icon_to_render_image_validates_and_swaps_rb_channels() {
+        let icon = ExeIconRgba {
+            width: 2,
+            height: 1,
+            rgba: Arc::from([0x11, 0x22, 0x33, 0xFF, 0xAA, 0xBB, 0xCC, 0x80]),
+        };
+        let rendered = rgba_icon_to_render_image(&icon).expect("valid 2x1 RGBA icon");
+        assert_eq!(rendered.frame_count(), 1);
+        assert_eq!(
+            rendered.size(0),
+            Size {
+                width: DevicePixels(2),
+                height: DevicePixels(1),
+            }
+        );
+        assert_eq!(
+            rendered.as_bytes(0),
+            Some(&[0x33, 0x22, 0x11, 0xFF, 0xCC, 0xBB, 0xAA, 0x80][..])
+        );
+
+        assert!(
+            rgba_icon_to_render_image(&ExeIconRgba {
+                width: 0,
+                height: 16,
+                rgba: Arc::from([]),
+            })
+            .is_none()
+        );
+        assert!(
+            rgba_icon_to_render_image(&ExeIconRgba {
+                width: 16,
+                height: 0,
+                rgba: Arc::from([]),
+            })
+            .is_none()
+        );
+        assert!(
+            rgba_icon_to_render_image(&ExeIconRgba {
+                width: 2,
+                height: 2,
+                rgba: Arc::from([0u8; 12]),
+            })
+            .is_none()
+        );
+        assert!(
+            rgba_icon_to_render_image(&ExeIconRgba {
+                width: 1,
+                height: 1,
+                rgba: Arc::from([0u8; 8]),
+            })
+            .is_none()
+        );
+    }
+}

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, LocalFree, SysAllocStringLen, SysFreeString, SysStringLen, VARIANT_BOOL,
+    ERROR_FILE_NOT_FOUND, SysAllocStringLen, SysFreeString, SysStringLen, VARIANT_BOOL,
 };
 use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW};
 use windows_sys::Win32::Security::{LookupAccountNameW, SID_NAME_USE};
@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Com::{
 use windows_sys::Win32::System::Variant::{VARIANT, VT_BSTR, VT_I4, VariantClear, VariantInit};
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
-use crate::handle::to_wide_null;
+use crate::handle::{LocalAllocGuard, to_wide_null};
 
 use super::RUN_FLAG;
 
@@ -432,9 +432,7 @@ fn resolve_account_sid(principal: &str) -> Result<String, String> {
         let mut psid: *mut c_void = ptr::null_mut();
         // SAFETY: Validates that `trimmed` is a syntactically valid Windows SID string.
         if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut psid) } != 0 && !psid.is_null() {
-            unsafe {
-                LocalFree(psid);
-            }
+            let _psid_guard = LocalAllocGuard::new(psid);
             return Ok(trimmed.to_owned());
         }
     }
@@ -482,14 +480,13 @@ fn resolve_account_sid(principal: &str) -> Result<String, String> {
     {
         return Err("ConvertSidToStringSidW failed".into());
     }
+    let _sid_guard = LocalAllocGuard::new(sid_str.cast::<c_void>());
     let resolved = unsafe {
         let mut len = 0usize;
         while *sid_str.add(len) != 0 {
             len += 1;
         }
-        let s = String::from_utf16_lossy(std::slice::from_raw_parts(sid_str, len));
-        LocalFree(sid_str.cast::<c_void>());
-        s
+        String::from_utf16_lossy(std::slice::from_raw_parts(sid_str, len))
     };
     Ok(resolved)
 }

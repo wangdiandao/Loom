@@ -17,8 +17,7 @@ use windows_sys::Win32::Foundation::{
     GetLastError, S_OK,
 };
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_EXPAND_SZ, REG_SZ, RegCloseKey, RegOpenKeyExW,
-    RegQueryValueExW,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_EXPAND_SZ, REG_SZ, RegOpenKeyExW, RegQueryValueExW,
 };
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, ENUM_SERVICE_STATUS_PROCESSW, EnumServicesStatusExW,
@@ -34,7 +33,7 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-use crate::handle::{map_win32_error, null_wide_ptr, to_wide_null};
+use crate::handle::{OwnedRegKey, map_win32_error, null_wide_ptr, to_wide_null};
 use crate::slow_prober::{ensure_com_initialized, is_unc_path};
 
 /// Maximum time spent waiting for a service to reach `SERVICE_STOPPED` during restart.
@@ -71,20 +70,6 @@ impl Drop for ScHandle {
             // SAFETY: `self.0` is an exclusively owned valid SCM or service handle.
             unsafe {
                 CloseServiceHandle(self.0);
-            }
-        }
-    }
-}
-
-/// RAII owner of a Win32 registry `HKEY` closing via `RegCloseKey` on drop.
-struct RegKeyGuard(HKEY);
-
-impl Drop for RegKeyGuard {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: `self.0` is an exclusively owned valid registry key handle.
-            unsafe {
-                RegCloseKey(self.0);
             }
         }
     }
@@ -195,7 +180,7 @@ impl ServiceManager for WindowsServiceManager {
             let display_str = unsafe { read_wide_ptr(entry.lpDisplayName) };
 
             let (group, description) = self.lookup_or_probe_meta(
-                services_root.as_ref().map(|k| k.0),
+                services_root.as_ref().map(OwnedRegKey::as_raw),
                 &name_str,
                 indirect_deadline,
                 &mut indirect_remaining,
@@ -461,14 +446,14 @@ fn enumerate_win32_services(scm: &ScHandle) -> Result<EnumeratedServicesBuf, Pal
     })
 }
 
-fn open_services_registry_root() -> Option<RegKeyGuard> {
+fn open_services_registry_root() -> Option<OwnedRegKey> {
     let subkey = to_wide_null(r"SYSTEM\CurrentControlSet\Services");
     let mut hkey: HKEY = ptr::null_mut();
     // SAFETY: `subkey` is null-terminated UTF-16; `hkey` receives the opened registry key.
     let status =
         unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut hkey) };
-    if status == ERROR_SUCCESS && !hkey.is_null() {
-        Some(RegKeyGuard(hkey))
+    if status == ERROR_SUCCESS {
+        OwnedRegKey::from_raw(hkey)
     } else {
         None
     }
@@ -484,22 +469,24 @@ fn read_service_registry_meta(
     let mut hkey: HKEY = ptr::null_mut();
     // SAFETY: `services_root` is an open registry key and `wide_sub` is null-terminated UTF-16.
     let status = unsafe { RegOpenKeyExW(services_root, wide_sub.as_ptr(), 0, KEY_READ, &mut hkey) };
-    if status != ERROR_SUCCESS || hkey.is_null() {
+    let Some(key) = (status == ERROR_SUCCESS)
+        .then(|| OwnedRegKey::from_raw(hkey))
+        .flatten()
+    else {
         return CachedServiceMeta {
             group: None,
             description: None,
             pending_indirect: None,
         };
-    }
-    let key = RegKeyGuard(hkey);
+    };
 
     // Prefer `svchost.exe -k <Group>` (matches Windows Task Manager Services tab),
     // falling back to registry `Group` value.
-    let group = read_reg_string(key.0, "ImagePath")
+    let group = read_reg_string(key.as_raw(), "ImagePath")
         .as_deref()
         .and_then(parse_svchost_group)
         .or_else(|| {
-            read_reg_string(key.0, "Group").and_then(|s| {
+            read_reg_string(key.as_raw(), "Group").and_then(|s| {
                 let t = s.trim();
                 if t.is_empty() {
                     None
@@ -511,7 +498,7 @@ fn read_service_registry_meta(
         .map(Arc::<str>::from);
 
     let mut pending_indirect = None;
-    let description = match read_reg_string(key.0, "Description") {
+    let description = match read_reg_string(key.as_raw(), "Description") {
         Some(raw) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {

@@ -10,6 +10,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -33,12 +36,12 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Run Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --workspace --no-deps
+        run: cargo doc --locked --workspace --no-deps --all-features
 
       - name: Run workspace tests (including headless Windows E2E)
         run: cargo test --locked --workspace
@@ -59,10 +62,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check headless crates on Linux
-        run: cargo check --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal -p loom-engine
+        run: cargo check --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal-macos -p loom-pal -p loom-engine
 
       - name: Run Clippy on headless crates (Linux)
-        run: cargo clippy --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal -p loom-engine --all-targets -- -D warnings
+        run: cargo clippy --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal-macos -p loom-pal -p loom-engine --all-targets -- -D warnings
 
       - name: Run headless tests on Linux
-        run: cargo test --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal -p loom-engine
+        run: cargo test --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal-macos -p loom-pal -p loom-engine

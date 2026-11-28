@@ -1,6 +1,6 @@
 //! Memory detail pane for the Performance view (60s usage chart, 4-segment composition bar, SMBIOS specs).
 
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::{
     Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
@@ -12,15 +12,17 @@ use loom_ui_kit::{
 };
 
 use crate::features::performance::PerformanceView;
+use crate::features::performance::cache::PerformanceSeriesCache;
 use crate::features::performance::charts::{
-    MetricStat, SpecRow, build_percent_area_chart, chart_frame, device_header,
-    history_ring_to_points, legend_swatch, metrics_two_column_panel,
+    MetricStat, SpecRow, build_percent_area_chart, chart_frame, copy_summary_menu_item,
+    device_header, legend_swatch, metrics_two_column_panel, opt_arc_str_or_fallback,
 };
 use crate::i18n;
 
 /// Renders the Memory hardware detail pane.
 pub(crate) fn render_memory_detail(
     perf: &PerformanceSlice,
+    cache: &mut PerformanceSeriesCache,
     colors: &LoomSemanticColors,
     cx: &mut Context<PerformanceView>,
 ) -> impl IntoElement {
@@ -42,7 +44,7 @@ pub(crate) fn render_memory_detail(
     }
     let header_subtitle = SharedString::from(header_parts.join(" · "));
 
-    let points = history_ring_to_points(&perf.mem_history);
+    let points = cache.memory_usage(perf).to_vec();
     let usage_chart = build_percent_area_chart(
         "perf-memory-usage-chart",
         points,
@@ -151,12 +153,7 @@ pub(crate) fn render_memory_detail(
         _ => unavailable.clone(),
     };
 
-    let form_factor_str = info
-        .form_factor
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| unavailable.clone());
+    let form_factor_str = opt_arc_str_or_fallback(&info.form_factor, &unavailable);
 
     let left_stats = vec![
         MetricStat::new(in_use_label, format_bytes(latest.mem_used_bytes)),
@@ -208,16 +205,5 @@ pub(crate) fn render_memory_detail(
         ))
         .child(composition_section)
         .child(metrics_two_column_panel(left_stats, right_specs, colors))
-        .context_menu(move |menu, _window, _cx| {
-            let weak_copy = weak_ctx.clone();
-            menu.item(
-                PopupMenuItem::new(i18n::tr("perf.perf_polish_copy_summary")).on_click(
-                    move |_, window, cx| {
-                        let _ = weak_copy.update(cx, |view, cx| {
-                            view.copy_selected_summary(window, cx);
-                        });
-                    },
-                ),
-            )
-        })
+        .context_menu(move |menu, _window, _cx| menu.item(copy_summary_menu_item(weak_ctx.clone())))
 }

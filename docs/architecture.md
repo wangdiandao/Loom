@@ -183,12 +183,12 @@ flowchart BT
 | `loom-types` | lib | Cross-platform compact domain models (`ProcessKey`, `ProcessHotSample`, `ProcessColdMeta`, gap-aware `HistoryRing`/`ThroughputRing`, `CpuCoreKind`, `d3_asleep`, `ProcessSocketRecord`, `FileLockHolder`, `LeakWarning`, `WebView2Role`, `TaskManagerReplacementStatus`, `AdminStartupStatus`, hardware snapshots, services, startup entries, sessions, history, `CapabilityFlags`). | No OS or UI dependencies; hot structs use `Copy` POD layouts. |
 | `loom-config` | lib | Local configuration (`settings.toml`: startup page, refresh cadence, theme, locale, window bounds, always-on-top/tray behavior, column preferences, global hotkey, additive v1 process/diagnostic toggles), frozen `v1` (`CONFIG_CONTRACT_VERSION = "1.0"`) forward migrations, atomic writes. | Synchronous load targeting `< 1 ms`; no dependency on platform backends or UI; tolerates unknown future optional keys and rejects unsupported future `schema_version`. |
 | `loom-pal-api` | lib | Frozen `v1` (`PAL_API_CONTRACT_VERSION = 1`) static PAL traits (`PlatformBackend`, `FastSystemSampler`, `SlowMetadataProber`, `ServiceManager`, `StartupManager`, `SessionManager`, `AppHistoryReader`, `SystemOperator` with defaulted additive methods for suspend/resume, Explorer restart, file-lock queries, listening ports, elevated ETW gating, system Task Manager replacement, and persistent administrator startup), caller-reused `SampleScratch` arenas, and `PalError`. | Depends solely on `loom-types`; does not expose raw OS handle or header types. |
-| `loom-pal-windows` | lib | Windows sampling and system control backend (`ntdll` idle-cycle CPU & `ProcessSequenceNumber`, pure `D3DKMT` GPU + `D3` power-gate, guarded `IOCTL`, `SMBIOS`, `SCM`, `WTS`, `WCT`, `MiniDump`, `iphlpapi` ports, Restart Manager file locks, elevated-only ETW process network, plus IFEO Task Manager replacement, Task Scheduler persistent administrator startup, and cross-UIPI single-instance activation). | Compiled only under `cfg(windows)` using `windows-sys`; encapsulates `unsafe` FFI and enforces the six anti-hang constraints. |
+| `loom-pal-windows` | lib | Windows sampling and system control backend organized into focused submodules (`fast_sampler/`, `slow_prober/`, `operator/`, `startup/`, `filelock/`, `perf/{cpu,disk,gpu,mem,net,nvml}`, `services`, `sessions`, `app_history`, `ports`, `etw_net`, `diagnostics`, `taskmgr/`, `admin/`, `install_guard`, `handle`) covering `ntdll` idle-cycle CPU & `ProcessSequenceNumber`, deferred `dxgi.dll` + pure `D3DKMT` GPU + `D3` power-gate, guarded `IOCTL`, `SMBIOS`, `SCM`, `WTS`, `WCT`, `MiniDump`, `iphlpapi` ports, Restart Manager + kernel handle file locks, elevated-only ETW process network, IFEO Task Manager replacement, Task Scheduler persistent administrator startup, and cross-UIPI single-instance activation. | Compiled only under `cfg(windows)` using `windows-sys`; encapsulates `unsafe` FFI behind unified RAII guards (`OwnedHandle`, `OwnedRegKey`, `OwnedModule`, `LocalAllocGuard`, `D3dkmtAdapterGuard`) and enforces the six anti-hang constraints. |
 | `loom-pal-macos` | lib | macOS backend skeleton (`Mach` / `libproc` / `IOKit` / `launchd` targets). | Compiled only under `cfg(target_os = "macos")`; contract stub scheduled for full implementation in `0.3.0`. |
 | `loom-pal-linux` | lib | Linux backend skeleton (`procfs` / `sysfs` / `netlink` / `drm` / `systemd` targets). | Compiled only under `cfg(target_os = "linux")`; contract stub scheduled for full implementation in `0.2.0`. |
 | `loom-pal` | lib | Compile-time platform facade (`pub type NativeBackend = ...`) plus single-instance lock, tray adapter, and power/display observers. | Keeps `#[cfg(target_os)]` conditionals out of upper crates without vtable indirection. |
-| `loom-engine` | lib | Headless sampling and orchestration engine (`EngineCoordinator<B>`, `SnapshotWakeSignal`, delta engine, gap-aware 60-point rings, anti-reuse process tree, structured search + on-demand `:PORT`, row-order & Hold-`Ctrl` freeze, default-ON transitivity-safe sort deadband hysteresis, reusable `ProjectionScratch`, WebView2 host attribution, zero-syscall leak warnings, pre-sorted view projections across all tables, `MonitorLease`). | Prohibits GPUI or multi-thread Tokio; headless-testable against `MockBackend`. |
-| `loom-ui-kit` | lib | Thin composition layer over `gpui-kit`: WCAG 2.1 contrast-verified semantic tokens with per-theme caching (`CachedSemanticColors`), uniform monospace numeric fast-shaping (`MetricDisplay` / static lookup tables), bounded `RowTextCache`, single-line preview capping, heatmap cells, gap-aware sparkline cards, stepped chart ceilings, adaptive core-grid solver (`8%` hysteresis), active GPU engine selection, stable ordering, formula-safe CSV helpers, segmented memory bars, and `rust-i18n` helpers. | No custom `Canvas`/shader drawing; holds no domain state. |
+| `loom-engine` | lib | Headless sampling and orchestration engine split into focused submodules (`coordinator/`, `projection/`, `slow_lane/`, `tree`, `query`, `wake`, `webview2`, `leaks`, `lease`): `EngineCoordinator<B>`, `SnapshotWakeSignal`, delta engine, gap-aware 60-point rings, anti-reuse process tree, structured search + on-demand `:PORT`, row-order & Hold-`Ctrl` freeze, default-ON transitivity-safe sort deadband hysteresis, reusable `ProjectionScratch`, WebView2 host attribution, zero-syscall leak warnings, pre-sorted view projections across all tables, and `MonitorLease`. | Prohibits GPUI or multi-thread Tokio; headless-testable against `MockBackend`. |
+| `loom-ui-kit` | lib | Thin composition layer over `gpui-kit` split into `theme/`, `format/`, `heatmap`, `sparkline`, `memory_bar`, `row_cache`, and `logic`: WCAG 2.1 contrast-verified semantic tokens with per-theme caching (`CachedSemanticColors`), uniform monospace numeric fast-shaping (`MetricDisplay` / static lookup tables), bounded `RowTextCache`, single-line preview capping, heatmap cells, gap-aware sparkline cards, stepped chart ceilings, adaptive core-grid solver (`8%` hysteresis), active GPU engine selection, stable ordering, formula-safe CSV helpers, and segmented memory bars. | No custom `Canvas`/shader drawing; holds no domain state. |
 | `loom-app` | bin | Desktop composition root & feature-sliced UI: priority boost, progressive boot pipeline, `AppShell`, and 8 isolated `features/*` modules. | Feature slices do not cross-import internals; cross-view jumps (`JumpToDetails`, `JumpToServices`) route through `ShellHandle`. |
 
 <a id="feature-sliced-ui-architecture"></a>
@@ -197,26 +197,29 @@ flowchart BT
 
 ```text
 crates/loom-app/src/
-├── main.rs                  # Entrypoint: HIGH_PRIORITY_CLASS boost, single-instance check
-├── bootstrap.rs             # Parallel settings load + EngineCoordinator<NativeBackend> + GPUI window open
+├── main.rs                  # Entrypoint: CLI fast-path, HIGH_PRIORITY_CLASS boost, boot dispatch
+├── bootstrap/               # Progressive boot pipeline (mod.rs, assets.rs, cli.rs, signals.rs)
 ├── bridge/
 │   ├── store.rs             # UiStore: per-domain Arc<*Slice> + Revision subscriptions
 │   ├── commands.rs          # EngineCommand dispatch & ElevationRequired notification prompt
 │   └── monitor_lease.rs     # RAII MonitorLease guard (auto-releases on unmount or minimize)
 ├── shell/
-│   ├── window.rs            # Root-wrapped window (TitleBar search + collapsible Sidebar + outlet)
+│   ├── window/              # Root-wrapped window (mod.rs, chrome.rs, shortcuts.rs)
 │   ├── nav.rs               # Declarative route registry & cross-view NavigationIntent bus
-│   ├── dialogs.rs           # Cross-view shell dialogs only (Run new task / generic confirmations)
-│   └── tray.rs              # Resident tray controller (destroys GPUI window on close to free VRAM)
-└── features/                # 8 autonomous vertical slices with no cross-imports
+│   ├── dialogs/             # Cross-view shell dialogs (run_new_task, confirm_end_task, minidump, file_locks)
+│   ├── diagnostic_summary.rs# Privacy-safe diagnostic & list-telemetry summary formatter
+│   ├── tray.rs              # Resident tray controller (destroys GPUI window on close to free VRAM)
+│   └── tray_overview.rs     # Zero-GPU-when-closed lightweight tray quick-overview popover
+└── features/                # Shared table helpers + 8 autonomous vertical slices (no cross-imports)
+    ├── table_columns/       # Shared column layout, menus, budgeted icon cache, IME search, viewport & telemetry
     ├── processes/           # Categorized groups / parent-child tree toggle + heatmap table + menu
-    ├── performance/         # Left sparkline device rail + CPU/Memory/Disk/Network/GPU views
+    ├── performance/         # Left sparkline rail + revision-cached series + CPU/Memory/Disk/Network/GPU views
     ├── app_history/         # Cumulative resource usage table + clear history action
     ├── startup/             # Startup entries + Last BIOS time + enable/disable controls
     ├── users/               # Expandable user-session process tree + disconnect actions
     ├── details/             # Full-column table/tree + scoped Affinity / Wait Chain dialogs + menu
     ├── services/            # SCM services table + start/stop/restart toolbar + PID jump
-    └── settings/            # Startup page / update speed / always-on-top & tray / theme & locale
+    └── settings/            # Startup page / update speed / always-on-top & tray / theme & locale / privileges
 ```
 
 Feature-specific dialogs (such as `Set affinity` and `Analyze wait chain` inside `features/details/`) remain scoped to their owning slice and open through `gpui-kit`'s `Root` dialog layer, avoiding a monolithic global modal enum in `shell/`.

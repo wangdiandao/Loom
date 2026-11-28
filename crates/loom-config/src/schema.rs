@@ -161,32 +161,15 @@ impl AppSettings {
         self.run_task_history.truncate(MAX_RUN_TASK_HISTORY);
     }
 
-    /// Normalizes `run_task_history` by trimming entries, removing blanks and duplicates,
-    /// and enforcing [`MAX_RUN_TASK_HISTORY`].
-    pub(crate) fn sanitize_run_task_history(&mut self) {
-        let mut cleaned = Vec::with_capacity(self.run_task_history.len().min(MAX_RUN_TASK_HISTORY));
-        for entry in self.run_task_history.drain(..) {
-            let trimmed = entry.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if cleaned.iter().any(|existing: &String| existing == trimmed) {
-                continue;
-            }
-            if trimmed.len() == entry.len() {
-                cleaned.push(entry);
-            } else {
-                cleaned.push(trimmed.to_owned());
-            }
-            if cleaned.len() == MAX_RUN_TASK_HISTORY {
-                break;
-            }
-        }
-        self.run_task_history = cleaned;
+    /// Normalizes all persisted string lists and optional strings in-place.
+    pub(crate) fn sanitize_all(&mut self) {
+        sanitize_string_list(&mut self.run_task_history, Some(MAX_RUN_TASK_HISTORY));
+        self.sanitize_global_hotkey();
+        sanitize_string_list(&mut self.leak_ignored_paths, None);
     }
 
     /// Normalizes `global_hotkey` by trimming whitespace and collapsing blank strings to `None`.
-    pub(crate) fn sanitize_global_hotkey(&mut self) {
+    fn sanitize_global_hotkey(&mut self) {
         self.global_hotkey = self.global_hotkey.take().and_then(|raw| {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -198,30 +181,32 @@ impl AppSettings {
             }
         });
     }
+}
 
-    /// Normalizes `leak_ignored_paths` by trimming whitespace and removing blank or duplicate entries.
-    pub(crate) fn sanitize_leak_ignored_paths(&mut self) {
-        let mut cleaned = Vec::with_capacity(self.leak_ignored_paths.len());
-        for entry in self.leak_ignored_paths.drain(..) {
-            let trimmed = entry.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if cleaned.iter().any(|existing: &String| existing == trimmed) {
-                continue;
-            }
-            if trimmed.len() == entry.len() {
-                cleaned.push(entry);
-            } else {
-                cleaned.push(trimmed.to_owned());
-            }
+/// Trims whitespace, removes empty/duplicate entries, and optionally caps list length.
+fn sanitize_string_list(entries: &mut Vec<String>, max_len: Option<usize>) {
+    let cap = max_len.map_or(entries.len(), |limit| entries.len().min(limit));
+    let mut cleaned = Vec::with_capacity(cap);
+    for entry in entries.drain(..) {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() || cleaned.iter().any(|existing: &String| existing == trimmed) {
+            continue;
         }
-        self.leak_ignored_paths = cleaned;
+        if trimmed.len() == entry.len() {
+            cleaned.push(entry);
+        } else {
+            cleaned.push(trimmed.to_owned());
+        }
+        if max_len.is_some_and(|limit| cleaned.len() == limit) {
+            break;
+        }
     }
+    *entries = cleaned;
 }
 
 /// Parses raw TOML text and applies forward schema migrations up to [`CURRENT_SCHEMA_VERSION`].
 ///
+/// - A leading UTF-8 BOM (`\u{feff}`), common when edited by Windows tools, is stripped cleanly.
 /// - Missing `schema_version` or `schema_version = 0` is migrated forward to
 ///   [`CURRENT_SCHEMA_VERSION`].
 /// - If legacy `resource_display_mode` is set while any of `memory_display_mode`,
@@ -231,6 +216,7 @@ impl AppSettings {
 /// - Schema versions greater than [`CURRENT_SCHEMA_VERSION`] return
 ///   [`ConfigError::UnsupportedSchemaVersion`].
 pub fn migrate_toml_value(raw: &str) -> Result<AppSettings, ConfigError> {
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     let mut table: toml::Table = toml::from_str(raw)?;
 
     let found_version = match table.get("schema_version") {
@@ -264,13 +250,17 @@ pub fn migrate_toml_value(raw: &str) -> Result<AppSettings, ConfigError> {
     }
 
     // Inherit legacy `resource_display_mode` for any per-column display modes omitted
-    // from older configs (both v0 and early v1 scaffolds).
-    if let Some(legacy_mode) = table.get("resource_display_mode").cloned() {
-        for key in [
-            "memory_display_mode",
-            "disk_display_mode",
-            "network_display_mode",
-        ] {
+    // from older configs (both v0 and early v1 scaffolds). Avoid cloning when all three
+    // per-column keys are already present.
+    const COLUMN_DISPLAY_KEYS: [&str; 3] = [
+        "memory_display_mode",
+        "disk_display_mode",
+        "network_display_mode",
+    ];
+    if COLUMN_DISPLAY_KEYS.iter().any(|k| !table.contains_key(*k))
+        && let Some(legacy_mode) = table.get("resource_display_mode").cloned()
+    {
+        for key in COLUMN_DISPLAY_KEYS {
             if !table.contains_key(key) {
                 table.insert(key.to_owned(), legacy_mode.clone());
             }
@@ -279,8 +269,6 @@ pub fn migrate_toml_value(raw: &str) -> Result<AppSettings, ConfigError> {
 
     let mut settings: AppSettings = toml::Value::Table(table).try_into()?;
     settings.schema_version = CURRENT_SCHEMA_VERSION;
-    settings.sanitize_run_task_history();
-    settings.sanitize_global_hotkey();
-    settings.sanitize_leak_ignored_paths();
+    settings.sanitize_all();
     Ok(settings)
 }

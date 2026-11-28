@@ -7,6 +7,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, div, linear_color_stop, linear_gradient, px,
 };
 
+use crate::format::format_u32_shared;
 use crate::theme::LoomSemanticColors;
 
 /// Sentinel permille value (`u16::MAX`) indicating a missing, paused, or
@@ -282,7 +283,7 @@ pub fn sparkline_card(props: SparklineCardProps, colors: &LoomSemanticColors) ->
 
     let chart = AreaChart::new(props.points)
         .id(chart_id)
-        .x(|point: &SparklinePoint| SharedString::from(point.index.to_string()))
+        .x(|point: &SparklinePoint| format_u32_shared(point.index as u32))
         .y(|point: &SparklinePoint| point.value)
         .linear()
         .stroke(props.accent_color)
@@ -332,7 +333,6 @@ pub fn sparkline_card(props: SparklineCardProps, colors: &LoomSemanticColors) ->
         .border_1()
         .border_color(border)
         .bg(bg)
-        .cursor_pointer()
         .hover(move |style| style.bg(hover_bg))
         .child(
             h_flex()
@@ -386,4 +386,131 @@ pub fn sparkline_card(props: SparklineCardProps, colors: &LoomSemanticColors) ->
                         .child(props.subtitle),
                 ),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::component::{Theme, ThemeColor, ThemeMode};
+
+    use crate::theme::LoomSemanticColors;
+
+    use super::{
+        GapAwareSparklinePoint, PERMILLE_GAP_SENTINEL, SparklineCardProps, SparklinePoint,
+        sparkline_card,
+    };
+
+    #[test]
+    fn sparkline_points_helpers() {
+        let from_f32 = SparklinePoint::from_slice(&[10.0, 25.5, 80.0]);
+        assert_eq!(
+            from_f32,
+            vec![
+                SparklinePoint::new(0, 10.0),
+                SparklinePoint::new(1, 25.5),
+                SparklinePoint::new(2, 80.0),
+            ]
+        );
+
+        let from_permille = SparklinePoint::from_permille_iter([0, 125, 1000]);
+        assert_eq!(
+            from_permille,
+            vec![
+                SparklinePoint::new(0, 0.0),
+                SparklinePoint::new(1, 12.5),
+                SparklinePoint::new(2, 100.0),
+            ]
+        );
+
+        let padded = SparklinePoint::from_permille_padded([250, 500], 4);
+        assert_eq!(
+            padded,
+            vec![
+                SparklinePoint::new(0, 0.0),
+                SparklinePoint::new(1, 0.0),
+                SparklinePoint::new(2, 25.0),
+                SparklinePoint::new(3, 50.0),
+            ]
+        );
+
+        let truncated = SparklinePoint::from_f32_padded([1.0, 2.0, 3.0, 4.0], 2);
+        assert_eq!(
+            truncated,
+            vec![SparklinePoint::new(0, 3.0), SparklinePoint::new(1, 4.0)]
+        );
+    }
+
+    #[test]
+    fn gap_aware_sparkline_helpers_and_card_construction() {
+        let window =
+            SparklinePoint::from_opt_f32_window([Some(10.0), None, Some(f32::NAN), Some(40.0)], 6);
+        assert_eq!(window.len(), 6);
+        assert!(window[0].is_gap());
+        assert!(window[1].is_gap());
+        assert_eq!(window[2], GapAwareSparklinePoint::new(2, Some(10.0)));
+        assert!(window[3].is_gap());
+        assert!(window[4].is_gap());
+        assert_eq!(window[5], GapAwareSparklinePoint::new(5, Some(40.0)));
+
+        let segments = SparklinePoint::from_opt_f32_segments(
+            [
+                Some(12.0),
+                Some(18.0),
+                None,
+                Some(f32::INFINITY),
+                Some(45.0),
+            ],
+            6,
+        );
+        assert_eq!(
+            segments,
+            vec![
+                vec![SparklinePoint::new(1, 12.0), SparklinePoint::new(2, 18.0)],
+                vec![SparklinePoint::new(5, 45.0)],
+            ]
+        );
+
+        let permille_segs = SparklinePoint::from_permille_sentinel_segments(
+            [100, PERMILLE_GAP_SENTINEL, 250, 500],
+            4,
+        );
+        assert_eq!(
+            permille_segs,
+            vec![
+                vec![SparklinePoint::new(0, 10.0)],
+                vec![SparklinePoint::new(2, 25.0), SparklinePoint::new(3, 50.0)],
+            ]
+        );
+
+        let finite_segs = SparklinePoint::from_f32_gap_safe_segments([5.0, f32::NAN, 15.0], 3);
+        assert_eq!(
+            finite_segs,
+            vec![
+                vec![SparklinePoint::new(0, 5.0)],
+                vec![SparklinePoint::new(2, 15.0)],
+            ]
+        );
+
+        let padded = SparklinePoint::from_opt_f32_padded([Some(10.0), None, Some(30.0)], 5);
+        assert_eq!(
+            padded,
+            vec![SparklinePoint::new(2, 10.0), SparklinePoint::new(4, 30.0)]
+        );
+
+        let mut theme = Theme::from(ThemeColor::dark().as_ref());
+        theme.mode = ThemeMode::Dark;
+        let colors = LoomSemanticColors::from_theme(&theme);
+        let _card = sparkline_card(
+            SparklineCardProps {
+                id: "cpu".into(),
+                title: "CPU".into(),
+                subtitle: "3.82 GHz".into(),
+                primary_metric: "14%".into(),
+                points: SparklinePoint::from_slice(&[5.0, 12.0, 14.0]),
+                y_max: 100.0,
+                accent_color: colors.chart_cpu,
+                selected: true,
+            },
+            &colors,
+        );
+    }
 }

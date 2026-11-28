@@ -401,23 +401,16 @@ fn is_csv_formula_trigger(value: &str) -> bool {
     false
 }
 
-/// Formats a single CSV cell safely per RFC 4180 while defending against
-/// spreadsheet formula injection (CSV / DDE injection).
-///
-/// If `value` begins with `=`, `+`, `-`, `@`, `\t`, or `\r` (including after
-/// arbitrary leading whitespace), a leading single quote (`'`) is prepended so
-/// Excel, LibreOffice Calc, and Google Sheets treat the cell strictly as text.
-/// If the resulting text contains `,`, `"`, `\n`, or `\r`, it is enclosed in
-/// double quotes with internal `"` characters doubled.
-pub fn format_csv_cell(value: &str) -> String {
+/// Appends a single RFC 4180 + formula-injection-safe CSV cell directly into `out`.
+fn push_csv_cell(out: &mut String, value: &str) {
     let needs_formula_escape = is_csv_formula_trigger(value);
     let needs_quoting = value.contains([',', '"', '\n', '\r']);
 
     if !needs_formula_escape && !needs_quoting {
-        return value.to_owned();
+        out.push_str(value);
+        return;
     }
 
-    let mut out = String::with_capacity(value.len() + 4);
     if needs_quoting {
         out.push('"');
     }
@@ -435,13 +428,32 @@ pub fn format_csv_cell(value: &str) -> String {
     } else {
         out.push_str(value);
     }
+}
+
+/// Formats a single CSV cell safely per RFC 4180 while defending against
+/// spreadsheet formula injection (CSV / DDE injection).
+///
+/// If `value` begins with `=`, `+`, `-`, `@`, `\t`, or `\r` (including after
+/// arbitrary leading whitespace), a leading single quote (`'`) is prepended so
+/// Excel, LibreOffice Calc, and Google Sheets treat the cell strictly as text.
+/// If the resulting text contains `,`, `"`, `\n`, or `\r`, it is enclosed in
+/// double quotes with internal `"` characters doubled.
+pub fn format_csv_cell(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 4);
+    push_csv_cell(&mut out, value);
     out
 }
 
 /// Builds a complete UTF-8 BOM + CRLF RFC 4180 CSV document using
 /// [`format_csv_cell`] on every header and data cell.
 pub fn build_csv_document(headers: &[&str], rows: &[Vec<String>]) -> String {
-    let mut out = String::new();
+    let estimated_bytes = 3
+        + headers.iter().map(|h| h.len() + 1).sum::<usize>()
+        + rows
+            .iter()
+            .map(|r| r.iter().map(|c| c.len() + 2).sum::<usize>() + 2)
+            .sum::<usize>();
+    let mut out = String::with_capacity(estimated_bytes);
     out.push(CSV_UTF8_BOM);
 
     if !headers.is_empty() {
@@ -449,7 +461,7 @@ pub fn build_csv_document(headers: &[&str], rows: &[Vec<String>]) -> String {
             if i > 0 {
                 out.push(',');
             }
-            out.push_str(&format_csv_cell(header));
+            push_csv_cell(&mut out, header);
         }
         out.push_str("\r\n");
     }
@@ -459,7 +471,7 @@ pub fn build_csv_document(headers: &[&str], rows: &[Vec<String>]) -> String {
             if i > 0 {
                 out.push(',');
             }
-            out.push_str(&format_csv_cell(cell));
+            push_csv_cell(&mut out, cell);
         }
         out.push_str("\r\n");
     }
@@ -492,4 +504,221 @@ pub fn merge_stable_order<K: Eq + Clone>(
         }
     }
     ordered_indices
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stepped_throughput_ceiling_covers_all_clean_steps_and_high_rates() {
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * KIB;
+        const GIB: u64 = 1024 * MIB;
+
+        assert_eq!(stepped_throughput_ceiling(0), (100.0, "KB/s", KIB as f64));
+        assert_eq!(
+            stepped_throughput_ceiling(100 * KIB),
+            (100.0, "KB/s", KIB as f64)
+        );
+        assert_eq!(
+            stepped_throughput_ceiling(100 * KIB + 1),
+            (200.0, "KB/s", KIB as f64)
+        );
+        assert_eq!(
+            stepped_throughput_ceiling(350 * KIB),
+            (500.0, "KB/s", KIB as f64)
+        );
+        assert_eq!(
+            stepped_throughput_ceiling(500 * KIB + 1),
+            (1.0, "MB/s", MIB as f64)
+        );
+        assert_eq!(
+            stepped_throughput_ceiling(15 * MIB),
+            (20.0, "MB/s", MIB as f64)
+        );
+        assert_eq!(
+            stepped_throughput_ceiling(150 * MIB),
+            (200.0, "MB/s", MIB as f64)
+        );
+        assert_eq!(
+            stepped_throughput_ceiling(600 * MIB),
+            (1.0, "GB/s", GIB as f64)
+        );
+        assert_eq!(
+            stepped_throughput_ceiling(3 * GIB),
+            (5.0, "GB/s", GIB as f64)
+        );
+        assert_eq!(
+            stepped_throughput_ceiling(50 * GIB),
+            (50.0, "GB/s", GIB as f64)
+        );
+
+        let (y_max, unit, div) = stepped_throughput_ceiling(50 * GIB + 1);
+        assert_eq!((y_max, unit, div), (100.0, "GB/s", GIB as f64));
+        assert!(y_max * div >= (50 * GIB + 1) as f64);
+
+        let (y_max_hi, unit_hi, div_hi) = stepped_throughput_ceiling(120 * GIB);
+        assert_eq!((y_max_hi, unit_hi, div_hi), (200.0, "GB/s", GIB as f64));
+    }
+
+    #[test]
+    fn stepped_network_ceiling_snaps_bytes_to_clean_bit_steps() {
+        assert_eq!(stepped_network_ceiling(0), (100.0, "Kbps", 125.0));
+        assert_eq!(stepped_network_ceiling(12_500), (100.0, "Kbps", 125.0));
+        assert_eq!(stepped_network_ceiling(12_501), (250.0, "Kbps", 125.0));
+        assert_eq!(stepped_network_ceiling(40_000), (500.0, "Kbps", 125.0));
+        assert_eq!(stepped_network_ceiling(125_000), (1.0, "Mbps", 125_000.0));
+        assert_eq!(stepped_network_ceiling(200_000), (2.0, "Mbps", 125_000.0));
+        assert_eq!(
+            stepped_network_ceiling(2_000_000),
+            (25.0, "Mbps", 125_000.0)
+        );
+        assert_eq!(
+            stepped_network_ceiling(200_000_000),
+            (2.5, "Gbps", 125_000_000.0)
+        );
+        assert_eq!(
+            stepped_network_ceiling(4_000_000_000),
+            (40.0, "Gbps", 125_000_000.0)
+        );
+        assert_eq!(
+            stepped_network_ceiling(12_500_000_000),
+            (100.0, "Gbps", 125_000_000.0)
+        );
+
+        let (y_hi, unit_hi, div_hi) = stepped_network_ceiling(15_000_000_000);
+        assert_eq!((y_hi, unit_hi, div_hi), (200.0, "Gbps", 125_000_000.0));
+        assert!(15_000_000_000.0 / div_hi <= y_hi);
+
+        let (y_max, unit_max, div_max) = stepped_network_ceiling(u64::MAX);
+        assert_eq!(unit_max, "Gbps");
+        assert!(y_max.is_finite() && y_max * div_max >= u64::MAX as f64);
+    }
+
+    #[test]
+    fn core_grid_layout_scoring_hysteresis_and_header_degradation() {
+        let empty = compute_core_grid_layout(0, 800.0, 500.0, None);
+        assert_eq!(empty.columns, 0);
+        assert_eq!(empty.rows, 0);
+
+        let l16 = compute_core_grid_layout(16, 1000.0, 600.0, None);
+        assert_eq!(l16.columns, 4);
+        assert_eq!(l16.rows, 4);
+        assert_eq!(l16.header_mode, CoreCardHeaderMode::Full);
+
+        let l24 = compute_core_grid_layout(24, 1000.0, 600.0, None);
+        assert_eq!(l24.columns, 6);
+        assert_eq!(l24.rows, 4);
+        assert_eq!(l24.header_mode, CoreCardHeaderMode::Full);
+
+        let l128 = compute_core_grid_layout(128, 1200.0, 500.0, None);
+        assert!(l128.columns <= 16 && l128.columns >= 8);
+        assert_eq!(l128.rows, 128usize.div_ceil(l128.columns));
+
+        let tall = compute_core_grid_layout(64, 1600.0, 460.0, None);
+        let medium = compute_core_grid_layout(64, 1600.0, 260.0, Some(tall.columns));
+        let tight = compute_core_grid_layout(64, 1600.0, 180.0, Some(medium.columns));
+        assert_eq!(tall.columns, 16);
+        assert_eq!(tall.header_mode, CoreCardHeaderMode::Full);
+        assert_eq!(medium.header_mode, CoreCardHeaderMode::Short);
+        assert_eq!(tight.header_mode, CoreCardHeaderMode::Hidden);
+        assert!(tall.card_height_px > medium.card_height_px);
+        assert!(medium.card_height_px > tight.card_height_px);
+
+        let mut transition_w = None;
+        let mut prev_cold = compute_core_grid_layout(8, 300.0, 500.0, None).columns;
+        for w in (302..=1200).step_by(2) {
+            let cur = compute_core_grid_layout(8, w as f32, 500.0, None).columns;
+            if cur != prev_cold {
+                transition_w = Some((w as f32, prev_cold, cur));
+                break;
+            }
+            prev_cold = cur;
+        }
+        let (cross_w, left_cols, right_cols) =
+            transition_w.expect("8 cores should have a column crossover between 300px and 1200px");
+
+        let held_right = compute_core_grid_layout(8, cross_w, 500.0, Some(left_cols));
+        assert_eq!(held_right.columns, left_cols);
+
+        let held_left = compute_core_grid_layout(8, cross_w - 2.0, 500.0, Some(right_cols));
+        assert_eq!(held_left.columns, right_cols);
+    }
+
+    #[test]
+    fn select_active_gpu_engines_filters_sorts_and_falls_back() {
+        assert!(select_active_gpu_engines(&[], 4).is_empty());
+        assert!(select_active_gpu_engines(&[(0, 500)], 0).is_empty());
+
+        let active =
+            select_active_gpu_engines(&[(0, 5), (1, 120), (2, 10), (3, 120), (4, 850), (5, 9)], 3);
+        assert_eq!(active, vec![4, 1, 3]);
+
+        let boundary = select_active_gpu_engines(&[(0, 9), (2, 10)], 4);
+        assert_eq!(boundary, vec![2]);
+
+        let all_zero = select_active_gpu_engines(&[(2, 0), (0, 0), (1, 0)], 4);
+        assert_eq!(all_zero, vec![0]);
+
+        let sub_threshold = select_active_gpu_engines(&[(0, 2), (1, 8), (2, 8)], 4);
+        assert_eq!(sub_threshold, vec![1]);
+    }
+
+    #[test]
+    fn csv_helpers_prevent_formula_injection_and_follow_rfc4180() {
+        assert_eq!(format_csv_cell("loom.exe"), "loom.exe");
+        assert_eq!(format_csv_cell("1234"), "1234");
+        assert_eq!(format_csv_cell("a=b"), "a=b");
+
+        assert_eq!(format_csv_cell("=1+1"), "'=1+1");
+        assert_eq!(format_csv_cell("+cmd|' /C calc'!A0"), "'+cmd|' /C calc'!A0");
+        assert_eq!(format_csv_cell("-2+3"), "'-2+3");
+        assert_eq!(format_csv_cell("@SUM(A1:A2)"), "'@SUM(A1:A2)");
+        assert_eq!(format_csv_cell("\t=1+1"), "'\t=1+1");
+        assert_eq!(format_csv_cell("\rfoo"), "\"'\rfoo\"");
+
+        assert_eq!(
+            format_csv_cell("   =HYPERLINK(\"http://x\",\"y\")"),
+            "\"'   =HYPERLINK(\"\"http://x\"\",\"\"y\"\")\""
+        );
+        assert_eq!(format_csv_cell("  +1"), "'  +1");
+        assert_eq!(format_csv_cell(" \n -bad"), "\"' \n -bad\"");
+
+        assert_eq!(format_csv_cell("a, b"), "\"a, b\"");
+        assert_eq!(format_csv_cell("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(format_csv_cell("line1\nline2"), "\"line1\nline2\"");
+
+        let doc = build_csv_document(
+            &["Name", "PID", "Cmd"],
+            &[
+                vec!["app.exe".into(), "42".into(), "=cmd, \"arg\"".into()],
+                vec!["safe.exe".into(), "99".into(), "normal".into()],
+            ],
+        );
+        assert!(doc.starts_with(CSV_UTF8_BOM));
+        assert_eq!(
+            doc,
+            "\u{FEFF}Name,PID,Cmd\r\napp.exe,42,\"'=cmd, \"\"arg\"\"\"\r\nsafe.exe,99,normal\r\n"
+        );
+    }
+
+    #[test]
+    fn merge_stable_order_preserves_open_order_appends_new_and_omits_removed() {
+        let mut pinned: Vec<&str> = Vec::new();
+
+        let first = merge_stable_order(&mut pinned, &["A", "B", "C"]);
+        assert_eq!(first, vec![0, 1, 2]);
+        assert_eq!(pinned, vec!["A", "B", "C"]);
+
+        let second = merge_stable_order(&mut pinned, &["C", "A"]);
+        assert_eq!(second, vec![1, 0]);
+
+        let third = merge_stable_order(&mut pinned, &["D", "C", "A"]);
+        assert_eq!(third, vec![2, 1, 0]);
+        assert_eq!(pinned, vec!["A", "B", "C", "D"]);
+
+        let fourth = merge_stable_order(&mut pinned, &["B", "D", "C", "A"]);
+        assert_eq!(fourth, vec![3, 0, 2, 1]);
+    }
 }

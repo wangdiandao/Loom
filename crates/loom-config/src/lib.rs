@@ -839,4 +839,13 @@ theme = "Dark"
         );
         assert!(reloaded.hide_windows_system_processes);
     }
+
+    #[test]
+    fn utf8_bom_prefixed_settings_load_cleanly() {
+        let bom_toml = "\u{feff}schema_version = 1\ntheme = \"Dark\"\nlanguage = \"EnUs\"\n";
+        let parsed = migrate_toml_value(bom_toml).expect("BOM-prefixed TOML must parse");
+        assert_eq!(parsed.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(parsed.theme, ThemePreference::Dark);
+        assert_eq!(parsed.language, LanguagePreference::EnUs);
+    }
 }

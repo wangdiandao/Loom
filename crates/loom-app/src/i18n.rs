@@ -11,6 +11,14 @@ pub(crate) fn apply_locale(preference: LanguagePreference) {
     rust_i18n::set_locale(preference.locale_tag());
 }
 
+/// Serializes unit/GPUI tests that mutate global `rust-i18n` locale state or assert
+/// locale-dependent translations so parallel test execution stays deterministic.
+#[cfg(test)]
+pub(crate) fn locale_test_lock() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCALE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    LOCALE_TEST_LOCK.lock()
+}
+
 /// Returns the localized translation string for `key` using the currently active locale.
 #[inline]
 pub(crate) fn tr(key: &str) -> String {
@@ -556,13 +564,9 @@ mod tests {
         "app_history.empty",
     ];
 
-    use std::sync::Mutex;
-
-    static LOCALE_TEST_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn zh_cn_and_en_us_cover_all_core_keys_and_switch_live() {
-        let _guard = LOCALE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = locale_test_lock();
         for &key in CORE_KEYS {
             apply_locale(LanguagePreference::EnUs);
             let en = tr(key);
@@ -609,7 +613,7 @@ mod tests {
 
     #[test]
     fn process_category_and_virtualization_labels_adapt_to_platform_profile() {
-        let _guard = LOCALE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = locale_test_lock();
 
         apply_locale(LanguagePreference::EnUs);
         assert_eq!(
