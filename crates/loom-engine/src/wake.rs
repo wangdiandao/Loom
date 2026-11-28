@@ -61,22 +61,32 @@ impl SnapshotWakeSignal {
 
     /// Signals all waiting async tasks, channel subscribers, and callbacks non-blockingly.
     pub fn notify(&self) {
-        let callbacks = {
+        let (callbacks, immediate_wakers) = {
             let mut state = self.inner.lock();
             if state.closed {
                 return;
             }
             state.pending = true;
-            state.callbacks.clone()
+            if state.callbacks.is_empty() {
+                state.channels.retain(|tx| match tx.try_send(()) {
+                    Ok(()) | Err(TrySendError::Full(())) => true,
+                    Err(TrySendError::Disconnected(())) => false,
+                });
+                (Vec::new(), Some(std::mem::take(&mut state.wakers)))
+            } else {
+                (state.callbacks.clone(), None)
+            }
         };
 
-        // Invoke callbacks before unblocking channel/async waiters so any observer
-        // woken via `subscribe_channel` or `wait` sees callback side effects immediately.
-        for cb in callbacks {
-            cb();
-        }
+        let wakers = if let Some(wakers) = immediate_wakers {
+            wakers
+        } else {
+            // Invoke callbacks before unblocking channel/async waiters so any observer
+            // woken via `subscribe_channel` or `wait` sees callback side effects immediately.
+            for cb in callbacks {
+                cb();
+            }
 
-        let wakers = {
             let mut state = self.inner.lock();
             if state.closed {
                 return;
@@ -159,7 +169,9 @@ impl Future for NextSnapshotWake {
         if state.closed {
             return Poll::Ready(false);
         }
-        state.wakers.push(cx.waker().clone());
+        if !state.wakers.iter().any(|w| w.will_wake(cx.waker())) {
+            state.wakers.push(cx.waker().clone());
+        }
         Poll::Pending
     }
 }
@@ -228,5 +240,28 @@ mod tests {
         signal.close();
         assert_eq!(Pin::new(&mut fut2).poll(&mut cx), Poll::Ready(false));
         assert!(rx.recv().is_err());
+    }
+
+    #[test]
+    fn wake_signal_deduplicates_repeated_pending_polls_without_callbacks() {
+        let signal = SnapshotWakeSignal::new();
+        let rx = signal.subscribe_channel();
+        let wake_hits = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(Arc::clone(&wake_hits));
+        let mut cx = Context::from_waker(&waker);
+
+        let mut fut = signal.wait();
+        assert_eq!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending);
+        assert_eq!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending);
+        assert_eq!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending);
+
+        signal.notify();
+        assert_eq!(
+            wake_hits.load(Ordering::Acquire),
+            1,
+            "repeated polls of the same waker must be deduplicated"
+        );
+        assert_eq!(Pin::new(&mut fut).poll(&mut cx), Poll::Ready(true));
+        assert!(rx.try_recv().is_ok());
     }
 }

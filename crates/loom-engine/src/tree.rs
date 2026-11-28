@@ -88,6 +88,7 @@ pub struct ProcessTree {
     children_keys: Vec<Vec<ProcessKey>>,
     children_indices: Vec<Vec<usize>>,
     roots: Vec<ProcessKey>,
+    parent_pids_scratch: Vec<u32>,
     state_scratch: Vec<u8>,
     chain_scratch: Vec<usize>,
 }
@@ -114,10 +115,10 @@ impl ProcessTree {
         self.pid_to_idx.clear();
         self.parent_idx.clear();
         self.roots.clear();
+        self.parent_pids_scratch.clear();
 
-        if self.nodes.capacity() < cap {
-            self.nodes.reserve(cap - self.nodes.capacity());
-        }
+        self.nodes.reserve(cap);
+        self.parent_pids_scratch.reserve(cap);
         if self.key_to_idx.capacity() < cap {
             self.key_to_idx.reserve(cap);
         }
@@ -126,14 +127,13 @@ impl ProcessTree {
         }
 
         // Dense indexing of unique ProcessKeys plus PID -> oldest live index lookup.
-        let mut parent_pids: Vec<u32> = Vec::with_capacity(cap);
         for &(key, parent_pid) in entries {
             if self.key_to_idx.contains_key(&key) {
                 continue;
             }
             let idx = self.nodes.len();
             self.nodes.push(key);
-            parent_pids.push(parent_pid);
+            self.parent_pids_scratch.push(parent_pid);
             self.key_to_idx.insert(key, idx);
 
             self.pid_to_idx
@@ -152,7 +152,7 @@ impl ProcessTree {
         // Step 1: Resolve tentative parent edges validated by creation timestamp.
         for idx in 0..n {
             let key = self.nodes[idx];
-            let ppid = parent_pids[idx];
+            let ppid = self.parent_pids_scratch[idx];
             if let Some(&p_idx) = self.pid_to_idx.get(&ppid)
                 && self.nodes[p_idx].is_valid_parent_of(key)
             {
@@ -262,6 +262,9 @@ impl ProcessTree {
 
     #[inline]
     pub(crate) fn children_indices(&self, idx: usize) -> &[usize] {
+        if idx >= self.nodes.len() {
+            return &[];
+        }
         self.children_indices
             .get(idx)
             .map(Vec::as_slice)
@@ -282,7 +285,7 @@ impl ProcessTree {
 /// overflow the stack or loop indefinitely.
 pub fn collect_bottom_up_kill_order(tree: &ProcessTree, root_key: ProcessKey) -> Vec<ProcessKey> {
     let mut order = Vec::new();
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::with_hasher(FastBuildHasher);
     let mut stack: Vec<(ProcessKey, bool)> = Vec::new();
 
     if visited.insert(root_key) {
@@ -348,5 +351,20 @@ mod tests {
         let order = collect_bottom_up_kill_order(&tree, root);
 
         assert_eq!(order, vec![leaf1, leaf2, mid, root]);
+    }
+
+    #[test]
+    fn rebuild_shrink_never_exposes_stale_trailing_children_indices() {
+        let root = ProcessKey::new(1, 100);
+        let child = ProcessKey::new(2, 200);
+        let grandchild = ProcessKey::new(3, 300);
+
+        let mut tree = ProcessTree::build(&[(root, 0), (child, 1), (grandchild, 2)]);
+        assert_eq!(tree.children_indices(1), &[2]);
+
+        tree.rebuild(&[(root, 0)]);
+        assert_eq!(tree.len(), 1);
+        assert!(tree.children_indices(0).is_empty());
+        assert!(tree.children_indices(1).is_empty());
     }
 }
