@@ -2,24 +2,38 @@
 //! and **Select columns** dialog shared by the Processes and Details `DataTable` slices.
 
 use std::collections::HashMap;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::table::{DataTable, TableDelegate, TableState};
-use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, Size, WindowExt as _, v_flex};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{
+    ActiveTheme as _, Icon, IconName, Sizable as _, Size, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Pixels, Render, RenderImage, SharedString, Styled as _, Window, div, px,
+    App, AppContext as _, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, GlobalElementId, Hsla, InspectorElementId,
+    InteractiveElement as _, IntoElement, LayoutId, ParentElement as _, Pixels, Position, Render,
+    RenderImage, SharedString, StatefulInteractiveElement as _, Style, Styled as _, Window, div,
+    px,
 };
 use loom_config::TableColumnSetting;
-use loom_types::ExeIconRgba;
-use loom_ui_kit::rgba_icon_to_render_image;
+use loom_engine::EngineCommand;
+use loom_types::{
+    CapabilityFlags, ExeIconRgba, LeakWarning, ProcessKey, ProcessStatusFlags, WebView2Role,
+};
+use loom_ui_kit::{build_csv_document, rgba_icon_to_render_image};
 
+use crate::bridge::{UiCommands, UiStore};
 use crate::i18n;
 
 /// Maximum number of cached GPUI [`RenderImage`] icons retained by [`IconRenderCache`].
@@ -262,7 +276,6 @@ impl<C: ColumnKey> TableColumnLayout<C> {
     }
 
     /// Returns the cached slice of currently visible columns in display order (`O(1)`).
-    #[cfg(test)]
     #[inline]
     pub(crate) fn visible_columns(&self) -> &[ColumnSpec<C>] {
         &self.visible
@@ -685,6 +698,763 @@ pub(crate) fn open_select_columns_dialog(
     });
 }
 
+// ---------------------------------------------------------------------------
+// Pause-sort-on-hover state machine and header indicator
+// ---------------------------------------------------------------------------
+
+/// Pure state machine coordinating row-order freezing across table body hover,
+/// column header hover, and open row context menus.
+///
+/// Row order freezes while hovering the table body (unless hovering the column
+/// header to click-sort) or while any row context menu is open.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OrderFreezeState {
+    table_hovered: bool,
+    header_hovered: bool,
+    context_menu_open: bool,
+    frozen: bool,
+}
+
+impl OrderFreezeState {
+    /// Returns whether row order is currently frozen.
+    #[inline]
+    pub(crate) const fn is_frozen(&self) -> bool {
+        self.frozen
+    }
+
+    #[inline]
+    const fn desired(&self) -> bool {
+        (self.table_hovered && !self.header_hovered) || self.context_menu_open
+    }
+
+    #[inline]
+    fn reconcile(&mut self) -> Option<bool> {
+        let next = self.desired();
+        if next != self.frozen {
+            self.frozen = next;
+            Some(next)
+        } else {
+            None
+        }
+    }
+
+    /// Updates table hover state and returns `Some(new_frozen)` when freeze transitions.
+    pub(crate) fn set_table_hovered(&mut self, hovered: bool) -> Option<bool> {
+        self.table_hovered = hovered;
+        if !hovered {
+            self.header_hovered = false;
+        }
+        self.reconcile()
+    }
+
+    /// Updates column-header hover state and returns `Some(new_frozen)` when freeze transitions.
+    pub(crate) fn set_header_hovered(&mut self, hovered: bool) -> Option<bool> {
+        self.header_hovered = hovered;
+        self.reconcile()
+    }
+
+    /// Updates row context-menu open state and returns `Some(new_frozen)` when freeze transitions.
+    pub(crate) fn set_context_menu_open(&mut self, open: bool) -> Option<bool> {
+        self.context_menu_open = open;
+        self.reconcile()
+    }
+}
+
+/// Renders a subtle amber paused-sort indicator icon on the active sort column header.
+pub(crate) fn sort_paused_indicator(
+    id: (&'static str, usize),
+    accent_color: Hsla,
+) -> impl IntoElement {
+    let tip = SharedString::from(i18n::tr("proc_ux_sort_paused_tooltip"));
+    h_flex()
+        .id(id)
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .size(px(16.0))
+        .rounded_full()
+        .bg(accent_color.opacity(0.16))
+        .aria_label(tip.clone())
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .child(
+            Icon::new(IconName::Pause)
+                .size(px(10.0))
+                .text_color(accent_color),
+        )
+}
+
+// ---------------------------------------------------------------------------
+// Direct type-to-search with CJK IME composition state machine & input bridge
+// ---------------------------------------------------------------------------
+
+/// Pure UTF-8 / UTF-16 state machine for direct table type-to-search with CJK IME composition.
+///
+/// Uncommitted IME preedit text is tracked in `marked_range` without mutating `committed`,
+/// so cancelling composition (via Escape or empty commit) leaves the previous query intact,
+/// while committing text immediately updates the global search query.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct TypeToSearchState {
+    committed: String,
+    buffer: String,
+    marked_range: Option<Range<usize>>,
+}
+
+impl TypeToSearchState {
+    /// Synchronizes committed text from the global store when no IME composition is active.
+    pub(crate) fn sync_committed(&mut self, query: &str) {
+        if self.marked_range.is_none() && self.committed != query {
+            self.committed.clear();
+            self.committed.push_str(query);
+            self.buffer.clear();
+            self.buffer.push_str(query);
+        }
+    }
+
+    /// Returns `true` when an IME preedit composition is currently active.
+    #[inline]
+    pub(crate) fn is_composing(&self) -> bool {
+        self.marked_range.is_some()
+    }
+
+    /// Returns the currently active IME preedit text, if any.
+    pub(crate) fn preedit_text(&self) -> Option<&str> {
+        let range = self.marked_range.as_ref()?;
+        self.buffer
+            .get(range.start..range.end)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Returns the UTF-16 length of the current text buffer.
+    pub(crate) fn utf16_len(&self) -> usize {
+        self.offset_to_utf16(self.buffer.len())
+    }
+
+    /// Returns the current caret range (collapsed at the end of the buffer) in UTF-16 units.
+    pub(crate) fn selected_utf16_range(&self) -> Range<usize> {
+        let end = self.utf16_len();
+        end..end
+    }
+
+    /// Returns the active IME marked text range in UTF-16 units, if composing.
+    pub(crate) fn marked_utf16_range(&self) -> Option<Range<usize>> {
+        self.marked_range
+            .as_ref()
+            .map(|r| self.range_to_utf16(r.clone()))
+    }
+
+    /// Extracts text for a UTF-16 range and returns `(adjusted_utf16_range, text)`.
+    pub(crate) fn text_for_utf16_range(&self, range_utf16: Range<usize>) -> (Range<usize>, String) {
+        let utf8 = self.range_from_utf16(range_utf16);
+        let adjusted = self.range_to_utf16(utf8.clone());
+        let text = self.buffer.get(utf8).unwrap_or_default().to_owned();
+        (adjusted, text)
+    }
+
+    /// Updates or cancels uncommitted IME preedit text without altering `committed`.
+    pub(crate) fn replace_and_mark(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        store_query: &str,
+    ) {
+        if self.marked_range.is_none() {
+            self.sync_committed(store_query);
+        }
+
+        let target = range_utf16
+            .map(|r| self.range_from_utf16(r))
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or(self.buffer.len()..self.buffer.len());
+
+        let sanitized = sanitize_search_input(new_text);
+        if sanitized.is_empty() {
+            self.buffer.clear();
+            self.buffer.push_str(&self.committed);
+            self.marked_range = None;
+            return;
+        }
+
+        self.buffer.replace_range(target.clone(), &sanitized);
+        self.marked_range = Some(target.start..target.start + sanitized.len());
+    }
+
+    /// Commits typed or IME-composed text into the search query.
+    ///
+    /// Returns `Some(next_query)` when the committed search query changed and should
+    /// be dispatched via `UiCommands::set_search_query`. Cancelling an active composition
+    /// with an empty string restores the previous `committed` query and returns `None`.
+    pub(crate) fn replace_text(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        store_query: &str,
+    ) -> Option<String> {
+        let was_composing = self.marked_range.is_some();
+        if !was_composing {
+            self.sync_committed(store_query);
+        }
+
+        let sanitized = sanitize_search_input(text);
+        if was_composing && sanitized.is_empty() && range_utf16.is_none() {
+            // IME cancelled composition (e.g., Windows WM_IME_COMPOSITION lparam == 0):
+            // restore previous committed query cleanly.
+            self.buffer.clear();
+            self.buffer.push_str(&self.committed);
+            self.marked_range = None;
+            return None;
+        }
+
+        if sanitized.is_empty() && range_utf16.is_none() {
+            return None;
+        }
+
+        let target = range_utf16
+            .map(|r| self.range_from_utf16(r))
+            .or_else(|| self.marked_range.take())
+            .unwrap_or(self.buffer.len()..self.buffer.len());
+
+        self.buffer.replace_range(target, &sanitized);
+        self.marked_range = None;
+
+        if self.buffer != self.committed {
+            self.committed.clear();
+            self.committed.push_str(&self.buffer);
+            Some(self.committed.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Cancels/unmarks any active IME preedit without altering the committed query.
+    pub(crate) fn unmark_text(&mut self) {
+        if self.marked_range.take().is_some() {
+            self.buffer.clear();
+            self.buffer.push_str(&self.committed);
+        }
+    }
+
+    /// Removes the last Unicode scalar from the committed query when not composing.
+    pub(crate) fn handle_backspace(&mut self, store_query: &str) -> Option<String> {
+        if self.marked_range.is_some() {
+            return None;
+        }
+        self.sync_committed(store_query);
+        self.committed.pop()?;
+        self.buffer.clear();
+        self.buffer.push_str(&self.committed);
+        Some(self.committed.clone())
+    }
+
+    /// Cancels active IME composition (preserving previous query) or clears a non-empty query.
+    pub(crate) fn handle_escape(&mut self, store_query: &str) -> Option<String> {
+        if self.marked_range.take().is_some() {
+            self.buffer.clear();
+            self.buffer.push_str(&self.committed);
+            return None;
+        }
+        self.sync_committed(store_query);
+        if self.committed.is_empty() {
+            return None;
+        }
+        self.committed.clear();
+        self.buffer.clear();
+        Some(String::new())
+    }
+
+    fn offset_to_utf16(&self, byte_offset: usize) -> usize {
+        let clamped = byte_offset.min(self.buffer.len());
+        let mut utf16 = 0usize;
+        for (idx, ch) in self.buffer.char_indices() {
+            if idx >= clamped {
+                break;
+            }
+            utf16 += ch.len_utf16();
+        }
+        utf16
+    }
+
+    fn offset_from_utf16(&self, utf16_offset: usize) -> usize {
+        let mut utf16 = 0usize;
+        for (idx, ch) in self.buffer.char_indices() {
+            if utf16 >= utf16_offset {
+                return idx;
+            }
+            utf16 += ch.len_utf16();
+        }
+        self.buffer.len()
+    }
+
+    fn range_to_utf16(&self, range: Range<usize>) -> Range<usize> {
+        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+    }
+
+    fn range_from_utf16(&self, range: Range<usize>) -> Range<usize> {
+        let start = self.offset_from_utf16(range.start);
+        let end = self.offset_from_utf16(range.end);
+        start.min(end)..start.max(end)
+    }
+}
+
+fn sanitize_search_input(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Zero-size, non-drawing GPUI element that binds an [`EntityInputHandler`] to a table's
+/// [`FocusHandle`] during paint so Windows/macOS/Linux IME composition and direct typing
+/// work seamlessly whenever the table is focused.
+pub(crate) struct TableInputBridge<V: EntityInputHandler> {
+    focus_handle: FocusHandle,
+    entity: Entity<V>,
+}
+
+impl<V: EntityInputHandler> TableInputBridge<V> {
+    /// Creates a new [`TableInputBridge`] binding `entity` to `focus_handle`.
+    pub(crate) fn new(focus_handle: FocusHandle, entity: Entity<V>) -> Self {
+        Self {
+            focus_handle,
+            entity,
+        }
+    }
+}
+
+impl<V: EntityInputHandler> Element for TableInputBridge<V> {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let style = Style {
+            position: Position::Absolute,
+            ..Style::default()
+        };
+        (window.request_layout(style, None, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.handle_input(
+            &self.focus_handle,
+            ElementInputHandler::new(bounds, self.entity.clone()),
+            cx,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Smart context-aware copying
+// ---------------------------------------------------------------------------
+
+/// Formats the default `Ctrl+C` clipboard representation (`"<name> (<pid>)"`).
+#[inline]
+pub(crate) fn format_process_name_and_pid(name: &str, pid: u32) -> String {
+    format!("{name} ({pid})")
+}
+
+/// Snapshot of copyable fields for a right-clicked process row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CopyRowFields {
+    /// Primary process image/display name.
+    pub(crate) name: String,
+    /// Process numeric PID.
+    pub(crate) pid: u32,
+    /// Resolved executable path, when known.
+    pub(crate) exe_path: Option<String>,
+    /// Resolved command line, when known.
+    pub(crate) command_line: Option<String>,
+    /// Pre-formatted multi-field row summary (matching `Ctrl+Shift+C`).
+    pub(crate) row_summary: String,
+    /// Optional `(column_label, cell_text)` for the specific column that was right-clicked.
+    pub(crate) clicked_column: Option<(String, String)>,
+}
+
+/// Builds the `"Copy >"` row context submenu shared by Processes and Details.
+pub(crate) fn build_copy_submenu(
+    fields: CopyRowFields,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<PopupMenu> {
+    PopupMenu::build(window, cx, move |mut sub, _window, _cx| {
+        let copy_name = fields.name.clone();
+        let copy_pid = fields.pid.to_string();
+        let copy_path = fields
+            .exe_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let copy_cmdline = fields
+            .command_line
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let copy_summary = fields.row_summary.clone();
+        let clicked_col = fields
+            .clicked_column
+            .clone()
+            .filter(|(_, val)| !val.trim().is_empty() && val.trim() != "—");
+
+        sub = sub
+            .item(
+                PopupMenuItem::new(i18n::tr("proc_ux_copy_name"))
+                    .disabled(copy_name.is_empty())
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_name.clone()));
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(i18n::tr("proc_ux_copy_pid")).on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_pid.clone()));
+                }),
+            )
+            .item(
+                PopupMenuItem::new(i18n::tr("proc_ux_copy_path"))
+                    .disabled(copy_path.is_none())
+                    .on_click(move |_, _, cx| {
+                        if let Some(ref p) = copy_path {
+                            cx.write_to_clipboard(ClipboardItem::new_string(p.clone()));
+                        }
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(i18n::tr("proc_ux_copy_cmdline"))
+                    .disabled(copy_cmdline.is_none())
+                    .on_click(move |_, _, cx| {
+                        if let Some(ref c) = copy_cmdline {
+                            cx.write_to_clipboard(ClipboardItem::new_string(c.clone()));
+                        }
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(i18n::tr("proc_ux_copy_summary")).on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_summary.clone()));
+                }),
+            );
+
+        if let Some((col_label, cell_text)) = clicked_col {
+            let label =
+                rust_i18n::t!("proc_ux_copy_column", column = col_label.as_str()).into_owned();
+            sub = sub
+                .separator()
+                .item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(cell_text.clone()));
+                }));
+        }
+
+        sub
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Formula-safe CSV export helpers
+// ---------------------------------------------------------------------------
+
+/// Formats a UTC timestamped CSV filename (`"<prefix>-YYYYMMDD-HHMMSS.csv"`).
+pub(crate) fn format_csv_export_filename(prefix: &str, epoch_secs: u64) -> String {
+    let days = (epoch_secs / 86_400) as i64;
+    let rem_secs = epoch_secs % 86_400;
+    let hour = rem_secs / 3_600;
+    let minute = (rem_secs % 3_600) / 60;
+    let second = rem_secs % 60;
+
+    // Howard Hinnant's proleptic Gregorian `civil_from_days` algorithm.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(month <= 2);
+
+    format!("{prefix}-{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}.csv")
+}
+
+/// Resolves a writable user export directory (`Downloads` -> `Desktop` -> `Documents` -> temp).
+pub(crate) fn default_csv_export_dir() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    if let Some(base) = home {
+        for sub in ["Downloads", "Desktop", "Documents"] {
+            let candidate = base.join(sub);
+            if candidate.is_dir() {
+                return candidate;
+            }
+        }
+        if base.is_dir() {
+            return base;
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// Serializes `headers` and `rows` via `loom_ui_kit::build_csv_document` (UTF-8 BOM +
+/// RFC 4180 + formula-injection neutralization) and writes the file to `dir.join(filename)`.
+pub(crate) fn write_csv_export_file(
+    dir: &Path,
+    filename: &str,
+    headers: &[String],
+    rows: &[Vec<String>],
+) -> std::io::Result<PathBuf> {
+    let header_refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+    let content = build_csv_document(&header_refs, rows);
+    let dest = dir.join(filename);
+    std::fs::write(&dest, content.as_bytes())?;
+    Ok(dest)
+}
+
+/// Exports visible table headers & rows to a timestamped CSV file off the UI thread and
+/// posts a confirmation (or error) [`Notification`] upon completion.
+pub(crate) fn spawn_csv_export(
+    store: Entity<UiStore>,
+    prefix: &'static str,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let epoch_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let filename = format_csv_export_filename(prefix, epoch_secs);
+
+    window
+        .spawn(cx, async move |cx| {
+            let write_result = cx
+                .background_executor()
+                .spawn(async move {
+                    let dir = default_csv_export_dir();
+                    write_csv_export_file(&dir, &filename, &headers, &rows)
+                })
+                .await;
+
+            let _ = cx.update(|window, cx| match write_result {
+                Ok(saved_path) => {
+                    let display_path = saved_path.display().to_string();
+                    let msg =
+                        rust_i18n::t!("csv_export_success_message", path = display_path.as_str())
+                            .into_owned();
+                    let open_label = i18n::tr("csv_export_open_location");
+                    let store_open = store.clone();
+                    let path_open = saved_path.clone();
+                    let notice = Notification::success(msg)
+                        .title(i18n::tr("csv_export_success_title"))
+                        .action(move |_, _, cx| {
+                            let store_click = store_open.clone();
+                            let path_click = path_open.clone();
+                            Button::new("csv-export-open-location")
+                                .outline()
+                                .xsmall()
+                                .label(open_label.clone())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    UiCommands::open_file_location(
+                                        &store_click,
+                                        path_click.clone(),
+                                        cx,
+                                    );
+                                    this.dismiss(window, cx);
+                                }))
+                        });
+                    window.push_notification(notice, cx);
+                }
+                Err(err) => {
+                    let notice = Notification::error(err.to_string())
+                        .title(i18n::tr("csv_export_error_title"));
+                    window.push_notification(notice, cx);
+                }
+            });
+        })
+        .detach();
+}
+
+// ---------------------------------------------------------------------------
+// Process controls, WebView2 role tags, and resource leak warning badges
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when `image_name` refers to `explorer.exe` (case-insensitive).
+#[inline]
+pub(crate) fn is_explorer_image(image_name: &str) -> bool {
+    image_name.trim().eq_ignore_ascii_case("explorer.exe")
+}
+
+/// Returns `true` when a process can safely be suspended or resumed.
+#[inline]
+pub(crate) fn can_suspend_or_resume_process(
+    pid: u32,
+    image_name: &str,
+    status: ProcessStatusFlags,
+    capabilities: CapabilityFlags,
+) -> bool {
+    capabilities.contains(CapabilityFlags::SUSPEND_RESUME)
+        && pid != 0
+        && pid != std::process::id()
+        && !image_name.trim().eq_ignore_ascii_case("dwm.exe")
+        && !status.intersects(
+            ProcessStatusFlags::SYSTEM_IDLE
+                | ProcessStatusFlags::KERNEL
+                | ProcessStatusFlags::PROTECTED
+                | ProcessStatusFlags::CRITICAL,
+        )
+}
+
+/// Returns the best path/name identifier for `EngineCommand::IgnoreLeakPath`.
+pub(crate) fn leak_ignore_target(exe_path: Option<&str>, image_name: &str) -> Option<String> {
+    if let Some(path) = exe_path.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(path.to_owned());
+    }
+    let name = image_name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Returns the localized role label for a [`WebView2Role`].
+pub(crate) fn webview2_role_label(role: WebView2Role) -> String {
+    match role {
+        WebView2Role::Browser => i18n::tr("webview2_role_browser"),
+        WebView2Role::Renderer => i18n::tr("webview2_role_renderer"),
+        WebView2Role::Gpu => i18n::tr("webview2_role_gpu"),
+        WebView2Role::Network => i18n::tr("webview2_role_network"),
+        WebView2Role::Storage => i18n::tr("webview2_role_storage"),
+        WebView2Role::Audio => i18n::tr("webview2_role_audio"),
+        WebView2Role::Utility => i18n::tr("webview2_role_utility"),
+        WebView2Role::Crashpad => i18n::tr("webview2_role_crashpad"),
+    }
+}
+
+/// Renders a subtle compact tag identifying a `msedgewebview2.exe` subprocess role.
+pub(crate) fn webview2_role_badge(
+    label: SharedString,
+    muted_bg: Hsla,
+    muted_fg: Hsla,
+    radius: Pixels,
+) -> impl IntoElement {
+    div()
+        .flex_shrink_0()
+        .px_1p5()
+        .py_0p5()
+        .rounded(radius)
+        .bg(muted_bg.opacity(0.75))
+        .text_size(px(10.0))
+        .text_color(muted_fg)
+        .child(label)
+}
+
+/// Renders an amber resource-leak warning icon badge with an informative hover tooltip.
+pub(crate) fn leak_warning_badge(
+    id: (&'static str, usize),
+    warning: &LeakWarning,
+    leak_color: Hsla,
+) -> impl IntoElement {
+    let tooltip_text = SharedString::from(format!(
+        "{}: {}",
+        i18n::tr("leak_warning_badge_prefix"),
+        warning.summary
+    ));
+    h_flex()
+        .id(id)
+        .size(px(22.0))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(leak_color.opacity(0.16))
+        .aria_label(tooltip_text.clone())
+        .tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
+        .child(
+            Icon::new(IconName::TriangleAlert)
+                .xsmall()
+                .text_color(leak_color),
+        )
+}
+
+/// Dispatches `EngineCommand::SuspendProcess` or `EngineCommand::ResumeProcess`.
+pub(crate) fn dispatch_suspend_or_resume(
+    store: &Entity<UiStore>,
+    key: ProcessKey,
+    currently_suspended: bool,
+    cx: &mut App,
+) {
+    let cmd = if currently_suspended {
+        EngineCommand::ResumeProcess(key)
+    } else {
+        EngineCommand::SuspendProcess(key)
+    };
+    let _ = store.read(cx).dispatch_command(cmd);
+}
+
+/// Dispatches `EngineCommand::RestartExplorer`.
+pub(crate) fn dispatch_restart_explorer(store: &Entity<UiStore>, cx: &mut App) {
+    let _ = store
+        .read(cx)
+        .dispatch_command(EngineCommand::RestartExplorer);
+}
+
+/// Dispatches `EngineCommand::IgnoreLeakPath` and persists the ignored path in `settings.toml`.
+pub(crate) fn dispatch_ignore_leak_path(store: &Entity<UiStore>, target: String, cx: &mut App) {
+    let trimmed = target.trim().to_owned();
+    if trimmed.is_empty() {
+        return;
+    }
+    store.update(cx, |s, cx| {
+        let _ = s.dispatch_command(EngineCommand::IgnoreLeakPath(trimmed.clone()));
+        let _ = s.update_settings(
+            |cfg| {
+                if !cfg
+                    .leak_ignored_paths
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(&trimmed))
+                {
+                    cfg.leak_ignored_paths.push(trimmed.clone());
+                }
+            },
+            cx,
+        );
+    });
+}
+
+/// Dispatches `EngineCommand::SetHideSystemProcesses` and persists it in `settings.toml`.
+pub(crate) fn dispatch_hide_system_processes(store: &Entity<UiStore>, hidden: bool, cx: &mut App) {
+    store.update(cx, |s, cx| {
+        let _ = s.dispatch_command(EngineCommand::SetHideSystemProcesses(hidden));
+        let _ = s.update_settings(|cfg| cfg.hide_windows_system_processes = hidden, cx);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -860,5 +1630,213 @@ mod tests {
         draft.set_checked(0, true);
         draft.set_checked(1, false);
         assert_eq!(draft.selected_slugs(), vec!["pid"]);
+    }
+
+    #[test]
+    fn order_freeze_state_coordinates_hover_header_and_context_menu() {
+        let mut state = OrderFreezeState::default();
+        assert!(!state.is_frozen());
+
+        // Hovering table body freezes order.
+        assert_eq!(state.set_table_hovered(true), Some(true));
+        assert!(state.is_frozen());
+        // Duplicate hover emits no transition.
+        assert_eq!(state.set_table_hovered(true), None);
+
+        // Moving onto the column header temporarily unfreezes so clicking sort works immediately.
+        assert_eq!(state.set_header_hovered(true), Some(false));
+        assert!(!state.is_frozen());
+        assert_eq!(state.set_header_hovered(false), Some(true));
+        assert!(state.is_frozen());
+
+        // Opening context menu keeps row order frozen even after mouse leaves table.
+        assert_eq!(state.set_context_menu_open(true), None);
+        assert_eq!(state.set_table_hovered(false), None);
+        assert!(state.is_frozen());
+
+        // Dismissing context menu while mouse is outside unfreezes immediately.
+        assert_eq!(state.set_context_menu_open(false), Some(false));
+        assert!(!state.is_frozen());
+    }
+
+    #[test]
+    fn type_to_search_state_handles_direct_typing_and_cjk_ime_cancel_commit() {
+        let mut search = TypeToSearchState::default();
+
+        // Direct ASCII typing appends without losing the first keystroke.
+        assert_eq!(search.replace_text(None, "c", ""), Some("c".to_owned()));
+        assert_eq!(search.replace_text(None, "h", "c"), Some("ch".to_owned()));
+
+        // Start CJK IME composition on top of existing query "ch":
+        // committed query stays untouched while composing.
+        search.replace_and_mark(None, "wei", "ch");
+        assert!(search.is_composing());
+        assert_eq!(search.preedit_text(), Some("wei"));
+        assert_eq!(search.marked_utf16_range(), Some(2..5));
+
+        // Cancelling composition (Escape or empty Windows WM_IME_COMPOSITION commit)
+        // leaves previous committed query "ch" intact.
+        assert_eq!(search.replace_text(None, "", "ch"), None);
+        assert!(!search.is_composing());
+        assert_eq!(search.preedit_text(), None);
+        assert_eq!(search.text_for_utf16_range(0..2).1, "ch");
+
+        // Second CJK composition -> commit "微信" appends cleanly to "ch".
+        search.replace_and_mark(None, "wx", "ch");
+        assert_eq!(search.preedit_text(), Some("wx"));
+        assert_eq!(
+            search.replace_text(None, "微信", "ch"),
+            Some("ch微信".to_owned())
+        );
+        assert!(!search.is_composing());
+        assert_eq!(search.utf16_len(), 4);
+
+        // Backspace pops one full Unicode scalar ("信").
+        assert_eq!(search.handle_backspace("ch微信"), Some("ch微".to_owned()));
+
+        // Escape cancels composition if active, otherwise clears query.
+        search.replace_and_mark(None, "pin", "ch微");
+        assert_eq!(search.handle_escape("ch微"), None);
+        assert!(!search.is_composing());
+        assert_eq!(search.handle_escape("ch微"), Some(String::new()));
+    }
+
+    #[test]
+    fn csv_export_filename_and_formula_safe_write_output() {
+        // 2026-11-28 02:16:52 UTC = 1795832212? Let's test Unix epoch 0 and a known date.
+        assert_eq!(
+            format_csv_export_filename("loom-processes", 0),
+            "loom-processes-19700101-000000.csv"
+        );
+        // 2026-01-02 03:04:05 UTC = 1767323045
+        assert_eq!(
+            format_csv_export_filename("loom-details", 1_767_323_045),
+            "loom-details-20260102-030405.csv"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let headers = vec![
+            "Name".to_owned(),
+            "PID".to_owned(),
+            "Command line".to_owned(),
+        ];
+        let rows = vec![vec![
+            "app.exe".to_owned(),
+            "1234".to_owned(),
+            "=CMD|'/C calc'!A0".to_owned(),
+        ]];
+        let written =
+            write_csv_export_file(dir.path(), "export.csv", &headers, &rows).expect("write csv");
+        let content = std::fs::read_to_string(&written).expect("read csv");
+        assert!(content.starts_with(loom_ui_kit::CSV_UTF8_BOM));
+        assert!(content.contains("Name,PID,Command line\r\n"));
+        assert!(content.contains("app.exe,1234,'=CMD|'/C calc'!A0\r\n"));
+    }
+
+    #[test]
+    fn suspend_resume_explorer_and_leak_target_gating() {
+        let with_cap = CapabilityFlags::SUSPEND_RESUME;
+        let no_cap = CapabilityFlags::empty();
+
+        assert!(can_suspend_or_resume_process(
+            4242,
+            "notepad.exe",
+            ProcessStatusFlags::empty(),
+            with_cap
+        ));
+        assert!(!can_suspend_or_resume_process(
+            4242,
+            "notepad.exe",
+            ProcessStatusFlags::empty(),
+            no_cap
+        ));
+        assert!(!can_suspend_or_resume_process(
+            0,
+            "System Idle Process",
+            ProcessStatusFlags::SYSTEM_IDLE,
+            with_cap
+        ));
+        assert!(!can_suspend_or_resume_process(
+            std::process::id(),
+            "loom-app.exe",
+            ProcessStatusFlags::empty(),
+            with_cap
+        ));
+        assert!(!can_suspend_or_resume_process(
+            512,
+            "DWM.EXE",
+            ProcessStatusFlags::empty(),
+            with_cap
+        ));
+        assert!(!can_suspend_or_resume_process(
+            600,
+            "csrss.exe",
+            ProcessStatusFlags::CRITICAL,
+            with_cap
+        ));
+
+        assert!(is_explorer_image("explorer.exe"));
+        assert!(is_explorer_image("EXPLORER.EXE"));
+        assert!(!is_explorer_image("iexplore.exe"));
+
+        assert_eq!(
+            leak_ignore_target(Some(r" C:\Apps\leak.exe "), "leak.exe"),
+            Some(r"C:\Apps\leak.exe".to_owned())
+        );
+        assert_eq!(
+            leak_ignore_target(None, "leak.exe"),
+            Some("leak.exe".to_owned())
+        );
+        assert_eq!(leak_ignore_target(Some("  "), "   "), None);
+    }
+
+    #[test]
+    fn processes_and_details_ux_locale_keys_exist_in_en_and_zh() {
+        let keys = [
+            "proc_ux_sort_paused_tooltip",
+            "proc_ux_hide_system_tooltip",
+            "proc_ux_copy_submenu",
+            "proc_ux_copy_name",
+            "proc_ux_copy_pid",
+            "proc_ux_copy_path",
+            "proc_ux_copy_cmdline",
+            "proc_ux_copy_summary",
+            "proc_ux_menu_suspend",
+            "proc_ux_menu_resume",
+            "proc_ux_menu_restart_explorer",
+            "proc_ux_ime_searching",
+            "csv_export_button",
+            "csv_export_success_title",
+            "csv_export_error_title",
+            "csv_export_open_location",
+            "leak_warning_ignore_menu",
+            "leak_warning_badge_prefix",
+            "webview2_role_browser",
+            "webview2_role_renderer",
+            "webview2_role_gpu",
+            "webview2_role_network",
+            "webview2_role_storage",
+            "webview2_role_audio",
+            "webview2_role_utility",
+            "webview2_role_crashpad",
+        ];
+        for key in keys {
+            let en = rust_i18n::t!(key, locale = "en-US");
+            let zh = rust_i18n::t!(key, locale = "zh-CN");
+            assert!(!en.is_empty() && en != key, "missing en-US for {key}");
+            assert!(!zh.is_empty() && zh != key, "missing zh-CN for {key}");
+        }
+        assert_eq!(
+            rust_i18n::t!(
+                "proc_ux_copy_column",
+                locale = "en-US",
+                column = "Publisher"
+            ),
+            "Copy \"Publisher\""
+        );
+        assert_eq!(
+            rust_i18n::t!("proc_ux_copy_column", locale = "zh-CN", column = "发布者"),
+            "复制“发布者”"
+        );
     }
 }
