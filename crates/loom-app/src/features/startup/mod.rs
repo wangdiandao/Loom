@@ -31,7 +31,7 @@ use loom_types::{
 use loom_ui_kit::UNAVAILABLE_LABEL;
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
-use crate::features::table_columns::{DataTablePane, IconRenderCache};
+use crate::features::table_columns::{BudgetedIconLookup, DataTablePane, IconRenderCache};
 use crate::i18n;
 
 const STARTUP_HEADER_HEIGHT: f32 = 32.0;
@@ -261,6 +261,7 @@ struct StartupTableDelegate {
     user_action_pending: bool,
     locale: StartupLocaleCache,
     icon_cache: IconRenderCache,
+    icon_catchup_scheduled: bool,
 }
 
 impl StartupTableDelegate {
@@ -283,6 +284,7 @@ impl StartupTableDelegate {
             user_action_pending: false,
             locale: StartupLocaleCache::build(),
             icon_cache: IconRenderCache::new(),
+            icon_catchup_scheduled: false,
         }
     }
 
@@ -409,6 +411,7 @@ impl TableDelegate for StartupTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        self.icon_cache.begin_frame();
         div()
             .id("startup-column-header")
             .bg(cx.theme().secondary.opacity(0.45))
@@ -460,7 +463,7 @@ impl TableDelegate for StartupTableDelegate {
         &mut self,
         row_ix: usize,
         col_ix: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let Some(&item_idx) = self.slice.visible_indices.get(row_ix) else {
@@ -483,10 +486,29 @@ impl TableDelegate for StartupTableDelegate {
         match col {
             StartupSortColumn::Name => {
                 let name = SharedString::from(Arc::clone(&entry.name));
-                let rendered_icon = entry
-                    .icon
-                    .as_ref()
-                    .and_then(|icon| self.icon_cache.get_or_insert(icon));
+                let rendered_icon = entry.icon.as_ref().and_then(|icon| {
+                    match self.icon_cache.get_or_insert_budgeted(icon) {
+                        BudgetedIconLookup::Hit(img) | BudgetedIconLookup::Uploaded(img) => {
+                            Some(img)
+                        }
+                        BudgetedIconLookup::Deferred => {
+                            if !self.icon_catchup_scheduled {
+                                self.icon_catchup_scheduled = true;
+                                let table_weak = cx.entity().downgrade();
+                                window.on_next_frame(move |_window, cx| {
+                                    let _ = table_weak.update(cx, |table, cx| {
+                                        let d = table.delegate_mut();
+                                        d.icon_catchup_scheduled = false;
+                                        d.icon_cache.begin_frame();
+                                        cx.notify();
+                                    });
+                                });
+                            }
+                            None
+                        }
+                        BudgetedIconLookup::Invalid => None,
+                    }
+                });
                 let icon_el = if let Some(render_img) = rendered_icon {
                     img(render_img)
                         .size(px(16.0))

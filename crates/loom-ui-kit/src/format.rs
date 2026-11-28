@@ -11,10 +11,31 @@ const GIB: u64 = 1024 * MIB;
 const TIB: u64 = 1024 * GIB;
 
 /// Maximum `u32` value covered by the zero-allocation static integer table.
-pub const SMALL_U32_TABLE_MAX: u32 = 512;
+pub const SMALL_U32_TABLE_MAX: u32 = 1024;
 
 /// Maximum child count covered by the zero-allocation static `"(N)"` table.
 pub const CHILD_COUNT_TABLE_MAX: u32 = 256;
+
+/// Maximum quantized tenths value covered by the lazily-chunked static table
+/// (`10_299` -> `"1029.9"`, covering every `KB/MB/GB/TB` and `Kbps/Mbps/Gbps`
+/// single-decimal tier below `1030.0`).
+pub const TENTHS_TABLE_MAX: u64 = 10_299;
+
+/// Number of entries per lazy tenths chunk (`10.0` per chunk).
+const TENTHS_CHUNK_LEN: usize = 100;
+/// Total lazy tenths chunks covering `0..=10_299`.
+const TENTHS_CHUNK_COUNT: usize = (TENTHS_TABLE_MAX as usize / TENTHS_CHUNK_LEN) + 1;
+
+/// Maximum magnitude covered by the lazily-chunked signed integer delta table (`±1024`).
+const SIGNED_U32_TABLE_MAX: u64 = 1024;
+const SIGNED_U32_CHUNK_LEN: usize = 64;
+const SIGNED_U32_CHUNK_COUNT: usize = (SIGNED_U32_TABLE_MAX as usize / SIGNED_U32_CHUNK_LEN) + 1;
+
+/// Maximum magnitude covered by the lazily-chunked signed tenths delta table (`±127.9`).
+const SIGNED_TENTHS_TABLE_MAX: u64 = 1279;
+const SIGNED_TENTHS_CHUNK_LEN: usize = 64;
+const SIGNED_TENTHS_CHUNK_COUNT: usize =
+    (SIGNED_TENTHS_TABLE_MAX as usize / SIGNED_TENTHS_CHUNK_LEN) + 1;
 
 /// Default single-line character cap applied to long table cell preview strings
 /// (such as command lines or executable paths) before passing them to text shaping.
@@ -23,11 +44,28 @@ pub const DEFAULT_CELL_PREVIEW_CHARS: usize = 256;
 /// Pre-formatted permille strings covering `"0.0%" ..= "100.0%"`.
 static PERMILLE_TABLE: OnceLock<[SharedString; 1001]> = OnceLock::new();
 
-/// Pre-formatted small unsigned integer strings covering `"0" ..= "512"`.
-static SMALL_U32_TABLE: OnceLock<[SharedString; 513]> = OnceLock::new();
+/// Pre-formatted small unsigned integer strings covering `"0" ..= "1024"`.
+static SMALL_U32_TABLE: OnceLock<[SharedString; SMALL_U32_TABLE_MAX as usize + 1]> =
+    OnceLock::new();
 
 /// Pre-formatted child-count badge strings covering `"(0)" ..= "(256)"`.
 static CHILD_COUNT_TABLE: OnceLock<[SharedString; 257]> = OnceLock::new();
+
+/// Lazily initialized 100-entry chunks of `"X.Y"` strings covering `"0.0" ..= "1029.9"`.
+static TENTHS_CHUNKS: [OnceLock<[SharedString; TENTHS_CHUNK_LEN]>; TENTHS_CHUNK_COUNT] =
+    [const { OnceLock::new() }; TENTHS_CHUNK_COUNT];
+
+/// Lazily initialized signed integer chunks (`+0..=+1024` and `-0..=-1024`).
+static SIGNED_POS_U32_CHUNKS: [OnceLock<[SharedString; SIGNED_U32_CHUNK_LEN]>;
+    SIGNED_U32_CHUNK_COUNT] = [const { OnceLock::new() }; SIGNED_U32_CHUNK_COUNT];
+static SIGNED_NEG_U32_CHUNKS: [OnceLock<[SharedString; SIGNED_U32_CHUNK_LEN]>;
+    SIGNED_U32_CHUNK_COUNT] = [const { OnceLock::new() }; SIGNED_U32_CHUNK_COUNT];
+
+/// Lazily initialized signed tenths chunks (`+0.0..=+127.9` and `-0.0..=-127.9`).
+static SIGNED_POS_TENTHS_CHUNKS: [OnceLock<[SharedString; SIGNED_TENTHS_CHUNK_LEN]>;
+    SIGNED_TENTHS_CHUNK_COUNT] = [const { OnceLock::new() }; SIGNED_TENTHS_CHUNK_COUNT];
+static SIGNED_NEG_TENTHS_CHUNKS: [OnceLock<[SharedString; SIGNED_TENTHS_CHUNK_LEN]>;
+    SIGNED_TENTHS_CHUNK_COUNT] = [const { OnceLock::new() }; SIGNED_TENTHS_CHUNK_COUNT];
 
 #[inline]
 fn permille_table() -> &'static [SharedString; 1001] {
@@ -41,7 +79,7 @@ fn permille_table() -> &'static [SharedString; 1001] {
 }
 
 #[inline]
-fn small_u32_table() -> &'static [SharedString; 513] {
+fn small_u32_table() -> &'static [SharedString; SMALL_U32_TABLE_MAX as usize + 1] {
     SMALL_U32_TABLE.get_or_init(|| {
         std::array::from_fn(|n| match n {
             0 => SharedString::new_static("0"),
@@ -69,11 +107,78 @@ const fn div_round_ties_even_u128(num: u128, den: u128) -> u64 {
     rounded as u64
 }
 
-/// Formats a quantized tenths value (e.g. `124` -> `"12.4"`) strictly using
-/// ASCII digits and `'.'` so `gpui-fast::NumberShaping` always hits.
+/// Zero-allocation fast-path tenths formatter returning a [`SharedString`]
+/// strictly using ASCII digits and `'.'` so `gpui-fast::NumberShaping` always hits.
+///
+/// Values in `0..=10_299` (`"0.0" ..= "1029.9"`) clone from lazily-initialized
+/// 100-entry static chunks with zero steady-state heap allocation; larger values
+/// fall back to dynamic formatting.
 #[inline]
-fn format_tenths_shared(tenths: u64) -> SharedString {
-    SharedString::from(format!("{}.{}", tenths / 10, tenths % 10))
+pub fn format_tenths_shared(tenths: u64) -> SharedString {
+    if tenths <= TENTHS_TABLE_MAX {
+        let idx = tenths as usize;
+        let chunk_ix = idx / TENTHS_CHUNK_LEN;
+        let offset = idx % TENTHS_CHUNK_LEN;
+        let chunk = TENTHS_CHUNKS[chunk_ix].get_or_init(|| {
+            let base = chunk_ix * TENTHS_CHUNK_LEN;
+            std::array::from_fn(|i| {
+                let v = base + i;
+                SharedString::from(format!("{}.{}", v / 10, v % 10))
+            })
+        });
+        chunk[offset].clone()
+    } else {
+        SharedString::from(format!("{}.{}", tenths / 10, tenths % 10))
+    }
+}
+
+#[inline]
+fn format_signed_u32_shared(positive: bool, mag: u64) -> SharedString {
+    if mag <= SIGNED_U32_TABLE_MAX {
+        let idx = mag as usize;
+        let chunk_ix = idx / SIGNED_U32_CHUNK_LEN;
+        let offset = idx % SIGNED_U32_CHUNK_LEN;
+        let sign = if positive { '+' } else { '-' };
+        let chunks = if positive {
+            &SIGNED_POS_U32_CHUNKS
+        } else {
+            &SIGNED_NEG_U32_CHUNKS
+        };
+        let chunk = chunks[chunk_ix].get_or_init(|| {
+            let base = chunk_ix * SIGNED_U32_CHUNK_LEN;
+            std::array::from_fn(|i| SharedString::from(format!("{sign}{}", base + i)))
+        });
+        chunk[offset].clone()
+    } else {
+        let sign = if positive { '+' } else { '-' };
+        SharedString::from(format!("{sign}{mag}"))
+    }
+}
+
+#[inline]
+fn format_signed_tenths_shared(positive: bool, tenths: u64) -> SharedString {
+    if tenths <= SIGNED_TENTHS_TABLE_MAX {
+        let idx = tenths as usize;
+        let chunk_ix = idx / SIGNED_TENTHS_CHUNK_LEN;
+        let offset = idx % SIGNED_TENTHS_CHUNK_LEN;
+        let sign = if positive { '+' } else { '-' };
+        let chunks = if positive {
+            &SIGNED_POS_TENTHS_CHUNKS
+        } else {
+            &SIGNED_NEG_TENTHS_CHUNKS
+        };
+        let chunk = chunks[chunk_ix].get_or_init(|| {
+            let base = chunk_ix * SIGNED_TENTHS_CHUNK_LEN;
+            std::array::from_fn(|i| {
+                let v = base + i;
+                SharedString::from(format!("{sign}{}.{}", v / 10, v % 10))
+            })
+        });
+        chunk[offset].clone()
+    } else {
+        let sign = if positive { '+' } else { '-' };
+        SharedString::from(format!("{sign}{}.{}", tenths / 10, tenths % 10))
+    }
 }
 
 /// Split numeric value and static unit suffix for high-frequency table cells.
@@ -480,15 +585,15 @@ pub fn format_signed_bytes_metric(delta_bytes: i64) -> MetricDisplay {
     if delta_bytes == 0 {
         return MetricDisplay::from_static("0", " B");
     }
-    let sign = if delta_bytes > 0 { '+' } else { '-' };
+    let positive = delta_bytes > 0;
     let (tier, val) = quantize_bytes_parts(delta_bytes.unsigned_abs());
     match tier {
         0 => MetricDisplay::from_static("0", " B"),
-        1 => MetricDisplay::new(format!("{sign}{val}"), " B"),
-        2 => MetricDisplay::new(format!("{sign}{val}"), " KB"),
-        3 => MetricDisplay::new(format!("{sign}{}.{}", val / 10, val % 10), " MB"),
-        4 => MetricDisplay::new(format!("{sign}{}.{}", val / 10, val % 10), " GB"),
-        _ => MetricDisplay::new(format!("{sign}{}.{}", val / 10, val % 10), " TB"),
+        1 => MetricDisplay::new(format_signed_u32_shared(positive, val), " B"),
+        2 => MetricDisplay::new(format_signed_u32_shared(positive, val), " KB"),
+        3 => MetricDisplay::new(format_signed_tenths_shared(positive, val), " MB"),
+        4 => MetricDisplay::new(format_signed_tenths_shared(positive, val), " GB"),
+        _ => MetricDisplay::new(format_signed_tenths_shared(positive, val), " TB"),
     }
 }
 
