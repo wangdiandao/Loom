@@ -9,7 +9,8 @@ use gpui_kit::{
 };
 use loom_types::GpuAdapterSlice;
 use loom_ui_kit::{
-    LoomSemanticColors, format_bytes, format_opt_percent_permille, format_opt_temp_celsius,
+    LoomSemanticColors, format_bytes, format_opt_clock_mhz, format_opt_fan_percent,
+    format_opt_percent_permille, format_opt_power_mw, format_opt_temp_celsius,
 };
 
 use crate::features::performance::PerformanceView;
@@ -203,14 +204,28 @@ pub(crate) fn render_gpu_detail(
             .unwrap_or_else(|| unavailable.clone())
     };
 
-    let left_stats = vec![
+    let mut left_stats = vec![
         MetricStat::new(i18n::tr("perf.gpu_utilization"), util_metric),
         MetricStat::new(ded_title, ded_metric),
         MetricStat::new(shared_title, shared_metric),
         MetricStat::new(i18n::tr("perf.gpu_temperature"), temp_metric),
     ];
+    if !gpu.d3_asleep {
+        if gpu.power_draw_mw.is_some() {
+            left_stats.push(MetricStat::new(
+                i18n::tr("perf.gpu_power_draw"),
+                format_opt_power_mw(gpu.power_draw_mw, gpu.d3_asleep),
+            ));
+        }
+        if gpu.fan_speed_percent.is_some() {
+            left_stats.push(MetricStat::new(
+                i18n::tr("perf.gpu_fan_speed"),
+                format_opt_fan_percent(gpu.fan_speed_percent, gpu.d3_asleep),
+            ));
+        }
+    }
 
-    let right_specs = vec![
+    let mut right_specs = vec![
         SpecRow::new(
             i18n::tr("perf.gpu_driver_version"),
             opt_str(&gpu.driver_version),
@@ -224,6 +239,20 @@ pub(crate) fn render_gpu_detail(
             opt_str(&gpu.pci_location),
         ),
     ];
+    if !gpu.d3_asleep {
+        if gpu.core_clock_mhz.is_some() {
+            right_specs.push(SpecRow::new(
+                i18n::tr("perf.gpu_core_clock"),
+                format_opt_clock_mhz(gpu.core_clock_mhz, gpu.d3_asleep),
+            ));
+        }
+        if gpu.memory_clock_mhz.is_some() {
+            right_specs.push(SpecRow::new(
+                i18n::tr("perf.gpu_memory_clock"),
+                format_opt_clock_mhz(gpu.memory_clock_mhz, gpu.d3_asleep),
+            ));
+        }
+    }
 
     let weak_ctx = cx.entity().downgrade();
     v_flex()

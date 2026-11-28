@@ -27,7 +27,8 @@ pub use format::{
     format_disk_cell_metric, format_disk_cell_shared, format_freq_ghz, format_latency_us,
     format_memory_cell, format_memory_cell_metric, format_memory_cell_shared, format_network_cell,
     format_network_cell_metric, format_network_cell_shared, format_network_rate_mbps,
-    format_network_rate_mbps_metric, format_network_rate_mbps_shared, format_opt_percent_permille,
+    format_network_rate_mbps_metric, format_network_rate_mbps_shared, format_opt_clock_mhz,
+    format_opt_fan_percent, format_opt_percent_permille, format_opt_power_mw,
     format_opt_temp_celsius, format_permille, format_permille_metric, format_permille_shared,
     format_rate_bytes_per_sec, format_rate_bytes_per_sec_metric, format_rate_bytes_per_sec_shared,
     format_signed_bytes, format_signed_bytes_metric, format_tenths_shared, format_u32_shared,
@@ -355,6 +356,20 @@ mod tests {
         assert_eq!(format_latency_us(1_000), "1.0 ms");
         assert_eq!(format_latency_us(12_450), "12.4 ms");
         assert_eq!(format_latency_us(1_500_000), "1.50 s");
+
+        assert_eq!(format_opt_power_mw(Some(42_500), false).as_ref(), "42.5 W");
+        assert_eq!(format_opt_power_mw(Some(42_500), true).as_ref(), "—");
+        assert_eq!(format_opt_power_mw(Some(0), false).as_ref(), "—");
+        assert_eq!(format_opt_power_mw(None, false).as_ref(), "—");
+
+        assert_eq!(format_opt_fan_percent(Some(0), false).as_ref(), "0%");
+        assert_eq!(format_opt_fan_percent(Some(48), false).as_ref(), "48%");
+        assert_eq!(format_opt_fan_percent(Some(48), true).as_ref(), "—");
+        assert_eq!(format_opt_fan_percent(Some(101), false).as_ref(), "—");
+
+        assert_eq!(format_opt_clock_mhz(Some(2130), false).as_ref(), "2130 MHz");
+        assert_eq!(format_opt_clock_mhz(Some(2130), true).as_ref(), "—");
+        assert_eq!(format_opt_clock_mhz(Some(0), false).as_ref(), "—");
 
         let (y_idle, lbl_idle) = adaptive_throughput_scale(0);
         assert_eq!(y_idle, (100 * KIB) as f32);

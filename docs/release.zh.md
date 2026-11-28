@@ -60,7 +60,7 @@ Loom 不使用抽象的 Phase 划分开发顺序，所有里程碑直接以语�
 1. **发布 PR**：更新 `[workspace.package].version`（及内部 crate 依赖版本）、刷新 `Cargo.lock`、整理 `CHANGELOG.md` 并同步文档中的版本说明。
 2. **CI 与桌面冒烟检查**：确认 `main` 上全部 CI 检查通过（无头 `loom-engine` 与故障注入测试、`#[gpui::test]` 界面测试、Clippy、Rustdoc），并执行桌面冒烟检查（`< 50 ms` 冷启动、托盘常驻与关窗释放显存、进程树终止、硬件波形刷新与按需 UAC 提权）。
 3. **Windows 打包与条件签名**：
-   - 安装包定义：`packaging/windows/wix/main.wxs`（WiX v4/v5 XML 清单，安装 `loom-app.exe`、`LICENSE` 及开始菜单快捷方式 `Loom Task Manager`）。
+   - 安装包定义：`packaging/windows/wix/main.wxs`（WiX v4/v5 XML 清单，安装 `loom-app.exe`、`LICENSE` 及开始菜单快捷方式 `Loom Task Manager`，并在完整卸载删除文件前通过提权延迟 CustomAction 自动调用 `--loom-taskmgr-uninstall` 与 `--loom-admin-uninstall` 清理系统集成项）。
    - 打包脚本：`packaging/windows/package-release.ps1` 生成 `loom-<Version>-windows-<Arch>-portable.zip`、`loom-<Version>-windows-<Arch>.msi`（未传 `-SkipMsi` 且 `wix` 可用时）以及 `SHA256SUMS.txt`。
    - 条件 Authenticode 签名：在 GitHub Actions 配置 `WINDOWS_SIGN_PFX_BASE64` 与 `WINDOWS_SIGN_PFX_PASSWORD` Secret（映射为脚本环境变量 `LOOM_SIGN_PFX_BASE64` / `LOOM_SIGN_PFX_PASSWORD`，本地亦可使用 `LOOM_SIGN_CERT_PATH`）。未配置时脚本安全跳过签名而不中断流程；临时解码出的 `.pfx` 文件会在 `finally` 块中覆写归零并删除。
 4. **打标与 GitHub Release 发布**：在 `main` 上创建带附注的 `vX.Y.Z` tag 并推送，触发 `.github/workflows/release.yml` 自动完成 Windows 与 Linux 无头校验、Windows 发行打包、提取 `CHANGELOG.md` 对应版本节正文并发布附带 `.msi`、`.zip` 与 `SHA256SUMS.txt` 的 GitHub Release。亦可通过 `workflow_dispatch` 传入 `version` 执行干跑打包验证（不创建 GitHub Release）。

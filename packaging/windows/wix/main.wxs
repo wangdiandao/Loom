@@ -29,6 +29,34 @@
       <ComponentGroupRef Id="ShortcutComponents" />
     </Feature>
 
+    <!-- Clean up opt-in IFEO Task Manager replacement and persistent admin Task Scheduler entries
+         prior to deleting loom-app.exe during a full uninstall (skipped during MajorUpgrade). -->
+    <CustomAction
+      Id="RestoreTaskManagerOnUninstall"
+      FileRef="LoomAppExe"
+      ExeCommand="--loom-taskmgr-uninstall"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+    <CustomAction
+      Id="CleanupAdminStartupOnUninstall"
+      FileRef="LoomAppExe"
+      ExeCommand="--loom-admin-uninstall"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom
+        Action="RestoreTaskManagerOnUninstall"
+        Before="RemoveFiles"
+        Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
+      <Custom
+        Action="CleanupAdminStartupOnUninstall"
+        Before="RemoveFiles"
+        Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
+    </InstallExecuteSequence>
+
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="Loom" />
     </StandardDirectory>

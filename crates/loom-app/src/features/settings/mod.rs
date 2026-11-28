@@ -796,17 +796,24 @@ impl Render for SettingsView {
         let admin_status = self.admin_status.clone();
         let admin_busy = self.admin_busy;
         let admin_checked = admin_status.as_ref().is_some_and(|s| s.enabled);
-        let admin_needs_repair = admin_status.as_ref().is_some_and(|s| s.enabled && !s.ready);
+        let admin_needs_repair = admin_status
+            .as_ref()
+            .is_some_and(|s| s.enabled && !s.ready && !s.unprotected_path);
         let admin_switch_disabled = admin_busy
             || match admin_status.as_ref() {
                 None => true,
                 Some(s) if s.enabled => false,
-                Some(s) => !s.supported || !s.eligible,
+                Some(s) => !s.supported || !s.eligible || s.unprotected_path,
             };
         let (admin_desc, admin_desc_color, admin_badge) = match admin_status.as_ref() {
             None => (None, muted_fg, None),
             Some(s) if !s.eligible => (
                 Some(i18n::tr("settings.admin_startup_ineligible_desc")),
+                muted_fg,
+                None,
+            ),
+            Some(s) if !s.enabled && s.unprotected_path => (
+                Some(i18n::tr("settings.admin_startup_unprotected_desc")),
                 muted_fg,
                 None,
             ),
@@ -844,6 +851,11 @@ impl Render for SettingsView {
         let (taskmgr_desc, taskmgr_desc_color, taskmgr_badge) = match taskmgr_status.as_ref() {
             None => (None, muted_fg, None),
             Some(s) => match s.state {
+                TaskManagerReplacementState::Disabled if s.unprotected_path => (
+                    Some(i18n::tr("settings.taskmgr_replace_unprotected_desc")),
+                    muted_fg,
+                    None,
+                ),
                 TaskManagerReplacementState::Disabled
                 | TaskManagerReplacementState::Enabled
                 | TaskManagerReplacementState::Unsupported => (None, muted_fg, None),

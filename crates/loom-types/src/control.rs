@@ -205,6 +205,10 @@ pub struct TaskManagerReplacementStatus {
     pub conflict_detail: Option<String>,
     /// Optional path to the recovery journal / instructions for troubleshooting.
     pub recovery_path: Option<String>,
+    /// `true` when the running executable resides in a non-admin-writable directory
+    /// (e.g., portable copy in `Downloads`/`Desktop`), blocking enabling replacement.
+    #[serde(default)]
+    pub unprotected_path: bool,
 }
 
 /// Read-only status snapshot for persistent administrator startup (e.g., Windows Task Scheduler).
@@ -224,4 +228,8 @@ pub struct AdminStartupStatus {
     pub can_drop_elevation: bool,
     /// Optional diagnostic detail when an existing grant is missing, stale, or invalid.
     pub error: Option<String>,
+    /// `true` when the running executable resides in a non-admin-writable directory
+    /// (e.g., portable copy in `Downloads`/`Desktop`), blocking enabling persistent elevation.
+    #[serde(default)]
+    pub unprotected_path: bool,
 }

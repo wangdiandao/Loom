@@ -41,6 +41,7 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 use crate::handle::{OwnedHandle, map_win32_error, os_str_to_wide_null, to_wide_null};
+use crate::install_guard;
 use crate::operator::WindowsSystemOperator;
 use crate::slow_prober::ensure_com_initialized;
 use crate::taskmgr::{launch, state_directory as base_state_directory};
@@ -186,6 +187,9 @@ pub fn status() -> Result<AdminStartupStatus, PalError> {
     let elevated = is_elevated();
     let eligible = is_eligible();
     let can_drop = can_drop_elevation();
+    let unprotected_path = std::env::current_exe()
+        .map(|p| install_guard::verify_protected_executable(&p).is_err())
+        .unwrap_or(true);
     let mut result = AdminStartupStatus {
         supported: true,
         enabled: false,
@@ -194,6 +198,7 @@ pub fn status() -> Result<AdminStartupStatus, PalError> {
         eligible,
         can_drop_elevation: can_drop,
         error: None,
+        unprotected_path,
     };
 
     let check = (|| -> Result<(), String> {
@@ -260,6 +265,12 @@ pub fn set_enabled(enabled: bool) -> Result<AdminStartupStatus, PalError> {
         message: msg,
     })?;
     let exe = canonical_exe(&std::env::current_exe().map_err(PalError::Io)?);
+    if enabled && let Err(reason) = install_guard::verify_protected_executable(&exe) {
+        return Err(PalError::OsError {
+            code: 5,
+            message: reason.to_string(),
+        });
+    }
 
     if is_elevated() {
         apply_elevated(&sid, &exe, enabled).map_err(|msg| PalError::OsError {
@@ -297,6 +308,9 @@ fn apply_elevated(sid: &str, exe: &Path, enabled: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    if enabled {
+        install_guard::verify_protected_executable(exe).map_err(|r| r.to_string())?;
+    }
     let _lock = acquire_lock(&dir)?;
     let record = GrantRecord {
         exe_path: exe.to_path_buf(),

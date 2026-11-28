@@ -33,6 +33,7 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 use crate::handle::{OwnedHandle, map_win32_error, os_str_to_wide_null, to_wide_null};
+use crate::install_guard;
 use crate::operator::WindowsSystemOperator;
 use crate::slow_prober::ensure_com_initialized;
 
@@ -118,6 +119,7 @@ pub fn status() -> Result<TaskManagerReplacementStatus, PalError> {
     let dir = state_directory();
     let store = MachineStore::new(dir.clone());
     let current_exe = std::env::current_exe().map_err(PalError::Io)?;
+    let unprotected_path = install_guard::verify_protected_executable(&current_exe).is_err();
     let ours = replacement_value(&current_exe);
 
     let live = registry::observe_hklm(TASKMGR_IFEO_KEY).map_err(|msg| PalError::OsError {
@@ -151,6 +153,7 @@ pub fn status() -> Result<TaskManagerReplacementStatus, PalError> {
                 can_restore: state == TaskManagerReplacementState::RecoveryNeeded,
                 conflict_detail,
                 recovery_path: Some(dir.join(RECOVERY_TEXT_FILE).display().to_string()),
+                unprotected_path,
             });
         }
     };
@@ -166,9 +169,9 @@ pub fn status() -> Result<TaskManagerReplacementStatus, PalError> {
     };
 
     let (can_enable, can_restore) = match state {
-        TaskManagerReplacementState::Disabled => (true, false),
+        TaskManagerReplacementState::Disabled => (!unprotected_path, false),
         TaskManagerReplacementState::Enabled => (false, true),
-        TaskManagerReplacementState::Revoked => (true, true),
+        TaskManagerReplacementState::Revoked => (!unprotected_path, true),
         TaskManagerReplacementState::RecoveryNeeded => (false, true),
         TaskManagerReplacementState::Conflict | TaskManagerReplacementState::Unsupported => {
             (false, false)
@@ -188,6 +191,7 @@ pub fn status() -> Result<TaskManagerReplacementStatus, PalError> {
         can_restore,
         conflict_detail,
         recovery_path,
+        unprotected_path,
     })
 }
 
@@ -199,6 +203,12 @@ pub fn set_replacement(enabled: bool) -> Result<TaskManagerReplacementStatus, Pa
         message: msg,
     })?;
     let exe = canonical_exe(&std::env::current_exe().map_err(PalError::Io)?);
+    if enabled && let Err(reason) = install_guard::verify_protected_executable(&exe) {
+        return Err(PalError::OsError {
+            code: 5,
+            message: reason.to_string(),
+        });
+    }
 
     if WindowsSystemOperator::new().is_elevated() {
         let res = if enabled {
@@ -360,6 +370,7 @@ fn enable_elevated(exe: &Path, owner_sid: &str) -> Result<(), String> {
             "administrator privileges are required to enable Task Manager replacement".into(),
         );
     }
+    install_guard::verify_protected_executable(exe).map_err(|r| r.to_string())?;
     let dir = state_directory();
     let _lock = acquire_lock(&dir)?;
     let mut store = MachineStore::new(dir.clone());
