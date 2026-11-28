@@ -3,10 +3,15 @@
 //! Splits the static toolbar + PID filter banner ([`ServicesView`]) from the
 //! 2D-virtualized `gpui-kit` `DataTable` (`Entity<TableState<ServicesTableDelegate>>`)
 //! so live snapshot ticks refresh only the table entity while hidden routes incur
-//! zero SCM polling overhead.
+//! zero SCM polling overhead. Filtering and sorting are offloaded completely to
+//! `loom-engine`, keeping the GPUI UI thread focused on O(1) rendering.
 
-use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash as _, Hasher as _};
+use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
@@ -18,12 +23,15 @@ use gpui_kit::component::{
 use gpui_kit::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
+    Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
 };
+use loom_engine::{EngineCommand, EngineCoordinator};
+use loom_pal::NativeBackend;
 use loom_types::{
     AppSnapshot, CapabilityFlags, LanguagePreference, MonitorDomain, ProcessKey, ProcessRowKind,
-    ServiceRecord, ServiceState, ServicesSlice, SortDirection,
+    ServiceRecord, ServiceState, ServicesSlice, ServicesSortColumn, SortDirection,
 };
+use loom_ui_kit::{SMALL_U32_TABLE_MAX, UNAVAILABLE_LABEL, format_u32_shared};
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
 use crate::features::table_columns::DataTablePane;
@@ -31,80 +39,65 @@ use crate::i18n;
 use crate::shell::ShellHandle;
 
 const SERVICES_HEADER_HEIGHT: f32 = 32.0;
+const SCROLL_COALESCE_QUIET_WINDOW: Duration = Duration::from_millis(150);
+const SCROLL_COALESCE_MAX_DEFER: Duration = Duration::from_millis(500);
+const PID_TEXT_CACHE_LIMIT: usize = 1024;
+const DEFAULT_FINGERPRINT_WINDOW: usize = 64;
 
-/// Sortable columns displayed by [`ServicesView`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ServicesSortColumn {
-    Name,
-    Pid,
-    Description,
-    Status,
-    Group,
+const SERVICES_COLUMNS: [ServicesSortColumn; 5] = [
+    ServicesSortColumn::Name,
+    ServicesSortColumn::Pid,
+    ServicesSortColumn::Description,
+    ServicesSortColumn::Status,
+    ServicesSortColumn::Group,
+];
+
+#[inline]
+const fn column_slug(col: ServicesSortColumn) -> &'static str {
+    match col {
+        ServicesSortColumn::Name => "name",
+        ServicesSortColumn::Pid => "pid",
+        ServicesSortColumn::Description => "description",
+        ServicesSortColumn::Status => "status",
+        ServicesSortColumn::Group => "group",
+    }
 }
 
-impl ServicesSortColumn {
-    const ALL: [Self; 5] = [
-        Self::Name,
-        Self::Pid,
-        Self::Description,
-        Self::Status,
-        Self::Group,
-    ];
-
-    #[inline]
-    const fn slug(self) -> &'static str {
-        match self {
-            Self::Name => "name",
-            Self::Pid => "pid",
-            Self::Description => "description",
-            Self::Status => "status",
-            Self::Group => "group",
-        }
+#[inline]
+const fn column_width(col: ServicesSortColumn) -> f32 {
+    match col {
+        ServicesSortColumn::Name => 200.0,
+        ServicesSortColumn::Pid => 84.0,
+        ServicesSortColumn::Description => 340.0,
+        ServicesSortColumn::Status => 120.0,
+        ServicesSortColumn::Group => 180.0,
     }
+}
 
-    #[inline]
-    const fn width(self) -> f32 {
-        match self {
-            Self::Name => 200.0,
-            Self::Pid => 84.0,
-            Self::Description => 340.0,
-            Self::Status => 120.0,
-            Self::Group => 180.0,
-        }
+#[inline]
+const fn column_min_width(col: ServicesSortColumn) -> f32 {
+    match col {
+        ServicesSortColumn::Name => 120.0,
+        ServicesSortColumn::Pid => 64.0,
+        ServicesSortColumn::Description => 140.0,
+        ServicesSortColumn::Status => 84.0,
+        ServicesSortColumn::Group => 96.0,
     }
+}
 
-    #[inline]
-    const fn min_width(self) -> f32 {
-        match self {
-            Self::Name => 120.0,
-            Self::Pid => 64.0,
-            Self::Description => 140.0,
-            Self::Status => 84.0,
-            Self::Group => 96.0,
-        }
-    }
+#[inline]
+const fn column_right_aligned(col: ServicesSortColumn) -> bool {
+    matches!(col, ServicesSortColumn::Pid)
+}
 
-    #[inline]
-    const fn right_aligned(self) -> bool {
-        matches!(self, Self::Pid)
-    }
-
-    #[inline]
-    const fn default_direction(self) -> SortDirection {
-        match self {
-            Self::Status => SortDirection::Descending,
-            Self::Name | Self::Pid | Self::Description | Self::Group => SortDirection::Ascending,
-        }
-    }
-
-    fn label(self) -> String {
-        match self {
-            Self::Name => i18n::tr("services.col_name"),
-            Self::Pid => i18n::tr("services.col_pid"),
-            Self::Description => i18n::tr("services.col_description"),
-            Self::Status => i18n::tr("services.col_status"),
-            Self::Group => i18n::tr("services.col_group"),
-        }
+#[inline]
+const fn column_default_direction(col: ServicesSortColumn) -> SortDirection {
+    match col {
+        ServicesSortColumn::Status => SortDirection::Descending,
+        ServicesSortColumn::Name
+        | ServicesSortColumn::Pid
+        | ServicesSortColumn::Description
+        | ServicesSortColumn::Group => SortDirection::Ascending,
     }
 }
 
@@ -113,20 +106,6 @@ const fn to_column_sort(dir: SortDirection) -> ColumnSort {
     match dir {
         SortDirection::Ascending => ColumnSort::Ascending,
         SortDirection::Descending => ColumnSort::Descending,
-    }
-}
-
-#[inline]
-const fn service_state_rank(state: ServiceState) -> u8 {
-    match state {
-        ServiceState::Running => 7,
-        ServiceState::StartPending => 6,
-        ServiceState::ContinuePending => 5,
-        ServiceState::Paused => 4,
-        ServiceState::PausePending => 3,
-        ServiceState::StopPending => 2,
-        ServiceState::Stopped => 1,
-        ServiceState::Unknown => 0,
     }
 }
 
@@ -160,122 +139,32 @@ pub(super) fn service_description_text(record: &ServiceRecord) -> &str {
     if !display.is_empty() {
         return display;
     }
-    "—"
+    UNAVAILABLE_LABEL
 }
 
-/// Case-insensitive substring check without allocating per-haystack lowercase copies when possible.
+/// Returns the best human-readable description as a [`SharedString`], reusing the
+/// backing `Arc<str>` with zero heap allocation when the text is already trimmed.
 #[inline]
-fn contains_ascii_or_unicode_icase(haystack: &str, needle_lower: &str) -> bool {
-    if needle_lower.is_empty() {
-        return true;
-    }
-    if haystack.is_ascii() && needle_lower.is_ascii() {
-        let h = haystack.as_bytes();
-        let n = needle_lower.as_bytes();
-        if n.len() > h.len() {
-            return false;
+pub(super) fn service_description_shared(record: &ServiceRecord) -> SharedString {
+    if let Some(ref desc) = record.description {
+        let trimmed = desc.trim();
+        if !trimmed.is_empty() {
+            return if trimmed.len() == desc.len() {
+                SharedString::from(Arc::clone(desc))
+            } else {
+                SharedString::from(trimmed.to_owned())
+            };
         }
-        return h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n));
     }
-    haystack.to_lowercase().contains(needle_lower)
-}
-
-/// Returns `true` when `record` matches both the optional PID filter and global search query.
-pub(super) fn matches_service_filter(
-    record: &ServiceRecord,
-    filter_pid: Option<u32>,
-    query_lower: &str,
-) -> bool {
-    if let Some(target_pid) = filter_pid
-        && record.pid != Some(target_pid)
-    {
-        return false;
-    }
-    if query_lower.is_empty() {
-        return true;
-    }
-    if contains_ascii_or_unicode_icase(&record.name, query_lower)
-        || contains_ascii_or_unicode_icase(&record.display_name, query_lower)
-    {
-        return true;
-    }
-    if record
-        .description
-        .as_deref()
-        .is_some_and(|d| contains_ascii_or_unicode_icase(d, query_lower))
-    {
-        return true;
-    }
-    if record
-        .group
-        .as_deref()
-        .is_some_and(|g| contains_ascii_or_unicode_icase(g, query_lower))
-    {
-        return true;
-    }
-    if let Some(pid) = record.pid
-        && pid.to_string().contains(query_lower)
-    {
-        return true;
-    }
-    false
-}
-
-/// Filters and sorts `items` into indices suitable for O(1) virtualized table lookups.
-pub(super) fn filter_and_sort_services(
-    items: &[ServiceRecord],
-    filter_pid: Option<u32>,
-    search_query: &str,
-    sort_col: ServicesSortColumn,
-    sort_dir: SortDirection,
-) -> Vec<usize> {
-    let query_lower = search_query.trim().to_lowercase();
-    let mut indices: Vec<usize> = items
-        .iter()
-        .enumerate()
-        .filter(|(_, record)| matches_service_filter(record, filter_pid, &query_lower))
-        .map(|(idx, _)| idx)
-        .collect();
-
-    indices.sort_by(|&a_idx, &b_idx| {
-        let a = &items[a_idx];
-        let b = &items[b_idx];
-        let ord = match sort_col {
-            ServicesSortColumn::Name => cmp_icase(&a.name, &b.name),
-            ServicesSortColumn::Pid => a.pid.unwrap_or(0).cmp(&b.pid.unwrap_or(0)),
-            ServicesSortColumn::Description => {
-                cmp_icase(service_description_text(a), service_description_text(b))
-            }
-            ServicesSortColumn::Status => service_state_rank(a.state)
-                .cmp(&service_state_rank(b.state))
-                .then_with(|| cmp_icase(&a.name, &b.name)),
-            ServicesSortColumn::Group => cmp_icase(
-                a.group.as_deref().unwrap_or(""),
-                b.group.as_deref().unwrap_or(""),
-            ),
+    let display = record.display_name.trim();
+    if !display.is_empty() {
+        return if display.len() == record.display_name.len() {
+            SharedString::from(Arc::clone(&record.display_name))
+        } else {
+            SharedString::from(display.to_owned())
         };
-        let ordered = match sort_dir {
-            SortDirection::Ascending => ord,
-            SortDirection::Descending => ord.reverse(),
-        };
-        ordered.then_with(|| cmp_icase(&a.name, &b.name))
-    });
-
-    indices
-}
-
-#[inline]
-fn cmp_icase(a: &str, b: &str) -> Ordering {
-    if a.is_ascii() && b.is_ascii() {
-        for (&ab, &bb) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
-            let c = ab.to_ascii_lowercase().cmp(&bb.to_ascii_lowercase());
-            if c != Ordering::Equal {
-                return c;
-            }
-        }
-        return a.len().cmp(&b.len());
     }
-    a.to_lowercase().cmp(&b.to_lowercase())
+    SharedString::new_static(UNAVAILABLE_LABEL)
 }
 
 /// Resolves a live [`ProcessKey`] for a service host `pid` from the latest [`AppSnapshot`].
@@ -299,6 +188,92 @@ pub(super) fn resolve_process_key_by_pid(snapshot: &AppSnapshot, pid: u32) -> Op
         })
 }
 
+/// Outcome of the scroll-burst coalescing gate for periodic snapshot updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoalesceDecision {
+    ApplyNow,
+    Defer(Duration),
+}
+
+/// Coalesces periodic snapshot ticks during active scrolling to keep GPU row layers
+/// on their fast composite path, while enforcing a bounded maximum defer cap.
+#[derive(Debug, Default)]
+struct ScrollCoalescer {
+    deferred_since: Option<Instant>,
+}
+
+impl ScrollCoalescer {
+    fn decide(
+        &mut self,
+        now: Instant,
+        last_scroll_at: Option<Instant>,
+        bypass: bool,
+    ) -> CoalesceDecision {
+        if bypass {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
+        }
+        let Some(scrolled_at) = last_scroll_at else {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
+        };
+        let since_scroll = now.saturating_duration_since(scrolled_at);
+        if since_scroll >= SCROLL_COALESCE_QUIET_WINDOW {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
+        }
+        let first_deferred = *self.deferred_since.get_or_insert(now);
+        let since_defer = now.saturating_duration_since(first_deferred);
+        if since_defer >= SCROLL_COALESCE_MAX_DEFER {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
+        }
+        let quiet_remaining = SCROLL_COALESCE_QUIET_WINDOW - since_scroll;
+        let cap_remaining = SCROLL_COALESCE_MAX_DEFER - since_defer;
+        CoalesceDecision::Defer(quiet_remaining.min(cap_remaining))
+    }
+
+    fn reset(&mut self) {
+        self.deferred_since = None;
+    }
+}
+
+/// Computes a lightweight content fingerprint over only the currently visible rows.
+pub(super) fn compute_services_viewport_fingerprint(
+    slice: &ServicesSlice,
+    visible_rows: &Range<usize>,
+    selected_row: Option<usize>,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let total = slice.visible_indices.len();
+    (slice.revision == 0).hash(&mut hasher);
+    total.hash(&mut hasher);
+    slice.sort_column.hash(&mut hasher);
+    slice.sort_direction.hash(&mut hasher);
+    slice.filter_pid.hash(&mut hasher);
+    selected_row.hash(&mut hasher);
+
+    let range = if visible_rows.is_empty() {
+        0..total.min(DEFAULT_FINGERPRINT_WINDOW)
+    } else {
+        visible_rows.start.min(total)..visible_rows.end.min(total)
+    };
+    range.start.hash(&mut hasher);
+    range.end.hash(&mut hasher);
+
+    for &item_idx in &slice.visible_indices[range] {
+        if let Some(record) = slice.items.get(item_idx) {
+            record.name.hash(&mut hasher);
+            record.pid.hash(&mut hasher);
+            record.state.hash(&mut hasher);
+            service_description_text(record).hash(&mut hasher);
+            record.group.as_deref().hash(&mut hasher);
+        }
+    }
+
+    hasher.finish()
+}
+
 /// Action eligibility derived from the currently selected service row.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ServicesToolbarState {
@@ -309,6 +284,11 @@ struct ServicesToolbarState {
 
 /// Cached localized strings for [`ServicesTableDelegate`].
 struct ServicesLocaleCache {
+    col_name: SharedString,
+    col_pid: SharedString,
+    col_description: SharedString,
+    col_status: SharedString,
+    col_group: SharedString,
     running: SharedString,
     stopped: SharedString,
     start_pending: SharedString,
@@ -324,6 +304,11 @@ struct ServicesLocaleCache {
 impl ServicesLocaleCache {
     fn build() -> Self {
         Self {
+            col_name: i18n::tr("services.col_name").into(),
+            col_pid: i18n::tr("services.col_pid").into(),
+            col_description: i18n::tr("services.col_description").into(),
+            col_status: i18n::tr("services.col_status").into(),
+            col_group: i18n::tr("services.col_group").into(),
             running: i18n::service_state_label(ServiceState::Running).into(),
             stopped: i18n::service_state_label(ServiceState::Stopped).into(),
             start_pending: i18n::service_state_label(ServiceState::StartPending).into(),
@@ -334,6 +319,17 @@ impl ServicesLocaleCache {
             unknown: i18n::service_state_label(ServiceState::Unknown).into(),
             loading: i18n::tr("services.loading").into(),
             empty: i18n::tr("services.empty").into(),
+        }
+    }
+
+    #[inline]
+    fn column_label(&self, col: ServicesSortColumn) -> SharedString {
+        match col {
+            ServicesSortColumn::Name => self.col_name.clone(),
+            ServicesSortColumn::Pid => self.col_pid.clone(),
+            ServicesSortColumn::Description => self.col_description.clone(),
+            ServicesSortColumn::Status => self.col_status.clone(),
+            ServicesSortColumn::Group => self.col_group.clone(),
         }
     }
 
@@ -359,31 +355,21 @@ struct ServicesTableDelegate {
     slice: Arc<ServicesSlice>,
     capabilities: CapabilityFlags,
     last_rev: u64,
-    filter_pid: Option<u32>,
-    search_query: String,
-    sort_col: ServicesSortColumn,
-    sort_dir: SortDirection,
-    visible_indices: Vec<usize>,
     selected_name: Option<Arc<str>>,
+    visible_rows: Range<usize>,
+    last_scroll_at: Option<Instant>,
+    last_viewport_fp: Option<u64>,
+    user_action_pending: bool,
+    pid_text_cache: HashMap<u32, SharedString>,
     locale: ServicesLocaleCache,
 }
 
 impl ServicesTableDelegate {
-    fn new(
-        store: Entity<UiStore>,
-        filter_pid: Option<u32>,
-        shell_handle: ShellHandle,
-        cx: &App,
-    ) -> Self {
+    fn new(store: Entity<UiStore>, shell_handle: ShellHandle, cx: &App) -> Self {
         let store_ref = store.read(cx);
         let snap = store_ref.snapshot();
         let slice = Arc::clone(&snap.services);
         let capabilities = snap.capabilities;
-        let search_query = store_ref.search_query().to_owned();
-        let sort_col = ServicesSortColumn::Name;
-        let sort_dir = SortDirection::Ascending;
-        let visible_indices =
-            filter_and_sort_services(&slice.items, filter_pid, &search_query, sort_col, sort_dir);
 
         Self {
             store: store.clone(),
@@ -391,48 +377,51 @@ impl ServicesTableDelegate {
             last_rev: snap.revisions.services,
             slice,
             capabilities,
-            filter_pid,
-            search_query,
-            sort_col,
-            sort_dir,
-            visible_indices,
             selected_name: None,
+            visible_rows: 0..0,
+            last_scroll_at: None,
+            last_viewport_fp: None,
+            user_action_pending: false,
+            pid_text_cache: HashMap::new(),
             locale: ServicesLocaleCache::build(),
         }
     }
 
-    fn rebuild_rows(&mut self) {
-        self.visible_indices = filter_and_sort_services(
-            &self.slice.items,
-            self.filter_pid,
-            &self.search_query,
-            self.sort_col,
-            self.sort_dir,
-        );
-    }
-
+    #[inline]
     fn row_at(&self, row_ix: usize) -> Option<&ServiceRecord> {
-        let item_idx = *self.visible_indices.get(row_ix)?;
+        let item_idx = *self.slice.visible_indices.get(row_ix)?;
         self.slice.items.get(item_idx)
     }
 
-    fn find_visible_index_by_name(&self, name: &str) -> Option<usize> {
-        self.visible_indices
-            .iter()
-            .position(|&idx| self.slice.items[idx].name.as_ref() == name)
+    /// Locates `name` in `slice.visible_indices`, checking `hint_row` in O(1) before scanning.
+    #[inline]
+    fn find_visible_index_by_name(&self, name: &str, hint_row: Option<usize>) -> Option<usize> {
+        if let Some(hint) = hint_row
+            && self
+                .row_at(hint)
+                .is_some_and(|record| record.name.as_ref() == name)
+        {
+            return Some(hint);
+        }
+        self.slice.visible_indices.iter().position(|&idx| {
+            self.slice
+                .items
+                .get(idx)
+                .is_some_and(|record| record.name.as_ref() == name)
+        })
     }
 
-    fn selected_record(&self) -> Option<&ServiceRecord> {
+    fn selected_record(&self, hint_row: Option<usize>) -> Option<&ServiceRecord> {
         let sel = self.selected_name.as_deref()?;
-        let row_ix = self.find_visible_index_by_name(sel)?;
+        let row_ix = self.find_visible_index_by_name(sel, hint_row)?;
         self.row_at(row_ix)
     }
 
-    fn toolbar_state(&self) -> ServicesToolbarState {
+    fn toolbar_state(&self, hint_row: Option<usize>) -> ServicesToolbarState {
         if !self.capabilities.contains(CapabilityFlags::SERVICES) {
             return ServicesToolbarState::default();
         }
-        let Some(record) = self.selected_record() else {
+        let Some(record) = self.selected_record(hint_row) else {
             return ServicesToolbarState::default();
         };
         ServicesToolbarState {
@@ -442,51 +431,84 @@ impl ServicesTableDelegate {
         }
     }
 
-    fn toggle_sort(&mut self, col_ix: usize) {
-        let Some(&target) = ServicesSortColumn::ALL.get(col_ix) else {
+    #[inline]
+    fn pid_shared(&mut self, pid: u32) -> SharedString {
+        if pid <= SMALL_U32_TABLE_MAX {
+            return format_u32_shared(pid);
+        }
+        if self.pid_text_cache.len() >= PID_TEXT_CACHE_LIMIT
+            && !self.pid_text_cache.contains_key(&pid)
+        {
+            self.pid_text_cache.clear();
+        }
+        self.pid_text_cache
+            .entry(pid)
+            .or_insert_with(|| format_u32_shared(pid))
+            .clone()
+    }
+
+    fn trigger_sort(&mut self, col_ix: usize, cx: &mut Context<TableState<Self>>) {
+        let Some(&target) = SERVICES_COLUMNS.get(col_ix) else {
             return;
         };
-        if self.sort_col == target {
-            self.sort_dir = self.sort_dir.toggle();
+        let next_dir = if self.slice.sort_column == target {
+            self.slice.sort_direction.toggle()
         } else {
-            self.sort_col = target;
-            self.sort_dir = target.default_direction();
-        }
-        self.rebuild_rows();
+            column_default_direction(target)
+        };
+        self.user_action_pending = true;
+        let store = self.store.clone();
+        UiCommands::set_services_sort(&store, target, next_dir, cx);
     }
 }
 
 impl TableDelegate for ServicesTableDelegate {
     fn columns_count(&self, _cx: &App) -> usize {
-        ServicesSortColumn::ALL.len()
+        SERVICES_COLUMNS.len()
     }
 
     fn rows_count(&self, _cx: &App) -> usize {
-        self.visible_indices.len()
+        self.slice.visible_indices.len()
     }
 
     fn loading(&self, _cx: &App) -> bool {
         self.slice.revision == 0
     }
 
+    fn visible_rows_changed(
+        &mut self,
+        visible_range: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) {
+        if self.visible_rows != visible_range {
+            let scrolled = !self.visible_rows.is_empty();
+            self.visible_rows = visible_range;
+            self.last_viewport_fp = None;
+            if scrolled {
+                self.last_scroll_at = Some(Instant::now());
+            }
+        }
+    }
+
     fn column(&self, col_ix: usize, _cx: &App) -> Column {
-        let Some(&col) = ServicesSortColumn::ALL.get(col_ix) else {
+        let Some(&col) = SERVICES_COLUMNS.get(col_ix) else {
             return Column::default();
         };
-        let mut column = Column::new(col.slug(), col.label())
-            .width(px(col.width()))
-            .min_width(px(col.min_width()))
+        let mut column = Column::new(column_slug(col), self.locale.column_label(col))
+            .width(px(column_width(col)))
+            .min_width(px(column_min_width(col)))
             .selectable(false)
             .movable(false);
 
         if col == ServicesSortColumn::Name {
             column = column.fixed_left();
         }
-        if col.right_aligned() {
+        if column_right_aligned(col) {
             column = column.text_right();
         }
-        if col == self.sort_col {
-            column = column.sort(to_column_sort(self.sort_dir));
+        if col == self.slice.sort_column {
+            column = column.sort(to_column_sort(self.slice.sort_direction));
         } else {
             column = column.sortable();
         }
@@ -500,8 +522,7 @@ impl TableDelegate for ServicesTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) {
-        self.toggle_sort(col_ix);
-        cx.notify();
+        self.trigger_sort(col_ix, cx);
     }
 
     fn render_header(
@@ -522,12 +543,13 @@ impl TableDelegate for ServicesTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let Some(&col) = ServicesSortColumn::ALL.get(col_ix) else {
+        let Some(&col) = SERVICES_COLUMNS.get(col_ix) else {
             return Empty.into_any_element();
         };
-        let is_active = col == self.sort_col;
+        let is_active = col == self.slice.sort_column;
         let fg = cx.theme().foreground;
         let muted_fg = cx.theme().muted_foreground;
+        let label = self.locale.column_label(col);
 
         h_flex()
             .id(("services-th", col_ix))
@@ -535,27 +557,15 @@ impl TableDelegate for ServicesTableDelegate {
             .min_w_0()
             .h_full()
             .items_center()
-            .when(col.right_aligned(), |d| d.justify_end())
+            .when(column_right_aligned(col), |d| d.justify_end())
             .text_xs()
             .text_color(if is_active { fg } else { muted_fg })
             .when(is_active, |d| d.font_semibold())
             .cursor_pointer()
             .on_click(cx.listener(move |table, _, _, cx| {
-                table.delegate_mut().toggle_sort(col_ix);
-                let sel = table
-                    .delegate()
-                    .selected_name
-                    .as_deref()
-                    .and_then(|name| table.delegate().find_visible_index_by_name(name));
-                if let Some(idx) = sel {
-                    table.set_selected_row(idx, cx);
-                } else {
-                    table.clear_selection(cx);
-                }
-                table.refresh(cx);
-                cx.notify();
+                table.delegate_mut().trigger_sort(col_ix, cx);
             }))
-            .child(div().min_w_0().truncate().child(col.label()))
+            .child(div().min_w_0().truncate().child(label))
             .into_any_element()
     }
 
@@ -575,63 +585,66 @@ impl TableDelegate for ServicesTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let Some(record) = self.row_at(row_ix) else {
+        let Some(&col) = SERVICES_COLUMNS.get(col_ix) else {
             return Empty.into_any_element();
         };
-        let Some(&col) = ServicesSortColumn::ALL.get(col_ix) else {
+        let Some(&item_idx) = self.slice.visible_indices.get(row_ix) else {
             return Empty.into_any_element();
         };
+        if item_idx >= self.slice.items.len() {
+            return Empty.into_any_element();
+        }
 
         let theme = cx.theme();
         let fg = theme.foreground;
         let muted_fg = theme.muted_foreground;
         let primary = theme.primary;
+        let mono_font = theme.mono_font_family.clone();
 
         match col {
-            ServicesSortColumn::Name => h_flex()
-                .size_full()
-                .items_center()
-                .overflow_hidden()
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .font_medium()
-                        .text_color(fg)
-                        .child(SharedString::from(Arc::clone(&record.name))),
-                )
-                .into_any_element(),
+            ServicesSortColumn::Name => {
+                let text = SharedString::from(Arc::clone(&self.slice.items[item_idx].name));
+                h_flex()
+                    .size_full()
+                    .items_center()
+                    .truncate()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(fg)
+                    .child(text)
+                    .into_any_element()
+            }
             ServicesSortColumn::Pid => {
-                let text = record
-                    .pid
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "—".to_owned());
+                let pid = self.slice.items[item_idx].pid;
+                let text = match pid {
+                    Some(pid) => self.pid_shared(pid),
+                    None => SharedString::new_static(UNAVAILABLE_LABEL),
+                };
                 h_flex()
                     .size_full()
                     .items_center()
                     .justify_end()
+                    .truncate()
                     .text_xs()
-                    .font_family(theme.mono_font_family.clone())
+                    .font_family(mono_font)
                     .text_color(muted_fg)
                     .child(text)
                     .into_any_element()
             }
-            ServicesSortColumn::Description => h_flex()
-                .size_full()
-                .items_center()
-                .overflow_hidden()
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(muted_fg)
-                        .child(service_description_text(record).to_owned()),
-                )
-                .into_any_element(),
+            ServicesSortColumn::Description => {
+                let text = service_description_shared(&self.slice.items[item_idx]);
+                h_flex()
+                    .size_full()
+                    .items_center()
+                    .truncate()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child(text)
+                    .into_any_element()
+            }
             ServicesSortColumn::Status => {
-                let color = if record.state == ServiceState::Running {
+                let state = self.slice.items[item_idx].state;
+                let color = if state == ServiceState::Running {
                     primary
                 } else {
                     muted_fg
@@ -639,36 +652,26 @@ impl TableDelegate for ServicesTableDelegate {
                 h_flex()
                     .size_full()
                     .items_center()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(color)
-                            .child(self.locale.state_label(record.state)),
-                    )
+                    .truncate()
+                    .text_xs()
+                    .text_color(color)
+                    .child(self.locale.state_label(state))
                     .into_any_element()
             }
             ServicesSortColumn::Group => {
-                let text = record
+                let text = self.slice.items[item_idx]
                     .group
                     .as_ref()
                     .filter(|s| !s.is_empty())
                     .map(|s| SharedString::from(Arc::clone(s)))
-                    .unwrap_or_else(|| SharedString::new_static("—"));
+                    .unwrap_or_else(|| SharedString::new_static(UNAVAILABLE_LABEL));
                 h_flex()
                     .size_full()
                     .items_center()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child(text),
-                    )
+                    .truncate()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child(text)
                     .into_any_element()
             }
         }
@@ -820,6 +823,7 @@ impl TableDelegate for ServicesTableDelegate {
 /// On-demand system services manager holding an RAII `MonitorDomain::Services` lease.
 pub(crate) struct ServicesView {
     store: Entity<UiStore>,
+    coordinator: Arc<EngineCoordinator<NativeBackend>>,
     _lease: ScopedMonitorLease,
     table: Entity<TableState<ServicesTableDelegate>>,
     table_pane: Entity<DataTablePane<ServicesTableDelegate>>,
@@ -827,7 +831,19 @@ pub(crate) struct ServicesView {
     toolbar_state: ServicesToolbarState,
     services_supported: bool,
     last_locale: LanguagePreference,
+    scroll_coalescer: ScrollCoalescer,
+    coalesce_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+}
+
+impl Drop for ServicesView {
+    fn drop(&mut self) {
+        if self.filter_pid.is_some() {
+            let _ = self
+                .coordinator
+                .send_command(EngineCommand::SetServicesFilterPid(None));
+        }
+    }
 }
 
 impl Focusable for ServicesView {
@@ -837,7 +853,8 @@ impl Focusable for ServicesView {
 }
 
 impl ServicesView {
-    /// Creates a new [`ServicesView`], immediately acquiring `MonitorDomain::Services`.
+    /// Creates a new [`ServicesView`], immediately acquiring `MonitorDomain::Services`
+    /// and syncing the backend PID filter.
     pub(crate) fn new(
         store: Entity<UiStore>,
         filter_pid: Option<u32>,
@@ -845,10 +862,11 @@ impl ServicesView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let lease = store.read(cx).acquire_lease(MonitorDomain::Services);
-        let (services_supported, last_locale) = {
+        let (coordinator, lease, services_supported, last_locale) = {
             let s = store.read(cx);
             (
+                Arc::clone(s.coordinator()),
+                s.acquire_lease(MonitorDomain::Services),
                 s.snapshot()
                     .capabilities
                     .contains(CapabilityFlags::SERVICES),
@@ -856,8 +874,13 @@ impl ServicesView {
             )
         };
 
+        // Always synchronize the backend PID filter on mount (including `None`) so
+        // stale filters from previous navigations never leak into a fresh view.
+        UiCommands::set_services_filter_pid(&store, filter_pid, cx);
+
         let table = cx.new(|cx| {
-            let delegate = ServicesTableDelegate::new(store.clone(), filter_pid, shell_handle, cx);
+            let mut delegate = ServicesTableDelegate::new(store.clone(), shell_handle, cx);
+            delegate.user_action_pending = filter_pid != delegate.slice.filter_pid;
             TableState::new(delegate, window, cx)
                 .row_selectable(true)
                 .col_selectable(false)
@@ -874,7 +897,10 @@ impl ServicesView {
                 i18n::tr("services.title"),
             )
         });
-        let toolbar_state = table.read(cx).delegate().toolbar_state();
+        let toolbar_state = {
+            let t = table.read(cx);
+            t.delegate().toolbar_state(t.selected_row())
+        };
 
         let mut subscriptions = Vec::with_capacity(2);
 
@@ -886,48 +912,21 @@ impl ServicesView {
                     if revs.services == current_rev {
                         return;
                     }
-                    let (next_slice, next_caps) = {
-                        let snap = store.read(cx).snapshot();
-                        (Arc::clone(&snap.services), snap.capabilities)
-                    };
-                    let next_toolbar = table_for_store.update(cx, |table, cx| {
-                        let d = table.delegate_mut();
-                        d.slice = next_slice;
-                        d.capabilities = next_caps;
-                        d.last_rev = revs.services;
-                        d.rebuild_rows();
-                        Self::sync_table_selection(table, cx);
-                        cx.notify();
-                        table.delegate().toolbar_state()
-                    });
-                    let supported = next_caps.contains(CapabilityFlags::SERVICES);
-                    if this.toolbar_state != next_toolbar || this.services_supported != supported {
-                        this.toolbar_state = next_toolbar;
-                        this.services_supported = supported;
-                        cx.notify();
-                    }
+                    this.handle_snapshot_updated(cx);
                 }
                 UiStoreEvent::SearchQueryChanged => {
-                    let next_query = store.read(cx).search_query().to_owned();
-                    let next_toolbar = table_for_store.update(cx, |table, cx| {
-                        let d = table.delegate_mut();
-                        d.search_query = next_query;
-                        d.rebuild_rows();
-                        Self::sync_table_selection(table, cx);
-                        cx.notify();
-                        table.delegate().toolbar_state()
+                    table_for_store.update(cx, |table, _| {
+                        table.delegate_mut().user_action_pending = true;
                     });
-                    if this.toolbar_state != next_toolbar {
-                        this.toolbar_state = next_toolbar;
-                        cx.notify();
-                    }
                 }
                 UiStoreEvent::SettingsChanged => {
                     let next_locale = store.read(cx).settings().language;
                     if this.last_locale != next_locale {
                         this.last_locale = next_locale;
                         table_for_store.update(cx, |table, cx| {
-                            table.delegate_mut().locale = ServicesLocaleCache::build();
+                            let d = table.delegate_mut();
+                            d.locale = ServicesLocaleCache::build();
+                            d.last_viewport_fp = None;
                             table.refresh(cx);
                             cx.notify();
                         });
@@ -950,8 +949,10 @@ impl ServicesView {
                             .delegate()
                             .row_at(*row_ix)
                             .map(|r| Arc::clone(&r.name));
-                        table.delegate_mut().selected_name = name;
-                        table.delegate().toolbar_state()
+                        let d = table.delegate_mut();
+                        d.selected_name = name;
+                        d.last_viewport_fp = None;
+                        d.toolbar_state(Some(*row_ix))
                     });
                     if this.toolbar_state != next_toolbar {
                         this.toolbar_state = next_toolbar;
@@ -964,11 +965,15 @@ impl ServicesView {
                             .delegate()
                             .row_at(*row_ix)
                             .map(|r| Arc::clone(&r.name));
-                        table.delegate_mut().selected_name = name.clone();
+                        {
+                            let d = table.delegate_mut();
+                            d.selected_name = name.clone();
+                            d.last_viewport_fp = None;
+                        }
                         if name.is_some() && table.selected_row() != Some(*row_ix) {
                             table.set_selected_row(*row_ix, cx);
                         }
-                        table.delegate().toolbar_state()
+                        table.delegate().toolbar_state(table.selected_row())
                     });
                     if this.toolbar_state != next_toolbar {
                         this.toolbar_state = next_toolbar;
@@ -977,8 +982,10 @@ impl ServicesView {
                 }
                 TableEvent::ClearSelection => {
                     let next_toolbar = table.update(cx, |table, _| {
-                        table.delegate_mut().selected_name = None;
-                        table.delegate().toolbar_state()
+                        let d = table.delegate_mut();
+                        d.selected_name = None;
+                        d.last_viewport_fp = None;
+                        d.toolbar_state(None)
                     });
                     if this.toolbar_state != next_toolbar {
                         this.toolbar_state = next_toolbar;
@@ -991,6 +998,7 @@ impl ServicesView {
 
         Self {
             store,
+            coordinator,
             _lease: lease,
             table,
             table_pane,
@@ -998,7 +1006,93 @@ impl ServicesView {
             toolbar_state,
             services_supported,
             last_locale,
+            scroll_coalescer: ScrollCoalescer::default(),
+            coalesce_task: None,
             _subscriptions: subscriptions,
+        }
+    }
+
+    fn handle_snapshot_updated(&mut self, cx: &mut Context<Self>) {
+        let (next_rev, next_slice, next_caps) = {
+            let snap = self.store.read(cx).snapshot();
+            (
+                snap.revisions.services,
+                Arc::clone(&snap.services),
+                snap.capabilities,
+            )
+        };
+
+        let (bypass, last_scroll_at) = {
+            let d = self.table.read(cx).delegate();
+            if next_rev == d.last_rev {
+                return;
+            }
+            let bypass = d.slice.revision == 0
+                || d.user_action_pending
+                || d.slice.sort_column != next_slice.sort_column
+                || d.slice.sort_direction != next_slice.sort_direction
+                || d.slice.filter_pid != next_slice.filter_pid;
+            (bypass, d.last_scroll_at)
+        };
+
+        match self
+            .scroll_coalescer
+            .decide(Instant::now(), last_scroll_at, bypass)
+        {
+            CoalesceDecision::Defer(wait) => {
+                if self.coalesce_task.is_none() {
+                    self.coalesce_task = Some(cx.spawn(async move |weak, cx| {
+                        cx.background_executor().timer(wait).await;
+                        let _ = weak.update(cx, |this, cx| {
+                            this.coalesce_task = None;
+                            this.handle_snapshot_updated(cx);
+                        });
+                    }));
+                }
+            }
+            CoalesceDecision::ApplyNow => {
+                self.coalesce_task = None;
+                let next_toolbar = self.table.update(cx, |table, cx| {
+                    let prev_fp = table.delegate().last_viewport_fp;
+                    let sort_changed = {
+                        let d = table.delegate_mut();
+                        let changed = d.slice.sort_column != next_slice.sort_column
+                            || d.slice.sort_direction != next_slice.sort_direction;
+                        d.slice = next_slice;
+                        d.capabilities = next_caps;
+                        d.last_rev = next_rev;
+                        d.user_action_pending = false;
+                        changed
+                    };
+
+                    Self::sync_table_selection(table, cx);
+
+                    let selected_row = table.selected_row();
+                    let next_fp = {
+                        let d = table.delegate();
+                        compute_services_viewport_fingerprint(
+                            &d.slice,
+                            &d.visible_rows,
+                            selected_row,
+                        )
+                    };
+                    table.delegate_mut().last_viewport_fp = Some(next_fp);
+
+                    if sort_changed {
+                        table.refresh(cx);
+                    }
+                    if sort_changed || prev_fp != Some(next_fp) {
+                        cx.notify();
+                    }
+                    table.delegate().toolbar_state(selected_row)
+                });
+                let supported = next_caps.contains(CapabilityFlags::SERVICES);
+                if self.toolbar_state != next_toolbar || self.services_supported != supported {
+                    self.toolbar_state = next_toolbar;
+                    self.services_supported = supported;
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -1006,16 +1100,17 @@ impl ServicesView {
         table: &mut TableState<ServicesTableDelegate>,
         cx: &mut Context<TableState<ServicesTableDelegate>>,
     ) {
+        let hint_row = table.selected_row();
         let selected_idx = table
             .delegate()
             .selected_name
             .as_deref()
-            .and_then(|name| table.delegate().find_visible_index_by_name(name));
+            .and_then(|name| table.delegate().find_visible_index_by_name(name, hint_row));
         if let Some(idx) = selected_idx {
-            if table.selected_row() != Some(idx) {
+            if hint_row != Some(idx) {
                 table.set_selected_row(idx, cx);
             }
-        } else if table.selected_row().is_some() {
+        } else if hint_row.is_some() {
             table.clear_selection(cx);
         }
     }
@@ -1026,23 +1121,20 @@ impl ServicesView {
             return;
         }
         self.filter_pid = pid;
-        let next_toolbar = self.table.update(cx, |table, cx| {
-            let d = table.delegate_mut();
-            d.filter_pid = pid;
-            d.rebuild_rows();
-            Self::sync_table_selection(table, cx);
-            cx.notify();
-            table.delegate().toolbar_state()
+        self.scroll_coalescer.reset();
+        self.coalesce_task = None;
+        self.table.update(cx, |table, _| {
+            table.delegate_mut().user_action_pending = true;
         });
-        self.toolbar_state = next_toolbar;
+        UiCommands::set_services_filter_pid(&self.store, pid, cx);
         cx.notify();
     }
 
     fn selected_service_name(&self, cx: &App) -> Option<String> {
-        self.table
-            .read(cx)
+        let table = self.table.read(cx);
+        table
             .delegate()
-            .selected_record()
+            .selected_record(table.selected_row())
             .map(|r| r.name.to_string())
     }
 }
@@ -1185,6 +1277,7 @@ impl Render for ServicesView {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use gpui_kit::{TestAppContext, VisualTestContext};
     use loom_config::{AppSettings, ConfigStore};
@@ -1192,7 +1285,8 @@ mod tests {
     use loom_pal::{NativeBackend, PlatformBackend};
     use loom_types::{
         AppSnapshot, MonitorDomain, ProcessCategory, ProcessKey, ProcessRowKind,
-        ProcessRowProjection, ProcessStatusFlags, ServiceRecord, ServiceState, SortDirection,
+        ProcessRowProjection, ProcessStatusFlags, ServiceRecord, ServiceState, ServicesSlice,
+        ServicesSortColumn, SortDirection,
     };
 
     use super::*;
@@ -1216,94 +1310,141 @@ mod tests {
     }
 
     #[test]
-    fn services_filter_and_sort_cover_all_fields_and_pid_filter() {
-        let items = vec![
-            sample_service(
-                "Spooler",
-                "Print Spooler",
-                Some("Loads files to memory for later printing"),
-                Some(2040),
-                ServiceState::Running,
-                Some("SpoolerGroup"),
-            ),
-            sample_service(
-                "Dhcp",
-                "DHCP Client",
-                None,
-                Some(1200),
-                ServiceState::Running,
-                Some("LocalServiceNetworkRestricted"),
-            ),
-            sample_service(
-                "wuauserv",
-                "Windows Update",
-                Some("Enables detection and installation of updates"),
-                None,
-                ServiceState::Stopped,
-                Some("netsvcs"),
-            ),
-        ];
-
-        // Sort by Name ascending (case-insensitive).
-        let by_name = filter_and_sort_services(
-            &items,
+    fn service_description_shared_reuses_trimmed_arc_and_falls_back() {
+        let with_desc = sample_service(
+            "Spooler",
+            "Print Spooler",
+            Some("Loads files to memory"),
+            Some(2040),
+            ServiceState::Running,
             None,
-            "",
-            ServicesSortColumn::Name,
-            SortDirection::Ascending,
         );
-        assert_eq!(by_name, vec![1, 0, 2]);
+        assert_eq!(
+            service_description_shared(&with_desc).as_ref(),
+            "Loads files to memory"
+        );
 
-        // Sort by PID descending.
-        let by_pid = filter_and_sort_services(
-            &items,
+        let padded_desc = sample_service(
+            "Spooler",
+            "Print Spooler",
+            Some("  Trimmed description  "),
             None,
-            "",
-            ServicesSortColumn::Pid,
-            SortDirection::Descending,
+            ServiceState::Stopped,
+            None,
         );
-        assert_eq!(by_pid, vec![0, 1, 2]);
+        assert_eq!(
+            service_description_shared(&padded_desc).as_ref(),
+            "Trimmed description"
+        );
 
-        // Filter by PID matches strictly.
-        let pid_only = filter_and_sort_services(
-            &items,
+        let fallback_display = sample_service(
+            "Dhcp",
+            "DHCP Client",
+            Some("   "),
             Some(1200),
-            "",
-            ServicesSortColumn::Name,
-            SortDirection::Ascending,
+            ServiceState::Running,
+            None,
         );
-        assert_eq!(pid_only, vec![1]);
+        assert_eq!(
+            service_description_shared(&fallback_display).as_ref(),
+            "DHCP Client"
+        );
 
-        // Search across description, group, and PID.
+        let empty = sample_service("Empty", "   ", None, None, ServiceState::Unknown, None);
         assert_eq!(
-            filter_and_sort_services(
-                &items,
-                None,
-                "printing",
-                ServicesSortColumn::Name,
-                SortDirection::Ascending,
-            ),
-            vec![0]
+            service_description_shared(&empty).as_ref(),
+            UNAVAILABLE_LABEL
         );
+    }
+
+    #[test]
+    fn services_viewport_fingerprint_detects_visible_changes_and_ignores_offscreen_edits() {
+        let mut slice = ServicesSlice {
+            revision: 1,
+            sort_column: ServicesSortColumn::Name,
+            sort_direction: SortDirection::Ascending,
+            filter_pid: None,
+            items: vec![
+                sample_service(
+                    "Alpha",
+                    "Alpha",
+                    None,
+                    Some(100),
+                    ServiceState::Running,
+                    None,
+                ),
+                sample_service("Beta", "Beta", None, Some(200), ServiceState::Stopped, None),
+                sample_service(
+                    "Gamma",
+                    "Gamma",
+                    None,
+                    Some(300),
+                    ServiceState::Running,
+                    None,
+                ),
+            ],
+            visible_indices: vec![0, 1, 2],
+            ..ServicesSlice::default()
+        };
+
+        let fp_initial = compute_services_viewport_fingerprint(&slice, &(0..2), Some(0));
+
+        // Mutating an off-screen row (index 2) keeps the visible fingerprint identical.
+        slice.items[2].state = ServiceState::Stopped;
+        let fp_offscreen = compute_services_viewport_fingerprint(&slice, &(0..2), Some(0));
+        assert_eq!(fp_initial, fp_offscreen);
+
+        // Mutating a visible row (index 1) changes the fingerprint.
+        slice.items[1].state = ServiceState::Running;
+        let fp_visible = compute_services_viewport_fingerprint(&slice, &(0..2), Some(0));
+        assert_ne!(fp_initial, fp_visible);
+
+        // Changing sort direction changes the fingerprint even if visible rows match.
+        let fp_before_sort = fp_visible;
+        slice.sort_direction = SortDirection::Descending;
+        let fp_after_sort = compute_services_viewport_fingerprint(&slice, &(0..2), Some(0));
+        assert_ne!(fp_before_sort, fp_after_sort);
+    }
+
+    #[test]
+    fn services_scroll_coalescer_enforces_quiet_window_max_defer_and_bypass() {
+        let mut coalescer = ScrollCoalescer::default();
+        let t0 = Instant::now();
+
+        // No scroll history -> apply immediately.
         assert_eq!(
-            filter_and_sort_services(
-                &items,
-                None,
-                "netsvcs",
-                ServicesSortColumn::Name,
-                SortDirection::Ascending,
-            ),
-            vec![2]
+            coalescer.decide(t0, None, false),
+            CoalesceDecision::ApplyNow
         );
+
+        // Active scroll (40 ms ago) -> defer by remaining 110 ms quiet window.
+        let t1 = t0 + Duration::from_millis(40);
         assert_eq!(
-            filter_and_sort_services(
-                &items,
-                None,
-                "2040",
-                ServicesSortColumn::Name,
-                SortDirection::Ascending,
-            ),
-            vec![0]
+            coalescer.decide(t1, Some(t0), false),
+            CoalesceDecision::Defer(Duration::from_millis(110))
+        );
+
+        // User-initiated bypass applies immediately and clears deferred timer.
+        assert_eq!(
+            coalescer.decide(t1, Some(t0), true),
+            CoalesceDecision::ApplyNow
+        );
+
+        // Continuous scroll hits the 500 ms max defer cap.
+        let start = t0 + Duration::from_secs(1);
+        assert!(matches!(
+            coalescer.decide(start, Some(start), false),
+            CoalesceDecision::Defer(_)
+        ));
+        let near_cap = start + Duration::from_millis(450);
+        assert_eq!(
+            coalescer.decide(near_cap, Some(near_cap), false),
+            CoalesceDecision::Defer(Duration::from_millis(50))
+        );
+        let at_cap = start + Duration::from_millis(500);
+        assert_eq!(
+            coalescer.decide(at_cap, Some(at_cap), false),
+            CoalesceDecision::ApplyNow
         );
     }
 
@@ -1352,7 +1493,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn services_view_acquires_and_releases_monitor_lease_on_mount_and_drop(
+    fn services_view_acquires_lease_dispatches_sort_and_clears_pid_filter_on_drop(
         cx: &mut TestAppContext,
     ) {
         cx.update(gpui_kit::init);
@@ -1388,6 +1529,15 @@ mod tests {
             coordinator.leases().is_active(MonitorDomain::Services),
             "mounting ServicesView must acquire MonitorDomain::Services lease"
         );
+
+        // Trigger backend sort dispatch and clear PID filter cleanly.
+        view.update(&mut vcx, |view, cx| {
+            view.table.update(cx, |table, cx| {
+                table.delegate_mut().trigger_sort(1, cx);
+            });
+            view.set_filter_pid(Some(5678), cx);
+        });
+        vcx.run_until_parked();
 
         drop(view);
         vcx.update(|window, _| window.remove_window());

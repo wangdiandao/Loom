@@ -11,9 +11,10 @@ use loom_config::TableColumnSetting;
 use loom_engine::{CommandEvent, EngineCommand, EngineCommandError};
 use loom_pal::PalError;
 use loom_types::{
-    CpuAffinityMask, DetailsSortColumn, DetailsViewMode, LanguagePreference, ProcessKey,
-    ProcessPriority, ProcessSortColumn, ProcessViewMode, RefreshSpeed, ResourceDisplayMode,
-    RunTaskRequest, SortDirection, StartupPage, ThemePreference,
+    AppHistorySortColumn, CpuAffinityMask, DetailsSortColumn, DetailsViewMode, LanguagePreference,
+    ProcessKey, ProcessPriority, ProcessSortColumn, ProcessViewMode, RefreshSpeed,
+    ResourceDisplayMode, RunTaskRequest, ServicesSortColumn, SortDirection, StartupPage,
+    StartupSortColumn, ThemePreference, UsersSortColumn,
 };
 
 use crate::bootstrap;
@@ -565,5 +566,71 @@ impl UiCommands {
         let _ = store
             .read(cx)
             .dispatch_command(EngineCommand::ClearAppHistory);
+    }
+
+    /// Updates the sort column and direction of the Services table on the backend engine.
+    pub(crate) fn set_services_sort(
+        store: &Entity<UiStore>,
+        column: ServicesSortColumn,
+        direction: SortDirection,
+        cx: &mut App,
+    ) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SetServicesSort { column, direction });
+    }
+
+    /// Updates or clears the optional hosting PID filter of the Services table on the backend engine.
+    pub(crate) fn set_services_filter_pid(store: &Entity<UiStore>, pid: Option<u32>, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SetServicesFilterPid(pid));
+    }
+
+    /// Updates the sort column and direction of the Startup Applications table on the backend engine.
+    pub(crate) fn set_startup_sort(
+        store: &Entity<UiStore>,
+        column: StartupSortColumn,
+        direction: SortDirection,
+        cx: &mut App,
+    ) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SetStartupSort { column, direction });
+    }
+
+    /// Updates the sort column and direction of the Users table on the backend engine.
+    pub(crate) fn set_users_sort(
+        store: &Entity<UiStore>,
+        column: UsersSortColumn,
+        direction: SortDirection,
+        cx: &mut App,
+    ) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SetUsersSort { column, direction });
+    }
+
+    /// Toggles the expanded/collapsed state of a user session row in the Users table on the backend engine.
+    pub(crate) fn toggle_user_session_expanded(
+        store: &Entity<UiStore>,
+        session_id: u32,
+        cx: &mut App,
+    ) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::ToggleUserSessionExpanded(session_id));
+    }
+
+    /// Updates the sort column and direction of the App History table on the backend engine.
+    pub(crate) fn set_app_history_sort(
+        store: &Entity<UiStore>,
+        column: AppHistorySortColumn,
+        direction: SortDirection,
+        cx: &mut App,
+    ) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SetAppHistorySort { column, direction });
     }
 }

@@ -3,10 +3,13 @@
 //! Splits the static toolbar ([`UsersView`]) from the expandable session-tree
 //! 2D-virtualized `gpui-kit` `DataTable` (`Entity<TableState<UsersTableDelegate>>`)
 //! so hidden routes incur zero WTS session polling or per-session aggregation overhead.
+//! Sorting, filtering, and session-tree flattening are offloaded to `loom-engine`.
 
-use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash as _, Hasher as _};
+use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
@@ -19,17 +22,18 @@ use gpui_kit::component::{
 use gpui_kit::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, MouseButton, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div,
     prelude::FluentBuilder as _, px,
 };
 use loom_types::{
     CapabilityFlags, LanguagePreference, MonitorDomain, ProcessKey, ProcessStatusFlags,
-    RunTaskRequest, SortDirection, UserSessionProcess, UserSessionRecord, UserSessionState,
-    UsersSlice,
+    ResourceDisplayMode, RunTaskRequest, SortDirection, UserSessionProcess, UserSessionState,
+    UsersRowProjection, UsersSlice, UsersSortColumn,
 };
 use loom_ui_kit::{
-    HeatmapLevel, LoomSemanticColors, format_bytes_shared, format_network_rate_mbps_shared,
-    format_permille_shared, format_rate_bytes_per_sec_shared, heatmap_cell,
+    CachedSemanticColors, HeatmapLevel, RowTextCache, format_child_count_shared,
+    format_permille_metric, heatmap_cell_metric, quantize_bytes_display, quantize_net_bps_display,
+    quantize_rate_bps_display,
 };
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
@@ -38,96 +42,93 @@ use crate::i18n;
 use crate::shell::ShellHandle;
 
 const USERS_HEADER_HEIGHT: f32 = 32.0;
+const SCROLL_COALESCE_QUIET_WINDOW: Duration = Duration::from_millis(150);
+const SCROLL_COALESCE_MAX_DEFER: Duration = Duration::from_millis(500);
+const DEFAULT_FINGERPRINT_WINDOW: usize = 64;
+
+/// Sentinel creation timestamp used to cache top-level session aggregate metrics inside
+/// [`RowTextCache`] without colliding with any real OS [`ProcessKey`].
+const SESSION_CACHE_CREATE_TIME_SENTINEL: u64 = u64::MAX;
 
 /// Fallback total physical memory (16 GiB) used only before the first performance sample arrives.
 const FALLBACK_TOTAL_RAM_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
-/// Sortable columns displayed by [`UsersView`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum UsersSortColumn {
-    User,
-    Status,
-    Cpu,
-    Memory,
-    Disk,
-    Network,
+const USERS_COLUMNS: [UsersSortColumn; 6] = [
+    UsersSortColumn::User,
+    UsersSortColumn::Status,
+    UsersSortColumn::Cpu,
+    UsersSortColumn::Memory,
+    UsersSortColumn::Disk,
+    UsersSortColumn::Network,
+];
+
+#[inline]
+const fn column_slug(col: UsersSortColumn) -> &'static str {
+    match col {
+        UsersSortColumn::User => "user",
+        UsersSortColumn::Status => "status",
+        UsersSortColumn::Cpu => "cpu",
+        UsersSortColumn::Memory => "memory",
+        UsersSortColumn::Disk => "disk",
+        UsersSortColumn::Network => "network",
+    }
 }
 
-impl UsersSortColumn {
-    const ALL: [Self; 6] = [
-        Self::User,
-        Self::Status,
-        Self::Cpu,
-        Self::Memory,
-        Self::Disk,
-        Self::Network,
-    ];
-
-    #[inline]
-    const fn slug(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Status => "status",
-            Self::Cpu => "cpu",
-            Self::Memory => "memory",
-            Self::Disk => "disk",
-            Self::Network => "network",
-        }
+#[inline]
+const fn column_width(col: UsersSortColumn) -> f32 {
+    match col {
+        UsersSortColumn::User => 280.0,
+        UsersSortColumn::Status => 120.0,
+        UsersSortColumn::Cpu => 92.0,
+        UsersSortColumn::Memory => 128.0,
+        UsersSortColumn::Disk => 116.0,
+        UsersSortColumn::Network => 116.0,
     }
+}
 
-    #[inline]
-    const fn width(self) -> f32 {
-        match self {
-            Self::User => 280.0,
-            Self::Status => 120.0,
-            Self::Cpu => 92.0,
-            Self::Memory => 128.0,
-            Self::Disk => 116.0,
-            Self::Network => 116.0,
-        }
+#[inline]
+const fn column_min_width(col: UsersSortColumn) -> f32 {
+    match col {
+        UsersSortColumn::User => 140.0,
+        UsersSortColumn::Status => 84.0,
+        UsersSortColumn::Cpu => 68.0,
+        UsersSortColumn::Memory => 88.0,
+        UsersSortColumn::Disk => 88.0,
+        UsersSortColumn::Network => 88.0,
     }
+}
 
-    #[inline]
-    const fn min_width(self) -> f32 {
-        match self {
-            Self::User => 140.0,
-            Self::Status => 84.0,
-            Self::Cpu => 68.0,
-            Self::Memory => 88.0,
-            Self::Disk => 88.0,
-            Self::Network => 88.0,
-        }
-    }
+#[inline]
+const fn column_right_aligned(col: UsersSortColumn) -> bool {
+    matches!(
+        col,
+        UsersSortColumn::Cpu
+            | UsersSortColumn::Memory
+            | UsersSortColumn::Disk
+            | UsersSortColumn::Network
+    )
+}
 
-    #[inline]
-    const fn right_aligned(self) -> bool {
-        matches!(self, Self::Cpu | Self::Memory | Self::Disk | Self::Network)
-    }
+#[inline]
+const fn column_is_heatmap(col: UsersSortColumn) -> bool {
+    matches!(
+        col,
+        UsersSortColumn::Cpu
+            | UsersSortColumn::Memory
+            | UsersSortColumn::Disk
+            | UsersSortColumn::Network
+    )
+}
 
-    #[inline]
-    const fn is_heatmap(self) -> bool {
-        matches!(self, Self::Cpu | Self::Memory | Self::Disk | Self::Network)
-    }
-
-    #[inline]
-    const fn default_direction(self) -> SortDirection {
-        match self {
-            Self::Cpu | Self::Memory | Self::Disk | Self::Network | Self::Status => {
-                SortDirection::Descending
-            }
-            Self::User => SortDirection::Ascending,
-        }
-    }
-
-    fn label(self) -> String {
-        match self {
-            Self::User => i18n::tr("users.col_user"),
-            Self::Status => i18n::tr("users.col_status"),
-            Self::Cpu => i18n::tr("users.col_cpu"),
-            Self::Memory => i18n::tr("users.col_memory"),
-            Self::Disk => i18n::tr("users.col_disk"),
-            Self::Network => i18n::tr("users.col_network"),
-        }
+#[inline]
+const fn column_default_direction(col: UsersSortColumn) -> SortDirection {
+    match col {
+        UsersSortColumn::Cpu
+        | UsersSortColumn::Memory
+        | UsersSortColumn::Disk
+        | UsersSortColumn::Network
+        | UsersSortColumn::Status => SortDirection::Descending,
+        UsersSortColumn::User => SortDirection::Ascending,
     }
 }
 
@@ -136,16 +137,6 @@ const fn to_column_sort(dir: SortDirection) -> ColumnSort {
     match dir {
         SortDirection::Ascending => ColumnSort::Ascending,
         SortDirection::Descending => ColumnSort::Descending,
-    }
-}
-
-#[inline]
-const fn session_state_rank(state: UserSessionState) -> u8 {
-    match state {
-        UserSessionState::Active => 3,
-        UserSessionState::Idle => 2,
-        UserSessionState::Disconnected => 1,
-        UserSessionState::Unknown => 0,
     }
 }
 
@@ -170,36 +161,6 @@ fn is_critical_or_system_process(status: ProcessStatusFlags) -> bool {
     )
 }
 
-#[inline]
-fn contains_icase(haystack: &str, needle_lower: &str) -> bool {
-    if needle_lower.is_empty() {
-        return true;
-    }
-    if haystack.is_ascii() && needle_lower.is_ascii() {
-        let h = haystack.as_bytes();
-        let n = needle_lower.as_bytes();
-        if n.len() > h.len() {
-            return false;
-        }
-        return h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n));
-    }
-    haystack.to_lowercase().contains(needle_lower)
-}
-
-#[inline]
-fn cmp_icase(a: &str, b: &str) -> Ordering {
-    if a.is_ascii() && b.is_ascii() {
-        for (&ab, &bb) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
-            let c = ab.to_ascii_lowercase().cmp(&bb.to_ascii_lowercase());
-            if c != Ordering::Equal {
-                return c;
-            }
-        }
-        return a.len().cmp(&b.len());
-    }
-    a.to_lowercase().cmp(&b.to_lowercase())
-}
-
 /// Stable selection key anchoring rows across live refreshes and tree expansion toggles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum UsersRowKey {
@@ -207,191 +168,130 @@ pub(super) enum UsersRowKey {
     Process(ProcessKey),
 }
 
-/// Flattened row projection rendered by [`UsersTableDelegate`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum UsersRow {
-    Session {
-        session_id: u32,
-        user_name: Arc<str>,
-        state: UserSessionState,
-        process_count: u32,
-        cpu_permille: u16,
-        memory_bytes: u64,
-        disk_bytes_per_sec: u64,
-        net_bytes_per_sec: u64,
-        has_children: bool,
-        is_expanded: bool,
-    },
-    Process {
-        session_id: u32,
-        process: UserSessionProcess,
-    },
-}
-
-impl UsersRow {
-    #[inline]
-    pub(super) fn key(&self) -> UsersRowKey {
-        match self {
-            Self::Session { session_id, .. } => UsersRowKey::Session(*session_id),
-            Self::Process { process, .. } => UsersRowKey::Process(process.key),
-        }
+#[inline]
+fn row_key(row: &UsersRowProjection) -> UsersRowKey {
+    match row {
+        UsersRowProjection::Session { session_id, .. } => UsersRowKey::Session(*session_id),
+        UsersRowProjection::Process { process, .. } => UsersRowKey::Process(process.key),
     }
 }
 
-fn matches_session_header(session: &UserSessionRecord, query_lower: &str) -> bool {
-    contains_icase(&session.user_name, query_lower)
-        || session.session_id.to_string().contains(query_lower)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoalesceDecision {
+    ApplyNow,
+    Defer(Duration),
 }
 
-fn matches_session_process(proc_item: &UserSessionProcess, query_lower: &str) -> bool {
-    contains_icase(&proc_item.display_name, query_lower)
-        || contains_icase(&proc_item.name, query_lower)
-        || proc_item.key.pid.to_string().contains(query_lower)
+#[derive(Debug, Default)]
+struct ScrollCoalescer {
+    deferred_since: Option<Instant>,
 }
 
-fn compare_sessions(
-    a: &UserSessionRecord,
-    b: &UserSessionRecord,
-    sort_col: UsersSortColumn,
-    sort_dir: SortDirection,
-) -> Ordering {
-    let ord = match sort_col {
-        UsersSortColumn::User => cmp_icase(&a.user_name, &b.user_name),
-        UsersSortColumn::Status => session_state_rank(a.state).cmp(&session_state_rank(b.state)),
-        UsersSortColumn::Cpu => a.cpu_permille.cmp(&b.cpu_permille),
-        UsersSortColumn::Memory => a.memory_bytes.cmp(&b.memory_bytes),
-        UsersSortColumn::Disk => a.disk_bytes_per_sec.cmp(&b.disk_bytes_per_sec),
-        UsersSortColumn::Network => a.net_bytes_per_sec.cmp(&b.net_bytes_per_sec),
-    };
-    let ordered = match sort_dir {
-        SortDirection::Ascending => ord,
-        SortDirection::Descending => ord.reverse(),
-    };
-    ordered.then_with(|| a.session_id.cmp(&b.session_id))
-}
-
-fn compare_child_processes(
-    a: &UserSessionProcess,
-    b: &UserSessionProcess,
-    sort_col: UsersSortColumn,
-    sort_dir: SortDirection,
-) -> Ordering {
-    let ord = match sort_col {
-        UsersSortColumn::User => cmp_icase(&a.display_name, &b.display_name),
-        UsersSortColumn::Status => {
-            let a_running = !a.status.contains(ProcessStatusFlags::SUSPENDED);
-            let b_running = !b.status.contains(ProcessStatusFlags::SUSPENDED);
-            a_running.cmp(&b_running)
+impl ScrollCoalescer {
+    fn decide(
+        &mut self,
+        now: Instant,
+        last_scroll_at: Option<Instant>,
+        bypass: bool,
+    ) -> CoalesceDecision {
+        if bypass {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
         }
-        UsersSortColumn::Cpu => a.cpu_permille.cmp(&b.cpu_permille),
-        UsersSortColumn::Memory => a.memory_bytes.cmp(&b.memory_bytes),
-        UsersSortColumn::Disk => a.disk_bytes_per_sec.cmp(&b.disk_bytes_per_sec),
-        UsersSortColumn::Network => a.net_bytes_per_sec.cmp(&b.net_bytes_per_sec),
-    };
-    let ordered = match sort_dir {
-        SortDirection::Ascending => ord,
-        SortDirection::Descending => ord.reverse(),
-    };
-    ordered
-        .then_with(|| cmp_icase(&a.display_name, &b.display_name))
-        .then_with(|| a.key.cmp(&b.key))
+        let Some(scrolled_at) = last_scroll_at else {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
+        };
+        let since_scroll = now.saturating_duration_since(scrolled_at);
+        if since_scroll >= SCROLL_COALESCE_QUIET_WINDOW {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
+        }
+        let first_deferred = *self.deferred_since.get_or_insert(now);
+        let since_defer = now.saturating_duration_since(first_deferred);
+        if since_defer >= SCROLL_COALESCE_MAX_DEFER {
+            self.deferred_since = None;
+            return CoalesceDecision::ApplyNow;
+        }
+        let quiet_remaining = SCROLL_COALESCE_QUIET_WINDOW - since_scroll;
+        let cap_remaining = SCROLL_COALESCE_MAX_DEFER - since_defer;
+        CoalesceDecision::Defer(quiet_remaining.min(cap_remaining))
+    }
 }
 
-/// Flattens `sessions` into expandable session headers and child process rows.
-///
-/// When `search_query` is non-empty, sessions with matching child processes are
-/// automatically expanded to reveal those matching children.
-pub(super) fn flatten_users_rows(
-    sessions: &[UserSessionRecord],
-    expanded_sessions: &HashSet<u32>,
-    search_query: &str,
-    sort_col: UsersSortColumn,
-    sort_dir: SortDirection,
-) -> Vec<UsersRow> {
-    let query_lower = search_query.trim().to_lowercase();
-    let mut session_refs: Vec<&UserSessionRecord> = sessions.iter().collect();
-    session_refs.sort_by(|a, b| compare_sessions(a, b, sort_col, sort_dir));
+/// Computes a lightweight content fingerprint over only the currently visible rows using
+/// display-quantized metric keys so sub-tenth metric jitter does not force repaints.
+pub(super) fn compute_users_viewport_fingerprint(
+    slice: &UsersSlice,
+    total_ram_bytes: u64,
+    visible_rows: &Range<usize>,
+    selected_row: Option<usize>,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let total = slice.rows.len();
+    (slice.revision == 0).hash(&mut hasher);
+    total.hash(&mut hasher);
+    slice.sort_column.hash(&mut hasher);
+    slice.sort_direction.hash(&mut hasher);
+    selected_row.hash(&mut hasher);
 
-    let mut rows = Vec::with_capacity(sessions.len() * 2);
+    let range = if visible_rows.is_empty() {
+        0..total.min(DEFAULT_FINGERPRINT_WINDOW)
+    } else {
+        visible_rows.start.min(total)..visible_rows.end.min(total)
+    };
+    range.start.hash(&mut hasher);
+    range.end.hash(&mut hasher);
 
-    for session in session_refs {
-        if query_lower.is_empty() {
-            let has_children = !session.processes.is_empty();
-            let is_expanded = has_children && expanded_sessions.contains(&session.session_id);
-            rows.push(UsersRow::Session {
-                session_id: session.session_id,
-                user_name: Arc::clone(&session.user_name),
-                state: session.state,
-                process_count: session.process_count,
-                cpu_permille: session.cpu_permille,
-                memory_bytes: session.memory_bytes,
-                disk_bytes_per_sec: session.disk_bytes_per_sec,
-                net_bytes_per_sec: session.net_bytes_per_sec,
+    for row in &slice.rows[range] {
+        match row {
+            UsersRowProjection::Session {
+                session_id,
+                user_name,
+                state,
+                process_count,
+                cpu_permille,
+                memory_bytes,
+                disk_bytes_per_sec,
+                net_bytes_per_sec,
                 has_children,
                 is_expanded,
-            });
-            if is_expanded {
-                let mut children: Vec<&UserSessionProcess> = session.processes.iter().collect();
-                children.sort_by(|a, b| compare_child_processes(a, b, sort_col, sort_dir));
-                for proc_item in children {
-                    rows.push(UsersRow::Process {
-                        session_id: session.session_id,
-                        process: proc_item.clone(),
-                    });
-                }
+            } => {
+                0u8.hash(&mut hasher);
+                session_id.hash(&mut hasher);
+                user_name.hash(&mut hasher);
+                state.hash(&mut hasher);
+                process_count.hash(&mut hasher);
+                cpu_permille.hash(&mut hasher);
+                quantize_bytes_display(*memory_bytes).hash(&mut hasher);
+                memory_heatmap_level(*memory_bytes, total_ram_bytes).hash(&mut hasher);
+                quantize_rate_bps_display(*disk_bytes_per_sec).hash(&mut hasher);
+                HeatmapLevel::from_bytes_per_sec(*disk_bytes_per_sec).hash(&mut hasher);
+                quantize_net_bps_display(*net_bytes_per_sec).hash(&mut hasher);
+                HeatmapLevel::from_bytes_per_sec(*net_bytes_per_sec).hash(&mut hasher);
+                has_children.hash(&mut hasher);
+                is_expanded.hash(&mut hasher);
             }
-        } else {
-            let header_matches = matches_session_header(session, &query_lower);
-            let mut matching_children: Vec<&UserSessionProcess> = session
-                .processes
-                .iter()
-                .filter(|p| matches_session_process(p, &query_lower))
-                .collect();
-
-            if !header_matches && matching_children.is_empty() {
-                continue;
-            }
-
-            let has_children = !session.processes.is_empty();
-            let auto_expand = !matching_children.is_empty();
-            let is_expanded =
-                auto_expand || (has_children && expanded_sessions.contains(&session.session_id));
-
-            rows.push(UsersRow::Session {
-                session_id: session.session_id,
-                user_name: Arc::clone(&session.user_name),
-                state: session.state,
-                process_count: session.process_count,
-                cpu_permille: session.cpu_permille,
-                memory_bytes: session.memory_bytes,
-                disk_bytes_per_sec: session.disk_bytes_per_sec,
-                net_bytes_per_sec: session.net_bytes_per_sec,
-                has_children,
-                is_expanded,
-            });
-
-            if auto_expand {
-                matching_children.sort_by(|a, b| compare_child_processes(a, b, sort_col, sort_dir));
-                for proc_item in matching_children {
-                    rows.push(UsersRow::Process {
-                        session_id: session.session_id,
-                        process: proc_item.clone(),
-                    });
-                }
-            } else if is_expanded {
-                let mut all_children: Vec<&UserSessionProcess> = session.processes.iter().collect();
-                all_children.sort_by(|a, b| compare_child_processes(a, b, sort_col, sort_dir));
-                for proc_item in all_children {
-                    rows.push(UsersRow::Process {
-                        session_id: session.session_id,
-                        process: proc_item.clone(),
-                    });
-                }
+            UsersRowProjection::Process {
+                session_id,
+                process,
+            } => {
+                1u8.hash(&mut hasher);
+                session_id.hash(&mut hasher);
+                process.key.hash(&mut hasher);
+                process.status.bits().hash(&mut hasher);
+                process.cpu_permille.hash(&mut hasher);
+                quantize_bytes_display(process.memory_bytes).hash(&mut hasher);
+                memory_heatmap_level(process.memory_bytes, total_ram_bytes).hash(&mut hasher);
+                quantize_rate_bps_display(process.disk_bytes_per_sec).hash(&mut hasher);
+                HeatmapLevel::from_bytes_per_sec(process.disk_bytes_per_sec).hash(&mut hasher);
+                quantize_net_bps_display(process.net_bytes_per_sec).hash(&mut hasher);
+                HeatmapLevel::from_bytes_per_sec(process.net_bytes_per_sec).hash(&mut hasher);
             }
         }
     }
 
-    rows
+    hasher.finish()
 }
 
 /// Opens a confirmation dialog before disconnecting a user session.
@@ -563,6 +463,12 @@ fn launch_manage_user_accounts(store: &Entity<UiStore>, cx: &mut App) {
 
 /// Cached localized strings for [`UsersTableDelegate`].
 struct UsersLocaleCache {
+    col_user: SharedString,
+    col_status: SharedString,
+    col_cpu: SharedString,
+    col_memory: SharedString,
+    col_disk: SharedString,
+    col_network: SharedString,
     active: SharedString,
     disconnected: SharedString,
     idle: SharedString,
@@ -576,6 +482,12 @@ struct UsersLocaleCache {
 impl UsersLocaleCache {
     fn build() -> Self {
         Self {
+            col_user: i18n::tr("users.col_user").into(),
+            col_status: i18n::tr("users.col_status").into(),
+            col_cpu: i18n::tr("users.col_cpu").into(),
+            col_memory: i18n::tr("users.col_memory").into(),
+            col_disk: i18n::tr("users.col_disk").into(),
+            col_network: i18n::tr("users.col_network").into(),
             active: i18n::user_session_state_label(UserSessionState::Active).into(),
             disconnected: i18n::user_session_state_label(UserSessionState::Disconnected).into(),
             idle: i18n::user_session_state_label(UserSessionState::Idle).into(),
@@ -584,6 +496,18 @@ impl UsersLocaleCache {
             suspended: i18n::tr("details.status_suspended").into(),
             loading: i18n::tr("users.loading").into(),
             empty: i18n::tr("users.empty").into(),
+        }
+    }
+
+    #[inline]
+    fn column_label(&self, col: UsersSortColumn) -> SharedString {
+        match col {
+            UsersSortColumn::User => self.col_user.clone(),
+            UsersSortColumn::Status => self.col_status.clone(),
+            UsersSortColumn::Cpu => self.col_cpu.clone(),
+            UsersSortColumn::Memory => self.col_memory.clone(),
+            UsersSortColumn::Disk => self.col_disk.clone(),
+            UsersSortColumn::Network => self.col_network.clone(),
         }
     }
 
@@ -606,12 +530,13 @@ struct UsersTableDelegate {
     capabilities: CapabilityFlags,
     total_ram_bytes: u64,
     last_rev: u64,
-    search_query: String,
-    sort_col: UsersSortColumn,
-    sort_dir: SortDirection,
-    expanded_sessions: HashSet<u32>,
-    rows: Vec<UsersRow>,
     selected_key: Option<UsersRowKey>,
+    visible_rows: Range<usize>,
+    last_scroll_at: Option<Instant>,
+    last_viewport_fp: Option<u64>,
+    user_action_pending: bool,
+    semantic_colors: CachedSemanticColors,
+    row_text_cache: RowTextCache,
     locale: UsersLocaleCache,
 }
 
@@ -622,17 +547,6 @@ impl UsersTableDelegate {
         let slice = Arc::clone(&snap.users);
         let capabilities = snap.capabilities;
         let total_ram_bytes = snap.performance.latest.mem_total_bytes;
-        let search_query = store_ref.search_query().to_owned();
-        let sort_col = UsersSortColumn::User;
-        let sort_dir = SortDirection::Ascending;
-        let expanded_sessions = HashSet::new();
-        let rows = flatten_users_rows(
-            &slice.sessions,
-            &expanded_sessions,
-            &search_query,
-            sort_col,
-            sort_dir,
-        );
 
         Self {
             store: store.clone(),
@@ -641,103 +555,121 @@ impl UsersTableDelegate {
             slice,
             capabilities,
             total_ram_bytes,
-            search_query,
-            sort_col,
-            sort_dir,
-            expanded_sessions,
-            rows,
             selected_key: None,
+            visible_rows: 0..0,
+            last_scroll_at: None,
+            last_viewport_fp: None,
+            user_action_pending: false,
+            semantic_colors: CachedSemanticColors::new(),
+            row_text_cache: RowTextCache::new(),
             locale: UsersLocaleCache::build(),
         }
     }
 
-    fn rebuild_rows(&mut self) {
-        self.rows = flatten_users_rows(
-            &self.slice.sessions,
-            &self.expanded_sessions,
-            &self.search_query,
-            self.sort_col,
-            self.sort_dir,
-        );
-    }
-
-    fn toggle_session_expanded(&mut self, session_id: u32) {
-        if !self.expanded_sessions.remove(&session_id) {
-            self.expanded_sessions.insert(session_id);
+    /// Locates `key` in `slice.rows`, checking `hint_row` in O(1) before scanning.
+    #[inline]
+    fn find_row_index(&self, key: UsersRowKey, hint_row: Option<usize>) -> Option<usize> {
+        if let Some(hint) = hint_row
+            && self
+                .slice
+                .rows
+                .get(hint)
+                .is_some_and(|row| row_key(row) == key)
+        {
+            return Some(hint);
         }
-        self.rebuild_rows();
+        self.slice.rows.iter().position(|row| row_key(row) == key)
     }
 
-    fn find_row_index(&self, key: UsersRowKey) -> Option<usize> {
-        self.rows.iter().position(|row| row.key() == key)
-    }
-
-    fn selected_session(&self) -> Option<(u32, String)> {
+    fn selected_session(&self, hint_row: Option<usize>) -> Option<(u32, String)> {
         let sel = self.selected_key?;
-        let row_ix = self.find_row_index(sel)?;
-        match self.rows.get(row_ix)? {
-            UsersRow::Session {
+        let row_ix = self.find_row_index(sel, hint_row)?;
+        match self.slice.rows.get(row_ix)? {
+            UsersRowProjection::Session {
                 session_id,
                 user_name,
                 ..
             } => Some((*session_id, user_name.to_string())),
-            UsersRow::Process { .. } => None,
+            UsersRowProjection::Process { .. } => None,
         }
     }
 
-    fn can_disconnect_selected(&self) -> bool {
+    fn can_disconnect_selected(&self, hint_row: Option<usize>) -> bool {
         self.capabilities.contains(CapabilityFlags::USER_SESSIONS)
-            && self.selected_session().is_some()
+            && self.selected_session(hint_row).is_some()
     }
 
-    fn toggle_sort(&mut self, col_ix: usize) {
-        let Some(&target) = UsersSortColumn::ALL.get(col_ix) else {
+    fn trigger_sort(&mut self, col_ix: usize, cx: &mut Context<TableState<Self>>) {
+        let Some(&target) = USERS_COLUMNS.get(col_ix) else {
             return;
         };
-        if self.sort_col == target {
-            self.sort_dir = self.sort_dir.toggle();
+        let next_dir = if self.slice.sort_column == target {
+            self.slice.sort_direction.toggle()
         } else {
-            self.sort_col = target;
-            self.sort_dir = target.default_direction();
-        }
-        self.rebuild_rows();
+            column_default_direction(target)
+        };
+        self.user_action_pending = true;
+        let store = self.store.clone();
+        UiCommands::set_users_sort(&store, target, next_dir, cx);
+    }
+
+    fn trigger_toggle_session(&mut self, session_id: u32, cx: &mut Context<TableState<Self>>) {
+        self.user_action_pending = true;
+        let store = self.store.clone();
+        UiCommands::toggle_user_session_expanded(&store, session_id, cx);
     }
 }
 
 impl TableDelegate for UsersTableDelegate {
     fn columns_count(&self, _cx: &App) -> usize {
-        UsersSortColumn::ALL.len()
+        USERS_COLUMNS.len()
     }
 
     fn rows_count(&self, _cx: &App) -> usize {
-        self.rows.len()
+        self.slice.rows.len()
     }
 
     fn loading(&self, _cx: &App) -> bool {
         self.slice.revision == 0
     }
 
+    fn visible_rows_changed(
+        &mut self,
+        visible_range: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) {
+        if self.visible_rows != visible_range {
+            let scrolled = !self.visible_rows.is_empty();
+            self.visible_rows = visible_range;
+            self.last_viewport_fp = None;
+            if scrolled {
+                self.last_scroll_at = Some(Instant::now());
+            }
+        }
+    }
+
     fn column(&self, col_ix: usize, _cx: &App) -> Column {
-        let Some(&col) = UsersSortColumn::ALL.get(col_ix) else {
+        let Some(&col) = USERS_COLUMNS.get(col_ix) else {
             return Column::default();
         };
-        let mut column = Column::new(col.slug(), col.label())
-            .width(px(col.width()))
-            .min_width(px(col.min_width()))
+        let mut column = Column::new(column_slug(col), self.locale.column_label(col))
+            .width(px(column_width(col)))
+            .min_width(px(column_min_width(col)))
             .selectable(false)
             .movable(false);
 
         if col == UsersSortColumn::User {
             column = column.fixed_left();
         }
-        if col.right_aligned() {
+        if column_right_aligned(col) {
             column = column.text_right();
         }
-        if col.is_heatmap() {
+        if column_is_heatmap(col) {
             column = column.p_0();
         }
-        if col == self.sort_col {
-            column = column.sort(to_column_sort(self.sort_dir));
+        if col == self.slice.sort_column {
+            column = column.sort(to_column_sort(self.slice.sort_direction));
         } else {
             column = column.sortable();
         }
@@ -751,8 +683,7 @@ impl TableDelegate for UsersTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) {
-        self.toggle_sort(col_ix);
-        cx.notify();
+        self.trigger_sort(col_ix, cx);
     }
 
     fn render_header(
@@ -773,12 +704,13 @@ impl TableDelegate for UsersTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let Some(&col) = UsersSortColumn::ALL.get(col_ix) else {
+        let Some(&col) = USERS_COLUMNS.get(col_ix) else {
             return Empty.into_any_element();
         };
-        let is_active = col == self.sort_col;
+        let is_active = col == self.slice.sort_column;
         let fg = cx.theme().foreground;
         let muted_fg = cx.theme().muted_foreground;
+        let label = self.locale.column_label(col);
 
         h_flex()
             .id(("users-th", col_ix))
@@ -786,27 +718,16 @@ impl TableDelegate for UsersTableDelegate {
             .min_w_0()
             .h_full()
             .items_center()
-            .when(col.is_heatmap(), |d| d.px_2())
-            .when(col.right_aligned(), |d| d.justify_end())
+            .when(column_is_heatmap(col), |d| d.px_2())
+            .when(column_right_aligned(col), |d| d.justify_end())
             .text_xs()
             .text_color(if is_active { fg } else { muted_fg })
             .when(is_active, |d| d.font_semibold())
             .cursor_pointer()
             .on_click(cx.listener(move |table, _, _, cx| {
-                table.delegate_mut().toggle_sort(col_ix);
-                let sel = table
-                    .delegate()
-                    .selected_key
-                    .and_then(|key| table.delegate().find_row_index(key));
-                if let Some(idx) = sel {
-                    table.set_selected_row(idx, cx);
-                } else {
-                    table.clear_selection(cx);
-                }
-                table.refresh(cx);
-                cx.notify();
+                table.delegate_mut().trigger_sort(col_ix, cx);
             }))
-            .child(div().min_w_0().truncate().child(col.label()))
+            .child(div().min_w_0().truncate().child(label))
             .into_any_element()
     }
 
@@ -826,21 +747,24 @@ impl TableDelegate for UsersTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let Some(row) = self.rows.get(row_ix) else {
+        let Some(&col) = USERS_COLUMNS.get(col_ix) else {
             return Empty.into_any_element();
         };
-        let Some(&col) = UsersSortColumn::ALL.get(col_ix) else {
+        if row_ix >= self.slice.rows.len() {
             return Empty.into_any_element();
-        };
+        }
 
         let theme = cx.theme();
-        let colors = LoomSemanticColors::from_theme(theme);
+        let colors = self.semantic_colors.get_copy(theme);
         let fg = theme.foreground;
         let muted_fg = theme.muted_foreground;
         let primary = theme.primary;
+        let list_hover = theme.list_hover;
+        let mono_font = theme.mono_font_family.clone();
+        let total_ram_bytes = self.total_ram_bytes;
 
-        match row {
-            UsersRow::Session {
+        match &self.slice.rows[row_ix] {
+            UsersRowProjection::Session {
                 session_id,
                 user_name,
                 state,
@@ -853,42 +777,50 @@ impl TableDelegate for UsersTableDelegate {
                 is_expanded,
             } => {
                 let sid = *session_id;
+                let state = *state;
+                let process_count = *process_count;
+                let cpu_permille = *cpu_permille;
+                let memory_bytes = *memory_bytes;
+                let disk_bytes_per_sec = *disk_bytes_per_sec;
+                let net_bytes_per_sec = *net_bytes_per_sec;
+                let has_children = *has_children;
+                let is_expanded = *is_expanded;
+                let cache_key = ProcessKey::new(sid, SESSION_CACHE_CREATE_TIME_SENTINEL);
+
                 match col {
                     UsersSortColumn::User => {
-                        let label = format!("{} ({})", user_name, process_count);
+                        let user_label = SharedString::from(Arc::clone(user_name));
+                        let count_label = format_child_count_shared(process_count);
                         h_flex()
                             .size_full()
                             .items_center()
                             .gap_1p5()
                             .overflow_hidden()
-                            .child(if *has_children {
+                            .child(if has_children {
                                 div()
+                                    .id(("users-expand", sid as usize))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(18.))
                                     .flex_shrink_0()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(list_hover))
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                         cx.stop_propagation();
                                     })
+                                    .on_click(cx.listener(move |table, _, _, cx| {
+                                        table.delegate_mut().trigger_toggle_session(sid, cx);
+                                    }))
                                     .child(
-                                        Button::new(("users-expand", sid as usize))
-                                            .xsmall()
-                                            .ghost()
-                                            .icon(if *is_expanded {
-                                                IconName::ChevronDown
-                                            } else {
-                                                IconName::ChevronRight
-                                            })
-                                            .on_click(cx.listener(move |table, _, _, cx| {
-                                                table.delegate_mut().toggle_session_expanded(sid);
-                                                let sel =
-                                                    table.delegate().selected_key.and_then(|key| {
-                                                        table.delegate().find_row_index(key)
-                                                    });
-                                                if let Some(idx) = sel {
-                                                    table.set_selected_row(idx, cx);
-                                                } else {
-                                                    table.clear_selection(cx);
-                                                }
-                                                cx.notify();
-                                            })),
+                                        Icon::new(if is_expanded {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        })
+                                        .xsmall()
+                                        .text_color(muted_fg),
                                     )
                                     .into_any_element()
                             } else {
@@ -902,18 +834,24 @@ impl TableDelegate for UsersTableDelegate {
                             )
                             .child(
                                 div()
-                                    .flex_1()
                                     .min_w_0()
                                     .truncate()
                                     .text_xs()
                                     .font_medium()
                                     .text_color(fg)
-                                    .child(label),
+                                    .child(user_label),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(count_label),
                             )
                             .into_any_element()
                     }
                     UsersSortColumn::Status => {
-                        let color = if *state == UserSessionState::Active {
+                        let color = if state == UserSessionState::Active {
                             primary
                         } else {
                             muted_fg
@@ -921,118 +859,173 @@ impl TableDelegate for UsersTableDelegate {
                         h_flex()
                             .size_full()
                             .items_center()
+                            .truncate()
+                            .text_xs()
+                            .text_color(color)
+                            .child(self.locale.state_label(state))
+                            .into_any_element()
+                    }
+                    UsersSortColumn::Cpu => heatmap_cell_metric(
+                        format_permille_metric(cpu_permille),
+                        HeatmapLevel::from_permille(cpu_permille),
+                        &colors,
+                        mono_font,
+                    )
+                    .into_any_element(),
+                    UsersSortColumn::Memory => {
+                        let metric = self.row_text_cache.memory_metric(
+                            cache_key,
+                            memory_bytes,
+                            0,
+                            ResourceDisplayMode::Values,
+                        );
+                        heatmap_cell_metric(
+                            metric,
+                            memory_heatmap_level(memory_bytes, total_ram_bytes),
+                            &colors,
+                            mono_font,
+                        )
+                        .into_any_element()
+                    }
+                    UsersSortColumn::Disk => {
+                        let metric = self.row_text_cache.disk_metric(
+                            cache_key,
+                            disk_bytes_per_sec,
+                            0,
+                            ResourceDisplayMode::Values,
+                        );
+                        heatmap_cell_metric(
+                            metric,
+                            HeatmapLevel::from_bytes_per_sec(disk_bytes_per_sec),
+                            &colors,
+                            mono_font,
+                        )
+                        .into_any_element()
+                    }
+                    UsersSortColumn::Network => {
+                        let metric = self.row_text_cache.network_metric(
+                            cache_key,
+                            net_bytes_per_sec,
+                            0,
+                            ResourceDisplayMode::Values,
+                        );
+                        heatmap_cell_metric(
+                            metric,
+                            HeatmapLevel::from_bytes_per_sec(net_bytes_per_sec),
+                            &colors,
+                            mono_font,
+                        )
+                        .into_any_element()
+                    }
+                }
+            }
+            UsersRowProjection::Process { process, .. } => {
+                let proc_key = process.key;
+                let status = process.status;
+                let cpu_permille = process.cpu_permille;
+                let memory_bytes = process.memory_bytes;
+                let disk_bytes_per_sec = process.disk_bytes_per_sec;
+                let net_bytes_per_sec = process.net_bytes_per_sec;
+
+                match col {
+                    UsersSortColumn::User => {
+                        let display = if process.display_name.trim().is_empty() {
+                            SharedString::from(Arc::clone(&process.name))
+                        } else {
+                            SharedString::from(Arc::clone(&process.display_name))
+                        };
+                        h_flex()
+                            .size_full()
+                            .items_center()
+                            .gap_1p5()
+                            .pl(px(28.))
                             .overflow_hidden()
                             .child(
+                                Icon::new(IconName::File)
+                                    .xsmall()
+                                    .text_color(muted_fg)
+                                    .flex_shrink_0(),
+                            )
+                            .child(
                                 div()
+                                    .flex_1()
                                     .min_w_0()
                                     .truncate()
                                     .text_xs()
-                                    .text_color(color)
-                                    .child(self.locale.state_label(*state)),
+                                    .text_color(fg)
+                                    .child(display),
                             )
                             .into_any_element()
                     }
-                    UsersSortColumn::Cpu => heatmap_cell(
-                        format_permille_shared(*cpu_permille),
-                        HeatmapLevel::from_permille(*cpu_permille),
+                    UsersSortColumn::Status => {
+                        let text = if status.contains(ProcessStatusFlags::SUSPENDED) {
+                            self.locale.suspended.clone()
+                        } else {
+                            self.locale.running.clone()
+                        };
+                        h_flex()
+                            .size_full()
+                            .items_center()
+                            .truncate()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child(text)
+                            .into_any_element()
+                    }
+                    UsersSortColumn::Cpu => heatmap_cell_metric(
+                        format_permille_metric(cpu_permille),
+                        HeatmapLevel::from_permille(cpu_permille),
                         &colors,
+                        mono_font,
                     )
                     .into_any_element(),
-                    UsersSortColumn::Memory => heatmap_cell(
-                        format_bytes_shared(*memory_bytes),
-                        memory_heatmap_level(*memory_bytes, self.total_ram_bytes),
-                        &colors,
-                    )
-                    .into_any_element(),
-                    UsersSortColumn::Disk => heatmap_cell(
-                        format_rate_bytes_per_sec_shared(*disk_bytes_per_sec),
-                        HeatmapLevel::from_bytes_per_sec(*disk_bytes_per_sec),
-                        &colors,
-                    )
-                    .into_any_element(),
-                    UsersSortColumn::Network => heatmap_cell(
-                        format_network_rate_mbps_shared(*net_bytes_per_sec),
-                        HeatmapLevel::from_bytes_per_sec(*net_bytes_per_sec),
-                        &colors,
-                    )
-                    .into_any_element(),
+                    UsersSortColumn::Memory => {
+                        let metric = self.row_text_cache.memory_metric(
+                            proc_key,
+                            memory_bytes,
+                            0,
+                            ResourceDisplayMode::Values,
+                        );
+                        heatmap_cell_metric(
+                            metric,
+                            memory_heatmap_level(memory_bytes, total_ram_bytes),
+                            &colors,
+                            mono_font,
+                        )
+                        .into_any_element()
+                    }
+                    UsersSortColumn::Disk => {
+                        let metric = self.row_text_cache.disk_metric(
+                            proc_key,
+                            disk_bytes_per_sec,
+                            0,
+                            ResourceDisplayMode::Values,
+                        );
+                        heatmap_cell_metric(
+                            metric,
+                            HeatmapLevel::from_bytes_per_sec(disk_bytes_per_sec),
+                            &colors,
+                            mono_font,
+                        )
+                        .into_any_element()
+                    }
+                    UsersSortColumn::Network => {
+                        let metric = self.row_text_cache.network_metric(
+                            proc_key,
+                            net_bytes_per_sec,
+                            0,
+                            ResourceDisplayMode::Values,
+                        );
+                        heatmap_cell_metric(
+                            metric,
+                            HeatmapLevel::from_bytes_per_sec(net_bytes_per_sec),
+                            &colors,
+                            mono_font,
+                        )
+                        .into_any_element()
+                    }
                 }
             }
-            UsersRow::Process { process, .. } => match col {
-                UsersSortColumn::User => {
-                    let display = if process.display_name.trim().is_empty() {
-                        SharedString::from(Arc::clone(&process.name))
-                    } else {
-                        SharedString::from(Arc::clone(&process.display_name))
-                    };
-                    h_flex()
-                        .size_full()
-                        .items_center()
-                        .gap_1p5()
-                        .pl(px(28.))
-                        .overflow_hidden()
-                        .child(
-                            Icon::new(IconName::File)
-                                .xsmall()
-                                .text_color(muted_fg)
-                                .flex_shrink_0(),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(fg)
-                                .child(display),
-                        )
-                        .into_any_element()
-                }
-                UsersSortColumn::Status => {
-                    let text = if process.status.contains(ProcessStatusFlags::SUSPENDED) {
-                        self.locale.suspended.clone()
-                    } else {
-                        self.locale.running.clone()
-                    };
-                    h_flex()
-                        .size_full()
-                        .items_center()
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .child(text),
-                        )
-                        .into_any_element()
-                }
-                UsersSortColumn::Cpu => heatmap_cell(
-                    format_permille_shared(process.cpu_permille),
-                    HeatmapLevel::from_permille(process.cpu_permille),
-                    &colors,
-                )
-                .into_any_element(),
-                UsersSortColumn::Memory => heatmap_cell(
-                    format_bytes_shared(process.memory_bytes),
-                    memory_heatmap_level(process.memory_bytes, self.total_ram_bytes),
-                    &colors,
-                )
-                .into_any_element(),
-                UsersSortColumn::Disk => heatmap_cell(
-                    format_rate_bytes_per_sec_shared(process.disk_bytes_per_sec),
-                    HeatmapLevel::from_bytes_per_sec(process.disk_bytes_per_sec),
-                    &colors,
-                )
-                .into_any_element(),
-                UsersSortColumn::Network => heatmap_cell(
-                    format_network_rate_mbps_shared(process.net_bytes_per_sec),
-                    HeatmapLevel::from_bytes_per_sec(process.net_bytes_per_sec),
-                    &colors,
-                )
-                .into_any_element(),
-            },
         }
     }
 
@@ -1043,12 +1036,12 @@ impl TableDelegate for UsersTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
-        let Some(row) = self.rows.get(row_ix).cloned() else {
+        let Some(row) = self.slice.rows.get(row_ix).cloned() else {
             return menu;
         };
 
         match row {
-            UsersRow::Session {
+            UsersRowProjection::Session {
                 session_id,
                 user_name,
                 has_children,
@@ -1077,8 +1070,7 @@ impl TableDelegate for UsersTableDelegate {
                         .item(PopupMenuItem::new(toggle_label).icon(toggle_icon).on_click(
                             move |_, _, cx| {
                                 let _ = table_weak.update(cx, |table, cx| {
-                                    table.delegate_mut().toggle_session_expanded(session_id);
-                                    cx.notify();
+                                    table.delegate_mut().trigger_toggle_session(session_id, cx);
                                 });
                             },
                         ))
@@ -1107,7 +1099,7 @@ impl TableDelegate for UsersTableDelegate {
                         }),
                 )
             }
-            UsersRow::Process { process, .. } => {
+            UsersRowProjection::Process { process, .. } => {
                 let store_end = self.store.clone();
                 let proc_end = process.clone();
                 let shell_details = self.shell_handle.clone();
@@ -1142,8 +1134,8 @@ impl TableDelegate for UsersTableDelegate {
     }
 
     fn row_label(&self, row_ix: usize, _cx: &App) -> Option<SharedString> {
-        match self.rows.get(row_ix)? {
-            UsersRow::Session {
+        match self.slice.rows.get(row_ix)? {
+            UsersRowProjection::Session {
                 user_name,
                 process_count,
                 state,
@@ -1157,7 +1149,7 @@ impl TableDelegate for UsersTableDelegate {
                 )
                 .into(),
             ),
-            UsersRow::Process { process, .. } => {
+            UsersRowProjection::Process { process, .. } => {
                 Some(format!("{} (PID {})", process.display_name, process.key.pid).into())
             }
         }
@@ -1217,6 +1209,8 @@ pub(crate) struct UsersView {
     table_pane: Entity<DataTablePane<UsersTableDelegate>>,
     can_disconnect: bool,
     last_locale: LanguagePreference,
+    scroll_coalescer: ScrollCoalescer,
+    coalesce_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1255,7 +1249,10 @@ impl UsersView {
                 i18n::tr("users.title"),
             )
         });
-        let can_disconnect = table.read(cx).delegate().can_disconnect_selected();
+        let can_disconnect = {
+            let t = table.read(cx);
+            t.delegate().can_disconnect_selected(t.selected_row())
+        };
 
         let mut subscriptions = Vec::with_capacity(2);
 
@@ -1267,51 +1264,21 @@ impl UsersView {
                     if revs.users == current_rev {
                         return;
                     }
-                    let (next_slice, next_caps, next_ram) = {
-                        let snap = store.read(cx).snapshot();
-                        (
-                            Arc::clone(&snap.users),
-                            snap.capabilities,
-                            snap.performance.latest.mem_total_bytes,
-                        )
-                    };
-                    let next_can_disconnect = table_for_store.update(cx, |table, cx| {
-                        let d = table.delegate_mut();
-                        d.slice = next_slice;
-                        d.capabilities = next_caps;
-                        d.total_ram_bytes = next_ram;
-                        d.last_rev = revs.users;
-                        d.rebuild_rows();
-                        Self::sync_table_selection(table, cx);
-                        cx.notify();
-                        table.delegate().can_disconnect_selected()
-                    });
-                    if this.can_disconnect != next_can_disconnect {
-                        this.can_disconnect = next_can_disconnect;
-                        cx.notify();
-                    }
+                    this.handle_snapshot_updated(cx);
                 }
                 UiStoreEvent::SearchQueryChanged => {
-                    let next_query = store.read(cx).search_query().to_owned();
-                    let next_can_disconnect = table_for_store.update(cx, |table, cx| {
-                        let d = table.delegate_mut();
-                        d.search_query = next_query;
-                        d.rebuild_rows();
-                        Self::sync_table_selection(table, cx);
-                        cx.notify();
-                        table.delegate().can_disconnect_selected()
+                    table_for_store.update(cx, |table, _| {
+                        table.delegate_mut().user_action_pending = true;
                     });
-                    if this.can_disconnect != next_can_disconnect {
-                        this.can_disconnect = next_can_disconnect;
-                        cx.notify();
-                    }
                 }
                 UiStoreEvent::SettingsChanged => {
                     let next_locale = store.read(cx).settings().language;
                     if this.last_locale != next_locale {
                         this.last_locale = next_locale;
                         table_for_store.update(cx, |table, cx| {
-                            table.delegate_mut().locale = UsersLocaleCache::build();
+                            let d = table.delegate_mut();
+                            d.locale = UsersLocaleCache::build();
+                            d.last_viewport_fp = None;
                             table.refresh(cx);
                             cx.notify();
                         });
@@ -1330,9 +1297,11 @@ impl UsersView {
             |this, table, event: &TableEvent, cx| match event {
                 TableEvent::SelectRow(row_ix) => {
                     let next_can_disconnect = table.update(cx, |table, _| {
-                        let key = table.delegate().rows.get(*row_ix).map(UsersRow::key);
-                        table.delegate_mut().selected_key = key;
-                        table.delegate().can_disconnect_selected()
+                        let key = table.delegate().slice.rows.get(*row_ix).map(row_key);
+                        let d = table.delegate_mut();
+                        d.selected_key = key;
+                        d.last_viewport_fp = None;
+                        d.can_disconnect_selected(Some(*row_ix))
                     });
                     if this.can_disconnect != next_can_disconnect {
                         this.can_disconnect = next_can_disconnect;
@@ -1341,12 +1310,18 @@ impl UsersView {
                 }
                 TableEvent::RightClickedRow(Some(row_ix)) => {
                     let next_can_disconnect = table.update(cx, |table, cx| {
-                        let key = table.delegate().rows.get(*row_ix).map(UsersRow::key);
-                        table.delegate_mut().selected_key = key;
+                        let key = table.delegate().slice.rows.get(*row_ix).map(row_key);
+                        {
+                            let d = table.delegate_mut();
+                            d.selected_key = key;
+                            d.last_viewport_fp = None;
+                        }
                         if key.is_some() && table.selected_row() != Some(*row_ix) {
                             table.set_selected_row(*row_ix, cx);
                         }
-                        table.delegate().can_disconnect_selected()
+                        table
+                            .delegate()
+                            .can_disconnect_selected(table.selected_row())
                     });
                     if this.can_disconnect != next_can_disconnect {
                         this.can_disconnect = next_can_disconnect;
@@ -1355,8 +1330,10 @@ impl UsersView {
                 }
                 TableEvent::ClearSelection => {
                     let next_can_disconnect = table.update(cx, |table, _| {
-                        table.delegate_mut().selected_key = None;
-                        table.delegate().can_disconnect_selected()
+                        let d = table.delegate_mut();
+                        d.selected_key = None;
+                        d.last_viewport_fp = None;
+                        d.can_disconnect_selected(None)
                     });
                     if this.can_disconnect != next_can_disconnect {
                         this.can_disconnect = next_can_disconnect;
@@ -1374,7 +1351,95 @@ impl UsersView {
             table_pane,
             can_disconnect,
             last_locale,
+            scroll_coalescer: ScrollCoalescer::default(),
+            coalesce_task: None,
             _subscriptions: subscriptions,
+        }
+    }
+
+    fn handle_snapshot_updated(&mut self, cx: &mut Context<Self>) {
+        let (next_rev, next_slice, next_caps, next_ram) = {
+            let snap = self.store.read(cx).snapshot();
+            (
+                snap.revisions.users,
+                Arc::clone(&snap.users),
+                snap.capabilities,
+                snap.performance.latest.mem_total_bytes,
+            )
+        };
+
+        let (bypass, last_scroll_at) = {
+            let d = self.table.read(cx).delegate();
+            if next_rev == d.last_rev {
+                return;
+            }
+            let bypass = d.slice.revision == 0
+                || d.user_action_pending
+                || d.slice.sort_column != next_slice.sort_column
+                || d.slice.sort_direction != next_slice.sort_direction;
+            (bypass, d.last_scroll_at)
+        };
+
+        match self
+            .scroll_coalescer
+            .decide(Instant::now(), last_scroll_at, bypass)
+        {
+            CoalesceDecision::Defer(wait) => {
+                if self.coalesce_task.is_none() {
+                    self.coalesce_task = Some(cx.spawn(async move |weak, cx| {
+                        cx.background_executor().timer(wait).await;
+                        let _ = weak.update(cx, |this, cx| {
+                            this.coalesce_task = None;
+                            this.handle_snapshot_updated(cx);
+                        });
+                    }));
+                }
+            }
+            CoalesceDecision::ApplyNow => {
+                self.coalesce_task = None;
+                let next_can_disconnect = self.table.update(cx, |table, cx| {
+                    let prev_fp = table.delegate().last_viewport_fp;
+                    let sort_changed = {
+                        let d = table.delegate_mut();
+                        let changed = d.slice.sort_column != next_slice.sort_column
+                            || d.slice.sort_direction != next_slice.sort_direction;
+                        d.slice = next_slice;
+                        d.capabilities = next_caps;
+                        d.total_ram_bytes = next_ram;
+                        d.last_rev = next_rev;
+                        d.user_action_pending = false;
+                        d.row_text_cache.begin_epoch();
+                        d.row_text_cache.prune_if_needed();
+                        changed
+                    };
+
+                    Self::sync_table_selection(table, cx);
+
+                    let selected_row = table.selected_row();
+                    let next_fp = {
+                        let d = table.delegate();
+                        compute_users_viewport_fingerprint(
+                            &d.slice,
+                            d.total_ram_bytes,
+                            &d.visible_rows,
+                            selected_row,
+                        )
+                    };
+                    table.delegate_mut().last_viewport_fp = Some(next_fp);
+
+                    if sort_changed {
+                        table.refresh(cx);
+                    }
+                    if sort_changed || prev_fp != Some(next_fp) {
+                        cx.notify();
+                    }
+                    table.delegate().can_disconnect_selected(selected_row)
+                });
+                if self.can_disconnect != next_can_disconnect {
+                    self.can_disconnect = next_can_disconnect;
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -1382,15 +1447,16 @@ impl UsersView {
         table: &mut TableState<UsersTableDelegate>,
         cx: &mut Context<TableState<UsersTableDelegate>>,
     ) {
+        let hint_row = table.selected_row();
         let selected_idx = table
             .delegate()
             .selected_key
-            .and_then(|key| table.delegate().find_row_index(key));
+            .and_then(|key| table.delegate().find_row_index(key, hint_row));
         if let Some(idx) = selected_idx {
-            if table.selected_row() != Some(idx) {
+            if hint_row != Some(idx) {
                 table.set_selected_row(idx, cx);
             }
-        } else if table.selected_row().is_some() {
+        } else if hint_row.is_some() {
             table.clear_selection(cx);
         }
     }
@@ -1438,8 +1504,9 @@ impl Render for UsersView {
                             .label(i18n::tr("users.disconnect"))
                             .disabled(!can_disconnect)
                             .on_click(cx.listener(|this, _, window, cx| {
+                                let t = this.table.read(cx);
                                 if let Some((session_id, user_name)) =
-                                    this.table.read(cx).delegate().selected_session()
+                                    t.delegate().selected_session(t.selected_row())
                                 {
                                     open_disconnect_session_dialog(
                                         &this.store,
@@ -1480,8 +1547,8 @@ impl Render for UsersView {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use gpui_kit::{TestAppContext, VisualTestContext};
     use loom_config::{AppSettings, ConfigStore};
@@ -1489,7 +1556,7 @@ mod tests {
     use loom_pal::{NativeBackend, PlatformBackend};
     use loom_types::{
         MonitorDomain, ProcessKey, ProcessStatusFlags, SortDirection, UserSessionProcess,
-        UserSessionRecord, UserSessionState,
+        UserSessionState, UsersRowProjection, UsersSlice, UsersSortColumn,
     };
 
     use super::*;
@@ -1508,110 +1575,90 @@ mod tests {
     }
 
     #[test]
-    fn flatten_users_rows_expands_sessions_and_auto_expands_on_child_search() {
-        let sessions = vec![
-            UserSessionRecord {
-                session_id: 1,
-                user_name: Arc::from("Alice"),
-                state: UserSessionState::Active,
-                process_count: 2,
-                cpu_permille: 120,
-                memory_bytes: 512 * 1024 * 1024,
-                disk_bytes_per_sec: 1024,
-                net_bytes_per_sec: 2048,
-                processes: vec![
-                    sample_proc(101, "code.exe", 100, 400 * 1024 * 1024),
-                    sample_proc(102, "notepad.exe", 20, 112 * 1024 * 1024),
-                ],
-            },
-            UserSessionRecord {
-                session_id: 2,
-                user_name: Arc::from("Bob"),
-                state: UserSessionState::Disconnected,
-                process_count: 1,
-                cpu_permille: 10,
-                memory_bytes: 64 * 1024 * 1024,
-                disk_bytes_per_sec: 0,
-                net_bytes_per_sec: 0,
-                processes: vec![sample_proc(201, "cmd.exe", 10, 64 * 1024 * 1024)],
-            },
-        ];
+    fn users_viewport_fingerprint_tracks_visible_quantized_metrics_and_ignores_offscreen() {
+        let mut slice = UsersSlice {
+            revision: 1,
+            sort_column: UsersSortColumn::Cpu,
+            sort_direction: SortDirection::Descending,
+            rows: vec![
+                UsersRowProjection::Session {
+                    session_id: 1,
+                    user_name: Arc::from("Alice"),
+                    state: UserSessionState::Active,
+                    process_count: 2,
+                    cpu_permille: 120,
+                    memory_bytes: 128 * 1024 * 1024,
+                    disk_bytes_per_sec: 0,
+                    net_bytes_per_sec: 0,
+                    has_children: true,
+                    is_expanded: true,
+                },
+                UsersRowProjection::Process {
+                    session_id: 1,
+                    process: sample_proc(101, "code.exe", 100, 64 * 1024 * 1024),
+                },
+                UsersRowProjection::Process {
+                    session_id: 1,
+                    process: sample_proc(102, "notepad.exe", 20, 32 * 1024 * 1024),
+                },
+            ],
+            ..UsersSlice::default()
+        };
 
-        // Collapsed by default: only 2 session headers.
-        let collapsed = flatten_users_rows(
-            &sessions,
-            &HashSet::new(),
-            "",
-            UsersSortColumn::User,
-            SortDirection::Ascending,
-        );
-        assert_eq!(collapsed.len(), 2);
-        assert!(matches!(
-            collapsed[0],
-            UsersRow::Session {
-                session_id: 1,
-                is_expanded: false,
-                ..
-            }
-        ));
+        let ram = 16 * 1024 * 1024 * 1024;
+        let fp_initial = compute_users_viewport_fingerprint(&slice, ram, &(0..2), Some(0));
 
-        // Explicitly expanding session 1 reveals both children sorted by CPU desc.
-        let mut expanded = HashSet::new();
-        expanded.insert(1);
-        let with_children = flatten_users_rows(
-            &sessions,
-            &expanded,
-            "",
-            UsersSortColumn::Cpu,
-            SortDirection::Descending,
+        // Sub-tenth memory jitter (4 KB on 128.0 MB) stays in the same quantized display bucket.
+        if let UsersRowProjection::Session { memory_bytes, .. } = &mut slice.rows[0] {
+            *memory_bytes += 4_096;
+        }
+        assert_eq!(
+            fp_initial,
+            compute_users_viewport_fingerprint(&slice, ram, &(0..2), Some(0))
         );
-        assert_eq!(with_children.len(), 4);
-        assert!(matches!(
-            with_children[0],
-            UsersRow::Session {
-                session_id: 1,
-                is_expanded: true,
-                ..
-            }
-        ));
-        assert!(matches!(
-            &with_children[1],
-            UsersRow::Process { process, .. } if process.name.as_ref() == "code.exe"
-        ));
-        assert!(matches!(
-            &with_children[2],
-            UsersRow::Process { process, .. } if process.name.as_ref() == "notepad.exe"
-        ));
-        assert!(matches!(
-            with_children[3],
-            UsersRow::Session { session_id: 2, .. }
-        ));
 
-        // Searching for a child process auto-expands its owning session even if collapsed.
-        let search_child = flatten_users_rows(
-            &sessions,
-            &HashSet::new(),
-            "notepad",
-            UsersSortColumn::User,
-            SortDirection::Ascending,
+        // Off-screen row change (index 2) leaves visible fingerprint unchanged.
+        if let UsersRowProjection::Process { process, .. } = &mut slice.rows[2] {
+            process.cpu_permille = 450;
+        }
+        assert_eq!(
+            fp_initial,
+            compute_users_viewport_fingerprint(&slice, ram, &(0..2), Some(0))
         );
-        assert_eq!(search_child.len(), 2);
-        assert!(matches!(
-            search_child[0],
-            UsersRow::Session {
-                session_id: 1,
-                is_expanded: true,
-                ..
-            }
-        ));
-        assert!(matches!(
-            &search_child[1],
-            UsersRow::Process { process, .. } if process.key.pid == 102
-        ));
+
+        // Visible CPU change (index 1) invalidates the fingerprint.
+        if let UsersRowProjection::Process { process, .. } = &mut slice.rows[1] {
+            process.cpu_permille = 250;
+        }
+        assert_ne!(
+            fp_initial,
+            compute_users_viewport_fingerprint(&slice, ram, &(0..2), Some(0))
+        );
+    }
+
+    #[test]
+    fn users_scroll_coalescer_enforces_quiet_window_cap_and_bypass() {
+        let mut coalescer = ScrollCoalescer::default();
+        let t0 = Instant::now();
+        assert_eq!(
+            coalescer.decide(t0 + Duration::from_millis(20), Some(t0), false),
+            CoalesceDecision::Defer(Duration::from_millis(130))
+        );
+        assert_eq!(
+            coalescer.decide(t0 + Duration::from_millis(150), Some(t0), false),
+            CoalesceDecision::ApplyNow
+        );
+        // Bypass immediately flushes.
+        assert_eq!(
+            coalescer.decide(t0 + Duration::from_millis(10), Some(t0), true),
+            CoalesceDecision::ApplyNow
+        );
     }
 
     #[gpui_kit::test]
-    fn users_view_acquires_and_releases_monitor_lease_on_mount_and_drop(cx: &mut TestAppContext) {
+    fn users_view_acquires_lease_dispatches_sort_and_expand_and_releases_on_drop(
+        cx: &mut TestAppContext,
+    ) {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().expect("tempdir");
         let config_store = ConfigStore::new(dir.path().join("settings.toml"));
@@ -1644,6 +1691,14 @@ mod tests {
             coordinator.leases().is_active(MonitorDomain::Users),
             "mounting UsersView must acquire MonitorDomain::Users lease"
         );
+
+        view.update(&mut vcx, |view, cx| {
+            view.table.update(cx, |table, cx| {
+                table.delegate_mut().trigger_sort(3, cx);
+                table.delegate_mut().trigger_toggle_session(1, cx);
+            });
+        });
+        vcx.run_until_parked();
 
         drop(view);
         vcx.update(|window, _| window.remove_window());
