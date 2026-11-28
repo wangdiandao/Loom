@@ -336,9 +336,16 @@ pub(crate) fn run(args: LaunchArgs, raw_args: Vec<String>) {
 
     // 4. Initialize NativeBackend + EngineCoordinator BEFORE opening the window so Tick 0
     //    executes on `loom-fast-sampler` in parallel with DX12 / GPUI window creation!
-    let coordinator = match NativeBackend::initialize()
-        .and_then(|backend| EngineCoordinator::new(backend, settings.clone()))
-    {
+    //    Enable MonitorDomain::Processes lease gating so switching away from the Processes
+    //    tab (with no tray quick-overview open) skips per-tick Processes table projection.
+    let engine_config = loom_engine::EngineConfig {
+        gate_processes_by_lease: true,
+        project_processes_on_boot: initial_route == Route::Processes,
+        ..loom_engine::EngineConfig::default()
+    };
+    let coordinator = match NativeBackend::initialize().and_then(|backend| {
+        EngineCoordinator::with_config(backend, settings.clone(), engine_config)
+    }) {
         Ok(coord) => Arc::new(coord),
         Err(err) => {
             tracing::error!(%err, "failed to initialize Loom native engine");

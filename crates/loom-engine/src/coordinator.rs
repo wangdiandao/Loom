@@ -89,6 +89,25 @@ pub struct EngineConfig {
     ///
     /// Defaults to `30 s` check cadence and `10 min` sustain window.
     pub leak_detector: LeakDetectorConfig,
+    /// When `true`, `ProcessTableSlice` projection is strictly gated by
+    /// `MonitorDomain::Processes` RAII leases (zero projection work while away from the
+    /// Processes tab and tray quick-overview).
+    ///
+    /// Defaults to `false` so headless callers and tests observe Processes snapshots without
+    /// acquiring an explicit lease; acquiring `MonitorDomain::Processes` once also activates
+    /// lease-based gating automatically.
+    pub gate_processes_by_lease: bool,
+    /// When `true`, Tick 0 still projects an initial `ProcessTableSlice` frame during startup
+    /// even when [`Self::gate_processes_by_lease`] is enabled, keeping first-frame latency
+    /// minimal when launching onto the Processes tab.
+    ///
+    /// Defaults to `true`.
+    pub project_processes_on_boot: bool,
+    /// Coalescing window applied to consecutive slow-lane cold-metadata arrivals before
+    /// re-projecting active process tables, preventing startup projection storms.
+    ///
+    /// Defaults to `40 ms`. Set to `Duration::ZERO` to publish every slow-lane batch immediately.
+    pub cold_meta_coalesce_window: Duration,
 }
 
 impl Default for EngineConfig {
@@ -105,6 +124,9 @@ impl Default for EngineConfig {
             app_history_flush_interval: Duration::from_secs(60),
             port_scan_cache_ttl: Duration::from_secs(2),
             leak_detector: LeakDetectorConfig::default(),
+            gate_processes_by_lease: false,
+            project_processes_on_boot: true,
+            cold_meta_coalesce_window: Duration::from_millis(40),
         }
     }
 }
@@ -229,9 +251,13 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
                     last_port_scan_at: None,
                     tick_count: 0,
                     next_tick: None,
+                    last_processes_projected_tick: 0,
                     last_details_projected_tick: 0,
                     last_perf_sampled_tick: 0,
                     last_per_core_sampled_tick: 0,
+                    pending_cold_publish: false,
+                    cold_flush_deadline: None,
+                    last_cold_publish_at: None,
                     last_domain_poll_tick: [0; MonitorDomain::COUNT],
                     hardware_info_probed: false,
                     pending_hardware_info: false,
@@ -428,9 +454,13 @@ struct FastLaneRunner<B: PlatformBackend> {
     last_port_scan_at: Option<Instant>,
     tick_count: u64,
     next_tick: Option<Instant>,
+    last_processes_projected_tick: u64,
     last_details_projected_tick: u64,
     last_perf_sampled_tick: u64,
     last_per_core_sampled_tick: u64,
+    pending_cold_publish: bool,
+    cold_flush_deadline: Option<Instant>,
+    last_cold_publish_at: Option<Instant>,
     last_domain_poll_tick: [u64; MonitorDomain::COUNT],
     hardware_info_probed: bool,
     pending_hardware_info: bool,
@@ -467,6 +497,9 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             let tick_rx = self
                 .next_tick
                 .map_or_else(crossbeam_channel::never, crossbeam_channel::at);
+            let cold_flush_rx = self
+                .cold_flush_deadline
+                .map_or_else(crossbeam_channel::never, crossbeam_channel::at);
             let slow_rx = self.slow_pool.result_rx();
 
             select! {
@@ -493,6 +526,9 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                         self.handle_slow_result_batch(first);
                     }
                 }
+                recv(cold_flush_rx) -> _ => {
+                    self.flush_pending_cold_publish();
+                }
                 recv(tick_rx) -> _ => {
                     if !self.window_dormant && !self.temp_frozen {
                         self.run_sample_tick();
@@ -515,6 +551,40 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
 
         self.slow_pool.shutdown();
         self.wake_signal.close();
+    }
+
+    #[inline]
+    fn processes_projection_active(&self) -> bool {
+        if self.config.gate_processes_by_lease
+            || self.leases.ever_acquired(MonitorDomain::Processes)
+        {
+            self.leases.is_active(MonitorDomain::Processes)
+        } else {
+            true
+        }
+    }
+
+    fn flush_pending_cold_publish(&mut self) {
+        self.cold_flush_deadline = None;
+        if !self.pending_cold_publish || self.window_dormant || self.temp_frozen {
+            self.pending_cold_publish = false;
+            return;
+        }
+        self.pending_cold_publish = false;
+        self.last_cold_publish_at = Some(Instant::now());
+        let processes_active = self.processes_projection_active();
+        let details_leased = self.leases.is_active(MonitorDomain::Details);
+        let users_active = self.leases.is_active(MonitorDomain::Users)
+            && (self.users_polled_once || !self.cached_user_sessions.is_empty());
+        let mask = SliceUpdateMask {
+            processes: processes_active,
+            details: details_leased,
+            users: users_active,
+            ..SliceUpdateMask::default()
+        };
+        if mask.any() {
+            self.publish_slices(mask);
+        }
     }
 
     fn sync_process_network_state(&mut self) {
@@ -610,13 +680,25 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         self.enqueue_performance_slow_probes();
         self.enqueue_leased_slow_domains();
 
-        // Project and publish snapshot, updating Details ONLY when leased.
+        // Clear any pending coalesced cold-metadata publish because this sample tick projects fresh data.
+        self.pending_cold_publish = false;
+        self.cold_flush_deadline = None;
+
+        // Project and publish snapshot, updating Processes/Details/Users/AppHistory ONLY when active.
+        let processes_active = self.processes_projection_active()
+            || (self.tick_count == 1 && self.config.project_processes_on_boot);
         let details_leased = self.leases.is_active(MonitorDomain::Details);
+        let users_active = self.leases.is_active(MonitorDomain::Users)
+            && (self.users_polled_once || !self.cached_user_sessions.is_empty());
+        let app_history_active =
+            self.leases.is_active(MonitorDomain::AppHistory) && self.app_history_polled_once;
         self.publish_slices(SliceUpdateMask {
-            processes: true,
+            processes: processes_active,
             details: details_leased,
             performance: true,
             include_per_core: per_core_leased,
+            users: users_active,
+            app_history: app_history_active,
             ..SliceUpdateMask::default()
         });
     }
@@ -829,6 +911,11 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             return;
         }
 
+        let processes_leased = self.leases.is_active(MonitorDomain::Processes);
+        let need_processes = processes_leased
+            && (self.current_snapshot.revisions.processes == 0
+                || self.last_processes_projected_tick != self.tick_count);
+
         let details_leased = self.leases.is_active(MonitorDomain::Details);
         let need_details = details_leased
             && (self.current_snapshot.revisions.details == 0
@@ -858,6 +945,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             && self.leases.is_active(MonitorDomain::AppHistory);
 
         let lease_mask = SliceUpdateMask {
+            processes: need_processes,
             details: need_details,
             performance: need_perf,
             include_per_core: per_core_leased,
@@ -865,7 +953,6 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             startup: need_startup,
             users: need_users,
             app_history: need_app_history,
-            ..SliceUpdateMask::default()
         };
         if lease_mask.any() {
             self.publish_slices(lease_mask);
@@ -904,16 +991,53 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
 
         if !self.window_dormant && !self.temp_frozen {
             if cold_updated || perf_updated {
-                let details_leased = cold_updated && self.leases.is_active(MonitorDomain::Details);
-                let per_core_leased =
-                    perf_updated && self.leases.is_active(MonitorDomain::PerCoreCpu);
-                self.publish_slices(SliceUpdateMask {
-                    processes: cold_updated,
-                    details: details_leased,
-                    performance: perf_updated,
-                    include_per_core: per_core_leased,
-                    ..SliceUpdateMask::default()
-                });
+                let now = Instant::now();
+                let coalesce_window = self.config.cold_meta_coalesce_window;
+                let can_defer_cold = cold_updated
+                    && !perf_updated
+                    && !snapshot_dirty
+                    && !coalesce_window.is_zero()
+                    && self
+                        .last_cold_publish_at
+                        .is_some_and(|last| now.saturating_duration_since(last) < coalesce_window);
+
+                if can_defer_cold {
+                    self.pending_cold_publish = true;
+                    let target = self
+                        .last_cold_publish_at
+                        .map_or(now + coalesce_window, |last| last + coalesce_window);
+                    self.cold_flush_deadline.get_or_insert(target);
+                } else {
+                    let include_cold = cold_updated || self.pending_cold_publish;
+                    if include_cold {
+                        self.pending_cold_publish = false;
+                        self.cold_flush_deadline = None;
+                        self.last_cold_publish_at = Some(now);
+                    }
+                    let processes_active = include_cold && self.processes_projection_active();
+                    let details_leased =
+                        include_cold && self.leases.is_active(MonitorDomain::Details);
+                    let users_active = include_cold
+                        && self.leases.is_active(MonitorDomain::Users)
+                        && (self.users_polled_once || !self.cached_user_sessions.is_empty());
+                    let per_core_leased =
+                        perf_updated && self.leases.is_active(MonitorDomain::PerCoreCpu);
+                    let mask = SliceUpdateMask {
+                        processes: processes_active,
+                        details: details_leased,
+                        performance: perf_updated,
+                        include_per_core: per_core_leased,
+                        users: users_active,
+                        ..SliceUpdateMask::default()
+                    };
+                    if mask.any() {
+                        self.publish_slices(mask);
+                    } else if snapshot_dirty {
+                        self.snapshot_store
+                            .store(Arc::new(self.current_snapshot.clone()));
+                        self.wake_signal.notify();
+                    }
+                }
             } else if snapshot_dirty {
                 self.snapshot_store
                     .store(Arc::new(self.current_snapshot.clone()));
@@ -1270,9 +1394,14 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                     }
                 }
             } else if !self.window_dormant && !self.temp_frozen {
+                let include_pending_cold = self.pending_cold_publish;
+                let processes_needed =
+                    (dirty.processes || include_pending_cold) && self.processes_projection_active();
+                let details_needed = (dirty.details || include_pending_cold)
+                    && self.leases.is_active(MonitorDomain::Details);
                 let mask = SliceUpdateMask {
-                    processes: dirty.processes,
-                    details: dirty.details && self.leases.is_active(MonitorDomain::Details),
+                    processes: processes_needed,
+                    details: details_needed,
                     performance: false,
                     include_per_core: false,
                     services: dirty.services
@@ -1281,7 +1410,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                     startup: dirty.startup
                         && self.leases.is_active(MonitorDomain::Startup)
                         && self.startup_polled_once,
-                    users: dirty.users
+                    users: (dirty.users || include_pending_cold)
                         && self.leases.is_active(MonitorDomain::Users)
                         && (self.users_polled_once || !self.cached_user_sessions.is_empty()),
                     app_history: dirty.app_history
@@ -1289,6 +1418,11 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                         && self.app_history_polled_once,
                 };
                 if mask.any() {
+                    if include_pending_cold {
+                        self.pending_cold_publish = false;
+                        self.cold_flush_deadline = None;
+                        self.last_cold_publish_at = Some(Instant::now());
+                    }
                     self.publish_slices(mask);
                 }
             }
@@ -1486,8 +1620,9 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                         && self.leases.is_active(MonitorDomain::Details)
                     {
                         let rev = self.current_snapshot.revisions.details.saturating_add(1);
-                        let slice = self.projection.project_details(
+                        let slice = self.projection.project_details_with_query(
                             &self.view_config,
+                            &self.parsed_query,
                             &self.cold_cache,
                             rev,
                         );
@@ -1870,44 +2005,21 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         if mask.processes {
             let rev = next.revisions.processes.saturating_add(1);
             next.revisions.processes = rev;
-            next.processes = Arc::new(self.projection.project_processes(
+            next.processes = Arc::new(self.projection.project_processes_with_query(
                 &self.view_config,
+                &self.parsed_query,
                 &self.cold_cache,
                 rev,
             ));
-
-            if self.leases.is_active(MonitorDomain::Users)
-                && (self.users_polled_once || !self.cached_user_sessions.is_empty())
-            {
-                let users_rev = next.revisions.users.saturating_add(1);
-                next.revisions.users = users_rev;
-                next.users = Arc::new(self.projection.project_users(
-                    &self.cached_user_sessions,
-                    &self.view_config,
-                    &self.cold_cache,
-                    users_rev,
-                ));
-                self.users_projection_dirty = false;
-            }
-
-            if self.leases.is_active(MonitorDomain::AppHistory) && self.app_history_polled_once {
-                let hist_rev = next.revisions.app_history.saturating_add(1);
-                next.revisions.app_history = hist_rev;
-                next.app_history = Arc::new(self.projection.project_app_history(
-                    self.persisted_app_history_since,
-                    &self.persisted_app_history,
-                    &self.view_config,
-                    hist_rev,
-                ));
-                self.app_history_projection_dirty = false;
-            }
+            self.last_processes_projected_tick = self.tick_count;
         }
 
         if mask.details {
             let rev = next.revisions.details.saturating_add(1);
             next.revisions.details = rev;
-            next.details = Arc::new(self.projection.project_details(
+            next.details = Arc::new(self.projection.project_details_with_query(
                 &self.view_config,
+                &self.parsed_query,
                 &self.cold_cache,
                 rev,
             ));
@@ -1951,7 +2063,6 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         }
 
         if mask.users
-            && !mask.processes
             && self.leases.is_active(MonitorDomain::Users)
             && (self.users_polled_once || !self.cached_user_sessions.is_empty())
         {
@@ -1967,7 +2078,6 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         }
 
         if mask.app_history
-            && !mask.processes
             && self.leases.is_active(MonitorDomain::AppHistory)
             && self.app_history_polled_once
         {

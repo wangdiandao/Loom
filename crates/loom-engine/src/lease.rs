@@ -5,7 +5,7 @@
 //! polling overhead.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crossbeam_channel::Sender;
 use loom_types::MonitorDomain;
@@ -15,6 +15,7 @@ use loom_types::MonitorDomain;
 #[derive(Debug)]
 pub struct MonitorLeaseRegistry {
     counts: [AtomicUsize; MonitorDomain::COUNT],
+    ever_acquired: [AtomicBool; MonitorDomain::COUNT],
     wakeup: Option<Sender<()>>,
 }
 
@@ -30,6 +31,7 @@ impl MonitorLeaseRegistry {
     pub fn new() -> Self {
         Self {
             counts: std::array::from_fn(|_| AtomicUsize::new(0)),
+            ever_acquired: std::array::from_fn(|_| AtomicBool::new(false)),
             wakeup: None,
         }
     }
@@ -40,6 +42,7 @@ impl MonitorLeaseRegistry {
     pub fn with_wakeup(wakeup: Sender<()>) -> Self {
         Self {
             counts: std::array::from_fn(|_| AtomicUsize::new(0)),
+            ever_acquired: std::array::from_fn(|_| AtomicBool::new(false)),
             wakeup: Some(wakeup),
         }
     }
@@ -49,6 +52,7 @@ impl MonitorLeaseRegistry {
     /// When `domain` transitions from `0` to `1` active leases, the registered
     /// coordinator wakeup hook (if any) is notified non-blockingly.
     pub fn acquire(self: &Arc<Self>, domain: MonitorDomain) -> MonitorLease {
+        self.ever_acquired[domain.index()].store(true, Ordering::Release);
         let prev = self.counts[domain.index()].fetch_add(1, Ordering::AcqRel);
         if prev == 0 {
             self.notify_wakeup();
@@ -63,6 +67,13 @@ impl MonitorLeaseRegistry {
     #[inline]
     pub fn is_active(&self, domain: MonitorDomain) -> bool {
         self.count(domain) > 0
+    }
+
+    /// Returns `true` if a [`MonitorLease`] for `domain` has ever been acquired during
+    /// the lifetime of this registry.
+    #[inline]
+    pub fn ever_acquired(&self, domain: MonitorDomain) -> bool {
+        self.ever_acquired[domain.index()].load(Ordering::Acquire)
     }
 
     /// Returns the number of active [`MonitorLease`] handles currently held for `domain`.
@@ -137,5 +148,15 @@ mod tests {
         assert!(!reg.is_active(MonitorDomain::Details));
         assert_eq!(reg.count(MonitorDomain::Details), 0);
         assert!(rx.try_recv().is_ok(), "1 -> 0 transition should wake");
+
+        // Processes domain tracks ever_acquired independently.
+        assert!(!reg.ever_acquired(MonitorDomain::Processes));
+        assert!(!reg.is_active(MonitorDomain::Processes));
+        let proc_lease = reg.acquire(MonitorDomain::Processes);
+        assert!(reg.ever_acquired(MonitorDomain::Processes));
+        assert!(reg.is_active(MonitorDomain::Processes));
+        drop(proc_lease);
+        assert!(reg.ever_acquired(MonitorDomain::Processes));
+        assert!(!reg.is_active(MonitorDomain::Processes));
     }
 }

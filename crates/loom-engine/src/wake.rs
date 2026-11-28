@@ -61,26 +61,35 @@ impl SnapshotWakeSignal {
 
     /// Signals all waiting async tasks, channel subscribers, and callbacks non-blockingly.
     pub fn notify(&self) {
-        let (wakers, callbacks) = {
+        let callbacks = {
             let mut state = self.inner.lock();
             if state.closed {
                 return;
             }
             state.pending = true;
+            state.callbacks.clone()
+        };
+
+        // Invoke callbacks before unblocking channel/async waiters so any observer
+        // woken via `subscribe_channel` or `wait` sees callback side effects immediately.
+        for cb in callbacks {
+            cb();
+        }
+
+        let wakers = {
+            let mut state = self.inner.lock();
+            if state.closed {
+                return;
+            }
             state.channels.retain(|tx| match tx.try_send(()) {
                 Ok(()) | Err(TrySendError::Full(())) => true,
                 Err(TrySendError::Disconnected(())) => false,
             });
-            let wakers = std::mem::take(&mut state.wakers);
-            let callbacks = state.callbacks.clone();
-            (wakers, callbacks)
+            std::mem::take(&mut state.wakers)
         };
 
         for waker in wakers {
             waker.wake();
-        }
-        for cb in callbacks {
-            cb();
         }
     }
 

@@ -28,7 +28,7 @@ use loom_types::{
 
 use crate::leaks::{LeakDetector, LeakDetectorConfig, LeakSampleInput};
 use crate::query::{ParsedQuery, QueryMatchContext};
-use crate::slow_lane::ColdMetaCache;
+use crate::slow_lane::{CachedProcessMeta, ColdMetaCache};
 use crate::tree::{FastBuildHasher, FastHasher, ProcessTree};
 use crate::webview2::{classify_webview2, is_webview2_image};
 
@@ -488,8 +488,22 @@ struct DeadbandContext<'a> {
 /// Persistent scratch buffers owned by [`ProjectionEngine`] and cleared in place across ticks
 /// to eliminate steady-state per-tick heap allocations during grouping, sorting, and tree flattening.
 #[derive(Debug, Default)]
+struct DetailsStaticOrderCache {
+    valid: bool,
+    sort_column: DetailsSortColumn,
+    sort_direction: SortDirection,
+    hide_system: bool,
+    cold_version: u64,
+    computed_len: usize,
+    live_keys_hash: u64,
+    ordered_indices: Vec<usize>,
+    ordered_keys: Vec<ProcessKey>,
+}
+
+#[derive(Debug, Default)]
 struct ProjectionScratch {
     frozen_ranks: HashMap<ProcessKey, usize, FastBuildHasher>,
+    dense_frozen_ranks: Vec<usize>,
     dense_deadband: Vec<DenseDeadbandEntry>,
     bool_mask_a: Vec<bool>,
     bool_mask_b: Vec<bool>,
@@ -513,12 +527,14 @@ struct ProjectionScratch {
     folded_arena: FoldedKeyArena,
     schwartz_entries: Vec<SchwartzEntry>,
     schwartz_children: Vec<SchwartzEntry>,
+    details_static_order: DetailsStaticOrderCache,
 }
 
 impl ProjectionScratch {
     fn with_capacity(cap: usize) -> Self {
         Self {
             frozen_ranks: HashMap::with_capacity_and_hasher(cap, FastBuildHasher),
+            dense_frozen_ranks: Vec::with_capacity(cap),
             dense_deadband: Vec::with_capacity(cap),
             bool_mask_a: Vec::with_capacity(cap),
             bool_mask_b: Vec::with_capacity(cap),
@@ -546,6 +562,7 @@ impl ProjectionScratch {
             folded_arena: FoldedKeyArena::default(),
             schwartz_entries: Vec::with_capacity(cap),
             schwartz_children: Vec::with_capacity(64),
+            details_static_order: DetailsStaticOrderCache::default(),
         }
     }
 
@@ -586,14 +603,29 @@ impl ProjectionScratch {
     }
 
     #[inline]
-    fn populate_frozen_ranks(&mut self, frozen: bool, order: &[ProcessKey]) -> bool {
+    fn populate_frozen_ranks(
+        &mut self,
+        frozen: bool,
+        order: &[ProcessKey],
+        computed: &[ComputedProcess],
+    ) -> bool {
         self.frozen_ranks.clear();
+        self.dense_frozen_ranks.clear();
         if !frozen || order.is_empty() {
             return false;
         }
         self.frozen_ranks.reserve(order.len());
         for (rank, &key) in order.iter().enumerate() {
             self.frozen_ranks.entry(key).or_insert(rank);
+        }
+        self.dense_frozen_ranks.reserve(computed.len());
+        for proc in computed {
+            self.dense_frozen_ranks.push(
+                self.frozen_ranks
+                    .get(&proc.key)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+            );
         }
         true
     }
@@ -1218,9 +1250,23 @@ impl ProjectionEngine {
         revision: u64,
     ) -> ProcessTableSlice {
         let parsed_query = ParsedQuery::parse(&config.search_query);
-        let use_frozen = self
-            .scratch
-            .populate_frozen_ranks(config.process_order_frozen, &config.frozen_process_order);
+        self.project_processes_with_query(config, &parsed_query, cold_cache, revision)
+    }
+
+    /// Builds a pre-sorted, pre-filtered [`ProcessTableSlice`] reusing an already-parsed
+    /// [`ParsedQuery`] to avoid re-tokenizing the search string on every tick.
+    pub fn project_processes_with_query(
+        &mut self,
+        config: &ViewProjectionConfig,
+        parsed_query: &ParsedQuery,
+        cold_cache: &ColdMetaCache,
+        revision: u64,
+    ) -> ProcessTableSlice {
+        let use_frozen = self.scratch.populate_frozen_ranks(
+            config.process_order_frozen,
+            &config.frozen_process_order,
+            &self.computed,
+        );
 
         let proc_deadband = if !use_frozen && config.sort_deadband_enabled {
             process_column_deadband(config.process_sort_column)
@@ -1255,14 +1301,14 @@ impl ProjectionEngine {
             ProcessViewMode::Grouped => self.project_processes_grouped(
                 config,
                 cold_cache,
-                &parsed_query,
+                parsed_query,
                 use_frozen,
                 proc_deadband,
             ),
             ProcessViewMode::Tree => self.project_processes_tree(
                 config,
                 cold_cache,
-                &parsed_query,
+                parsed_query,
                 use_frozen,
                 proc_deadband,
             ),
@@ -1317,9 +1363,23 @@ impl ProjectionEngine {
         revision: u64,
     ) -> DetailsTableSlice {
         let parsed_query = ParsedQuery::parse(&config.search_query);
-        let use_frozen = self
-            .scratch
-            .populate_frozen_ranks(config.details_order_frozen, &config.frozen_details_order);
+        self.project_details_with_query(config, &parsed_query, cold_cache, revision)
+    }
+
+    /// Builds a pre-sorted, pre-filtered [`DetailsTableSlice`] reusing an already-parsed
+    /// [`ParsedQuery`] to avoid re-tokenizing the search string on every tick.
+    pub fn project_details_with_query(
+        &mut self,
+        config: &ViewProjectionConfig,
+        parsed_query: &ParsedQuery,
+        cold_cache: &ColdMetaCache,
+        revision: u64,
+    ) -> DetailsTableSlice {
+        let use_frozen = self.scratch.populate_frozen_ranks(
+            config.details_order_frozen,
+            &config.frozen_details_order,
+            &self.computed,
+        );
 
         let details_deadband = if !use_frozen && config.sort_deadband_enabled {
             details_column_deadband(config.details_sort_column)
@@ -1357,14 +1417,14 @@ impl ProjectionEngine {
             DetailsViewMode::Flat => self.project_details_flat(
                 config,
                 cold_cache,
-                &parsed_query,
+                parsed_query,
                 use_frozen,
                 details_deadband,
             ),
             DetailsViewMode::Tree => self.project_details_tree(
                 config,
                 cold_cache,
-                &parsed_query,
+                parsed_query,
                 use_frozen,
                 details_deadband,
             ),
@@ -2003,7 +2063,7 @@ impl ProjectionEngine {
         let total_net_bps = *total_net_bytes_per_sec;
 
         let ProjectionScratch {
-            ref frozen_ranks,
+            ref dense_frozen_ranks,
             ref dense_deadband,
             bool_mask_a: ref mut in_any_section,
             bool_mask_b: ref mut visited,
@@ -2013,7 +2073,7 @@ impl ProjectionEngine {
             ref mut by_category,
             ..
         } = *scratch;
-        let frozen_ranks = use_frozen.then_some(frozen_ranks);
+        let frozen_ranks = use_frozen.then_some(dense_frozen_ranks.as_slice());
         let deadband_ctx = deadband.map(|db| DeadbandContext {
             deadband: db,
             dense_prev: dense_deadband.as_slice(),
@@ -2102,7 +2162,8 @@ impl ProjectionEngine {
                 let child_count = visible_children.len() as u32;
 
                 rows.push(build_process_row_from_parts(
-                    proc,
+                    computed,
+                    idx,
                     latest_tree,
                     leak_detector,
                     total_disk_bps,
@@ -2180,7 +2241,7 @@ impl ProjectionEngine {
         let total_net_bps = *total_net_bytes_per_sec;
 
         let ProjectionScratch {
-            ref frozen_ranks,
+            ref dense_frozen_ranks,
             ref dense_deadband,
             bool_mask_a: ref mut in_remaining_section,
             bool_mask_b: ref mut visited,
@@ -2202,7 +2263,7 @@ impl ProjectionEngine {
             ref mut name_to_groups,
             ..
         } = *scratch;
-        let frozen_ranks = use_frozen.then_some(frozen_ranks);
+        let frozen_ranks = use_frozen.then_some(dense_frozen_ranks.as_slice());
         let deadband_ctx = deadband.map(|db| DeadbandContext {
             deadband: db,
             dense_prev: dense_deadband.as_slice(),
@@ -2514,7 +2575,8 @@ impl ProjectionEngine {
                 };
 
                 rows.push(build_aggregated_process_row_from_parts(
-                    leader,
+                    computed,
+                    *leader_idx,
                     agg,
                     latest_tree,
                     leak_detector,
@@ -2540,7 +2602,8 @@ impl ProjectionEngine {
                     );
                     for &c_idx in children.iter() {
                         rows.push(build_process_row_from_parts(
-                            &computed[c_idx],
+                            computed,
+                            c_idx,
                             latest_tree,
                             leak_detector,
                             total_disk_bps,
@@ -2673,7 +2736,8 @@ impl ProjectionEngine {
 
                 if let Some(ref agg) = group_agg[idx] {
                     rows.push(build_aggregated_process_row_from_parts(
-                        proc,
+                        computed,
+                        idx,
                         agg,
                         latest_tree,
                         leak_detector,
@@ -2688,7 +2752,8 @@ impl ProjectionEngine {
                     ));
                 } else {
                     rows.push(build_process_row_from_parts(
-                        proc,
+                        computed,
+                        idx,
                         latest_tree,
                         leak_detector,
                         total_disk_bps,
@@ -2748,7 +2813,7 @@ impl ProjectionEngine {
         let total_net_bps = *total_net_bytes_per_sec;
 
         let ProjectionScratch {
-            ref frozen_ranks,
+            ref dense_frozen_ranks,
             ref dense_deadband,
             bool_mask_a: ref mut visible_mask,
             bool_mask_b: ref mut visited,
@@ -2758,7 +2823,7 @@ impl ProjectionEngine {
             ref mut visible_children,
             ..
         } = *scratch;
-        let frozen_ranks = use_frozen.then_some(frozen_ranks);
+        let frozen_ranks = use_frozen.then_some(dense_frozen_ranks.as_slice());
         let deadband_ctx = deadband.map(|db| DeadbandContext {
             deadband: db,
             dense_prev: dense_deadband.as_slice(),
@@ -2837,7 +2902,8 @@ impl ProjectionEngine {
             let child_count = visible_children.len() as u32;
 
             rows.push(build_process_row_from_parts(
-                proc,
+                computed,
+                idx,
                 latest_tree,
                 leak_detector,
                 total_disk_bps,
@@ -2888,42 +2954,98 @@ impl ProjectionEngine {
         } = self;
 
         let ProjectionScratch {
-            ref frozen_ranks,
+            ref dense_frozen_ranks,
             ref dense_deadband,
             section_roots: ref mut indices,
+            ref mut details_static_order,
             ..
         } = *scratch;
-        let frozen_ranks = use_frozen.then_some(frozen_ranks);
+        let frozen_ranks = use_frozen.then_some(dense_frozen_ranks.as_slice());
         let deadband_ctx = deadband.map(|db| DeadbandContext {
             deadband: db,
             dense_prev: dense_deadband.as_slice(),
         });
 
         indices.clear();
-        for (idx, proc) in computed.iter().enumerate() {
-            if !is_hidden_system_process(proc, config.hide_windows_system_processes)
-                && (!has_query
-                    || matches_query_with_ports(
-                        proc,
-                        cold_cache,
-                        parsed_query,
-                        listening_ports,
-                        true,
-                    ))
+
+        let can_use_static_cache =
+            !has_query && !use_frozen && details_column_is_static(config.details_sort_column);
+
+        let mut cache_hit = false;
+        let mut live_keys_hash = 0u64;
+        let cold_version = cold_cache.version();
+        if can_use_static_cache {
+            live_keys_hash = compute_details_static_keys_hash(computed);
+            if details_static_order.valid
+                && details_static_order.sort_column == config.details_sort_column
+                && details_static_order.sort_direction == config.details_sort_direction
+                && details_static_order.hide_system == config.hide_windows_system_processes
+                && details_static_order.cold_version == cold_version
+                && details_static_order.computed_len == computed.len()
+                && details_static_order.live_keys_hash == live_keys_hash
+                && details_static_order.ordered_indices.len()
+                    == details_static_order.ordered_keys.len()
             {
-                indices.push(idx);
+                let slots_match = details_static_order
+                    .ordered_indices
+                    .iter()
+                    .zip(details_static_order.ordered_keys.iter())
+                    .all(|(&idx, &expected_key)| {
+                        computed
+                            .get(idx)
+                            .is_some_and(|proc| proc.key == expected_key)
+                    });
+                if slots_match {
+                    indices.extend_from_slice(&details_static_order.ordered_indices);
+                    cache_hit = true;
+                }
             }
         }
 
-        sort_details_indices_slice(
-            computed,
-            indices,
-            cold_cache,
-            config.details_sort_column,
-            config.details_sort_direction,
-            frozen_ranks,
-            deadband_ctx,
-        );
+        if !cache_hit {
+            for (idx, proc) in computed.iter().enumerate() {
+                if !is_hidden_system_process(proc, config.hide_windows_system_processes)
+                    && (!has_query
+                        || matches_query_with_ports(
+                            proc,
+                            cold_cache,
+                            parsed_query,
+                            listening_ports,
+                            true,
+                        ))
+                {
+                    indices.push(idx);
+                }
+            }
+
+            sort_details_indices_slice(
+                computed,
+                indices,
+                cold_cache,
+                config.details_sort_column,
+                config.details_sort_direction,
+                frozen_ranks,
+                deadband_ctx,
+            );
+
+            if can_use_static_cache {
+                details_static_order.valid = true;
+                details_static_order.sort_column = config.details_sort_column;
+                details_static_order.sort_direction = config.details_sort_direction;
+                details_static_order.hide_system = config.hide_windows_system_processes;
+                details_static_order.cold_version = cold_version;
+                details_static_order.computed_len = computed.len();
+                details_static_order.live_keys_hash = live_keys_hash;
+                details_static_order.ordered_indices.clear();
+                details_static_order
+                    .ordered_indices
+                    .extend_from_slice(indices);
+                details_static_order.ordered_keys.clear();
+                details_static_order
+                    .ordered_keys
+                    .extend(indices.iter().map(|&idx| computed[idx].key));
+            }
+        }
 
         let mut rows = Vec::with_capacity(indices.len());
         for &idx in indices.iter() {
@@ -2963,7 +3085,7 @@ impl ProjectionEngine {
         let n = computed.len();
 
         let ProjectionScratch {
-            ref frozen_ranks,
+            ref dense_frozen_ranks,
             ref dense_deadband,
             bool_mask_a: ref mut visible_mask,
             bool_mask_b: ref mut visited,
@@ -2973,7 +3095,7 @@ impl ProjectionEngine {
             ref mut visible_children,
             ..
         } = *scratch;
-        let frozen_ranks = use_frozen.then_some(frozen_ranks);
+        let frozen_ranks = use_frozen.then_some(dense_frozen_ranks.as_slice());
         let deadband_ctx = deadband.map(|db| DeadbandContext {
             deadband: db,
             dense_prev: dense_deadband.as_slice(),
@@ -3137,9 +3259,45 @@ fn hash_session_ascii_ci(session_id: u32, s: &str) -> u64 {
 }
 
 #[inline]
+const fn details_column_is_static(column: DetailsSortColumn) -> bool {
+    matches!(
+        column,
+        DetailsSortColumn::Name
+            | DetailsSortColumn::Pid
+            | DetailsSortColumn::UserName
+            | DetailsSortColumn::SessionId
+            | DetailsSortColumn::Arch
+            | DetailsSortColumn::UacVirtualization
+            | DetailsSortColumn::Publisher
+            | DetailsSortColumn::Description
+            | DetailsSortColumn::ExePath
+            | DetailsSortColumn::CommandLine
+    )
+}
+
+#[inline]
+fn compute_details_static_keys_hash(computed: &[ComputedProcess]) -> u64 {
+    let mut h = FastHasher::new();
+    h.write_usize(computed.len());
+    for proc in computed {
+        h.write_u32(proc.key.pid);
+        h.write_u64(proc.key.create_time_100ns);
+        h.write_u32(proc.session_id);
+        h.write_usize(proc.name.as_ptr() as usize);
+        h.write_usize(proc.name.len());
+        h.write_u8(proc.category as u8);
+        h.write_u16(
+            (proc.status & (ProcessStatusFlags::KERNEL | ProcessStatusFlags::SYSTEM_IDLE)).bits(),
+        );
+    }
+    h.finish()
+}
+
+#[inline]
 #[allow(clippy::too_many_arguments)]
 fn build_process_row_from_parts(
-    proc: &ComputedProcess,
+    computed: &[ComputedProcess],
+    idx: usize,
     latest_tree: &ProcessTree,
     leak_detector: &LeakDetector,
     total_disk_bytes_per_sec: u64,
@@ -3151,6 +3309,7 @@ fn build_process_row_from_parts(
     is_expanded: bool,
     child_count: u32,
 ) -> ProcessRowProjection {
+    let proc = &computed[idx];
     let cold_entry = cold_cache.get_entry(proc.key);
     let cold = cold_entry.map(|e| &e.meta);
     let asset = cold.and_then(|meta| meta.asset.as_ref());
@@ -3159,12 +3318,12 @@ fn build_process_row_from_parts(
     let exe_path = cold.and_then(|meta| meta.exe_path.clone());
     let command_line = cold.and_then(|meta| meta.command_line.clone());
     let icon = asset.and_then(|a| a.icon.clone());
-    let display_name = resolve_display_name(proc, cold_cache);
-    let status = effective_status(proc, cold_cache);
+    let display_name = resolve_display_name_with_entry(proc, cold_entry);
+    let status = effective_status_with_entry(proc, cold_entry, cold_cache);
     let disk_permille =
         compute_throughput_permille(proc.disk_bytes_per_sec, total_disk_bytes_per_sec);
     let net_permille = compute_throughput_permille(proc.net_bytes_per_sec, total_net_bytes_per_sec);
-    let parent_key = latest_tree.parent(proc.key);
+    let parent_key = latest_tree.parent_index(idx).map(|p| latest_tree.key_at(p));
     let webview2_role = if is_webview2_image(&proc.name) {
         cold_entry.and_then(|e| e.webview2_role).or_else(|| {
             cold.filter(|m| m.exe_path.is_none())
@@ -3231,7 +3390,7 @@ fn build_details_row_from_parts(
     let cold = cold_entry.map(|e| &e.meta);
     let asset = cold.and_then(|m| m.asset.as_ref());
     let parent_key = latest_tree.parent_index(idx).map(|p| latest_tree.key_at(p));
-    let status = effective_status(proc, cold_cache);
+    let status = effective_status_with_entry(proc, cold_entry, cold_cache);
     let exe_path = cold.and_then(|m| m.exe_path.clone());
     let command_line = cold.and_then(|m| m.command_line.clone());
     let webview2_role = if is_webview2_image(&proc.name) {
@@ -3287,7 +3446,8 @@ fn build_details_row_from_parts(
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn build_aggregated_process_row_from_parts(
-    proc: &ComputedProcess,
+    computed: &[ComputedProcess],
+    idx: usize,
     agg: &GroupAggregate,
     latest_tree: &ProcessTree,
     leak_detector: &LeakDetector,
@@ -3301,7 +3461,8 @@ fn build_aggregated_process_row_from_parts(
     child_count: u32,
 ) -> ProcessRowProjection {
     let mut row = build_process_row_from_parts(
-        proc,
+        computed,
+        idx,
         latest_tree,
         leak_detector,
         total_disk_bytes_per_sec,
@@ -3548,15 +3709,13 @@ fn compare_process_items(
     cold_cache: &ColdMetaCache,
     column: ProcessSortColumn,
     direction: SortDirection,
-    frozen_ranks: Option<&HashMap<ProcessKey, usize, FastBuildHasher>>,
+    frozen_ranks: Option<&[usize]>,
     deadband_ctx: Option<DeadbandContext<'_>>,
 ) -> Ordering {
     let a = &computed[ia];
     let b = &computed[ib];
     if let Some(ranks) = frozen_ranks {
-        let ra = ranks.get(&a.key).copied().unwrap_or(usize::MAX);
-        let rb = ranks.get(&b.key).copied().unwrap_or(usize::MAX);
-        let frozen_ord = ra.cmp(&rb);
+        let frozen_ord = ranks[ia].cmp(&ranks[ib]);
         if frozen_ord != Ordering::Equal {
             return frozen_ord;
         }
@@ -3588,7 +3747,7 @@ fn sort_process_indices_with_aggregates_slice(
     cold_cache: &ColdMetaCache,
     column: ProcessSortColumn,
     direction: SortDirection,
-    frozen_ranks: Option<&HashMap<ProcessKey, usize, FastBuildHasher>>,
+    frozen_ranks: Option<&[usize]>,
     deadband_ctx: Option<DeadbandContext<'_>>,
 ) {
     indices.sort_by(|&ia, &ib| {
@@ -3614,7 +3773,7 @@ fn sort_process_indices_slice(
     cold_cache: &ColdMetaCache,
     column: ProcessSortColumn,
     direction: SortDirection,
-    frozen_ranks: Option<&HashMap<ProcessKey, usize, FastBuildHasher>>,
+    frozen_ranks: Option<&[usize]>,
     deadband_ctx: Option<DeadbandContext<'_>>,
 ) {
     indices.sort_by(|&ia, &ib| {
@@ -3640,16 +3799,14 @@ fn sort_details_indices_slice(
     cold_cache: &ColdMetaCache,
     column: DetailsSortColumn,
     direction: SortDirection,
-    frozen_ranks: Option<&HashMap<ProcessKey, usize, FastBuildHasher>>,
+    frozen_ranks: Option<&[usize]>,
     deadband_ctx: Option<DeadbandContext<'_>>,
 ) {
     indices.sort_by(|&ia, &ib| {
         let a = &computed[ia];
         let b = &computed[ib];
         if let Some(ranks) = frozen_ranks {
-            let ra = ranks.get(&a.key).copied().unwrap_or(usize::MAX);
-            let rb = ranks.get(&b.key).copied().unwrap_or(usize::MAX);
-            let frozen_ord = ra.cmp(&rb);
+            let frozen_ord = ranks[ia].cmp(&ranks[ib]);
             if frozen_ord != Ordering::Equal {
                 return frozen_ord;
             }
@@ -4280,10 +4437,12 @@ fn section_header_row(category: ProcessCategory, count: usize) -> ProcessRowProj
 }
 
 #[inline]
-fn resolve_display_name(proc: &ComputedProcess, cold_cache: &ColdMetaCache) -> Arc<str> {
-    cold_cache
-        .get_process(proc.key)
-        .and_then(|meta| meta.asset.as_ref())
+fn resolve_display_name_with_entry(
+    proc: &ComputedProcess,
+    cold_entry: Option<&CachedProcessMeta>,
+) -> Arc<str> {
+    cold_entry
+        .and_then(|entry| entry.meta.asset.as_ref())
         .and_then(|asset| asset.file_description.as_ref())
         .filter(|desc| !desc.trim().is_empty())
         .cloned()
@@ -4292,15 +4451,33 @@ fn resolve_display_name(proc: &ComputedProcess, cold_cache: &ColdMetaCache) -> A
 }
 
 #[inline]
-fn effective_status(proc: &ComputedProcess, cold_cache: &ColdMetaCache) -> ProcessStatusFlags {
+fn resolve_display_name(proc: &ComputedProcess, cold_cache: &ColdMetaCache) -> Arc<str> {
+    resolve_display_name_with_entry(proc, cold_cache.get_entry(proc.key))
+}
+
+#[inline]
+fn effective_status_with_entry(
+    proc: &ComputedProcess,
+    cold_entry: Option<&CachedProcessMeta>,
+    cold_cache: &ColdMetaCache,
+) -> ProcessStatusFlags {
     let mut status = proc.status;
-    if cold_cache.efficiency_mode(proc.key) {
+    if let Some(entry) = cold_entry {
+        if entry.meta.efficiency_mode {
+            status |= ProcessStatusFlags::EFFICIENCY_MODE;
+        }
+        if entry.meta.is_elevated {
+            status |= ProcessStatusFlags::ELEVATED;
+        }
+    } else if cold_cache.efficiency_mode(proc.key) {
         status |= ProcessStatusFlags::EFFICIENCY_MODE;
     }
-    if cold_cache.is_elevated(proc.key) {
-        status |= ProcessStatusFlags::ELEVATED;
-    }
     status
+}
+
+#[inline]
+fn effective_status(proc: &ComputedProcess, cold_cache: &ColdMetaCache) -> ProcessStatusFlags {
+    effective_status_with_entry(proc, cold_cache.get_entry(proc.key), cold_cache)
 }
 
 #[inline]
@@ -6241,5 +6418,96 @@ mod tests {
             median < std::time::Duration::from_millis(50),
             "1000-process + 500-CJK-service projection median latency {median:?} exceeded 50 ms debug budget (all: {durations:?})"
         );
+    }
+
+    #[test]
+    fn details_static_sort_cache_and_dense_frozen_ranks_stay_accurate() {
+        let mut engine = ProjectionEngine::new();
+        let mut cold = ColdMetaCache::new();
+        let mut scratch = ProcessSampleScratch::<()>::with_capacity(8, 256);
+
+        let populate = |scratch: &mut ProcessSampleScratch<()>, cpu_a: u64, cpu_b: u64| {
+            scratch.clear();
+            for (pid, name, cpu) in [
+                (300u32, "zebra.exe", cpu_a),
+                (100u32, "alpha.exe", cpu_b),
+                (200u32, "middle.exe", 50_000),
+            ] {
+                let (name_offset, name_len) = scratch.push_str(name);
+                scratch.samples.push(ProcessHotSample {
+                    key: ProcessKey::new(pid, 1000),
+                    name_offset,
+                    name_len,
+                    user_time_100ns: cpu,
+                    private_working_set_bytes: 16 * 1024 * 1024,
+                    ..ProcessHotSample::default()
+                });
+            }
+        };
+
+        let cfg = ViewProjectionConfig {
+            details_view_mode: DetailsViewMode::Flat,
+            details_sort_column: DetailsSortColumn::Name,
+            details_sort_direction: SortDirection::Ascending,
+            ..ViewProjectionConfig::default()
+        };
+        let empty_query = ParsedQuery::default();
+
+        populate(&mut scratch, 10_000, 20_000);
+        engine.ingest_process_sample(Timestamp100Ns::new(10_000_000), &scratch, 4);
+        let s1 = engine.project_details_with_query(&cfg, &empty_query, &cold, 1);
+        let names1: Vec<&str> = s1.rows.iter().map(|r| r.name.as_ref()).collect();
+        assert_eq!(names1, vec!["alpha.exe", "middle.exe", "zebra.exe"]);
+        assert!(engine.scratch.details_static_order.valid);
+
+        // Next tick with identical process set & cold version hits the static-order cache
+        // while still projecting live updated CPU counters.
+        populate(&mut scratch, 900_000, 300_000);
+        engine.ingest_process_sample(Timestamp100Ns::new(20_000_000), &scratch, 4);
+        let s2 = engine.project_details_with_query(&cfg, &empty_query, &cold, 2);
+        let names2: Vec<&str> = s2.rows.iter().map(|r| r.name.as_ref()).collect();
+        assert_eq!(names2, vec!["alpha.exe", "middle.exe", "zebra.exe"]);
+        assert!(s2.rows[2].cpu_permille > s2.rows[0].cpu_permille);
+
+        // Cold metadata arrival bumps ColdMetaCache::version and invalidates publisher order cleanly.
+        let v_before = cold.version();
+        cold.insert_process(loom_types::ProcessColdMeta {
+            key: ProcessKey::new(300, 1000),
+            exe_path: Some(Arc::from(r"C:\zebra.exe")),
+            command_line: None,
+            user_name: None,
+            arch: ProcessArch::X64,
+            uac_virtualization: UacVirtualization::NotAllowed,
+            efficiency_mode: false,
+            is_elevated: false,
+            app_group_id: None,
+            asset: Some(Arc::new(loom_types::ExeStaticAsset {
+                normalized_path: Arc::from(r"c:\zebra.exe"),
+                publisher: Some(Arc::from("AAA Corp")),
+                file_description: None,
+                icon: None,
+                is_network_path: false,
+            })),
+        });
+        assert!(cold.version() > v_before);
+
+        let pub_cfg = ViewProjectionConfig {
+            details_sort_column: DetailsSortColumn::Publisher,
+            details_sort_direction: SortDirection::Descending,
+            ..cfg.clone()
+        };
+        let s3 = engine.project_details_with_query(&pub_cfg, &empty_query, &cold, 3);
+        assert_eq!(s3.rows[0].key.pid, 300);
+
+        // Dense frozen ranks preserve captured order regardless of live metric swings.
+        let mut frozen_cfg = ViewProjectionConfig {
+            details_sort_column: DetailsSortColumn::Cpu,
+            details_sort_direction: SortDirection::Descending,
+            ..cfg
+        };
+        frozen_cfg.freeze_details_order(&s1.rows);
+        let s4 = engine.project_details_with_query(&frozen_cfg, &empty_query, &cold, 4);
+        let frozen_pids: Vec<u32> = s4.rows.iter().map(|r| r.key.pid).collect();
+        assert_eq!(frozen_pids, vec![100, 200, 300]);
     }
 }

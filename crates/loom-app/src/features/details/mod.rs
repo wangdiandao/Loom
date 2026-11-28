@@ -50,12 +50,13 @@ use loom_ui_kit::{
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
 use crate::features::table_columns::{
     ColumnKey, ColumnSpec, ColumnToggleItem, CopyRowFields, DataTablePane, FnvHasher64,
-    HeaderMenuAction, IconRenderCache, OrderFreezeState, ScrollBurstCoalescer, TableColumnLayout,
-    TableInputBridge, TypeToSearchState, build_column_header_menu, build_copy_submenu,
-    can_suspend_or_resume_process, dispatch_ignore_leak_path, dispatch_restart_explorer,
-    dispatch_suspend_or_resume, expand_chevron_button, format_process_name_and_pid,
-    is_explorer_image, leak_ignore_target, leak_warning_badge, open_select_columns_dialog,
-    sort_paused_indicator, spawn_csv_export, webview2_role_badge, webview2_role_label,
+    HeaderMenuAction, IconRenderCache, OrderFreezeState, ScrollBurstCoalescer, SortPausedBadge,
+    TableColumnLayout, TableInputBridge, TypeToSearchState, build_column_header_menu,
+    build_copy_submenu, can_suspend_or_resume_process, dispatch_ignore_leak_path,
+    dispatch_restart_explorer, dispatch_suspend_or_resume, expand_chevron_button,
+    format_process_name_and_pid, is_explorer_image, leak_ignore_target, leak_warning_badge,
+    open_select_columns_dialog, should_attach_cell_tooltip, spawn_csv_export, webview2_role_badge,
+    webview2_role_label,
 };
 use crate::i18n;
 use crate::shell::{ShellHandle, dialogs};
@@ -917,7 +918,6 @@ fn compute_details_viewport_fingerprint(
     selected_idx: Option<usize>,
     highlighted_key: Option<ProcessKey>,
     total_ram_bytes: u64,
-    order_frozen: bool,
 ) -> u64 {
     let mut h = FnvHasher64::new();
     let rows_len = details.rows.len();
@@ -939,7 +939,6 @@ fn compute_details_viewport_fingerprint(
         h.write_u8(0);
     }
     h.write_u64(total_ram_bytes);
-    h.write_bool(order_frozen);
     h.write_usize(start);
     h.write_usize(end);
     h.write_u64(cols_mask);
@@ -1082,10 +1081,12 @@ struct DetailsTableDelegate {
     total_ram_bytes: u64,
     last_rev: u64,
     selected_key: Option<ProcessKey>,
+    reanchored_selection: Option<Option<usize>>,
     highlighted_key: Option<ProcessKey>,
     pending_scroll_key: Option<ProcessKey>,
     last_right_clicked_col: Option<usize>,
     order_freeze: OrderFreezeState,
+    sort_paused_badge: Entity<SortPausedBadge>,
     menu_focus_subs: Vec<Subscription>,
     column_layout: TableColumnLayout<DetailsColumn>,
     icon_cache: IconRenderCache,
@@ -1106,41 +1107,53 @@ impl DetailsTableDelegate {
         store: Entity<UiStore>,
         highlighted_key: Option<ProcessKey>,
         shell_handle: ShellHandle,
-        cx: &App,
+        cx: &mut App,
     ) -> Self {
-        let store_ref = store.read(cx);
-        let snap = store_ref.snapshot();
-        let capabilities = snap.capabilities;
-        let platform = snap.platform;
-        let total_ram_bytes = snap.performance.latest.mem_total_bytes;
+        let (details, capabilities, platform, total_ram_bytes, last_rev, saved_cols) = {
+            let store_ref = store.read(cx);
+            let snap = store_ref.snapshot();
+            (
+                Arc::clone(&snap.details),
+                snap.capabilities,
+                snap.platform,
+                snap.performance.latest.mem_total_bytes,
+                snap.revisions.details,
+                store_ref.details_columns().to_vec(),
+            )
+        };
 
         let mut column_layout = TableColumnLayout::new(DetailsColumn::default_specs(capabilities));
-        let saved_cols = store_ref.details_columns();
         if !saved_cols.is_empty() {
-            column_layout.apply_saved(saved_cols);
+            column_layout.apply_saved(&saved_cols);
         }
-        let initial_rows_len = snap.details.rows.len();
+        let initial_rows_len = details.rows.len();
+        let locale = DetailsLocaleCache::build(platform);
+        let sort_paused_tip = locale.sort_paused_tooltip.clone();
+        let sort_paused_badge =
+            cx.new(|_| SortPausedBadge::new("details-sort-paused", sort_paused_tip));
 
         Self {
             store: store.clone(),
             shell_handle,
-            details: Arc::clone(&snap.details),
+            details,
             capabilities,
             platform,
             total_ram_bytes,
-            last_rev: snap.revisions.details,
+            last_rev,
             selected_key: highlighted_key,
+            reanchored_selection: None,
             highlighted_key,
             pending_scroll_key: highlighted_key,
             last_right_clicked_col: None,
             order_freeze: OrderFreezeState::default(),
+            sort_paused_badge,
             menu_focus_subs: Vec::new(),
             column_layout,
             icon_cache: IconRenderCache::new(),
             semantic_colors: CachedSemanticColors::new(),
             row_cache: RowTextCache::new(),
             user_name_cache: HashMap::new(),
-            locale: DetailsLocaleCache::build(platform),
+            locale,
             visible_rows: 0..0,
             visible_cols: 0..0,
             last_rows_len: initial_rows_len,
@@ -1175,7 +1188,6 @@ impl DetailsTableDelegate {
             selected_idx,
             self.highlighted_key,
             self.total_ram_bytes,
-            self.order_freeze.is_frozen(),
         )
     }
 
@@ -1185,12 +1197,13 @@ impl DetailsTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) {
         if let Some(frozen) = transition {
-            self.invalidate_viewport_fingerprint();
             let _ = self
                 .store
                 .read(cx)
                 .dispatch_command(EngineCommand::SetDetailsOrderFreeze(frozen));
-            cx.notify();
+            self.sort_paused_badge.update(cx, |badge, cx| {
+                badge.set_frozen(frozen, cx);
+            });
         }
     }
 
@@ -1590,13 +1603,16 @@ impl TableDelegate for DetailsTableDelegate {
         };
         let col = spec.id;
         let is_active_sort = col.sort_column() == Some(self.details.sort_column);
-        let is_sort_paused = is_active_sort && self.order_freeze.is_frozen();
+        if is_active_sort {
+            self.sort_paused_badge.update(cx, |badge, _| {
+                badge.set_col_ix(col_ix);
+            });
+        }
         let theme = cx.theme();
         let fg = theme.foreground;
         let muted_fg = theme.muted_foreground;
-        let sort_paused_color = self.semantic_colors.get_copy(theme).sort_paused;
         let col_label = self.locale.column_label(col);
-        let sort_paused_tip = self.locale.sort_paused_tooltip.clone();
+        let sort_paused_badge = self.sort_paused_badge.clone();
         let table_weak = cx.entity().downgrade();
 
         h_flex()
@@ -1615,20 +1631,12 @@ impl TableDelegate for DetailsTableDelegate {
             .on_click(cx.listener(move |table, _, _, cx| {
                 table.delegate_mut().trigger_sort_col(col_ix, cx);
             }))
-            .when(is_sort_paused && col.right_aligned(), |d| {
-                d.child(sort_paused_indicator(
-                    ("details-sort-paused", col_ix),
-                    sort_paused_color,
-                    sort_paused_tip.clone(),
-                ))
+            .when(is_active_sort && col.right_aligned(), |d| {
+                d.child(sort_paused_badge.clone())
             })
             .child(div().min_w_0().truncate().child(col_label))
-            .when(is_sort_paused && !col.right_aligned(), |d| {
-                d.child(sort_paused_indicator(
-                    ("details-sort-paused", col_ix),
-                    sort_paused_color,
-                    sort_paused_tip,
-                ))
+            .when(is_active_sort && !col.right_aligned(), |d| {
+                d.child(sort_paused_badge)
             })
             .context_menu(move |menu, window, cx| {
                 Self::build_header_context_menu(menu, Some(col), table_weak.clone(), window, cx)
@@ -1701,6 +1709,26 @@ impl TableDelegate for DetailsTableDelegate {
                     .webview2_role
                     .map(|role| self.locale.webview2_label(role));
 
+                let name_el = if let Some(role_label) = wv2_label {
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_center()
+                        .gap_1p5()
+                        .overflow_hidden()
+                        .child(div().min_w_0().truncate().text_xs().child(name))
+                        .child(webview2_role_badge(role_label, muted_bg, muted_fg, radius))
+                        .into_any_element()
+                } else {
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .child(name)
+                        .into_any_element()
+                };
+
                 h_flex()
                     .size_full()
                     .items_center()
@@ -1727,28 +1755,13 @@ impl TableDelegate for DetailsTableDelegate {
                     .child(if let Some(image) = icon_image {
                         img(image).size(px(16.)).flex_shrink_0().into_any_element()
                     } else {
-                        h_flex()
-                            .size(px(16.))
+                        Icon::new(IconName::File)
+                            .size(px(15.))
                             .flex_shrink_0()
-                            .items_center()
-                            .justify_center()
-                            .child(Icon::new(IconName::File).xsmall().text_color(muted_fg))
+                            .text_color(muted_fg)
                             .into_any_element()
                     })
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .items_center()
-                            .gap_1p5()
-                            .overflow_hidden()
-                            .child(div().min_w_0().truncate().text_xs().child(name))
-                            .when_some(wv2_label, |el, role_label| {
-                                el.child(webview2_role_badge(
-                                    role_label, muted_bg, muted_fg, radius,
-                                ))
-                            }),
-                    )
+                    .child(name_el)
                     .into_any_element()
             }
             DetailsColumn::Pid => h_flex()
@@ -1858,14 +1871,9 @@ impl TableDelegate for DetailsTableDelegate {
                 .size_full()
                 .items_center()
                 .overflow_hidden()
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(muted_fg)
-                        .child(self.locale.priority_label(row.priority)),
-                )
+                .text_xs()
+                .text_color(muted_fg)
+                .child(self.locale.priority_label(row.priority))
                 .into_any_element(),
             DetailsColumn::Handles => h_flex()
                 .size_full()
@@ -1889,27 +1897,17 @@ impl TableDelegate for DetailsTableDelegate {
                 .size_full()
                 .items_center()
                 .overflow_hidden()
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(muted_fg)
-                        .child(self.locale.arch_label(row.arch)),
-                )
+                .text_xs()
+                .text_color(muted_fg)
+                .child(self.locale.arch_label(row.arch))
                 .into_any_element(),
             DetailsColumn::UacVirtualization => h_flex()
                 .size_full()
                 .items_center()
                 .overflow_hidden()
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(muted_fg)
-                        .child(self.locale.uac_label(row.uac_virtualization)),
-                )
+                .text_xs()
+                .text_color(muted_fg)
+                .child(self.locale.uac_label(row.uac_virtualization))
                 .into_any_element(),
             DetailsColumn::Elevated => {
                 let text = if row.status.contains(ProcessStatusFlags::ELEVATED) {
@@ -1921,14 +1919,9 @@ impl TableDelegate for DetailsTableDelegate {
                     .size_full()
                     .items_center()
                     .overflow_hidden()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child(text),
-                    )
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child(text)
                     .into_any_element()
             }
             DetailsColumn::GpuMemory => render_metric_cell(
@@ -1984,18 +1977,30 @@ impl TableDelegate for DetailsTableDelegate {
                     let preview =
                         self.row_cache
                             .preview_slot(key, 0, path_arc, DEFAULT_CELL_PREVIEW_CHARS);
-                    let tip = SharedString::from(Arc::clone(path_arc));
-                    h_flex()
-                        .id(("details-exe", row_id))
-                        .size_full()
-                        .items_center()
-                        .overflow_hidden()
-                        .text_xs()
-                        .font_family(mono_font)
-                        .text_color(muted_fg)
-                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                        .child(div().min_w_0().truncate().child(preview))
-                        .into_any_element()
+                    if should_attach_cell_tooltip(path_arc, spec.width) {
+                        let tip = SharedString::from(Arc::clone(path_arc));
+                        h_flex()
+                            .id(("details-exe", row_id))
+                            .size_full()
+                            .items_center()
+                            .overflow_hidden()
+                            .text_xs()
+                            .font_family(mono_font)
+                            .text_color(muted_fg)
+                            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                            .child(div().min_w_0().truncate().child(preview))
+                            .into_any_element()
+                    } else {
+                        h_flex()
+                            .size_full()
+                            .items_center()
+                            .overflow_hidden()
+                            .text_xs()
+                            .font_family(mono_font)
+                            .text_color(muted_fg)
+                            .child(div().min_w_0().truncate().child(preview))
+                            .into_any_element()
+                    }
                 } else {
                     h_flex()
                         .size_full()
@@ -2014,18 +2019,30 @@ impl TableDelegate for DetailsTableDelegate {
                     let preview =
                         self.row_cache
                             .preview_slot(key, 1, cmd_arc, DEFAULT_CELL_PREVIEW_CHARS);
-                    let tip = SharedString::from(Arc::clone(cmd_arc));
-                    h_flex()
-                        .id(("details-cmd", row_id))
-                        .size_full()
-                        .items_center()
-                        .overflow_hidden()
-                        .text_xs()
-                        .font_family(mono_font)
-                        .text_color(muted_fg)
-                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                        .child(div().min_w_0().truncate().child(preview))
-                        .into_any_element()
+                    if should_attach_cell_tooltip(cmd_arc, spec.width) {
+                        let tip = SharedString::from(Arc::clone(cmd_arc));
+                        h_flex()
+                            .id(("details-cmd", row_id))
+                            .size_full()
+                            .items_center()
+                            .overflow_hidden()
+                            .text_xs()
+                            .font_family(mono_font)
+                            .text_color(muted_fg)
+                            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                            .child(div().min_w_0().truncate().child(preview))
+                            .into_any_element()
+                    } else {
+                        h_flex()
+                            .size_full()
+                            .items_center()
+                            .overflow_hidden()
+                            .text_xs()
+                            .font_family(mono_font)
+                            .text_color(muted_fg)
+                            .child(div().min_w_0().truncate().child(preview))
+                            .into_any_element()
+                    }
                 } else {
                     h_flex()
                         .size_full()
@@ -2417,9 +2434,16 @@ impl DetailsView {
                         this.last_locale = next_locale;
                         table_for_store.update(cx, |table, cx| {
                             let platform = table.delegate().platform;
-                            let d = table.delegate_mut();
-                            d.locale = DetailsLocaleCache::build(platform);
-                            d.invalidate_viewport_fingerprint();
+                            let (badge, next_tip) = {
+                                let d = table.delegate_mut();
+                                d.locale = DetailsLocaleCache::build(platform);
+                                d.invalidate_viewport_fingerprint();
+                                (
+                                    d.sort_paused_badge.clone(),
+                                    d.locale.sort_paused_tooltip.clone(),
+                                )
+                            };
+                            badge.update(cx, |b, cx| b.set_tooltip(next_tip, cx));
                             table.refresh(cx);
                             cx.notify();
                         });
@@ -2447,6 +2471,11 @@ impl DetailsView {
                 TableEvent::SelectRow(row_ix) => {
                     let next_has_sel = table.update(cx, |table, _| {
                         let d = table.delegate_mut();
+                        if d.reanchored_selection == Some(Some(*row_ix)) {
+                            d.reanchored_selection = None;
+                            return d.selected_key.is_some();
+                        }
+                        d.reanchored_selection = None;
                         d.selected_key = d.details.rows.get(*row_ix).map(|r| r.key);
                         d.invalidate_viewport_fingerprint();
                         d.selected_key.is_some()
@@ -2462,6 +2491,7 @@ impl DetailsView {
                         {
                             let d = table.delegate_mut();
                             d.selected_key = key_opt;
+                            d.reanchored_selection = None;
                             d.invalidate_viewport_fingerprint();
                         }
                         if key_opt.is_some() && table.selected_row() != Some(*row_ix) {
@@ -2475,12 +2505,18 @@ impl DetailsView {
                     }
                 }
                 TableEvent::ClearSelection => {
-                    table.update(cx, |table, _| {
+                    let was_reanchor = table.update(cx, |table, _| {
                         let d = table.delegate_mut();
+                        if d.reanchored_selection == Some(None) {
+                            d.reanchored_selection = None;
+                            return true;
+                        }
+                        d.reanchored_selection = None;
                         d.selected_key = None;
                         d.invalidate_viewport_fingerprint();
+                        false
                     });
-                    if this.has_selection {
+                    if !was_reanchor && this.has_selection {
                         this.has_selection = false;
                         cx.notify();
                     }
@@ -2572,10 +2608,12 @@ impl DetailsView {
             let mut selection_changed = false;
             if let Some(idx) = selected_idx {
                 if prev_selected_row != Some(idx) {
+                    table.delegate_mut().reanchored_selection = Some(Some(idx));
                     table.set_selected_row(idx, cx);
                     selection_changed = true;
                 }
             } else if prev_selected_row.is_some() {
+                table.delegate_mut().reanchored_selection = Some(None);
                 table.clear_selection(cx);
                 selection_changed = true;
             }
@@ -2669,13 +2707,33 @@ impl DetailsView {
         let Some(target) = table.delegate().pending_scroll_key else {
             return;
         };
-        let found = find_row_index_by_key(&table.delegate().details.rows, target);
+        let found = find_row_index_by_key(&table.delegate().details.rows, target).or_else(|| {
+            (target.create_time_100ns == 0)
+                .then(|| {
+                    table
+                        .delegate()
+                        .details
+                        .rows
+                        .iter()
+                        .position(|row| row.key.pid == target.pid)
+                })
+                .flatten()
+        });
         if let Some(idx) = found {
+            let resolved_key = table.delegate().details.rows[idx].key;
             table
                 .vertical_scroll_handle
                 .scroll_to_item(idx, ScrollStrategy::Center);
+            {
+                let d = table.delegate_mut();
+                d.selected_key = Some(resolved_key);
+                if d.highlighted_key == Some(target) {
+                    d.highlighted_key = Some(resolved_key);
+                }
+                d.reanchored_selection = Some(Some(idx));
+                d.pending_scroll_key = None;
+            }
             table.set_selected_row(idx, cx);
-            table.delegate_mut().pending_scroll_key = None;
         }
     }
 
@@ -3826,7 +3884,6 @@ mod tests {
             None,
             None,
             ram,
-            false,
         );
 
         // Mutating an off-screen row (index 50) keeps the same fingerprint.
@@ -3842,7 +3899,6 @@ mod tests {
                 None,
                 None,
                 ram,
-                false,
             )
         );
 
@@ -3860,7 +3916,6 @@ mod tests {
                 None,
                 None,
                 ram,
-                false,
             )
         );
 
@@ -3874,7 +3929,6 @@ mod tests {
             None,
             None,
             ram,
-            false,
         );
         assert_ne!(fp_base, fp_cpu);
 
@@ -3891,7 +3945,6 @@ mod tests {
                 None,
                 None,
                 ram,
-                false,
             )
         );
     }
@@ -4201,7 +4254,6 @@ mod tests {
             None,
             None,
             ram,
-            false,
         );
         slice.rows[0].working_set_delta_bytes = 2 * 1024 * 1024;
         let fp_pos = compute_details_viewport_fingerprint(
@@ -4212,7 +4264,6 @@ mod tests {
             None,
             None,
             ram,
-            false,
         );
         assert_ne!(fp_zero, fp_pos);
 
@@ -4226,7 +4277,6 @@ mod tests {
             None,
             None,
             ram,
-            false,
         );
         assert_eq!(fp_pos, fp_pos_jitter);
 
@@ -4240,7 +4290,6 @@ mod tests {
             None,
             None,
             ram,
-            false,
         );
         assert_ne!(fp_pos, fp_neg);
     }

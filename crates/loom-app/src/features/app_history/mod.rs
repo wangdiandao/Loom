@@ -351,6 +351,7 @@ struct AppHistoryTableDelegate {
     slice: Arc<AppHistorySlice>,
     last_rev: u64,
     selected_app_id: Option<Arc<str>>,
+    reanchored_selection: Option<Option<usize>>,
     visible_rows: Range<usize>,
     last_scroll_at: Option<Instant>,
     last_viewport_fp: Option<u64>,
@@ -370,6 +371,7 @@ impl AppHistoryTableDelegate {
             last_rev: snap.revisions.app_history,
             slice,
             selected_app_id: None,
+            reanchored_selection: None,
             visible_rows: 0..0,
             last_scroll_at: None,
             last_viewport_fp: None,
@@ -771,11 +773,13 @@ impl AppHistoryView {
             |_this, table, event: &TableEvent, cx| match event {
                 TableEvent::SelectRow(row_ix) => {
                     table.update(cx, |table, _| {
-                        let id = table
-                            .delegate()
-                            .row_at(*row_ix)
-                            .map(|r| Arc::clone(&r.app_id));
                         let d = table.delegate_mut();
+                        if d.reanchored_selection == Some(Some(*row_ix)) {
+                            d.reanchored_selection = None;
+                            return;
+                        }
+                        d.reanchored_selection = None;
+                        let id = d.row_at(*row_ix).map(|r| Arc::clone(&r.app_id));
                         d.selected_app_id = id;
                         d.last_viewport_fp = None;
                     });
@@ -789,6 +793,7 @@ impl AppHistoryView {
                         {
                             let d = table.delegate_mut();
                             d.selected_app_id = id.clone();
+                            d.reanchored_selection = None;
                             d.last_viewport_fp = None;
                         }
                         if id.is_some() && table.selected_row() != Some(*row_ix) {
@@ -799,6 +804,11 @@ impl AppHistoryView {
                 TableEvent::ClearSelection => {
                     table.update(cx, |table, _| {
                         let d = table.delegate_mut();
+                        if d.reanchored_selection == Some(None) {
+                            d.reanchored_selection = None;
+                            return;
+                        }
+                        d.reanchored_selection = None;
                         d.selected_app_id = None;
                         d.last_viewport_fp = None;
                     });
@@ -914,9 +924,11 @@ impl AppHistoryView {
             .and_then(|id| table.delegate().find_visible_index_by_id(id, hint_row));
         if let Some(idx) = selected_idx {
             if hint_row != Some(idx) {
+                table.delegate_mut().reanchored_selection = Some(Some(idx));
                 table.set_selected_row(idx, cx);
             }
         } else if hint_row.is_some() {
+            table.delegate_mut().reanchored_selection = Some(None);
             table.clear_selection(cx);
         }
     }

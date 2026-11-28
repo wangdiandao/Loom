@@ -245,8 +245,9 @@ mod tests {
         assert_eq!(CapabilityFlags::FILE_LOCKS.bits(), 1 << 15);
         assert_eq!(CapabilityFlags::PROCESS_SOCKETS.bits(), 1 << 16);
         assert_eq!(CapabilityFlags::ELEVATED_PROCESS_NET.bits(), 1 << 17);
-        assert_eq!(MonitorDomain::COUNT, 8);
+        assert_eq!(MonitorDomain::COUNT, 9);
         assert_eq!(MonitorDomain::ProcessNetwork.index(), 7);
+        assert_eq!(MonitorDomain::Processes.index(), 8);
     }
 
     #[test]

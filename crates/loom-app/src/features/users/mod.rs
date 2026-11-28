@@ -531,6 +531,7 @@ struct UsersTableDelegate {
     total_ram_bytes: u64,
     last_rev: u64,
     selected_key: Option<UsersRowKey>,
+    reanchored_selection: Option<Option<usize>>,
     visible_rows: Range<usize>,
     last_scroll_at: Option<Instant>,
     last_viewport_fp: Option<u64>,
@@ -556,6 +557,7 @@ impl UsersTableDelegate {
             capabilities,
             total_ram_bytes,
             selected_key: None,
+            reanchored_selection: None,
             visible_rows: 0..0,
             last_scroll_at: None,
             last_viewport_fp: None,
@@ -1297,8 +1299,13 @@ impl UsersView {
             |this, table, event: &TableEvent, cx| match event {
                 TableEvent::SelectRow(row_ix) => {
                     let next_can_disconnect = table.update(cx, |table, _| {
-                        let key = table.delegate().slice.rows.get(*row_ix).map(row_key);
                         let d = table.delegate_mut();
+                        if d.reanchored_selection == Some(Some(*row_ix)) {
+                            d.reanchored_selection = None;
+                            return d.can_disconnect_selected(Some(*row_ix));
+                        }
+                        d.reanchored_selection = None;
+                        let key = d.slice.rows.get(*row_ix).map(row_key);
                         d.selected_key = key;
                         d.last_viewport_fp = None;
                         d.can_disconnect_selected(Some(*row_ix))
@@ -1314,6 +1321,7 @@ impl UsersView {
                         {
                             let d = table.delegate_mut();
                             d.selected_key = key;
+                            d.reanchored_selection = None;
                             d.last_viewport_fp = None;
                         }
                         if key.is_some() && table.selected_row() != Some(*row_ix) {
@@ -1329,13 +1337,18 @@ impl UsersView {
                     }
                 }
                 TableEvent::ClearSelection => {
-                    let next_can_disconnect = table.update(cx, |table, _| {
+                    let (was_reanchor, next_can_disconnect) = table.update(cx, |table, _| {
                         let d = table.delegate_mut();
+                        if d.reanchored_selection == Some(None) {
+                            d.reanchored_selection = None;
+                            return (true, d.can_disconnect_selected(None));
+                        }
+                        d.reanchored_selection = None;
                         d.selected_key = None;
                         d.last_viewport_fp = None;
-                        d.can_disconnect_selected(None)
+                        (false, d.can_disconnect_selected(None))
                     });
-                    if this.can_disconnect != next_can_disconnect {
+                    if !was_reanchor && this.can_disconnect != next_can_disconnect {
                         this.can_disconnect = next_can_disconnect;
                         cx.notify();
                     }
@@ -1454,9 +1467,11 @@ impl UsersView {
             .and_then(|key| table.delegate().find_row_index(key, hint_row));
         if let Some(idx) = selected_idx {
             if hint_row != Some(idx) {
+                table.delegate_mut().reanchored_selection = Some(Some(idx));
                 table.set_selected_row(idx, cx);
             }
         } else if hint_row.is_some() {
+            table.delegate_mut().reanchored_selection = Some(None);
             table.clear_selection(cx);
         }
     }
