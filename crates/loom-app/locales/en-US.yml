@@ -132,7 +132,6 @@ details:
   confirm_tree_action: "End process tree"
   tree_kill_partial: "Ended %{succeeded} of %{total} processes; %{failed} failed."
   affinity_title: "Processor affinity"
-  affinity_subtitle: "Select which logical processors \"%{name}\" (PID %{pid}) is allowed to run on."
   affinity_all_cpus: "All processors"
   affinity_cpu_label: "CPU %{index}"
   affinity_group_label: "Group %{group}"
@@ -140,7 +139,6 @@ details:
   affinity_loading: "Loading current processor affinity..."
   affinity_apply: "Apply"
   wait_chain_title: "Analyze wait chain"
-  wait_chain_subtitle: "Wait dependency graph for \"%{name}\" (PID %{pid})."
   wait_chain_loading: "Analyzing thread wait chain..."
   wait_chain_normal: "\"%{name}\" is running normally. No blocked threads or wait dependencies were detected."
   wait_chain_deadlock_banner: "Deadlock detected in the thread wait chain."
@@ -150,7 +148,6 @@ details:
 
 minidump:
   title: "Create memory dump file"
-  subtitle: "Writing memory dump for \"%{name}\" (PID %{pid})."
   output_path_label: "Dump file location"
   creating: "Creating memory dump file..."
   cancelling: "Cancelling memory dump..."
@@ -160,7 +157,6 @@ minidump:
 
 run_task:
   title: "Create new task"
-  description: "Type the name of a program, folder, document, or Internet resource, and Loom will open it for you."
   open_label: "Open"
   placeholder: "Enter an application name, command, or full path..."
   browse: "Browse..."
@@ -182,7 +178,6 @@ table:
   menu_select_columns: "Select columns..."
   menu_reset_columns: "Reset default columns"
   select_columns_title: "Select columns"
-  select_columns_subtitle: "Select the columns that will appear in the table."
 
 settings:
   title: "Settings"
@@ -248,15 +243,6 @@ tray:
   tooltip: "Loom Task Manager"
   show: "Show Loom"
   exit: "Exit"
-
-milestone:
-  badge: "Scheduled for v%{version}"
-  notice: "No placeholder data or background polling runs for this view until its native collector ships."
-  performance_desc: "Real-time CPU, Memory, Disk, Network, and GPU multi-device performance graphs will land in v0.0.4."
-  app_history_desc: "Cumulative per-application CPU time and network usage history will land in v0.0.5."
-  startup_desc: "Startup applications inventory, last BIOS time, and enable/disable controls will land in v0.0.5."
-  users_desc: "Logged-in user session aggregation and per-session process inspection will land in v0.0.5."
-  services_desc: "On-demand system services management and host PID cross-linking will land in v0.0.5."
 
 perf:
   cpu: "CPU"
@@ -466,7 +452,6 @@ shell_hotkeys:
   explorer_restarting: "Restarting Windows Explorer..."
   search_help_tooltip: "Search syntax help"
   search_help_title: "Structured search syntax"
-  search_help_subtitle: "Click an example to apply it immediately:"
   syntax_or_desc: "Match either term (OR)"
   syntax_not_desc: "Exclude matching processes"
   syntax_pid_desc: "Filter by exact PID"
@@ -478,14 +463,12 @@ shell_hotkeys:
 
 file_locks:
   title: "Find file locks"
-  description: "Inspect which processes or services hold open handles on a file or directory using OS Restart Manager."
   path_label: "File or folder path"
   path_placeholder: "Enter or browse a file or directory path..."
   browse: "Browse..."
   search: "Find locks"
   searching: "Inspecting open file locks..."
   empty_path_error: "Please enter a file or directory path first."
-  idle_hint: "Enter a path above and click \"Find locks\" to inspect locking processes."
   no_locks: "No processes are currently locking this path."
   explorer_banner: "Windows Explorer is holding a lock on this path."
   restart_explorer: "Restart Explorer"
@@ -495,14 +478,12 @@ file_locks:
 
 diag_summary:
   copied_title: "Diagnostic summary copied"
-  copied_message: "Privacy-safe system & Loom config summary copied to clipboard."
 
 tray_overview:
   menu_item: "Quick Overview"
   title: "Loom Quick Overview"
   top_processes: "Top processes by CPU"
   empty_processes: "Sampling live processes..."
-  click_hint: "Click a process to inspect"
   open_loom: "Open Loom"
 
 # Processes & Details UX, CSV export, leak warnings, and WebView2 role labels

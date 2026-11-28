@@ -119,7 +119,7 @@ pub struct ProcessRowProjection {
     pub exe_path: Option<Arc<str>>,
     /// Full process command line, if resolved on the slow lane.
     pub command_line: Option<Arc<str>>,
-    /// Optional downsampled `20x20` RGBA icon.
+    /// Optional DPI-matched RGBA icon.
     pub icon: Option<ExeIconRgba>,
     /// Grouping category of this process.
     pub category: ProcessCategory,
@@ -359,6 +359,8 @@ pub struct StartupEntry {
     pub command: Option<Arc<str>>,
     /// Resolved local executable or target file path, when available for shell actions.
     pub file_path: Option<Arc<str>>,
+    /// Optional DPI-matched RGBA icon.
+    pub icon: Option<ExeIconRgba>,
     /// Whether this startup entry is currently enabled.
     pub enabled: bool,
     /// Estimated startup impact.

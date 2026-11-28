@@ -281,7 +281,7 @@ Windows frequently recycles exited `PID`s. Loom keys each process instance by `P
 | **Lifecycle key `ProcessKey`** | `(PID, CreateTime FILETIME)` | `(pid_t, /proc/[pid]/stat starttime)` | `(pid_t, pbi_start_tvsec)` |
 | **Efficiency mode (`EcoMode`)** | `EcoQoS` (`PROCESS_POWER_THROTTLING`) | `SCHED_IDLE` / `nice` / cgroup weight | Task QoS / App Nap |
 | **System service (`ServiceRecord`)** | Windows SCM (`EnumServicesStatusExW`) | `systemd` D-Bus Units | `launchd` Daemons & Agents |
-| **Startup entry (`StartupEntry`)** | Registry `Run`/`StartupApproved` + Folders + UWP `StartupTask` | XDG Autostart (`~/.config/autostart/*.desktop`) | `SMAppService` / `LaunchAgents` |
+| **Startup entry (`StartupEntry`)** | Registry `Run`/`StartupApproved` + Folders + UWP/MSIX `StartupTask` (PE descriptions, `AppxManifest.xml` + `SHLoadIndirectString`, and DPI-matched native RGBA icons) | XDG Autostart (`~/.config/autostart/*.desktop`) | `SMAppService` / `LaunchAgents` |
 | **User session (`UserSession`)** | WTS (`WTSEnumerateSessionsW`) | `systemd-logind` Sessions | `utmpx` / Console User |
 | **Virtualization / sandbox column** | UAC Virtualization (`TokenVirtualizationEnabled`) | Namespace / Flatpak / Snap | App Sandbox Entitlements |
 | **Wait-chain diagnostics (`WaitChain`)** | Win32 WCT (`GetThreadWaitChain`) | `/proc/[pid]/task/[tid]/wchan` | `proc_pidinfo` Thread `wchan` |

@@ -61,17 +61,34 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
 use windows_sys::Win32::UI::Shell::{
-    SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
+    SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES,
+    SHGetFileInfoW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    DestroyIcon, GetIconInfo, GetSystemMetrics, HICON, ICONINFO, SM_CXSMICON,
+};
 
 use crate::circuit_breaker::CircuitBreaker;
 use crate::handle::{OwnedHandle, null_wide_ptr, open_verified_process, to_wide_null};
 use crate::perf::cpu::probe_hardware_static_info as probe_win_hardware_static_info;
 use crate::perf::disk::DiskPerformanceProber;
 
-/// Target downsampled icon width and height in pixels (`20 x 20` RGBA8 = 1,600 bytes).
-const ICON_TARGET_DIM: u16 = 20;
+/// Minimum and maximum clamped physical pixel dimensions for extracted small app icons.
+const MIN_ICON_DIM: u16 = 16;
+const MAX_ICON_DIM: u16 = 64;
+
+/// Returns the system DPI-matched physical pixel dimension for a `16px` logical UI icon
+/// (e.g. `16` at 100% DPI, `20` at 125%, `24` at 150%, `32` at 200%).
+#[inline]
+pub(crate) fn target_icon_dim() -> u16 {
+    // SAFETY: `GetSystemMetrics` is a pure read-only Win32 query.
+    let raw = unsafe { GetSystemMetrics(SM_CXSMICON) };
+    if raw <= 0 {
+        MIN_ICON_DIM
+    } else {
+        (raw as u16).clamp(MIN_ICON_DIM, MAX_ICON_DIM)
+    }
+}
 
 /// Thread-local RAII COM STA initializer so Shell APIs work reliably on slow-lane worker threads.
 struct ComThreadGuard {
@@ -322,7 +339,7 @@ impl SlowMetadataProber for WindowsSlowProber {
 
         if self.is_network_path(trimmed) {
             ensure_com_initialized();
-            let icon = extract_icon_20x20(trimmed, true);
+            let icon = extract_icon_rgba(trimmed, true);
             return Ok(ExeStaticAsset {
                 normalized_path,
                 publisher: None,
@@ -336,7 +353,7 @@ impl SlowMetadataProber for WindowsSlowProber {
         ensure_com_initialized();
 
         let (publisher, file_description) = read_pe_version_info(trimmed);
-        let icon = extract_icon_20x20(trimmed, false);
+        let icon = extract_icon_rgba(trimmed, false);
 
         let elapsed = start.elapsed();
         if self
@@ -706,16 +723,31 @@ fn query_token_user(token: HANDLE, prober: &WindowsSlowProber) -> Option<Arc<str
     prober.resolve_sid(token_user.User.Sid)
 }
 
+/// Local PE version-resource strings extracted without network certificate checks.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PeVersionInfo {
+    pub(crate) publisher: Option<Arc<str>>,
+    pub(crate) file_description: Option<Arc<str>>,
+    pub(crate) product_name: Option<Arc<str>>,
+}
+
 /// Reads local PE version resources (`CompanyName`, `FileDescription`) without performing
 /// any network certificate revocation (CRL/OCSP) checks.
 pub(crate) fn read_pe_version_info(exe_path: &str) -> (Option<Arc<str>>, Option<Arc<str>>) {
+    let info = read_pe_version_info_full(exe_path);
+    (info.publisher, info.file_description)
+}
+
+/// Reads local PE version resources (`CompanyName`, `FileDescription`, `ProductName`)
+/// without performing any network certificate revocation (CRL/OCSP) checks.
+pub(crate) fn read_pe_version_info_full(exe_path: &str) -> PeVersionInfo {
     let wide_path = to_wide_null(exe_path);
     let mut unused_handle: u32 = 0;
 
     // SAFETY: `wide_path` is null-terminated UTF-16.
     let size = unsafe { GetFileVersionInfoSizeW(wide_path.as_ptr(), &mut unused_handle) };
     if size == 0 || size > 4 * 1024 * 1024 {
-        return (None, None);
+        return PeVersionInfo::default();
     }
 
     let mut data = vec![0u8; size as usize];
@@ -729,27 +761,32 @@ pub(crate) fn read_pe_version_info(exe_path: &str) -> (Option<Arc<str>>, Option<
         )
     };
     if ok == 0 {
-        return (None, None);
+        return PeVersionInfo::default();
     }
 
     let translations = read_version_translations(&data);
 
-    let mut publisher = None;
-    let mut description = None;
+    let mut info = PeVersionInfo::default();
 
     for &(lang, codepage) in &translations {
-        if publisher.is_none() {
-            publisher = query_version_string(&data, lang, codepage, "CompanyName");
+        if info.publisher.is_none() {
+            info.publisher = query_version_string(&data, lang, codepage, "CompanyName");
         }
-        if description.is_none() {
-            description = query_version_string(&data, lang, codepage, "FileDescription");
+        if info.file_description.is_none() {
+            info.file_description = query_version_string(&data, lang, codepage, "FileDescription");
         }
-        if publisher.is_some() && description.is_some() {
+        if info.product_name.is_none() {
+            info.product_name = query_version_string(&data, lang, codepage, "ProductName");
+        }
+        if info.publisher.is_some()
+            && info.file_description.is_some()
+            && info.product_name.is_some()
+        {
             break;
         }
     }
 
-    (publisher, description)
+    info
 }
 
 /// Extracts `(language, codepage)` pairs from `\VarFileInfo\Translation`, appending
@@ -825,12 +862,18 @@ fn query_version_string(data: &[u8], lang: u16, codepage: u16, field: &str) -> O
     }
 }
 
-/// Extracts an executable icon via `SHGetFileInfoW` and resamples it to `20x20` RGBA8.
+/// Extracts an executable icon via `SHGetFileInfoW` matched to [`target_icon_dim()`].
+///
+/// Prefers the native `SHGFI_SMALLICON` bitmap directly with zero resampling whenever its
+/// dimensions already match the display's small-icon pixel size (e.g. `16x16` at 100% DPI),
+/// and falls back to downsampling `SHGFI_LARGEICON` when the small icon would otherwise
+/// require upscaling.
 ///
 /// When `memory_only` is `true` (for UNC / `DRIVE_REMOTE` paths), passes
 /// `SHGFI_USEFILEATTRIBUTES` so Windows resolves the generic extension icon from memory
 /// without touching the network share.
-fn extract_icon_20x20(exe_path: &str, memory_only: bool) -> Option<ExeIconRgba> {
+pub(crate) fn extract_icon_rgba(exe_path: &str, memory_only: bool) -> Option<ExeIconRgba> {
+    let target_dim = target_icon_dim();
     let wide_path = if memory_only {
         // Extension-only hint (e.g. ".exe") avoids any path resolution against remote shares.
         let ext = std::path::Path::new(exe_path)
@@ -843,9 +886,71 @@ fn extract_icon_20x20(exe_path: &str, memory_only: bool) -> Option<ExeIconRgba> 
         to_wide_null(exe_path)
     };
 
+    let small_icon = fetch_shell_icon(&wide_path, memory_only, true);
+    if let Some((src_w, src_h, rgba)) = small_icon {
+        let target_usize = usize::from(target_dim);
+        if src_w == target_usize && src_h == target_usize {
+            return Some(ExeIconRgba {
+                width: target_dim,
+                height: target_dim,
+                rgba: Arc::from(rgba),
+            });
+        }
+        // Avoid upscaling a smaller small-icon bitmap when a crisp large icon is available.
+        if (src_w < target_usize || src_h < target_usize)
+            && let Some((lg_w, lg_h, lg_rgba)) = fetch_shell_icon(&wide_path, memory_only, false)
+            && lg_w >= target_usize
+            && lg_h >= target_usize
+        {
+            let final_rgba = if lg_w == target_usize && lg_h == target_usize {
+                lg_rgba
+            } else {
+                resample_rgba_premultiplied(&lg_rgba, lg_w, lg_h, target_usize, target_usize)
+            };
+            return Some(ExeIconRgba {
+                width: target_dim,
+                height: target_dim,
+                rgba: Arc::from(final_rgba),
+            });
+        }
+
+        let final_rgba =
+            resample_rgba_premultiplied(&rgba, src_w, src_h, target_usize, target_usize);
+        return Some(ExeIconRgba {
+            width: target_dim,
+            height: target_dim,
+            rgba: Arc::from(final_rgba),
+        });
+    }
+
+    // Fallback to large icon if small icon query failed.
+    let (lg_w, lg_h, lg_rgba) = fetch_shell_icon(&wide_path, memory_only, false)?;
+    let target_usize = usize::from(target_dim);
+    let final_rgba = if lg_w == target_usize && lg_h == target_usize {
+        lg_rgba
+    } else {
+        resample_rgba_premultiplied(&lg_rgba, lg_w, lg_h, target_usize, target_usize)
+    };
+    Some(ExeIconRgba {
+        width: target_dim,
+        height: target_dim,
+        rgba: Arc::from(final_rgba),
+    })
+}
+
+fn fetch_shell_icon(
+    wide_path: &[u16],
+    memory_only: bool,
+    small: bool,
+) -> Option<(usize, usize, Vec<u8>)> {
     // SAFETY: `SHFILEINFOW` is POD.
     let mut shfi: SHFILEINFOW = unsafe { zeroed() };
-    let mut flags = SHGFI_ICON | SHGFI_SMALLICON;
+    let mut flags = SHGFI_ICON
+        | if small {
+            SHGFI_SMALLICON
+        } else {
+            SHGFI_LARGEICON
+        };
     let file_attrs = if memory_only {
         flags |= SHGFI_USEFILEATTRIBUTES;
         FILE_ATTRIBUTE_NORMAL
@@ -868,12 +973,12 @@ fn extract_icon_20x20(exe_path: &str, memory_only: bool) -> Option<ExeIconRgba> 
     }
 
     let icon_guard = IconGuard(shfi.hIcon);
-    hicon_to_rgba_20x20(icon_guard.0)
+    hicon_to_raw_rgba(icon_guard.0)
 }
 
-/// Converts a Win32 `HICON` into a `20x20` RGBA8 [`ExeIconRgba`], ensuring every GDI
-/// bitmap and device context handle is released via RAII guards.
-fn hicon_to_rgba_20x20(hicon: HICON) -> Option<ExeIconRgba> {
+/// Converts a Win32 `HICON` into tightly packed top-down RGBA8 pixels at its native size,
+/// ensuring every GDI bitmap and device context handle is released via RAII guards.
+fn hicon_to_raw_rgba(hicon: HICON) -> Option<(usize, usize, Vec<u8>)> {
     // SAFETY: `ICONINFO` is POD.
     let mut icon_info: ICONINFO = unsafe { zeroed() };
     // SAFETY: `hicon` is a valid icon handle owned by caller's `IconGuard`.
@@ -982,62 +1087,121 @@ fn hicon_to_rgba_20x20(hicon: HICON) -> Option<ExeIconRgba> {
         px.swap(0, 2);
     }
 
-    let dst_dim = usize::from(ICON_TARGET_DIM);
-    let rgba = if src_w == dst_dim && src_h == dst_dim {
-        bgra
-    } else {
-        resample_rgba_bilinear(&bgra, src_w, src_h, dst_dim, dst_dim)
-    };
-
-    Some(ExeIconRgba {
-        width: ICON_TARGET_DIM,
-        height: ICON_TARGET_DIM,
-        rgba: Arc::from(rgba),
-    })
+    Some((src_w, src_h, bgra))
 }
 
-/// Bilinear resampler converting a tightly packed `src_w x src_h` RGBA8 image into
-/// `dst_w x dst_h` RGBA8.
-fn resample_rgba_bilinear(
+#[inline]
+fn lanczos3_kernel(x: f32) -> f32 {
+    let ax = x.abs();
+    if ax < 1e-6 {
+        return 1.0;
+    }
+    if ax >= 3.0 {
+        return 0.0;
+    }
+    let pix = std::f32::consts::PI * ax;
+    let pix_a = pix / 3.0;
+    (pix.sin() / pix) * (pix_a.sin() / pix_a)
+}
+
+/// High-quality two-pass separable Lanczos3 resampler operating in premultiplied alpha
+/// space so downsampled icons stay sharp at small sizes without dark fringe halos.
+pub(crate) fn resample_rgba_premultiplied(
     src: &[u8],
     src_w: usize,
     src_h: usize,
     dst_w: usize,
     dst_h: usize,
 ) -> Vec<u8> {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return Vec::new();
+    }
+    if src_w == dst_w && src_h == dst_h {
+        return src.to_vec();
+    }
+
+    // Horizontal pass: premultiply straight RGBA8 -> `[f32; 4]` at `dst_w x src_h`.
+    let mut temp = vec![[0.0f32; 4]; dst_w * src_h];
+    let x_ratio = src_w as f32 / dst_w as f32;
+    let x_scale = x_ratio.max(1.0);
+    let x_support = 3.0 * x_scale;
+
+    for dx in 0..dst_w {
+        let center = (dx as f32 + 0.5) * x_ratio - 0.5;
+        let left = (center - x_support).floor().max(0.0) as usize;
+        let right = (center + x_support).ceil().min((src_w - 1) as f32) as usize;
+
+        let mut weights = Vec::with_capacity(right - left + 1);
+        let mut weight_sum = 0.0f32;
+        for sx in left..=right {
+            let w = lanczos3_kernel((sx as f32 - center) / x_scale);
+            weights.push(w);
+            weight_sum += w;
+        }
+        let inv_w = if weight_sum.abs() > 1e-6 {
+            1.0 / weight_sum
+        } else {
+            1.0
+        };
+
+        for sy in 0..src_h {
+            let mut acc = [0.0f32; 4];
+            let row_off = sy * src_w;
+            for (k, sx) in (left..=right).enumerate() {
+                let w = weights[k] * inv_w;
+                let idx = (row_off + sx) * 4;
+                let a = f32::from(src[idx + 3]) / 255.0;
+                acc[0] += f32::from(src[idx]) * a * w;
+                acc[1] += f32::from(src[idx + 1]) * a * w;
+                acc[2] += f32::from(src[idx + 2]) * a * w;
+                acc[3] += a * w;
+            }
+            temp[sy * dst_w + dx] = acc;
+        }
+    }
+
+    // Vertical pass: `dst_w x src_h` -> `dst_w x dst_h`, un-premultiplying back to straight RGBA8.
     let mut dst = vec![0u8; dst_w * dst_h * 4];
-    let x_scale = src_w as f32 / dst_w as f32;
-    let y_scale = src_h as f32 / dst_h as f32;
+    let y_ratio = src_h as f32 / dst_h as f32;
+    let y_scale = y_ratio.max(1.0);
+    let y_support = 3.0 * y_scale;
 
     for dy in 0..dst_h {
-        let sy = ((dy as f32 + 0.5) * y_scale - 0.5).clamp(0.0, (src_h - 1) as f32);
-        let y0 = sy.floor() as usize;
-        let y1 = (y0 + 1).min(src_h - 1);
-        let fy = sy - y0 as f32;
+        let center = (dy as f32 + 0.5) * y_ratio - 0.5;
+        let top = (center - y_support).floor().max(0.0) as usize;
+        let bottom = (center + y_support).ceil().min((src_h - 1) as f32) as usize;
+
+        let mut weights = Vec::with_capacity(bottom - top + 1);
+        let mut weight_sum = 0.0f32;
+        for sy in top..=bottom {
+            let w = lanczos3_kernel((sy as f32 - center) / y_scale);
+            weights.push(w);
+            weight_sum += w;
+        }
+        let inv_w = if weight_sum.abs() > 1e-6 {
+            1.0 / weight_sum
+        } else {
+            1.0
+        };
 
         for dx in 0..dst_w {
-            let sx = ((dx as f32 + 0.5) * x_scale - 0.5).clamp(0.0, (src_w - 1) as f32);
-            let x0 = sx.floor() as usize;
-            let x1 = (x0 + 1).min(src_w - 1);
-            let fx = sx - x0 as f32;
-
-            let i00 = (y0 * src_w + x0) * 4;
-            let i10 = (y0 * src_w + x1) * 4;
-            let i01 = (y1 * src_w + x0) * 4;
-            let i11 = (y1 * src_w + x1) * 4;
-
-            let w00 = (1.0 - fx) * (1.0 - fy);
-            let w10 = fx * (1.0 - fy);
-            let w01 = (1.0 - fx) * fy;
-            let w11 = fx * fy;
+            let mut acc = [0.0f32; 4];
+            for (k, sy) in (top..=bottom).enumerate() {
+                let w = weights[k] * inv_w;
+                let px = temp[sy * dst_w + dx];
+                acc[0] += px[0] * w;
+                acc[1] += px[1] * w;
+                acc[2] += px[2] * w;
+                acc[3] += px[3] * w;
+            }
 
             let out_idx = (dy * dst_w + dx) * 4;
-            for c in 0..4 {
-                let val = f32::from(src[i00 + c]) * w00
-                    + f32::from(src[i10 + c]) * w10
-                    + f32::from(src[i01 + c]) * w01
-                    + f32::from(src[i11 + c]) * w11;
-                dst[out_idx + c] = val.round().clamp(0.0, 255.0) as u8;
+            let a = acc[3].clamp(0.0, 1.0);
+            if a > 1e-4 {
+                dst[out_idx] = (acc[0] / a).round().clamp(0.0, 255.0) as u8;
+                dst[out_idx + 1] = (acc[1] / a).round().clamp(0.0, 255.0) as u8;
+                dst[out_idx + 2] = (acc[2] / a).round().clamp(0.0, 255.0) as u8;
+                dst[out_idx + 3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
             }
         }
     }
@@ -1078,5 +1242,33 @@ mod tests {
             circuit_target_key(r"\\?\UNC\filesrv\share\bin\tool.exe"),
             r"\\filesrv\share"
         );
+    }
+
+    #[test]
+    fn premultiplied_lanczos_preserves_transparent_edge_color_without_dark_halo() {
+        // 4x4 image: left half solid white (255,255,255,255), right half fully transparent black (0,0,0,0).
+        let mut src = vec![0u8; 4 * 4 * 4];
+        for y in 0..4 {
+            for x in 0..2 {
+                let idx = (y * 4 + x) * 4;
+                src[idx] = 255;
+                src[idx + 1] = 255;
+                src[idx + 2] = 255;
+                src[idx + 3] = 255;
+            }
+        }
+        // Downsample 4x4 -> 3x3 (fractional boundary where straight-alpha leaks dark fringe).
+        let dst = resample_rgba_premultiplied(&src, 4, 4, 3, 3);
+        assert_eq!(dst.len(), 3 * 3 * 4);
+        // Any semi-transparent or opaque pixel must retain pure white RGB (255,255,255), never darkened gray!
+        for px in dst.as_chunks::<4>().0 {
+            if px[3] > 0 {
+                assert!(
+                    px[0] >= 250 && px[1] >= 250 && px[2] >= 250,
+                    "expected clean white edge without dark halo, got {:?}",
+                    px
+                );
+            }
+        }
     }
 }

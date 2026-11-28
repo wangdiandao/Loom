@@ -691,9 +691,7 @@ impl SelectColumnsDialogView {
 
 impl Render for SelectColumnsDialogView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let muted_fg = theme.muted_foreground;
-        let border = theme.border;
+        let border = cx.theme().border;
 
         let checkboxes = self
             .draft
@@ -718,12 +716,6 @@ impl Render for SelectColumnsDialogView {
         v_flex()
             .w_full()
             .gap_3()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted_fg)
-                    .child(i18n::tr("table.select_columns_subtitle")),
-            )
             .child(
                 v_flex()
                     .id("select-columns-scroll")

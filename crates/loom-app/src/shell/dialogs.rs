@@ -224,12 +224,6 @@ impl Render for RunNewTaskForm {
             .w_full()
             .gap_3()
             .child(
-                div()
-                    .text_sm()
-                    .text_color(muted_fg)
-                    .child(i18n::tr("run_task.description")),
-            )
-            .child(
                 v_flex()
                     .w_full()
                     .gap_1p5()
@@ -503,8 +497,6 @@ enum MiniDumpState {
 
 struct MiniDumpDialogView {
     store: Entity<UiStore>,
-    key: ProcessKey,
-    name: String,
     dest: PathBuf,
     cancel: Arc<AtomicBool>,
     state: MiniDumpState,
@@ -515,11 +507,11 @@ impl MiniDumpDialogView {
     fn new(
         store: Entity<UiStore>,
         key: ProcessKey,
-        name: String,
+        name: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let dest = default_minidump_path(&name, key.pid);
+        let dest = default_minidump_path(name, key.pid);
         let cancel = Arc::new(AtomicBool::new(false));
 
         let (state, dump_task) = match UiCommands::write_minidump_async(
@@ -568,8 +560,6 @@ impl MiniDumpDialogView {
 
         Self {
             store,
-            key,
-            name,
             dest,
             cancel,
             state,
@@ -609,13 +599,6 @@ impl Render for MiniDumpDialogView {
         let danger = theme.danger;
         let radius = theme.radius;
         let mono_font = theme.mono_font_family.clone();
-
-        let subtitle = rust_i18n::t!(
-            "minidump.subtitle",
-            name = self.name.as_str(),
-            pid = self.key.pid
-        )
-        .into_owned();
         let path_display = self.dest.display().to_string();
 
         let (status_body, footer) = match &self.state {
@@ -822,7 +805,6 @@ impl Render for MiniDumpDialogView {
         v_flex()
             .w_full()
             .gap_3()
-            .child(div().text_xs().text_color(muted_fg).child(subtitle))
             .child(
                 v_flex()
                     .w_full()
@@ -864,12 +846,18 @@ pub(crate) fn open_minidump_dialog(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let dialog_view = cx.new(|cx| MiniDumpDialogView::new(store, key, name, window, cx));
+    let dialog_title = format!(
+        "{} — {} (PID {})",
+        i18n::tr("minidump.title"),
+        name,
+        key.pid
+    );
+    let dialog_view = cx.new(|cx| MiniDumpDialogView::new(store, key, &name, window, cx));
     window.open_dialog(cx, move |dialog, _window, _cx| {
         dialog
             .w(px(520.))
             .centered()
-            .title(i18n::tr("minidump.title"))
+            .title(dialog_title.clone())
             .child(dialog_view.clone())
     });
 }
@@ -1091,34 +1079,26 @@ impl Render for FileLocksDialogView {
         let is_searching = matches!(self.state, FileLocksState::Searching);
 
         let body = match &self.state {
-            FileLocksState::Idle => div()
-                .w_full()
-                .p_3()
-                .rounded(radius)
-                .bg(muted_bg.opacity(0.4))
-                .border_1()
-                .border_color(border.opacity(0.7))
-                .text_xs()
-                .text_color(muted_fg)
-                .child(i18n::tr("file_locks.idle_hint"))
-                .into_any_element(),
-            FileLocksState::Searching => h_flex()
-                .w_full()
-                .items_center()
-                .gap_2p5()
-                .p_3()
-                .rounded(radius)
-                .bg(muted_bg.opacity(0.55))
-                .border_1()
-                .border_color(border)
-                .child(Spinner::new().small().color(muted_fg))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(fg)
-                        .child(i18n::tr("file_locks.searching")),
-                )
-                .into_any_element(),
+            FileLocksState::Idle => None,
+            FileLocksState::Searching => Some(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2p5()
+                    .p_3()
+                    .rounded(radius)
+                    .bg(muted_bg.opacity(0.55))
+                    .border_1()
+                    .border_color(border)
+                    .child(Spinner::new().small().color(muted_fg))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(fg)
+                            .child(i18n::tr("file_locks.searching")),
+                    )
+                    .into_any_element(),
+            ),
             FileLocksState::ElevationRequired => {
                 let store = self.store.clone();
                 let supports_relaunch = store
@@ -1126,278 +1106,283 @@ impl Render for FileLocksDialogView {
                     .snapshot()
                     .capabilities
                     .contains(CapabilityFlags::ELEVATION_RELAUNCH);
+                Some(
+                    h_flex()
+                        .w_full()
+                        .items_start()
+                        .justify_between()
+                        .gap_2p5()
+                        .p_3()
+                        .rounded(radius)
+                        .bg(warning.opacity(0.14))
+                        .border_1()
+                        .border_color(warning.opacity(0.35))
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .items_start()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::TriangleAlert)
+                                        .small()
+                                        .text_color(warning),
+                                )
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_semibold()
+                                                .text_color(fg)
+                                                .child(i18n::tr("uac.title")),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(muted_fg)
+                                                .child(i18n::tr("uac.message")),
+                                        ),
+                                ),
+                        )
+                        .when(supports_relaunch, |this| {
+                            this.child(
+                                Button::new("file-locks-relaunch-admin")
+                                    .xsmall()
+                                    .primary()
+                                    .label(i18n::tr("uac.action"))
+                                    .on_click(move |_, window, cx| {
+                                        UiCommands::relaunch_elevated(&store, "processes", cx);
+                                        window.close_dialog(cx);
+                                    }),
+                            )
+                        })
+                        .into_any_element(),
+                )
+            }
+            FileLocksState::Error(message) => Some(
                 h_flex()
                     .w_full()
                     .items_start()
-                    .justify_between()
-                    .gap_2p5()
+                    .gap_2()
                     .p_3()
                     .rounded(radius)
-                    .bg(warning.opacity(0.14))
+                    .bg(danger.opacity(0.12))
                     .border_1()
-                    .border_color(warning.opacity(0.35))
+                    .border_color(danger.opacity(0.35))
+                    .child(Icon::new(IconName::CircleAlert).small().text_color(danger))
                     .child(
-                        h_flex()
+                        div()
                             .flex_1()
                             .min_w_0()
-                            .items_start()
-                            .gap_2()
-                            .child(
-                                Icon::new(IconName::TriangleAlert)
-                                    .small()
-                                    .text_color(warning),
-                            )
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .gap_0p5()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_semibold()
-                                            .text_color(fg)
-                                            .child(i18n::tr("uac.title")),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(muted_fg)
-                                            .child(i18n::tr("uac.message")),
-                                    ),
-                            ),
+                            .text_xs()
+                            .text_color(danger)
+                            .child(message.clone()),
                     )
-                    .when(supports_relaunch, |this| {
-                        this.child(
-                            Button::new("file-locks-relaunch-admin")
-                                .xsmall()
-                                .primary()
-                                .label(i18n::tr("uac.action"))
-                                .on_click(move |_, window, cx| {
-                                    UiCommands::relaunch_elevated(&store, "processes", cx);
-                                    window.close_dialog(cx);
-                                }),
-                        )
-                    })
-                    .into_any_element()
-            }
-            FileLocksState::Error(message) => h_flex()
-                .w_full()
-                .items_start()
-                .gap_2()
-                .p_3()
-                .rounded(radius)
-                .bg(danger.opacity(0.12))
-                .border_1()
-                .border_color(danger.opacity(0.35))
-                .child(Icon::new(IconName::CircleAlert).small().text_color(danger))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .text_color(danger)
-                        .child(message.clone()),
-                )
-                .into_any_element(),
-            FileLocksState::Results(holders) if holders.is_empty() => h_flex()
-                .w_full()
-                .items_center()
-                .gap_2()
-                .p_3()
-                .rounded(radius)
-                .bg(success.opacity(0.12))
-                .border_1()
-                .border_color(success.opacity(0.35))
-                .child(Icon::new(IconName::CircleCheck).small().text_color(success))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(fg)
-                        .child(i18n::tr("file_locks.no_locks")),
-                )
-                .into_any_element(),
+                    .into_any_element(),
+            ),
+            FileLocksState::Results(holders) if holders.is_empty() => Some(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .p_3()
+                    .rounded(radius)
+                    .bg(success.opacity(0.12))
+                    .border_1()
+                    .border_color(success.opacity(0.35))
+                    .child(Icon::new(IconName::CircleCheck).small().text_color(success))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(fg)
+                            .child(i18n::tr("file_locks.no_locks")),
+                    )
+                    .into_any_element(),
+            ),
             FileLocksState::Results(holders) => {
                 let has_explorer = holders.iter().any(is_explorer_lock_holder);
                 let store_for_explorer = self.store.clone();
                 let snapshot = self.store.read(cx).snapshot().clone();
 
-                v_flex()
-                    .w_full()
-                    .gap_2()
-                    .when(has_explorer, |this| {
-                        this.child(
-                            h_flex()
-                                .w_full()
-                                .items_center()
-                                .justify_between()
-                                .gap_2()
-                                .px_3()
-                                .py_2()
-                                .rounded(radius)
-                                .bg(warning.opacity(0.14))
-                                .border_1()
-                                .border_color(warning.opacity(0.35))
-                                .child(
-                                    h_flex()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            Icon::new(IconName::TriangleAlert)
-                                                .small()
-                                                .text_color(warning),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .text_xs()
-                                                .font_medium()
-                                                .text_color(fg)
-                                                .child(i18n::tr("file_locks.explorer_banner")),
-                                        ),
-                                )
-                                .child(
-                                    Button::new("file-locks-restart-explorer")
-                                        .xsmall()
-                                        .warning()
-                                        .icon(IconName::RefreshCw)
-                                        .label(i18n::tr("file_locks.restart_explorer"))
-                                        .on_click(move |_, window, cx| {
-                                            UiCommands::restart_explorer(&store_for_explorer, cx);
-                                            window.push_notification(
-                                                Notification::info(i18n::tr(
-                                                    "shell_hotkeys.explorer_restarting",
-                                                )),
-                                                cx,
-                                            );
-                                        }),
-                                ),
-                        )
-                    })
-                    .child(
-                        v_flex()
-                            .id("file-locks-holders-list")
-                            .w_full()
-                            .max_h(px(240.))
-                            .overflow_y_scroll()
-                            .gap_1p5()
-                            .children(holders.iter().enumerate().map(|(ix, holder)| {
-                                let key = resolve_process_key_for_pid(&snapshot, holder.pid);
-                                let shell = self.shell.clone();
-                                let display_name = if holder.app_name.trim().is_empty() {
-                                    rust_i18n::t!("file_locks.pid_label", pid = holder.pid)
-                                        .into_owned()
-                                } else {
-                                    holder.app_name.to_string()
-                                };
-                                let pid_badge =
-                                    rust_i18n::t!("file_locks.pid_label", pid = holder.pid)
-                                        .into_owned();
-                                let service_name = holder.service_name.clone();
-                                let restartable = holder.restartable;
-
+                Some(
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .when(has_explorer, |this| {
+                            this.child(
                                 h_flex()
                                     .w_full()
                                     .items_center()
                                     .justify_between()
                                     .gap_2()
-                                    .px_2p5()
+                                    .px_3()
                                     .py_2()
                                     .rounded(radius)
-                                    .bg(muted_bg.opacity(0.35))
+                                    .bg(warning.opacity(0.14))
                                     .border_1()
-                                    .border_color(border.opacity(0.6))
+                                    .border_color(warning.opacity(0.35))
                                     .child(
-                                        v_flex()
+                                        h_flex()
                                             .flex_1()
                                             .min_w_0()
-                                            .gap_1()
+                                            .items_center()
+                                            .gap_2()
                                             .child(
-                                                h_flex()
-                                                    .items_center()
-                                                    .gap_1p5()
-                                                    .flex_wrap()
-                                                    .child(
-                                                        div()
-                                                            .text_sm()
-                                                            .font_medium()
-                                                            .text_color(fg)
-                                                            .truncate()
-                                                            .child(display_name),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .px_1p5()
-                                                            .py_0p5()
-                                                            .rounded(radius)
-                                                            .bg(muted_bg)
-                                                            .text_xs()
-                                                            .font_family(mono_font.clone())
-                                                            .text_color(muted_fg)
-                                                            .child(pid_badge),
-                                                    ),
+                                                Icon::new(IconName::TriangleAlert)
+                                                    .small()
+                                                    .text_color(warning),
                                             )
                                             .child(
-                                                h_flex()
-                                                    .items_center()
-                                                    .gap_1p5()
-                                                    .flex_wrap()
-                                                    .when_some(service_name, |this, svc| {
-                                                        this.child(
-                                                            div()
-                                                                .px_1p5()
-                                                                .py_0p5()
-                                                                .rounded(radius)
-                                                                .bg(primary.opacity(0.14))
-                                                                .text_xs()
-                                                                .text_color(primary)
-                                                                .child(svc.to_string()),
-                                                        )
-                                                    })
-                                                    .when(restartable, |this| {
-                                                        this.child(
-                                                            div()
-                                                                .px_1p5()
-                                                                .py_0p5()
-                                                                .rounded(radius)
-                                                                .bg(success.opacity(0.14))
-                                                                .text_xs()
-                                                                .text_color(success)
-                                                                .child(i18n::tr(
-                                                                    "file_locks.restartable_badge",
-                                                                )),
-                                                        )
-                                                    }),
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .text_xs()
+                                                    .font_medium()
+                                                    .text_color(fg)
+                                                    .child(i18n::tr("file_locks.explorer_banner")),
                                             ),
                                     )
                                     .child(
-                                        Button::new(("file-locks-jump-details", ix))
+                                        Button::new("file-locks-restart-explorer")
                                             .xsmall()
-                                            .outline()
-                                            .label(i18n::tr("file_locks.go_to_details"))
+                                            .warning()
+                                            .icon(IconName::RefreshCw)
+                                            .label(i18n::tr("file_locks.restart_explorer"))
                                             .on_click(move |_, window, cx| {
-                                                window.close_dialog(cx);
-                                                shell.jump_to_details(key, window, cx);
+                                                UiCommands::restart_explorer(
+                                                    &store_for_explorer,
+                                                    cx,
+                                                );
+                                                window.push_notification(
+                                                    Notification::info(i18n::tr(
+                                                        "shell_hotkeys.explorer_restarting",
+                                                    )),
+                                                    cx,
+                                                );
                                             }),
-                                    )
-                            })),
-                    )
-                    .into_any_element()
+                                    ),
+                            )
+                        })
+                        .child(
+                            v_flex()
+                                .id("file-locks-holders-list")
+                                .w_full()
+                                .max_h(px(240.))
+                                .overflow_y_scroll()
+                                .gap_1p5()
+                                .children(holders.iter().enumerate().map(|(ix, holder)| {
+                                    let key = resolve_process_key_for_pid(&snapshot, holder.pid);
+                                    let shell = self.shell.clone();
+                                    let display_name = if holder.app_name.trim().is_empty() {
+                                        rust_i18n::t!("file_locks.pid_label", pid = holder.pid)
+                                            .into_owned()
+                                    } else {
+                                        holder.app_name.to_string()
+                                    };
+                                    let pid_badge =
+                                        rust_i18n::t!("file_locks.pid_label", pid = holder.pid)
+                                            .into_owned();
+                                    let service_name = holder.service_name.clone();
+                                    let restartable = holder.restartable;
+
+                                    h_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_2()
+                                        .px_2p5()
+                                        .py_2()
+                                        .rounded(radius)
+                                        .bg(muted_bg.opacity(0.35))
+                                        .border_1()
+                                        .border_color(border.opacity(0.6))
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap_1()
+                                                .child(
+                                                    h_flex()
+                                                        .items_center()
+                                                        .gap_1p5()
+                                                        .flex_wrap()
+                                                        .child(
+                                                            div()
+                                                                .text_sm()
+                                                                .font_medium()
+                                                                .text_color(fg)
+                                                                .truncate()
+                                                                .child(display_name),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .px_1p5()
+                                                                .py_0p5()
+                                                                .rounded(radius)
+                                                                .bg(muted_bg)
+                                                                .text_xs()
+                                                                .font_family(mono_font.clone())
+                                                                .text_color(muted_fg)
+                                                                .child(pid_badge),
+                                                        ),
+                                                )
+                                                .child(
+                                                    h_flex()
+                                                        .items_center()
+                                                        .gap_1p5()
+                                                        .flex_wrap()
+                                                        .when_some(service_name, |this, svc| {
+                                                            this.child(
+                                                                div()
+                                                                    .px_1p5()
+                                                                    .py_0p5()
+                                                                    .rounded(radius)
+                                                                    .bg(primary.opacity(0.14))
+                                                                    .text_xs()
+                                                                    .text_color(primary)
+                                                                    .child(svc.to_string()),
+                                                            )
+                                                        })
+                                                        .when(restartable, |this| {
+                                                            this.child(
+                                                                div()
+                                                                    .px_1p5()
+                                                                    .py_0p5()
+                                                                    .rounded(radius)
+                                                                    .bg(success.opacity(0.14))
+                                                                    .text_xs()
+                                                                    .text_color(success)
+                                                                    .child(i18n::tr(
+                                                                        "file_locks.restartable_badge",
+                                                                    )),
+                                                            )
+                                                        }),
+                                                ),
+                                        )
+                                        .child(
+                                            Button::new(("file-locks-jump-details", ix))
+                                                .xsmall()
+                                                .outline()
+                                                .label(i18n::tr("file_locks.go_to_details"))
+                                                .on_click(move |_, window, cx| {
+                                                    window.close_dialog(cx);
+                                                    shell.jump_to_details(key, window, cx);
+                                                }),
+                                        )
+                                })),
+                        )
+                        .into_any_element(),
+                )
             }
         };
 
         v_flex()
             .w_full()
             .gap_3()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(muted_fg)
-                    .child(i18n::tr("file_locks.description")),
-            )
             .child(
                 v_flex()
                     .w_full()
@@ -1453,7 +1438,7 @@ impl Render for FileLocksDialogView {
                         )
                     }),
             )
-            .child(body)
+            .when_some(body, |this, el| this.child(el))
             .child(
                 DialogFooter::new().child(
                     Button::new("file-locks-close")

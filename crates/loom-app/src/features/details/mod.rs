@@ -1710,10 +1710,10 @@ impl TableDelegate for DetailsTableDelegate {
                         })
                     })
                     .child(if let Some(image) = icon_image {
-                        img(image).size(px(18.)).flex_shrink_0().into_any_element()
+                        img(image).size(px(16.)).flex_shrink_0().into_any_element()
                     } else {
                         h_flex()
-                            .size(px(18.))
+                            .size(px(16.))
                             .flex_shrink_0()
                             .items_center()
                             .justify_center()

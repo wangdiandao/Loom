@@ -134,7 +134,6 @@ enum AffinityLoadState {
 struct SetAffinityDialogView {
     store: Entity<UiStore>,
     key: ProcessKey,
-    name: String,
     state: AffinityLoadState,
     _load_task: Option<Task<()>>,
 }
@@ -143,7 +142,6 @@ impl SetAffinityDialogView {
     fn new(
         store: Entity<UiStore>,
         key: ProcessKey,
-        name: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -188,7 +186,6 @@ impl SetAffinityDialogView {
         Self {
             store,
             key,
-            name,
             state,
             _load_task: load_task,
         }
@@ -218,13 +215,6 @@ impl Render for SetAffinityDialogView {
         let danger = theme.danger;
         let warning = theme.warning;
         let radius = theme.radius;
-
-        let subtitle = rust_i18n::t!(
-            "details.affinity_subtitle",
-            name = self.name.as_str(),
-            pid = self.key.pid
-        )
-        .into_owned();
 
         let content = match &self.state {
             AffinityLoadState::Loading => v_flex()
@@ -515,11 +505,7 @@ impl Render for SetAffinityDialogView {
             }
         };
 
-        v_flex()
-            .w_full()
-            .gap_3()
-            .child(div().text_xs().text_color(muted_fg).child(subtitle))
-            .child(content)
+        v_flex().w_full().gap_3().child(content)
     }
 }
 
@@ -531,11 +517,17 @@ pub(super) fn open_set_affinity_dialog(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let dialog_view = cx.new(|cx| SetAffinityDialogView::new(store, key, name, window, cx));
+    let dialog_title = format!(
+        "{} — {} (PID {})",
+        i18n::tr("details.affinity_title"),
+        name,
+        key.pid
+    );
+    let dialog_view = cx.new(|cx| SetAffinityDialogView::new(store, key, window, cx));
     window.open_dialog(cx, move |dialog, _window, _cx| {
         dialog
             .w(px(540.))
-            .title(i18n::tr("details.affinity_title"))
+            .title(dialog_title.clone())
             .child(dialog_view.clone())
     });
 }
