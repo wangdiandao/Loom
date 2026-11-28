@@ -319,9 +319,22 @@ impl Serialize for AccentColorPreference {
     where
         S: serde::Serializer,
     {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
         match *self {
             Self::System => serializer.serialize_str("System"),
-            Self::Custom { r, g, b } => serializer.serialize_str(&Self::format_hex(r, g, b)),
+            Self::Custom { r, g, b } => {
+                let buf = [
+                    b'#',
+                    HEX[usize::from(r >> 4)],
+                    HEX[usize::from(r & 0x0F)],
+                    HEX[usize::from(g >> 4)],
+                    HEX[usize::from(g & 0x0F)],
+                    HEX[usize::from(b >> 4)],
+                    HEX[usize::from(b & 0x0F)],
+                ];
+                let hex = std::str::from_utf8(&buf).unwrap_or("#000000");
+                serializer.serialize_str(hex)
+            }
         }
     }
 }
@@ -331,18 +344,34 @@ impl<'de> Deserialize<'de> for AccentColorPreference {
     where
         D: serde::Deserializer<'de>,
     {
-        let raw = String::deserialize(deserializer)?;
-        let trimmed = raw.trim();
-        if trimmed.eq_ignore_ascii_case("system") {
-            return Ok(Self::System);
+        struct AccentColorVisitor;
+
+        impl serde::de::Visitor<'_> for AccentColorVisitor {
+            type Value = AccentColorPreference;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("\"System\" or a hex color such as \"#0078D4\"")
+            }
+
+            fn visit_str<E>(self, raw: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let trimmed = raw.trim();
+                if trimmed.eq_ignore_ascii_case("system") {
+                    return Ok(AccentColorPreference::System);
+                }
+                AccentColorPreference::parse_hex(trimmed)
+                    .map(|(r, g, b)| AccentColorPreference::Custom { r, g, b })
+                    .ok_or_else(|| {
+                        E::custom(format!(
+                            "expected \"System\" or a hex color such as \"#0078D4\", found \"{raw}\""
+                        ))
+                    })
+            }
         }
-        Self::parse_hex(trimmed)
-            .map(|(r, g, b)| Self::Custom { r, g, b })
-            .ok_or_else(|| {
-                serde::de::Error::custom(format!(
-                    "expected \"System\" or a hex color such as \"#0078D4\", found \"{raw}\""
-                ))
-            })
+
+        deserializer.deserialize_str(AccentColorVisitor)
     }
 }
 

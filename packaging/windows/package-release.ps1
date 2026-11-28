@@ -58,7 +58,7 @@ function Invoke-AuthenticodeSign {
     )
 
     Write-Host "[package-release] Signing $(Split-Path -Leaf $TargetPath)..."
-    $args = @(
+    $signArgs = @(
         'sign',
         '/fd', 'SHA256',
         '/tr', $TimestampServer,
@@ -66,11 +66,11 @@ function Invoke-AuthenticodeSign {
         '/f', $CertPath
     )
     if (-not [string]::IsNullOrEmpty($CertPassword)) {
-        $args += @('/p', $CertPassword)
+        $signArgs += @('/p', $CertPassword)
     }
-    $args += $TargetPath
+    $signArgs += $TargetPath
 
-    & $SignToolPath @args
+    & $SignToolPath @signArgs
     if ($LASTEXITCODE -ne 0) {
         throw "signtool.exe failed with exit code $LASTEXITCODE while signing '$TargetPath'."
     }

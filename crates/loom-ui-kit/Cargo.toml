@@ -12,5 +12,5 @@ test-support = []
 
 [dependencies]
 gpui-kit.workspace = true
-image = { version = "0.25", default-features = false }
+image.workspace = true
 loom-types.workspace = true

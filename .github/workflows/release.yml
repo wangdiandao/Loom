@@ -50,13 +50,13 @@ jobs:
 
       - name: Run Clippy (Windows workspace)
         if: matrix.kind == 'windows'
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Build documentation (Windows workspace)
         if: matrix.kind == 'windows'
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --workspace --no-deps
+        run: cargo doc --locked --workspace --no-deps --all-features
 
       - name: Run workspace tests (Windows)
         if: matrix.kind == 'windows'
@@ -64,15 +64,15 @@ jobs:
 
       - name: Check headless crates on Linux
         if: matrix.kind == 'linux'
-        run: cargo check --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal -p loom-engine
+        run: cargo check --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal-macos -p loom-pal -p loom-engine
 
       - name: Run Clippy on headless crates (Linux)
         if: matrix.kind == 'linux'
-        run: cargo clippy --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal -p loom-engine --all-targets -- -D warnings
+        run: cargo clippy --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal-macos -p loom-pal -p loom-engine --all-targets -- -D warnings
 
       - name: Run headless tests on Linux
         if: matrix.kind == 'linux'
-        run: cargo test --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal -p loom-engine
+        run: cargo test --locked -p loom-types -p loom-config -p loom-pal-api -p loom-pal-linux -p loom-pal-macos -p loom-pal -p loom-engine
 
   package-windows:
     name: Package Windows (x64 MSI + Portable ZIP)
@@ -112,7 +112,7 @@ jobs:
       - name: Install WiX CLI
         shell: pwsh
         run: |
-          dotnet tool install --global wix
+          dotnet tool update --global wix --version "5.*"
           "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           & "$env:USERPROFILE\.dotnet\tools\wix.exe" --version
 
@@ -179,7 +179,8 @@ jobs:
           }
 
           $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-          [System.IO.File]::WriteAllText("dist/RELEASE_NOTES.md", ($notes + "`n"), $utf8NoBom)
+          $notesPath = Join-Path (Get-Location).Path "dist/RELEASE_NOTES.md"
+          [System.IO.File]::WriteAllText($notesPath, ($notes + "`n"), $utf8NoBom)
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')

@@ -103,18 +103,17 @@ impl ConfigStore {
     /// created in the same parent directory as [`Self::path`] so the final rename is
     /// atomic on the target filesystem and leaves no stray temp files behind.
     pub fn save(&self, settings: &AppSettings) -> Result<(), ConfigError> {
-        let mut normalized = settings.clone();
-        if normalized.schema_version == 0 {
-            normalized.schema_version = CURRENT_SCHEMA_VERSION;
-        } else if normalized.schema_version > CURRENT_SCHEMA_VERSION {
+        if settings.schema_version > CURRENT_SCHEMA_VERSION {
             return Err(ConfigError::UnsupportedSchemaVersion {
-                found: normalized.schema_version,
+                found: settings.schema_version,
                 max_supported: CURRENT_SCHEMA_VERSION,
             });
         }
-        normalized.sanitize_run_task_history();
-        normalized.sanitize_global_hotkey();
-        normalized.sanitize_leak_ignored_paths();
+        let mut normalized = settings.clone();
+        if normalized.schema_version == 0 {
+            normalized.schema_version = CURRENT_SCHEMA_VERSION;
+        }
+        normalized.sanitize_all();
 
         let serialized = toml::to_string_pretty(&normalized)?;
 

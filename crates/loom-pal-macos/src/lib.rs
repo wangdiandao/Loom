@@ -235,24 +235,58 @@ impl SystemOperator for MacosStub {
 
     fn logical_cpu_count(&self) -> u32 {
         std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
+            .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
             .unwrap_or(1)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use loom_types::TaskManagerReplacementState;
+
     use super::*;
 
     #[test]
     fn macos_backend_advertises_platform_profile_and_noop_window_helpers() {
+        assert_eq!(std::mem::size_of::<MacosBackend>(), 0);
         assert_eq!(MacosBackend::PLATFORM, PlatformProfile::MACOS);
         assert_eq!(MacosBackend::CAPABILITIES, CapabilityFlags::empty());
         assert!(!MacosBackend::is_main_window_minimized());
+        assert_eq!(MacosBackend::system_accent_color(), None);
         MacosBackend::set_main_window_always_on_top(true);
         MacosBackend::restore_and_focus_main_window();
 
         let backend = MacosBackend::initialize().expect("MacosBackend::initialize");
         assert!(backend.operator().logical_cpu_count() >= 1);
+        assert!(!backend.operator().is_elevated());
+
+        let mut fast = backend.create_fast_sampler().expect("create_fast_sampler");
+        let mut proc_scratch = ProcessSampleScratch::new();
+        let _ = proc_scratch.push_str("stale");
+        assert!(matches!(
+            fast.sample_processes(&mut proc_scratch),
+            Err(PalError::Unsupported(_))
+        ));
+        assert!(proc_scratch.string_buf.is_empty());
+
+        let mut perf_scratch = PerfSampleScratch::new();
+        perf_scratch.per_core_permille.push(500);
+        assert!(matches!(
+            fast.sample_performance(&mut perf_scratch),
+            Err(PalError::Unsupported(_))
+        ));
+        assert!(perf_scratch.per_core_permille.is_empty());
+
+        let slow = backend.create_slow_prober().expect("create_slow_prober");
+        assert!(slow.probe_disk_performance().unwrap().is_empty());
+        assert!(slow.list_listening_ports().unwrap().is_empty());
+
+        let tm = backend
+            .operator()
+            .task_manager_replacement_status()
+            .unwrap();
+        assert_eq!(tm.state, TaskManagerReplacementState::Unsupported);
+        let admin = backend.operator().admin_startup_status().unwrap();
+        assert!(!admin.supported);
     }
 }
