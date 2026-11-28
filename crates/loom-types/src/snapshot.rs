@@ -34,11 +34,13 @@ pub enum MonitorDomain {
     PerCoreCpu,
     /// Optional elevated-only per-process network byte attribution (e.g., ETW).
     ProcessNetwork,
+    /// Processes overview table projection (ProcessTableSlice).
+    Processes,
 }
 
 impl MonitorDomain {
     /// Total number of [`MonitorDomain`] variants.
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
 
     /// Returns a dense array index in `0..Self::COUNT` for lock-free lease tables.
     #[inline]
@@ -52,6 +54,7 @@ impl MonitorDomain {
             Self::AppHistory => 5,
             Self::PerCoreCpu => 6,
             Self::ProcessNetwork => 7,
+            Self::Processes => 8,
         }
     }
 }

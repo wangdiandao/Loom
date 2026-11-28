@@ -298,7 +298,6 @@ impl UiStore {
         let next = self.coordinator.snapshot();
         if self.apply_snapshot_if_changed(next) {
             cx.emit(UiStoreEvent::SnapshotUpdated(self.last_revisions));
-            cx.notify();
         }
 
         while let Ok(event) = self.event_rx.try_recv() {

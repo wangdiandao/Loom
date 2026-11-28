@@ -254,6 +254,7 @@ struct StartupTableDelegate {
     capabilities: CapabilityFlags,
     last_rev: u64,
     selected_id: Option<Arc<str>>,
+    reanchored_selection: Option<Option<usize>>,
     visible_rows: Range<usize>,
     last_scroll_at: Option<Instant>,
     last_viewport_fp: Option<u64>,
@@ -275,6 +276,7 @@ impl StartupTableDelegate {
             slice,
             capabilities,
             selected_id: None,
+            reanchored_selection: None,
             visible_rows: 0..0,
             last_scroll_at: None,
             last_viewport_fp: None,
@@ -806,8 +808,13 @@ impl StartupView {
             |this, table, event: &TableEvent, cx| match event {
                 TableEvent::SelectRow(row_ix) => {
                     let next_toolbar = table.update(cx, |table, _| {
-                        let id = table.delegate().row_at(*row_ix).map(|e| Arc::clone(&e.id));
                         let d = table.delegate_mut();
+                        if d.reanchored_selection == Some(Some(*row_ix)) {
+                            d.reanchored_selection = None;
+                            return d.toolbar_state(Some(*row_ix));
+                        }
+                        d.reanchored_selection = None;
+                        let id = d.row_at(*row_ix).map(|e| Arc::clone(&e.id));
                         d.selected_id = id;
                         d.last_viewport_fp = None;
                         d.toolbar_state(Some(*row_ix))
@@ -823,6 +830,7 @@ impl StartupView {
                         {
                             let d = table.delegate_mut();
                             d.selected_id = id.clone();
+                            d.reanchored_selection = None;
                             d.last_viewport_fp = None;
                         }
                         if id.is_some() && table.selected_row() != Some(*row_ix) {
@@ -836,13 +844,18 @@ impl StartupView {
                     }
                 }
                 TableEvent::ClearSelection => {
-                    let next_toolbar = table.update(cx, |table, _| {
+                    let (was_reanchor, next_toolbar) = table.update(cx, |table, _| {
                         let d = table.delegate_mut();
+                        if d.reanchored_selection == Some(None) {
+                            d.reanchored_selection = None;
+                            return (true, d.toolbar_state(None));
+                        }
+                        d.reanchored_selection = None;
                         d.selected_id = None;
                         d.last_viewport_fp = None;
-                        d.toolbar_state(None)
+                        (false, d.toolbar_state(None))
                     });
-                    if this.toolbar_state != next_toolbar {
+                    if !was_reanchor && this.toolbar_state != next_toolbar {
                         this.toolbar_state = next_toolbar;
                         cx.notify();
                     }
@@ -960,9 +973,11 @@ impl StartupView {
             .and_then(|id| table.delegate().find_visible_index_by_id(id, hint_row));
         if let Some(idx) = selected_idx {
             if hint_row != Some(idx) {
+                table.delegate_mut().reanchored_selection = Some(Some(idx));
                 table.set_selected_row(idx, cx);
             }
         } else if hint_row.is_some() {
+            table.delegate_mut().reanchored_selection = Some(None);
             table.clear_selection(cx);
         }
     }

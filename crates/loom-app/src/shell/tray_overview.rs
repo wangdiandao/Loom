@@ -92,19 +92,26 @@ pub(crate) struct TrayOverviewView {
     focus_handle: FocusHandle,
     has_been_active: bool,
     _perf_lease: ScopedMonitorLease,
+    _processes_lease: ScopedMonitorLease,
     _subscriptions: Vec<Subscription>,
 }
 
 impl TrayOverviewView {
-    /// Constructs a new [`TrayOverviewView`] sharing `store` and holding a scoped
-    /// `Performance` lease strictly for the lifetime of this popover window.
+    /// Constructs a new [`TrayOverviewView`] sharing `store` and holding scoped
+    /// `Performance` and `Processes` leases strictly for the lifetime of this popover window.
     pub(crate) fn new(store: Entity<UiStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         window.set_window_title(&i18n::tr("tray_overview.title"));
 
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
-        let perf_lease = store.read(cx).acquire_lease(MonitorDomain::Performance);
+        let (perf_lease, processes_lease) = {
+            let s = store.read(cx);
+            (
+                s.acquire_lease(MonitorDomain::Performance),
+                s.acquire_lease(MonitorDomain::Processes),
+            )
+        };
 
         let mut subscriptions = Vec::with_capacity(2);
         subscriptions.push(
@@ -134,6 +141,7 @@ impl TrayOverviewView {
             focus_handle,
             has_been_active,
             _perf_lease: perf_lease,
+            _processes_lease: processes_lease,
             _subscriptions: subscriptions,
         }
     }

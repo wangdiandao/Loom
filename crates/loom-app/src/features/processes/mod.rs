@@ -48,12 +48,13 @@ use loom_ui_kit::{
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
 use crate::features::table_columns::{
     ColumnKey, ColumnSpec, ColumnToggleItem, CopyRowFields, DataTablePane, FnvHasher64,
-    HeaderMenuAction, IconRenderCache, OrderFreezeState, ScrollBurstCoalescer, TableColumnLayout,
-    TableInputBridge, TypeToSearchState, build_column_header_menu, build_copy_submenu,
-    can_suspend_or_resume_process, dispatch_hide_system_processes, dispatch_ignore_leak_path,
-    dispatch_restart_explorer, dispatch_suspend_or_resume, expand_chevron_button,
-    is_explorer_image, leak_ignore_target, leak_warning_badge, open_select_columns_dialog,
-    sort_paused_indicator, spawn_csv_export, webview2_role_badge, webview2_role_label,
+    HeaderMenuAction, IconRenderCache, OrderFreezeState, ScrollBurstCoalescer, SortPausedBadge,
+    TableColumnLayout, TableInputBridge, TypeToSearchState, build_column_header_menu,
+    build_copy_submenu, can_suspend_or_resume_process, dispatch_hide_system_processes,
+    dispatch_ignore_leak_path, dispatch_restart_explorer, dispatch_suspend_or_resume,
+    expand_chevron_button, is_explorer_image, leak_ignore_target, leak_warning_badge,
+    open_select_columns_dialog, should_attach_cell_tooltip, spawn_csv_export, webview2_role_badge,
+    webview2_role_label,
 };
 use crate::i18n;
 use crate::shell::{ShellHandle, dialogs};
@@ -335,7 +336,6 @@ fn compute_processes_viewport_fingerprint(
     mem_mode: ResourceDisplayMode,
     disk_mode: ResourceDisplayMode,
     net_mode: ResourceDisplayMode,
-    order_frozen: bool,
 ) -> u64 {
     let mut h = FnvHasher64::new();
     let rows_len = slice.rows.len();
@@ -351,7 +351,6 @@ fn compute_processes_viewport_fingerprint(
     h.write_u8(mem_mode as u8);
     h.write_u8(disk_mode as u8);
     h.write_u8(net_mode as u8);
-    h.write_bool(order_frozen);
     h.write_usize(start);
     h.write_usize(end);
     h.write_u64(cols_mask);
@@ -485,12 +484,15 @@ struct ProcessesTableDelegate {
     net_mode: ResourceDisplayMode,
     column_layout: TableColumnLayout<ProcessColumn>,
     selected_key: Option<ProcessKey>,
+    reanchored_selection: Option<Option<usize>>,
     last_right_clicked_col: Option<usize>,
     order_freeze: OrderFreezeState,
+    sort_paused_badge: Entity<SortPausedBadge>,
     menu_focus_subs: Vec<Subscription>,
     icon_cache: IconRenderCache,
     semantic_colors: CachedSemanticColors,
     row_cache: RowTextCache,
+    section_header_cache: [Option<(usize, SharedString)>; 3],
     locale: ProcessesLocaleCache,
     visible_rows: Range<usize>,
     visible_cols: Range<usize>,
@@ -501,37 +503,53 @@ struct ProcessesTableDelegate {
 }
 
 impl ProcessesTableDelegate {
-    fn new(store: Entity<UiStore>, shell: ShellHandle, cx: &App) -> Self {
-        let store_ref = store.read(cx);
-        let snapshot = store_ref.snapshot();
-        let settings = store_ref.settings();
-        let platform = snapshot.platform;
+    fn new(store: Entity<UiStore>, shell: ShellHandle, cx: &mut App) -> Self {
+        let (platform, slice, last_rev, mem_mode, disk_mode, net_mode, saved_cols) = {
+            let store_ref = store.read(cx);
+            let snapshot = store_ref.snapshot();
+            let settings = store_ref.settings();
+            (
+                snapshot.platform,
+                Arc::clone(&snapshot.processes),
+                snapshot.revisions.processes,
+                settings.memory_display_mode,
+                settings.disk_display_mode,
+                settings.network_display_mode,
+                store_ref.processes_columns().to_vec(),
+            )
+        };
 
         let mut column_layout = TableColumnLayout::new(ProcessColumn::default_specs());
-        let saved_cols = store_ref.processes_columns();
         if !saved_cols.is_empty() {
-            column_layout.apply_saved(saved_cols);
+            column_layout.apply_saved(&saved_cols);
         }
-        let initial_rows_len = snapshot.processes.rows.len();
+        let initial_rows_len = slice.rows.len();
+        let locale = ProcessesLocaleCache::build(platform);
+        let sort_paused_tip = locale.sort_paused_tooltip.clone();
+        let sort_paused_badge =
+            cx.new(|_| SortPausedBadge::new("proc-sort-paused", sort_paused_tip));
 
         Self {
             store: store.clone(),
             shell,
-            slice: Arc::clone(&snapshot.processes),
+            slice,
             platform,
-            last_rev: snapshot.revisions.processes,
-            mem_mode: settings.memory_display_mode,
-            disk_mode: settings.disk_display_mode,
-            net_mode: settings.network_display_mode,
+            last_rev,
+            mem_mode,
+            disk_mode,
+            net_mode,
             column_layout,
             selected_key: None,
+            reanchored_selection: None,
             last_right_clicked_col: None,
             order_freeze: OrderFreezeState::default(),
+            sort_paused_badge,
             menu_focus_subs: Vec::new(),
             icon_cache: IconRenderCache::new(),
             semantic_colors: CachedSemanticColors::new(),
             row_cache: RowTextCache::new(),
-            locale: ProcessesLocaleCache::build(platform),
+            section_header_cache: [None, None, None],
+            locale,
             visible_rows: 0..0,
             visible_cols: 0..0,
             last_rows_len: initial_rows_len,
@@ -539,6 +557,28 @@ impl ProcessesTableDelegate {
             scroll_coalescer: ScrollBurstCoalescer::new(),
             user_initiated_pending: false,
         }
+    }
+
+    #[inline]
+    fn cached_section_header_label(
+        &mut self,
+        category: ProcessCategory,
+        count: usize,
+    ) -> SharedString {
+        let slot = match category {
+            ProcessCategory::App => 0,
+            ProcessCategory::Background => 1,
+            ProcessCategory::System => 2,
+        };
+        if let Some((cached_count, ref cached_label)) = self.section_header_cache[slot]
+            && cached_count == count
+        {
+            return cached_label.clone();
+        }
+        let label: SharedString =
+            format!("{} ({count})", self.locale.category_label(category)).into();
+        self.section_header_cache[slot] = Some((count, label.clone()));
+        label
     }
 
     #[inline]
@@ -567,7 +607,6 @@ impl ProcessesTableDelegate {
             self.mem_mode,
             self.disk_mode,
             self.net_mode,
-            self.order_freeze.is_frozen(),
         )
     }
 
@@ -577,12 +616,13 @@ impl ProcessesTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) {
         if let Some(frozen) = transition {
-            self.invalidate_viewport_fingerprint();
             let _ = self
                 .store
                 .read(cx)
                 .dispatch_command(EngineCommand::SetProcessOrderFreeze(frozen));
-            cx.notify();
+            self.sort_paused_badge.update(cx, |badge, cx| {
+                badge.set_frozen(frozen, cx);
+            });
         }
     }
 
@@ -948,13 +988,16 @@ impl TableDelegate for ProcessesTableDelegate {
         };
         let col = spec.id;
         let is_active_sort = col.sort_column() == Some(self.slice.sort_column);
-        let is_sort_paused = is_active_sort && self.order_freeze.is_frozen();
+        if is_active_sort {
+            self.sort_paused_badge.update(cx, |badge, _| {
+                badge.set_col_ix(col_ix);
+            });
+        }
         let theme = cx.theme();
         let fg = theme.foreground;
         let muted_fg = theme.muted_foreground;
-        let sort_paused_color = self.semantic_colors.get_copy(theme).sort_paused;
         let col_label = self.locale.column_label(col);
-        let sort_paused_tip = self.locale.sort_paused_tooltip.clone();
+        let sort_paused_badge = self.sort_paused_badge.clone();
         let store = self.store.clone();
         let table_weak = cx.entity().downgrade();
 
@@ -974,20 +1017,12 @@ impl TableDelegate for ProcessesTableDelegate {
             .on_click(cx.listener(move |table, _, _, cx| {
                 table.delegate_mut().trigger_sort_col(col_ix, cx);
             }))
-            .when(is_sort_paused && col.right_aligned(), |d| {
-                d.child(sort_paused_indicator(
-                    ("proc-sort-paused", col_ix),
-                    sort_paused_color,
-                    sort_paused_tip.clone(),
-                ))
+            .when(is_active_sort && col.right_aligned(), |d| {
+                d.child(sort_paused_badge.clone())
             })
             .child(div().min_w_0().truncate().child(col_label))
-            .when(is_sort_paused && !col.right_aligned(), |d| {
-                d.child(sort_paused_indicator(
-                    ("proc-sort-paused", col_ix),
-                    sort_paused_color,
-                    sort_paused_tip,
-                ))
+            .when(is_active_sort && !col.right_aligned(), |d| {
+                d.child(sort_paused_badge)
             })
             .context_menu(move |menu, window, cx| {
                 Self::build_header_context_menu(
@@ -1031,7 +1066,7 @@ impl TableDelegate for ProcessesTableDelegate {
             ProcessRowKind::SectionHeader { category, count } => {
                 if col_ix == 0 {
                     let primary = cx.theme().primary;
-                    let label = format!("{} ({count})", self.locale.category_label(category));
+                    let label = self.cached_section_header_label(category, count);
                     h_flex()
                         .size_full()
                         .items_center()
@@ -1084,6 +1119,47 @@ impl TableDelegate for ProcessesTableDelegate {
                                 .into_any_element()
                         };
 
+                        let name_el = if child_badge.is_none() && wv2_label.is_none() {
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .when(is_selected || has_children, |d| d.font_medium())
+                                .child(display_name)
+                                .into_any_element()
+                        } else {
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .items_center()
+                                .gap_1p5()
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .when(is_selected || has_children, |d| d.font_medium())
+                                        .child(display_name),
+                                )
+                                .when_some(child_badge, |this, badge| {
+                                    this.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_xs()
+                                            .text_color(muted_fg)
+                                            .child(badge),
+                                    )
+                                })
+                                .when_some(wv2_label, |this, role_label| {
+                                    this.child(webview2_role_badge(
+                                        role_label, muted_bg, muted_fg, radius,
+                                    ))
+                                })
+                                .into_any_element()
+                        };
+
                         h_flex()
                             .size_full()
                             .items_center()
@@ -1106,50 +1182,16 @@ impl TableDelegate for ProcessesTableDelegate {
                                 div().w(px(20.)).flex_shrink_0().into_any_element()
                             })
                             .child(icon_el)
-                            .child(
-                                h_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .overflow_hidden()
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_xs()
-                                            .when(is_selected || has_children, |d| d.font_medium())
-                                            .child(display_name),
-                                    )
-                                    .when_some(child_badge, |this, badge| {
-                                        this.child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .text_xs()
-                                                .text_color(muted_fg)
-                                                .child(badge),
-                                        )
-                                    })
-                                    .when_some(wv2_label, |this, role_label| {
-                                        this.child(webview2_role_badge(
-                                            role_label, muted_bg, muted_fg, radius,
-                                        ))
-                                    }),
-                            )
+                            .child(name_el)
                             .into_any_element()
                     }
                     ProcessColumn::Category => h_flex()
                         .size_full()
                         .items_center()
                         .overflow_hidden()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .child(self.locale.category_label(row.category)),
-                        )
+                        .text_xs()
+                        .text_color(muted_fg)
+                        .child(self.locale.category_label(row.category))
                         .into_any_element(),
                     ProcessColumn::Pid => h_flex()
                         .size_full()
@@ -1282,20 +1324,32 @@ impl TableDelegate for ProcessesTableDelegate {
                                 cmd_arc,
                                 DEFAULT_CELL_PREVIEW_CHARS,
                             );
-                            let tooltip_text = SharedString::from(Arc::clone(cmd_arc));
-                            h_flex()
-                                .id(("proc-cmd", row_id))
-                                .size_full()
-                                .items_center()
-                                .overflow_hidden()
-                                .text_xs()
-                                .font_family(mono_font)
-                                .text_color(muted_fg)
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(tooltip_text.clone()).build(window, cx)
-                                })
-                                .child(div().min_w_0().truncate().child(preview))
-                                .into_any_element()
+                            if should_attach_cell_tooltip(cmd_arc, spec.width) {
+                                let tooltip_text = SharedString::from(Arc::clone(cmd_arc));
+                                h_flex()
+                                    .id(("proc-cmd", row_id))
+                                    .size_full()
+                                    .items_center()
+                                    .overflow_hidden()
+                                    .text_xs()
+                                    .font_family(mono_font)
+                                    .text_color(muted_fg)
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(tooltip_text.clone()).build(window, cx)
+                                    })
+                                    .child(div().min_w_0().truncate().child(preview))
+                                    .into_any_element()
+                            } else {
+                                h_flex()
+                                    .size_full()
+                                    .items_center()
+                                    .overflow_hidden()
+                                    .text_xs()
+                                    .font_family(mono_font)
+                                    .text_color(muted_fg)
+                                    .child(div().min_w_0().truncate().child(preview))
+                                    .into_any_element()
+                            }
                         } else {
                             h_flex()
                                 .size_full()
@@ -1425,6 +1479,7 @@ struct PendingProcessesSnapshot {
 pub(crate) struct ProcessesView {
     store: Entity<UiStore>,
     coordinator: Arc<EngineCoordinator<NativeBackend>>,
+    _processes_lease: ScopedMonitorLease,
     table: Entity<TableState<ProcessesTableDelegate>>,
     table_pane: Entity<DataTablePane<ProcessesTableDelegate>>,
     table_left_x: Rc<Cell<Pixels>>,
@@ -1569,10 +1624,18 @@ impl ProcessesView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (coordinator, view_mode, hide_system_processes, last_locale, initial_query) = {
+        let (
+            coordinator,
+            processes_lease,
+            view_mode,
+            hide_system_processes,
+            last_locale,
+            initial_query,
+        ) = {
             let s = store.read(cx);
             (
                 Arc::clone(s.coordinator()),
+                s.acquire_lease(MonitorDomain::Processes),
                 s.snapshot().processes.view_mode,
                 s.settings().hide_windows_system_processes,
                 s.settings().language,
@@ -1678,7 +1741,11 @@ impl ProcessesView {
                         if locale_changed {
                             let platform = d.platform;
                             d.locale = ProcessesLocaleCache::build(platform);
+                            d.section_header_cache = [None, None, None];
+                            let next_tip = d.locale.sort_paused_tooltip.clone();
+                            let badge = d.sort_paused_badge.clone();
                             d.invalidate_viewport_fingerprint();
+                            badge.update(cx, |b, cx| b.set_tooltip(next_tip, cx));
                             table.refresh(cx);
                         } else if mode_changed {
                             d.invalidate_viewport_fingerprint();
@@ -1715,6 +1782,11 @@ impl ProcessesView {
                 TableEvent::SelectRow(row_ix) => {
                     let next_end_enabled = table.update(cx, |table, _| {
                         let d = table.delegate_mut();
+                        if d.reanchored_selection == Some(Some(*row_ix)) {
+                            d.reanchored_selection = None;
+                            return d.slice.rows.get(*row_ix).is_some_and(can_terminate_process);
+                        }
+                        d.reanchored_selection = None;
                         d.invalidate_viewport_fingerprint();
                         match d.slice.rows.get(*row_ix) {
                             Some(row) if row.kind == ProcessRowKind::Process => {
@@ -1744,6 +1816,7 @@ impl ProcessesView {
                         {
                             let d = table.delegate_mut();
                             d.selected_key = key_opt;
+                            d.reanchored_selection = None;
                             d.invalidate_viewport_fingerprint();
                         }
                         if key_opt.is_some() && table.selected_row() != Some(*row_ix) {
@@ -1757,12 +1830,18 @@ impl ProcessesView {
                     }
                 }
                 TableEvent::ClearSelection => {
-                    table.update(cx, |table, _| {
+                    let was_reanchor = table.update(cx, |table, _| {
                         let d = table.delegate_mut();
+                        if d.reanchored_selection == Some(None) {
+                            d.reanchored_selection = None;
+                            return true;
+                        }
+                        d.reanchored_selection = None;
                         d.selected_key = None;
                         d.invalidate_viewport_fingerprint();
+                        false
                     });
-                    if this.end_task_enabled {
+                    if !was_reanchor && this.end_task_enabled {
                         this.end_task_enabled = false;
                         cx.notify();
                     }
@@ -1789,6 +1868,7 @@ impl ProcessesView {
         let mut view = Self {
             store,
             coordinator,
+            _processes_lease: processes_lease,
             table,
             table_pane,
             table_left_x: Rc::new(Cell::new(px(0.0))),
@@ -1847,14 +1927,16 @@ impl ProcessesView {
                     (d.slice.view_mode, selected_idx, end_enabled)
                 };
 
-                // Re-anchor selection index to ProcessKey without scrolling.
+                // Re-anchor selection index to ProcessKey without scrolling or clearing next_fp.
                 let mut selection_changed = false;
                 if let Some(idx) = selected_idx {
                     if prev_selected_row != Some(idx) {
+                        table.delegate_mut().reanchored_selection = Some(Some(idx));
                         table.set_selected_row(idx, cx);
                         selection_changed = true;
                     }
                 } else if prev_selected_row.is_some() {
+                    table.delegate_mut().reanchored_selection = Some(None);
                     table.clear_selection(cx);
                     selection_changed = true;
                 }
@@ -3178,7 +3260,6 @@ mod tests {
             ResourceDisplayMode::Values,
             ResourceDisplayMode::Values,
             ResourceDisplayMode::Values,
-            false,
         );
 
         // Identical slice computes identical fingerprint.
@@ -3193,7 +3274,6 @@ mod tests {
                 ResourceDisplayMode::Values,
                 ResourceDisplayMode::Values,
                 ResourceDisplayMode::Values,
-                false,
             )
         );
 
@@ -3211,7 +3291,6 @@ mod tests {
                 ResourceDisplayMode::Values,
                 ResourceDisplayMode::Values,
                 ResourceDisplayMode::Values,
-                false,
             )
         );
 
@@ -3228,7 +3307,6 @@ mod tests {
                 ResourceDisplayMode::Values,
                 ResourceDisplayMode::Values,
                 ResourceDisplayMode::Values,
-                false,
             )
         );
 
@@ -3243,11 +3321,10 @@ mod tests {
             ResourceDisplayMode::Values,
             ResourceDisplayMode::Values,
             ResourceDisplayMode::Values,
-            false,
         );
         assert_ne!(fp_base, fp_cpu);
 
-        // Selection or freeze-state changes invalidate the fingerprint.
+        // Selection change invalidates the fingerprint.
         let fp_sel = super::compute_processes_viewport_fingerprint(
             &slice,
             &layout,
@@ -3257,7 +3334,6 @@ mod tests {
             ResourceDisplayMode::Values,
             ResourceDisplayMode::Values,
             ResourceDisplayMode::Values,
-            false,
         );
         assert_ne!(fp_cpu, fp_sel);
     }
@@ -3467,6 +3543,51 @@ mod tests {
             this.commit_snapshot(102, slice_v3, platform, cx)
         });
         assert!(notified_v3, "visible row CPU change must notify TableState");
+
+        // 5. Programmatic selection re-anchoring preserves last_viewport_fingerprint across
+        //    the emitted TableEvent::SelectRow callback, and hover-freeze transitions update
+        //    the isolated SortPausedBadge without clearing the table's viewport fingerprint.
+        let mut reordered = make_rows(250, 999);
+        reordered.swap(0, 3);
+        let slice_v4 = Arc::new(ProcessTableSlice {
+            revision: 103,
+            rows: reordered,
+            ..Default::default()
+        });
+        view.update(&mut vcx, |this, cx| {
+            this.commit_snapshot(103, slice_v4, platform, cx);
+        });
+        vcx.run_until_parked();
+        assert_eq!(
+            table.read_with(&vcx, |t, _| t.selected_row()),
+            Some(3),
+            "selected ProcessKey must re-anchor to its new row index"
+        );
+        assert!(
+            table.read_with(&vcx, |t, _| t
+                .delegate()
+                .last_viewport_fingerprint
+                .is_some()),
+            "programmatic selection re-anchoring must not self-invalidate last_viewport_fingerprint"
+        );
+
+        let fp_before_hover = table.read_with(&vcx, |t, _| t.delegate().last_viewport_fingerprint);
+        table.update(&mut vcx, |t, cx| {
+            t.delegate_mut().set_table_hovered(true, cx);
+        });
+        assert_eq!(
+            table.read_with(&vcx, |t, _| t.delegate().last_viewport_fingerprint),
+            fp_before_hover,
+            "hover-freeze transition must update isolated SortPausedBadge without clearing viewport fingerprint"
+        );
+
+        // 6. ProcessesView holds MonitorDomain::Processes while mounted.
+        assert!(
+            coordinator_for_shutdown
+                .leases()
+                .is_active(loom_types::MonitorDomain::Processes),
+            "mounted ProcessesView must hold MonitorDomain::Processes lease"
+        );
 
         coordinator_for_shutdown.shutdown();
     }

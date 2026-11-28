@@ -3919,3 +3919,77 @@ fn details_working_set_delta_tracks_signed_growth_shrink_and_sorting() {
 
     coord.shutdown();
 }
+
+#[test]
+fn processes_domain_lease_gates_projection_while_details_stays_independent() {
+    let p1 = MockProcSpec::new(100, 10, 0, "app.exe");
+    let p2 = MockProcSpec::new(200, 20, 0, "worker.exe");
+    let state = MockState::new(vec![p1, p2]);
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let config = EngineConfig {
+        gate_processes_by_lease: true,
+        project_processes_on_boot: false,
+        cold_meta_coalesce_window: Duration::from_millis(25),
+        ..EngineConfig::default()
+    };
+    let coord = EngineCoordinator::with_config(backend, settings, config).unwrap();
+
+    // Without a Processes lease and with project_processes_on_boot = false,
+    // Processes projection stays skipped even across explicit ForceRefresh ticks.
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(coord.snapshot().revisions.processes, 0);
+    assert!(coord.snapshot().processes.rows.is_empty());
+
+    // Details lease updates Details independently without waking Processes projection.
+    let _details_lease = coord.acquire_lease(MonitorDomain::Details);
+    assert!(wait_until(Duration::from_secs(2), || {
+        coord.snapshot().revisions.details >= 1 && coord.snapshot().details.rows.len() == 2
+    }));
+    assert_eq!(
+        coord.snapshot().revisions.processes,
+        0,
+        "unleased Processes must stay skipped while Details is active"
+    );
+
+    // Acquiring MonitorDomain::Processes immediately triggers lease-wakeup projection.
+    let proc_lease = coord.acquire_lease(MonitorDomain::Processes);
+    assert!(wait_until(Duration::from_secs(2), || {
+        coord.snapshot().revisions.processes >= 1 && !coord.snapshot().processes.rows.is_empty()
+    }));
+    let rev_while_leased = coord.snapshot().revisions.processes;
+
+    // Dropping the Processes lease halts Processes re-projection on subsequent ticks.
+    drop(proc_lease);
+    // Give the lease-drop wakeup a brief moment to settle, then force a fresh tick.
+    std::thread::sleep(Duration::from_millis(30));
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(
+        coord.snapshot().revisions.processes,
+        rev_while_leased,
+        "releasing MonitorDomain::Processes must skip subsequent Processes projections"
+    );
+    assert!(
+        coord.snapshot().revisions.details >= 2,
+        "Details must continue refreshing while Processes is unleased"
+    );
+
+    // Re-acquiring MonitorDomain::Processes immediately catches up with the latest tick.
+    let _proc_lease_again = coord.acquire_lease(MonitorDomain::Processes);
+    assert!(wait_until(Duration::from_secs(2), || {
+        coord.snapshot().revisions.processes > rev_while_leased
+    }));
+
+    coord.shutdown();
+}

@@ -21,7 +21,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, AppContext as _, Bounds, ClickEvent, ClipboardItem, Context, Element, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, GlobalElementId, Hsla,
+    ElementInputHandler, Empty, Entity, EntityInputHandler, FocusHandle, GlobalElementId, Hsla,
     InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, MouseButton,
     ParentElement as _, Pixels, Position, Render, RenderImage, SharedString,
     StatefulInteractiveElement as _, Style, Styled as _, Window, div, px,
@@ -31,7 +31,9 @@ use loom_engine::EngineCommand;
 use loom_types::{
     CapabilityFlags, ExeIconRgba, LeakWarning, ProcessKey, ProcessStatusFlags, WebView2Role,
 };
-use loom_ui_kit::{build_csv_document, rgba_icon_to_render_image};
+use loom_ui_kit::{
+    CachedSemanticColors, DEFAULT_CELL_PREVIEW_CHARS, build_csv_document, rgba_icon_to_render_image,
+};
 
 use crate::bridge::{UiCommands, UiStore};
 use crate::i18n;
@@ -790,6 +792,7 @@ pub(crate) struct OrderFreezeState {
 
 impl OrderFreezeState {
     /// Returns whether row order is currently frozen.
+    #[cfg(test)]
     #[inline]
     pub(crate) const fn is_frozen(&self) -> bool {
         self.frozen
@@ -831,6 +834,91 @@ impl OrderFreezeState {
         self.context_menu_open = open;
         self.reconcile()
     }
+}
+
+/// Isolated GPUI Entity rendering the active sort header's amber paused-sort indicator.
+///
+/// Hosting the 16 px badge in its own entity lets hover-freeze transitions update only
+/// this tiny header badge without notifying the enclosing `TableState` or invalidating
+/// the table body's viewport fingerprint.
+pub(crate) struct SortPausedBadge {
+    id_prefix: &'static str,
+    col_ix: usize,
+    frozen: bool,
+    tooltip: SharedString,
+    semantic_colors: CachedSemanticColors,
+}
+
+impl SortPausedBadge {
+    /// Creates a new hidden [`SortPausedBadge`] bound to `id_prefix`.
+    pub(crate) fn new(id_prefix: &'static str, tooltip: SharedString) -> Self {
+        Self {
+            id_prefix,
+            col_ix: 0,
+            frozen: false,
+            tooltip,
+            semantic_colors: CachedSemanticColors::new(),
+        }
+    }
+
+    /// Updates whether the badge should be displayed, notifying only on state transitions.
+    pub(crate) fn set_frozen(&mut self, frozen: bool, cx: &mut Context<Self>) {
+        if self.frozen != frozen {
+            self.frozen = frozen;
+            cx.notify();
+        }
+    }
+
+    /// Updates the localized tooltip text (e.g. after a live language switch).
+    pub(crate) fn set_tooltip(&mut self, tooltip: SharedString, cx: &mut Context<Self>) {
+        if self.tooltip != tooltip {
+            self.tooltip = tooltip;
+            if self.frozen {
+                cx.notify();
+            }
+        }
+    }
+
+    /// Updates the active sort column index used for the badge's element ID.
+    #[inline]
+    pub(crate) fn set_col_ix(&mut self, col_ix: usize) {
+        self.col_ix = col_ix;
+    }
+}
+
+impl Render for SortPausedBadge {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.frozen {
+            return Empty.into_any_element();
+        }
+        let color = self.semantic_colors.get_copy(cx.theme()).sort_paused;
+        sort_paused_indicator((self.id_prefix, self.col_ix), color, self.tooltip.clone())
+            .into_any_element()
+    }
+}
+
+/// Estimates whether a single-line monospace `text_xs` cell string (`CommandLine` / `ExePath`)
+/// may overflow `col_width_px` or exceed [`DEFAULT_CELL_PREVIEW_CHARS`], warranting a
+/// stateful hover [`Tooltip`].
+///
+/// Short strings that comfortably fit inside the column skip `.id(...)` and `.tooltip(...)`
+/// registration on every visible row.
+#[inline]
+pub(crate) fn should_attach_cell_tooltip(text: &str, col_width_px: f32) -> bool {
+    if text.len() > DEFAULT_CELL_PREVIEW_CHARS {
+        return true;
+    }
+    let usable_px = (col_width_px - 20.0).max(0.0);
+    // Conservative monospace `text_xs` glyph width (~7.2 px per ASCII cell).
+    const CHAR_WIDTH_PX: f32 = 7.2;
+    if text.is_ascii() {
+        return (text.len() as f32) * CHAR_WIDTH_PX > usable_px;
+    }
+    let mut cols = 0usize;
+    for ch in text.chars() {
+        cols += if ch.is_ascii() { 1 } else { 2 };
+    }
+    (cols as f32) * CHAR_WIDTH_PX > usable_px
 }
 
 /// Renders a subtle amber paused-sort indicator icon on the active sort column header.
@@ -2296,5 +2384,24 @@ mod tests {
         assert!(coalescer.should_defer_snapshot(t_user + Duration::from_millis(20), false));
         assert!(!coalescer.should_defer_snapshot(t_user + Duration::from_millis(30), true));
         assert!(!coalescer.take_pending());
+    }
+
+    #[test]
+    fn should_attach_cell_tooltip_only_when_text_can_overflow_column_width() {
+        // Short ASCII path fits comfortably in a 300px column -> skip stateful tooltip.
+        assert!(!should_attach_cell_tooltip(r"C:\app.exe", 300.0));
+        // Long ASCII command line exceeds 300px column -> attach tooltip.
+        assert!(should_attach_cell_tooltip(
+            r#""C:\Program Files\Example\app.exe" --profile-directory=Default --enable-features=Fast"#,
+            300.0
+        ));
+        // Wide CJK path counts double width and triggers tooltip on narrow columns.
+        assert!(should_attach_cell_tooltip(
+            "C:\\用户\\测试目录\\应用程序主程序.exe",
+            180.0
+        ));
+        // Texts exceeding DEFAULT_CELL_PREVIEW_CHARS always attach tooltip regardless of width.
+        let huge = "a".repeat(DEFAULT_CELL_PREVIEW_CHARS + 10);
+        assert!(should_attach_cell_tooltip(&huge, 5000.0));
     }
 }

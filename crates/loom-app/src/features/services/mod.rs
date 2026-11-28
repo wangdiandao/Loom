@@ -356,6 +356,7 @@ struct ServicesTableDelegate {
     capabilities: CapabilityFlags,
     last_rev: u64,
     selected_name: Option<Arc<str>>,
+    reanchored_selection: Option<Option<usize>>,
     visible_rows: Range<usize>,
     last_scroll_at: Option<Instant>,
     last_viewport_fp: Option<u64>,
@@ -378,6 +379,7 @@ impl ServicesTableDelegate {
             slice,
             capabilities,
             selected_name: None,
+            reanchored_selection: None,
             visible_rows: 0..0,
             last_scroll_at: None,
             last_viewport_fp: None,
@@ -945,11 +947,13 @@ impl ServicesView {
             |this, table, event: &TableEvent, cx| match event {
                 TableEvent::SelectRow(row_ix) => {
                     let next_toolbar = table.update(cx, |table, _| {
-                        let name = table
-                            .delegate()
-                            .row_at(*row_ix)
-                            .map(|r| Arc::clone(&r.name));
                         let d = table.delegate_mut();
+                        if d.reanchored_selection == Some(Some(*row_ix)) {
+                            d.reanchored_selection = None;
+                            return d.toolbar_state(Some(*row_ix));
+                        }
+                        d.reanchored_selection = None;
+                        let name = d.row_at(*row_ix).map(|r| Arc::clone(&r.name));
                         d.selected_name = name;
                         d.last_viewport_fp = None;
                         d.toolbar_state(Some(*row_ix))
@@ -968,6 +972,7 @@ impl ServicesView {
                         {
                             let d = table.delegate_mut();
                             d.selected_name = name.clone();
+                            d.reanchored_selection = None;
                             d.last_viewport_fp = None;
                         }
                         if name.is_some() && table.selected_row() != Some(*row_ix) {
@@ -981,13 +986,18 @@ impl ServicesView {
                     }
                 }
                 TableEvent::ClearSelection => {
-                    let next_toolbar = table.update(cx, |table, _| {
+                    let (was_reanchor, next_toolbar) = table.update(cx, |table, _| {
                         let d = table.delegate_mut();
+                        if d.reanchored_selection == Some(None) {
+                            d.reanchored_selection = None;
+                            return (true, d.toolbar_state(None));
+                        }
+                        d.reanchored_selection = None;
                         d.selected_name = None;
                         d.last_viewport_fp = None;
-                        d.toolbar_state(None)
+                        (false, d.toolbar_state(None))
                     });
-                    if this.toolbar_state != next_toolbar {
+                    if !was_reanchor && this.toolbar_state != next_toolbar {
                         this.toolbar_state = next_toolbar;
                         cx.notify();
                     }
@@ -1108,9 +1118,11 @@ impl ServicesView {
             .and_then(|name| table.delegate().find_visible_index_by_name(name, hint_row));
         if let Some(idx) = selected_idx {
             if hint_row != Some(idx) {
+                table.delegate_mut().reanchored_selection = Some(Some(idx));
                 table.set_selected_row(idx, cx);
             }
         } else if hint_row.is_some() {
+            table.delegate_mut().reanchored_selection = Some(None);
             table.clear_selection(cx);
         }
     }

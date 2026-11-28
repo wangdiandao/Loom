@@ -257,12 +257,24 @@ pub struct ColdMetaCache {
     exe_assets: HashMap<Arc<str>, Arc<ExeStaticAsset>>,
     eco_overrides: HashMap<ProcessKey, bool>,
     uac_overrides: HashMap<ProcessKey, UacVirtualization>,
+    version: u64,
 }
 
 impl ColdMetaCache {
     /// Creates an empty two-level cold metadata cache.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Monotonic revision incremented whenever Level-1 process metadata or overrides change.
+    #[inline]
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
+
+    #[inline]
+    fn bump_version(&mut self) {
+        self.version = self.version.wrapping_add(1);
     }
 
     /// Looks up cached per-process cold metadata for `key`.
@@ -331,10 +343,11 @@ impl ColdMetaCache {
                 let mut cloned = (*entry.meta).clone();
                 cloned.efficiency_mode = enabled;
                 entry.meta = Arc::new(cloned);
+                self.bump_version();
             }
             self.eco_overrides.remove(&key);
-        } else {
-            self.eco_overrides.insert(key, enabled);
+        } else if self.eco_overrides.insert(key, enabled) != Some(enabled) {
+            self.bump_version();
         }
     }
 
@@ -353,10 +366,11 @@ impl ColdMetaCache {
                 let mut cloned = (*entry.meta).clone();
                 cloned.uac_virtualization = next;
                 entry.meta = Arc::new(cloned);
+                self.bump_version();
             }
             self.uac_overrides.remove(&key);
-        } else {
-            self.uac_overrides.insert(key, next);
+        } else if self.uac_overrides.insert(key, next) != Some(next) {
+            self.bump_version();
         }
     }
 
@@ -416,6 +430,7 @@ impl ColdMetaCache {
         }
         let entry = CachedProcessMeta::from_meta(Arc::new(meta));
         self.proc_meta.insert(proc_key, entry);
+        self.bump_version();
         needs_asset_probe
     }
 
@@ -445,14 +460,26 @@ impl ColdMetaCache {
                 updated_any = true;
             }
         }
+        if updated_any {
+            self.bump_version();
+        }
         updated_any
     }
 
     /// Evicts exited processes from Level 1 while preserving Level-2 executable assets.
     pub fn retain_live_processes(&mut self, live: &HashSet<ProcessKey>) {
+        let prev_proc_len = self.proc_meta.len();
+        let prev_eco_len = self.eco_overrides.len();
+        let prev_uac_len = self.uac_overrides.len();
         self.proc_meta.retain(|k, _| live.contains(k));
         self.eco_overrides.retain(|k, _| live.contains(k));
         self.uac_overrides.retain(|k, _| live.contains(k));
+        if self.proc_meta.len() != prev_proc_len
+            || self.eco_overrides.len() != prev_eco_len
+            || self.uac_overrides.len() != prev_uac_len
+        {
+            self.bump_version();
+        }
     }
 
     fn insert_asset_arc(
@@ -1046,7 +1073,8 @@ fn execute_priority_job<B: PlatformBackend>(
                     MonitorDomain::Details
                     | MonitorDomain::Performance
                     | MonitorDomain::PerCoreCpu
-                    | MonitorDomain::ProcessNetwork => None,
+                    | MonitorDomain::ProcessNetwork
+                    | MonitorDomain::Processes => None,
                 }
             } else {
                 None
@@ -1081,7 +1109,8 @@ fn execute_priority_job<B: PlatformBackend>(
                 MonitorDomain::Details
                 | MonitorDomain::Performance
                 | MonitorDomain::PerCoreCpu
-                | MonitorDomain::ProcessNetwork => {
+                | MonitorDomain::ProcessNetwork
+                | MonitorDomain::Processes => {
                     return;
                 }
             };

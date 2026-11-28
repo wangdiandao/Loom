@@ -221,7 +221,7 @@ crates/loom-app/src/
 
 `AppSnapshot` 拆分为独立的 `Arc` 子切片，并在 `loom-engine` 后台线程完成排序、搜索过滤与树展开扁平化：
 
-- `processes: Arc<ProcessTableSlice>`（已按当前排序列、搜索词与展开态扁平化的 `Vec<ProcessRowProjection>`，选中态与右键菜单锚定 `ProcessKey`，避免行重排导致误操作；`ProjectionEngine` 绑定 `PlatformBackend::PLATFORM`，仅在 `PlatformKind::Windows` 分组视图下启用对齐任务管理器的壳层解嵌套与多进程应用聚合，不影响 Linux/macOS 分组与通用 `Process Tree`）
+- `processes: Arc<ProcessTableSlice>`（已按当前排序列、搜索词与展开态扁平化的 `Vec<ProcessRowProjection>`，选中态与右键菜单锚定 `ProcessKey`，避免行重排导致误操作；支持 `MonitorDomain::Processes` RAII 租约门控，在桌面应用切离进程页且托盘速览未打开时跳过每拍进程表投影；`ProjectionEngine` 绑定 `PlatformBackend::PLATFORM`，仅在 `PlatformKind::Windows` 分组视图下启用对齐任务管理器的壳层解嵌套与多进程应用聚合，不影响 Linux/macOS 分组与通用 `Process Tree`）
 - `details: Arc<DetailsTableSlice>`（仅在 `Details` 页激活持有租约时构建投影）
 - `performance: Arc<PerformanceSlice>`（五大类硬件摘要、60 点定长量化历史环与设备元数据）
 - `services: Arc<ServicesSlice>` / `startup: Arc<StartupSlice>` / `users: Arc<UsersSlice>` / `app_history: Arc<AppHistorySlice>`（均受 `MonitorLease` 门控，未查看时无后台轮询与投影开销；激活时同样在引擎后台线程完成过滤、施瓦茨排序与 `Users` 会话树扁平化投影，消除 UI 主线程排序过滤抖动）
@@ -229,13 +229,13 @@ crates/loom-app/src/
 
 **引擎侧与渲染热路径分层优化**：
 
-- **引擎投影稳定性与低分配**：默认开启传递性安全的 **排序微抖动迟滞（Sort Deadband）**（CPU/GPU `< 0.2%`、磁盘/网络 `< 16 KiB/s` 在排序前以 `O(N)` 预计算稠密迟滞键 `ProjectionScratch::dense_deadband`，排序比较阶段纯 `O(1)` 索引零哈希查询），配合跨帧复用缓冲 `ProjectionScratch`（含冲突安全的 `HashGroupIndex` 与 `FoldedKeyArena`）及 `ColdMetaCache` 预计算（`webview2_role`、`webview2_host_exe`、`user_name_short`）。
+- **引擎投影稳定性与低分配**：默认开启传递性安全的 **排序微抖动迟滞（Sort Deadband）**（CPU/GPU `< 0.2%`、磁盘/网络 `< 16 KiB/s` 在排序前以 `O(N)` 预计算稠密迟滞键 `ProjectionScratch::dense_deadband`，冻结排序同理预计算 `dense_frozen_ranks`，排序比较阶段纯 `O(1)` 索引零哈希查询）；直接复用协调器已解析的 `ParsedQuery` 消除每拍重复词法解析；对 `Details` 静态排序列按进程键签名与 `ColdMetaCache::version` 缓存有序索引跳过稳态 `O(N log N)` 字符串比较；单行构建合并冷缓存查询与 `O(1)` 父索引读取；冷元数据批量回填通过短窗口（默认 `40 ms`）合并发布避免启动期投影风暴；配合跨帧复用缓冲 `ProjectionScratch`（含冲突安全的 `HashGroupIndex` 与 `FoldedKeyArena`）及 `ColdMetaCache` 预计算（`webview2_role`、`webview2_host_exe`、`user_name_short`）。
 - **UI 渲染管线与 `gpui-fast` 协同**：`loom-app` 启用 `gpui-kit` 的 `gpui-fast` 渲染后端（保留子树与局部 Splice、Taffy 布局节点跨帧复用、`NumberShaping` 数字快速整形、GPU Scroll Layers 瓦片缓存与 D3D11 状态去重），并将静态页面工具栏与高频刷新的二维虚拟化 `DataTable`（`Entity<TableState<D>>`）解耦。表体渲染通过以下机制消除热路径分配与无效重绘：
-  - 按主题/版本缓存 19 项 WCAG 语义色（`CachedSemanticColors`）与表头本地化字符串（`*LocaleCache`）；
-  - 指标与热力图列统一使用等宽字体（`mono_font_family`）+ `MetricDisplay`（数值部分严格限定在 `gpui-fast::NumberShaping` 字符集内，辅以静态查找表与有界 `RowTextCache`）；
-  - `CommandLine`/`ExePath` 等长文本列在单元格渲染层按 256 字符做单行安全截断（Tooltip、复制与 CSV 导出仍保留完整文本）；
-  - 表级单一右键捕获结合 `TableColumnLayout::column_index_at_x` 动态定位点击列（替代逐单元格事件监听器）、轻量折叠箭头、空状态微章短路与条件化 `a11y` 拼接；
-  - 基于 `visible_rows_changed`/`visible_columns_changed` 与 `ViewportFingerprint` 的视口脏检查、`O(1)` 选中行重锚定，以及 `ScrollBurstCoalescer`（`150 ms` 静默防抖 / `500 ms` 强制上限，用户主动操作立即旁路）在快速滚动期间保护 `gpui-fast` GPU Scroll Layers 瓦片命中。GPUI 主线程在 `TableDelegate::render_td` 中仅对视口可见行与可见列做 `O(1)` 索引读取（目标 UI 线程单帧 `< 0.5 ms`，交互滚动稳跑 `120 FPS`）。
+  - 按主题/版本缓存 19 项 WCAG 语义色（`CachedSemanticColors`）、表头本地化字符串（`*LocaleCache`）与分组标题计数字符串；
+  - 指标与热力图列统一使用等宽字体（`mono_font_family`）+ `MetricDisplay`（数值部分严格限定在 `gpui-fast::NumberShaping` 字符集内，辅以静态查找表与有界 `RowTextCache`，零热力级别跳过冗余圆角与透明背景样式）；
+  - `CommandLine`/`ExePath` 等长文本列在单元格渲染层按 256 字符做单行安全截断，且仅在内容可能超出列宽截断时按需挂载 `Stateful` ID 与 `Tooltip`（复制与 CSV 导出始终保留完整文本）；纯文本单元格与无徽章名称列压平多余容器嵌套以减少 Taffy 布局节点；
+  - 表级单一右键捕获结合 `TableColumnLayout::column_index_at_x` 动态定位点击列（替代逐单元格事件监听器）、轻量折叠箭头、空状态微章短路、独立表头排序暂停徽章 Entity（悬停冻结切换不触发整表重绘）与条件化 `a11y` 拼接；
+  - 基于 `visible_rows_changed`/`visible_columns_changed` 与 `ViewportFingerprint` 的视口脏检查（程序选中重锚定不自清指纹）、`O(1)` 选中行重锚定，以及 `ScrollBurstCoalescer`（`150 ms` 静默防抖 / `500 ms` 强制上限，用户主动操作立即旁路）在快速滚动期间保护 `gpui-fast` GPU Scroll Layers 瓦片命中。GPUI 主线程在 `TableDelegate::render_td` 中仅对视口可见行与可见列做 `O(1)` 索引读取（目标 UI 线程单帧 `< 0.5 ms`，交互滚动稳跑 `120 FPS`）。
 
 ### 5.2 `gpui-kit` 组件映射
 

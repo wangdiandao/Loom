@@ -1,6 +1,7 @@
 //! Right-aligned resource heatmap table cell widget.
 
 use gpui_kit::component::h_flex;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{IntoElement, ParentElement as _, SharedString, Styled as _};
 
 use crate::format::{HeatmapLevel, MetricDisplay};
@@ -8,8 +9,9 @@ use crate::theme::LoomSemanticColors;
 
 /// Renders a compact, right-aligned table cell tinted according to [`HeatmapLevel`].
 ///
-/// Cells at [`HeatmapLevel::None`] have a transparent background; higher tiers
-/// progressively tint with warm amber/orange hues from [`LoomSemanticColors`].
+/// Cells at [`HeatmapLevel::None`] omit background/radius styling to minimize
+/// paint overhead; higher tiers progressively tint with warm amber/orange hues
+/// from [`LoomSemanticColors`].
 pub fn heatmap_cell(
     text: impl Into<SharedString>,
     level: HeatmapLevel,
@@ -21,8 +23,9 @@ pub fn heatmap_cell(
         .items_center()
         .px_2()
         .py_0p5()
-        .rounded_sm()
-        .bg(colors.heatmap_bg(level))
+        .when(level != HeatmapLevel::None, |d| {
+            d.rounded_sm().bg(colors.heatmap_bg(level))
+        })
         .text_xs()
         .text_color(colors.text_primary)
         .whitespace_nowrap()
@@ -46,8 +49,9 @@ pub fn heatmap_cell_mono(
         .items_center()
         .px_2()
         .py_0p5()
-        .rounded_sm()
-        .bg(colors.heatmap_bg(level))
+        .when(level != HeatmapLevel::None, |d| {
+            d.rounded_sm().bg(colors.heatmap_bg(level))
+        })
         .text_xs()
         .font_family(mono_font)
         .text_color(colors.text_primary)
@@ -73,8 +77,9 @@ pub fn heatmap_cell_metric(
         .items_center()
         .px_2()
         .py_0p5()
-        .rounded_sm()
-        .bg(colors.heatmap_bg(level))
+        .when(level != HeatmapLevel::None, |d| {
+            d.rounded_sm().bg(colors.heatmap_bg(level))
+        })
         .text_xs()
         .font_family(mono_font)
         .text_color(colors.text_primary)
