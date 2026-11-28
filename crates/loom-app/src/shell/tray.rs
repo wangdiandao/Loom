@@ -12,12 +12,15 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 
 use crate::i18n;
 
+const TRAY_MENU_QUICK_OVERVIEW_ID: &str = "loom.tray.quick_overview";
 const TRAY_MENU_SHOW_ID: &str = "loom.tray.show";
 const TRAY_MENU_EXIT_ID: &str = "loom.tray.exit";
 
 /// User interaction events emitted by the OS system tray icon or its context menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrayAction {
+    /// Toggle the lightweight live Quick Overview popover window near the system tray.
+    QuickOverview,
     /// Restore or reopen the main Loom desktop window.
     Show,
     /// Terminate the Loom application cleanly.
@@ -98,6 +101,7 @@ impl Future for NextTrayAction {
 /// Owns the native OS system tray icon and its localized context menu items.
 pub(crate) struct TrayController {
     tray_icon: TrayIcon,
+    quick_overview_item: MenuItem,
     show_item: MenuItem,
     exit_item: MenuItem,
     signal: TrayEventSignal,
@@ -106,10 +110,17 @@ pub(crate) struct TrayController {
 impl TrayController {
     /// Creates and registers the OS system tray icon on the main GUI thread.
     pub(crate) fn new() -> Result<(Self, TrayEventSignal), tray_icon::Error> {
+        let quick_overview_item = MenuItem::with_id(
+            TRAY_MENU_QUICK_OVERVIEW_ID,
+            i18n::tr("tray_overview.menu_item"),
+            true,
+            None,
+        );
         let show_item = MenuItem::with_id(TRAY_MENU_SHOW_ID, i18n::tr("tray.show"), true, None);
         let exit_item = MenuItem::with_id(TRAY_MENU_EXIT_ID, i18n::tr("tray.exit"), true, None);
 
         let menu = Menu::new();
+        let _ = menu.append(&quick_overview_item);
         let _ = menu.append(&show_item);
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&exit_item);
@@ -143,6 +154,7 @@ impl TrayController {
         let menu_signal = signal.clone();
         MenuEvent::set_event_handler(Some(Arc::new(move |event: MenuEvent| {
             match event.id().0.as_str() {
+                TRAY_MENU_QUICK_OVERVIEW_ID => menu_signal.push(TrayAction::QuickOverview),
                 TRAY_MENU_SHOW_ID => menu_signal.push(TrayAction::Show),
                 TRAY_MENU_EXIT_ID => menu_signal.push(TrayAction::Exit),
                 _ => {}
@@ -152,6 +164,7 @@ impl TrayController {
         Ok((
             Self {
                 tray_icon,
+                quick_overview_item,
                 show_item,
                 exit_item,
                 signal: signal.clone(),
@@ -162,6 +175,8 @@ impl TrayController {
 
     /// Re-applies localized strings to the tray tooltip and menu items after a live locale switch.
     pub(crate) fn update_locale(&self) {
+        self.quick_overview_item
+            .set_text(i18n::tr("tray_overview.menu_item"));
         self.show_item.set_text(i18n::tr("tray.show"));
         self.exit_item.set_text(i18n::tr("tray.exit"));
         let _ = self.tray_icon.set_tooltip(Some(i18n::tr("tray.tooltip")));
