@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 use loom_config::AppSettings;
 use loom_engine::{
-    CommandKind, CommandSuccess, EngineCommand, EngineConfig, EngineCoordinator, ProjectionEngine,
-    ViewProjectionConfig,
+    CommandKind, CommandSuccess, EngineCommand, EngineConfig, EngineCoordinator,
+    LeakDetectorConfig, ProjectionEngine, ViewProjectionConfig,
 };
 use loom_pal_api::{
     AppHistoryReader, FastSystemSampler, PalError, PerfSampleScratch, PlatformBackend,
@@ -18,14 +18,16 @@ use loom_pal_api::{
     SystemOperator,
 };
 use loom_types::{
-    AppHistoryRecord, CapabilityFlags, CpuAffinityMask, CpuStaticInfo, DetailsViewMode,
-    DiskDeviceSample, DiskMediaType, ExeIconRgba, ExeStaticAsset, GpuAdapterSample,
-    GpuEngineSample, HardwareStaticInfo, MemoryHardwareInfo, MonitorDomain, NetAdapterSample,
-    NetConnectionType, PlatformProfile, ProcessArch, ProcessCategory, ProcessColdMeta,
-    ProcessHotSample, ProcessKey, ProcessPriority, ProcessRowKind, ProcessSortColumn,
-    ProcessStatusFlags, ProcessViewMode, RefreshSpeed, RunTaskRequest, ServiceRecord, ServiceState,
+    AppHistoryRecord, CapabilityFlags, CpuAffinityMask, CpuCoreKind, CpuStaticInfo,
+    DetailsSortColumn, DetailsViewMode, DiskDeviceSample, DiskMediaType, ExeIconRgba,
+    ExeStaticAsset, FileLockHolder, GpuAdapterSample, GpuEngineSample, HardwareStaticInfo,
+    HistoryRing, LeakKind, MemoryHardwareInfo, MonitorDomain, NetAdapterSample, NetConnectionType,
+    PlatformProfile, ProcessArch, ProcessCategory, ProcessColdMeta, ProcessHotSample, ProcessKey,
+    ProcessPriority, ProcessRowKind, ProcessSocketRecord, ProcessSortColumn, ProcessStatusFlags,
+    ProcessViewMode, RefreshSpeed, RunTaskRequest, ServiceRecord, ServiceState, SocketProtocol,
     SortDirection, StartupEntry, StartupImpact, SystemPerfSample, Timestamp100Ns, TreeKillItem,
     TreeKillReport, UacVirtualization, UserSessionRecord, UserSessionState, WaitChainNode,
+    WebView2Role,
 };
 use parking_lot::Mutex;
 
@@ -44,8 +46,10 @@ struct MockProcSpec {
     net_bytes: u64,
     net_delta_per_tick: u64,
     private_mem_bytes: u64,
+    handle_count: u32,
     status: ProcessStatusFlags,
     exe_path: Option<String>,
+    command_line: Option<String>,
 }
 
 impl MockProcSpec {
@@ -64,8 +68,10 @@ impl MockProcSpec {
             net_bytes: 0,
             net_delta_per_tick: 0,
             private_mem_bytes: 32 * 1024 * 1024,
+            handle_count: 64,
             status: ProcessStatusFlags::empty(),
             exe_path: None,
+            command_line: None,
         }
     }
 }
@@ -76,6 +82,8 @@ struct MockMgmtState {
     list_startup_calls: AtomicUsize,
     list_sessions_calls: AtomicUsize,
     read_history_calls: AtomicUsize,
+    save_history_calls: AtomicUsize,
+    saved_history_snapshots: Mutex<Vec<(u64, Vec<AppHistoryRecord>)>>,
     open_console_calls: AtomicUsize,
     services: Mutex<Vec<ServiceRecord>>,
     startup_bios_ms: Mutex<Option<u64>>,
@@ -90,12 +98,20 @@ struct MockMgmtState {
 
 struct MockState {
     procs: Vec<MockProcSpec>,
+    dynamic_mem_override: Mutex<HashMap<ProcessKey, u64>>,
     current_ts: u64,
     ts_step_100ns: u64,
+    extra_ts_jump_100ns: Mutex<u64>,
     logical_cpus: u32,
     mem_total_bytes: u64,
     sample_proc_calls: AtomicUsize,
     sample_perf_calls: AtomicUsize,
+    fail_next_perf_sample: AtomicBool,
+    gpu_d3_asleep: AtomicBool,
+    core_kinds: Mutex<Vec<CpuCoreKind>>,
+    per_proc_net_transitions: Mutex<Vec<bool>>,
+    list_ports_calls: AtomicUsize,
+    listening_ports: Mutex<Vec<ProcessSocketRecord>>,
     probe_proc_calls: AtomicUsize,
     probe_asset_calls: AtomicUsize,
     probe_asset_slow_calls: AtomicUsize,
@@ -108,6 +124,11 @@ struct MockState {
     slow_probe_sleep: Duration,
     slow_probe_release: Option<Receiver<()>>,
     recorded_tree_kills: Mutex<Vec<Vec<ProcessKey>>>,
+    suspended_keys: Mutex<Vec<ProcessKey>>,
+    resumed_keys: Mutex<Vec<ProcessKey>>,
+    suspend_error_elevation: AtomicBool,
+    restart_explorer_calls: AtomicUsize,
+    file_locks_result: Mutex<Vec<FileLockHolder>>,
     priorities: Mutex<HashMap<ProcessKey, ProcessPriority>>,
     browse_result: Mutex<Option<PathBuf>>,
     terminate_error_elevation: AtomicBool,
@@ -122,14 +143,26 @@ struct MockState {
 
 impl MockState {
     fn new(procs: Vec<MockProcSpec>) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new(Self::new_raw(procs))
+    }
+
+    fn new_raw(procs: Vec<MockProcSpec>) -> Self {
+        Self {
             procs,
+            dynamic_mem_override: Mutex::new(HashMap::new()),
             current_ts: 100_000_000,
             ts_step_100ns: 2_500_000, // 250 ms per tick
+            extra_ts_jump_100ns: Mutex::new(0),
             logical_cpus: 4,
             mem_total_bytes: 16 * 1024 * 1024 * 1024,
             sample_proc_calls: AtomicUsize::new(0),
             sample_perf_calls: AtomicUsize::new(0),
+            fail_next_perf_sample: AtomicBool::new(false),
+            gpu_d3_asleep: AtomicBool::new(false),
+            core_kinds: Mutex::new(Vec::new()),
+            per_proc_net_transitions: Mutex::new(Vec::new()),
+            list_ports_calls: AtomicUsize::new(0),
+            listening_ports: Mutex::new(Vec::new()),
             probe_proc_calls: AtomicUsize::new(0),
             probe_asset_calls: AtomicUsize::new(0),
             probe_asset_slow_calls: AtomicUsize::new(0),
@@ -142,6 +175,11 @@ impl MockState {
             slow_probe_sleep: Duration::ZERO,
             slow_probe_release: None,
             recorded_tree_kills: Mutex::new(Vec::new()),
+            suspended_keys: Mutex::new(Vec::new()),
+            resumed_keys: Mutex::new(Vec::new()),
+            suspend_error_elevation: AtomicBool::new(false),
+            restart_explorer_calls: AtomicUsize::new(0),
+            file_locks_result: Mutex::new(Vec::new()),
             priorities: Mutex::new(HashMap::new()),
             browse_result: Mutex::new(None),
             terminate_error_elevation: AtomicBool::new(false),
@@ -152,7 +190,7 @@ impl MockState {
             minidump_sleep: Duration::ZERO,
             is_elevated: AtomicBool::new(false),
             mgmt: MockMgmtState::default(),
-        })
+        }
     }
 }
 
@@ -209,7 +247,10 @@ impl FastSystemSampler for MockFastSampler {
         self.tick += 1;
         self.state.sample_proc_calls.fetch_add(1, Ordering::AcqRel);
 
-        let ts = Timestamp100Ns::new(self.state.current_ts + tick * self.state.ts_step_100ns);
+        let extra_jump = *self.state.extra_ts_jump_100ns.lock();
+        let ts = Timestamp100Ns::new(
+            self.state.current_ts + tick * self.state.ts_step_100ns + extra_jump,
+        );
         scratch.perf = SystemPerfSample {
             timestamp: ts,
             logical_cpu_count: self.state.logical_cpus,
@@ -220,12 +261,17 @@ impl FastSystemSampler for MockFastSampler {
             ..SystemPerfSample::default()
         };
 
+        let mem_overrides = self.state.dynamic_mem_override.lock().clone();
         for spec in &self.state.procs {
             let (name_offset, name_len) = scratch.push_str(&spec.name);
             let (window_title_offset, window_title_len) = scratch.push_str(&spec.window_title);
             let cpu = spec.cpu_time_100ns + tick * spec.cpu_delta_per_tick;
             let disk = spec.disk_bytes + tick * spec.disk_delta_per_tick;
             let net = spec.net_bytes + tick * spec.net_delta_per_tick;
+            let private_mem = mem_overrides
+                .get(&spec.key)
+                .copied()
+                .unwrap_or(spec.private_mem_bytes);
             let priority = self
                 .state
                 .priorities
@@ -238,12 +284,12 @@ impl FastSystemSampler for MockFastSampler {
                 parent_pid: spec.parent_pid,
                 session_id: spec.session_id,
                 thread_count: 4,
-                handle_count: 64,
+                handle_count: spec.handle_count,
                 kernel_time_100ns: cpu / 2,
                 user_time_100ns: cpu - cpu / 2,
-                private_working_set_bytes: spec.private_mem_bytes,
-                working_set_bytes: spec.private_mem_bytes,
-                commit_bytes: spec.private_mem_bytes,
+                private_working_set_bytes: private_mem,
+                working_set_bytes: private_mem,
+                commit_bytes: private_mem,
                 disk_read_bytes: disk,
                 net_recv_bytes: net,
                 category: spec.category,
@@ -265,6 +311,16 @@ impl FastSystemSampler for MockFastSampler {
         scratch: &mut PerfSampleScratch,
     ) -> Result<Timestamp100Ns, PalError> {
         let calls = self.state.sample_perf_calls.fetch_add(1, Ordering::AcqRel) as u64;
+        if self
+            .state
+            .fail_next_perf_sample
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(PalError::OsError {
+                code: -1,
+                message: "injected perf sampling error".into(),
+            });
+        }
         let ts = Timestamp100Ns::new(self.state.current_ts + calls * self.state.ts_step_100ns);
         scratch.sample = SystemPerfSample {
             timestamp: ts,
@@ -314,7 +370,7 @@ impl FastSystemSampler for MockFastSampler {
             dedicated_total_bytes: 8 * 1024 * 1024 * 1024,
             shared_used_bytes: 512 * 1024 * 1024,
             shared_total_bytes: 8 * 1024 * 1024 * 1024,
-            d3_asleep: false,
+            d3_asleep: self.state.gpu_d3_asleep.load(Ordering::Acquire),
             engines: vec![
                 GpuEngineSample {
                     name: Arc::from("3D"),
@@ -328,11 +384,15 @@ impl FastSystemSampler for MockFastSampler {
         });
         Ok(ts)
     }
+
+    fn set_per_process_network_enabled(&mut self, enabled: bool) {
+        self.state.per_proc_net_transitions.lock().push(enabled);
+    }
 }
 
 struct MockSlowProber {
     state: Arc<MockState>,
-    by_key: HashMap<ProcessKey, Option<String>>,
+    by_key: HashMap<ProcessKey, (Option<String>, Option<String>)>,
 }
 
 impl SlowMetadataProber for MockSlowProber {
@@ -345,17 +405,14 @@ impl SlowMetadataProber for MockSlowProber {
                 std::thread::sleep(self.state.slow_probe_sleep);
             }
         }
-        let exe_path = self
-            .by_key
-            .get(&key)
-            .cloned()
-            .flatten()
-            .map(Arc::<str>::from);
+        let (exe_opt, cmd_opt) = self.by_key.get(&key).cloned().unwrap_or((None, None));
+        let exe_path = exe_opt.map(Arc::<str>::from);
+        let command_line = Some(Arc::<str>::from(cmd_opt.as_deref().unwrap_or("--mock-arg")));
 
         Ok(ProcessColdMeta {
             key,
             exe_path,
-            command_line: Some(Arc::from("--mock-arg")),
+            command_line,
             user_name: Some(Arc::from("TEST\\User")),
             arch: ProcessArch::X64,
             uac_virtualization: UacVirtualization::NotAllowed,
@@ -404,7 +461,7 @@ impl SlowMetadataProber for MockSlowProber {
                 l1_cache_bytes: 512 * 1024,
                 l2_cache_bytes: 4 * 1024 * 1024,
                 l3_cache_bytes: 32 * 1024 * 1024,
-                core_kinds: Vec::new(),
+                core_kinds: self.state.core_kinds.lock().clone(),
             },
             memory: MemoryHardwareInfo {
                 speed_mt_s: Some(6000),
@@ -433,6 +490,11 @@ impl SlowMetadataProber for MockSlowProber {
             avg_response_us: 350,
             circuit_open: false,
         }])
+    }
+
+    fn list_listening_ports(&self) -> Result<Vec<ProcessSocketRecord>, PalError> {
+        self.state.list_ports_calls.fetch_add(1, Ordering::AcqRel);
+        Ok(self.state.listening_ports.lock().clone())
     }
 }
 
@@ -585,6 +647,24 @@ impl AppHistoryReader for MockHistory {
         self.state.mgmt.history_items.lock().clear();
         Ok(())
     }
+    fn save_history(
+        &self,
+        since_epoch_secs: u64,
+        records: &[AppHistoryRecord],
+    ) -> Result<(), PalError> {
+        self.state
+            .mgmt
+            .save_history_calls
+            .fetch_add(1, Ordering::AcqRel);
+        *self.state.mgmt.history_since.lock() = Some(since_epoch_secs);
+        *self.state.mgmt.history_items.lock() = records.to_vec();
+        self.state
+            .mgmt
+            .saved_history_snapshots
+            .lock()
+            .push((since_epoch_secs, records.to_vec()));
+        Ok(())
+    }
 }
 
 struct MockOperator {
@@ -665,6 +745,26 @@ impl SystemOperator for MockOperator {
         self.state.debugger_attached_keys.lock().push(key);
         Ok(())
     }
+    fn suspend_process(&self, key: ProcessKey) -> Result<(), PalError> {
+        if self.state.suspend_error_elevation.load(Ordering::Acquire) {
+            return Err(PalError::ElevationRequired);
+        }
+        self.state.suspended_keys.lock().push(key);
+        Ok(())
+    }
+    fn resume_process(&self, key: ProcessKey) -> Result<(), PalError> {
+        self.state.resumed_keys.lock().push(key);
+        Ok(())
+    }
+    fn restart_explorer(&self) -> Result<(), PalError> {
+        self.state
+            .restart_explorer_calls
+            .fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+    fn find_file_locks(&self, _path: &Path) -> Result<Vec<FileLockHolder>, PalError> {
+        Ok(self.state.file_locks_result.lock().clone())
+    }
     fn relaunch_self_elevated(&self, _restore_route: &str) -> Result<(), PalError> {
         Ok(())
     }
@@ -720,7 +820,7 @@ impl PlatformBackend for MockBackend {
             .state
             .procs
             .iter()
-            .map(|p| (p.key, p.exe_path.clone()))
+            .map(|p| (p.key, (p.exe_path.clone(), p.command_line.clone())))
             .collect();
         Ok(MockSlowProber {
             state: Arc::clone(&self.state),
@@ -988,35 +1088,10 @@ fn slow_disk_5s_fault_injection_never_blocks_fast_lane_or_shutdown() {
     let fast_proc = MockProcSpec::new(501, 1_001, 0, "fast_app.exe");
 
     let state = Arc::new(MockState {
-        procs: vec![slow_proc, fast_proc],
-        current_ts: 100_000_000,
-        ts_step_100ns: 2_500_000,
-        logical_cpus: 4,
-        mem_total_bytes: 16 * 1024 * 1024 * 1024,
-        sample_proc_calls: AtomicUsize::new(0),
-        sample_perf_calls: AtomicUsize::new(0),
-        probe_proc_calls: AtomicUsize::new(0),
-        probe_asset_calls: AtomicUsize::new(0),
-        probe_asset_slow_calls: AtomicUsize::new(0),
-        probe_hw_calls: AtomicUsize::new(0),
-        probe_disk_calls: AtomicUsize::new(0),
-        disk_probe_sleep: Duration::ZERO,
-        exe_asset_slow_prefix: None,
-        exe_asset_sleep: Duration::ZERO,
         slow_probe_block_pid: Some(500),
         slow_probe_sleep: Duration::from_secs(5),
         slow_probe_release: Some(release_rx),
-        recorded_tree_kills: Mutex::new(Vec::new()),
-        priorities: Mutex::new(HashMap::new()),
-        browse_result: Mutex::new(None),
-        terminate_error_elevation: AtomicBool::new(false),
-        uac_error_elevation: AtomicBool::new(false),
-        debugger_error_elevation: AtomicBool::new(false),
-        debugger_attached_keys: Mutex::new(Vec::new()),
-        wait_chain_nodes: Mutex::new(Vec::new()),
-        minidump_sleep: Duration::ZERO,
-        is_elevated: AtomicBool::new(false),
-        mgmt: MockMgmtState::default(),
+        ..MockState::new_raw(vec![slow_proc, fast_proc])
     });
 
     let backend = MockBackend::from_state(Arc::clone(&state));
@@ -1660,35 +1735,8 @@ fn performance_lease_gates_hardware_and_disk_polling_and_populates_60_point_hist
 #[test]
 fn slow_disk_probe_400ms_never_blocks_fast_lane_and_deduplicates_polls() {
     let state = Arc::new(MockState {
-        procs: vec![MockProcSpec::new(20, 100, 0, "worker.exe")],
-        current_ts: 100_000_000,
-        ts_step_100ns: 2_500_000,
-        logical_cpus: 4,
-        mem_total_bytes: 16 * 1024 * 1024 * 1024,
-        sample_proc_calls: AtomicUsize::new(0),
-        sample_perf_calls: AtomicUsize::new(0),
-        probe_proc_calls: AtomicUsize::new(0),
-        probe_asset_calls: AtomicUsize::new(0),
-        probe_asset_slow_calls: AtomicUsize::new(0),
-        probe_hw_calls: AtomicUsize::new(0),
-        probe_disk_calls: AtomicUsize::new(0),
         disk_probe_sleep: Duration::from_millis(400),
-        exe_asset_slow_prefix: None,
-        exe_asset_sleep: Duration::ZERO,
-        slow_probe_block_pid: None,
-        slow_probe_sleep: Duration::ZERO,
-        slow_probe_release: None,
-        recorded_tree_kills: Mutex::new(Vec::new()),
-        priorities: Mutex::new(HashMap::new()),
-        browse_result: Mutex::new(None),
-        terminate_error_elevation: AtomicBool::new(false),
-        uac_error_elevation: AtomicBool::new(false),
-        debugger_error_elevation: AtomicBool::new(false),
-        debugger_attached_keys: Mutex::new(Vec::new()),
-        wait_chain_nodes: Mutex::new(Vec::new()),
-        minidump_sleep: Duration::ZERO,
-        is_elevated: AtomicBool::new(false),
-        mgmt: MockMgmtState::default(),
+        ..MockState::new_raw(vec![MockProcSpec::new(20, 100, 0, "worker.exe")])
     });
 
     let backend = MockBackend::from_state(Arc::clone(&state));
@@ -2839,4 +2887,645 @@ fn steady_state_dormancy_and_unleased_domains_zero_overhead_test() {
     assert_eq!(state.mgmt.read_history_calls.load(Ordering::Acquire), 0);
 
     coord.shutdown();
+}
+
+#[test]
+fn snapshot_wake_signal_fires_on_publish_and_command_events_and_closes_on_shutdown() {
+    let p1 = MockProcSpec::new(100, 10, 0, "worker.exe");
+    let state = MockState::new(vec![p1]);
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let coord = EngineCoordinator::with_config(backend, settings, EngineConfig::default()).unwrap();
+
+    let wake_rx = coord.subscribe_snapshot_wake();
+    let cb_hits = Arc::new(AtomicUsize::new(0));
+    let cb_counter = Arc::clone(&cb_hits);
+    coord.set_snapshot_waker(Arc::new(move || {
+        cb_counter.fetch_add(1, Ordering::AcqRel);
+    }));
+    // Drain any initial pending signal from Tick 0.
+    while wake_rx.try_recv().is_ok() {}
+    let hits_before = cb_hits.load(Ordering::Acquire);
+
+    // ForceRefresh publishes a new snapshot -> must wake both channel & callback immediately.
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(
+        wake_rx.recv_timeout(Duration::from_secs(1)).is_ok(),
+        "snapshot publication must notify subscribe_snapshot_wake receiver"
+    );
+    assert!(cb_hits.load(Ordering::Acquire) > hits_before);
+
+    // CommandEvent emission (even without snapshot publish) must also trigger wake signal.
+    while wake_rx.try_recv().is_ok() {}
+    let hits_before_ev = cb_hits.load(Ordering::Acquire);
+    let ev = coord
+        .send_command_with_reply(EngineCommand::TerminateProcess(ProcessKey::new(100, 10)))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(ev.is_ok());
+    assert!(
+        wake_rx.recv_timeout(Duration::from_secs(1)).is_ok(),
+        "CommandEvent emission must trigger snapshot wake signal"
+    );
+    assert!(cb_hits.load(Ordering::Acquire) > hits_before_ev);
+
+    // Shutdown closes the wake channel cleanly.
+    coord.shutdown();
+    while wake_rx.try_recv().is_ok() {}
+    assert!(wake_rx.recv_timeout(Duration::from_secs(1)).is_err());
+}
+
+#[test]
+fn order_freeze_temp_freeze_and_force_refresh_work_without_clobbering_refresh_speed() {
+    let mut p1 = MockProcSpec::new(101, 10, 0, "alpha.exe");
+    p1.private_mem_bytes = 500 * 1024 * 1024;
+    let mut p2 = MockProcSpec::new(102, 10, 0, "beta.exe");
+    p2.private_mem_bytes = 100 * 1024 * 1024;
+    let k1 = p1.key;
+    let k2 = p2.key;
+
+    let state = MockState::new(vec![p1, p2]);
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let coord = EngineCoordinator::with_config(backend, settings, EngineConfig::default()).unwrap();
+    let _details_lease = coord.acquire_lease(MonitorDomain::Details);
+
+    coord
+        .send_command_with_reply(EngineCommand::SetProcessSort {
+            column: ProcessSortColumn::Memory,
+            direction: SortDirection::Descending,
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    coord
+        .send_command_with_reply(EngineCommand::SetDetailsSort {
+            column: DetailsSortColumn::Memory,
+            direction: SortDirection::Descending,
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    // Freeze both Processes & Details row order while alpha > beta.
+    coord
+        .send_command_with_reply(EngineCommand::SetProcessOrderFreeze(true))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    coord
+        .send_command_with_reply(EngineCommand::SetDetailsOrderFreeze(true))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    // Flip live memory so beta (900 MiB) > alpha (50 MiB) and ForceRefresh while Paused.
+    {
+        let mut ov = state.dynamic_mem_override.lock();
+        ov.insert(k1, 50 * 1024 * 1024);
+        ov.insert(k2, 900 * 1024 * 1024);
+    }
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    let snap = coord.snapshot();
+    let proc_rows: Vec<(ProcessKey, u64)> = snap
+        .processes
+        .rows
+        .iter()
+        .filter(|r| r.kind == ProcessRowKind::Process)
+        .map(|r| (r.key, r.memory_bytes))
+        .collect();
+    assert_eq!(
+        proc_rows,
+        vec![(k1, 50 * 1024 * 1024), (k2, 900 * 1024 * 1024)],
+        "frozen Processes order must stay k1 -> k2 while live metrics update"
+    );
+    let det_rows: Vec<(ProcessKey, u64)> = snap
+        .details
+        .rows
+        .iter()
+        .map(|r| (r.key, r.private_working_set_bytes))
+        .collect();
+    assert_eq!(
+        det_rows,
+        vec![(k1, 50 * 1024 * 1024), (k2, 900 * 1024 * 1024)],
+        "frozen Details order must stay k1 -> k2 while live metrics update"
+    );
+
+    // Unfreezing immediately re-sorts k2 ahead of k1.
+    coord
+        .send_command_with_reply(EngineCommand::SetProcessOrderFreeze(false))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    coord
+        .send_command_with_reply(EngineCommand::SetDetailsOrderFreeze(false))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let unfrozen = coord.snapshot();
+    let proc_keys: Vec<ProcessKey> = unfrozen
+        .processes
+        .rows
+        .iter()
+        .filter(|r| r.kind == ProcessRowKind::Process)
+        .map(|r| r.key)
+        .collect();
+    assert_eq!(proc_keys, vec![k2, k1]);
+    assert_eq!(
+        unfrozen
+            .details
+            .rows
+            .iter()
+            .map(|r| r.key)
+            .collect::<Vec<_>>(),
+        vec![k2, k1]
+    );
+
+    // SetTempFreeze(true) -> SetTempFreeze(false) while RefreshSpeed::Paused must STAY paused!
+    let calls_before = state.sample_proc_calls.load(Ordering::Acquire);
+    coord
+        .send_command_with_reply(EngineCommand::SetTempFreeze(true))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    coord
+        .send_command_with_reply(EngineCommand::SetTempFreeze(false))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(120));
+    assert_eq!(
+        state.sample_proc_calls.load(Ordering::Acquire),
+        calls_before,
+        "releasing SetTempFreeze must not resume sampling when RefreshSpeed::Paused"
+    );
+
+    coord.shutdown();
+}
+
+#[test]
+fn structured_port_search_is_strictly_on_demand_and_hide_system_filter_works() {
+    let mut node_proc = MockProcSpec::new(3000, 10, 0, "node.exe");
+    node_proc.category = ProcessCategory::Background;
+    let mut sys_proc = MockProcSpec::new(400, 10, 0, "svchost.exe");
+    sys_proc.category = ProcessCategory::System;
+    let mut shell_proc = MockProcSpec::new(401, 10, 0, "pwsh.exe");
+    shell_proc.category = ProcessCategory::System;
+
+    let state = MockState::new(vec![node_proc, sys_proc, shell_proc]);
+    state.listening_ports.lock().push(ProcessSocketRecord {
+        protocol: SocketProtocol::Tcp,
+        local_addr: Arc::from("0.0.0.0"),
+        local_port: 3000,
+        remote_addr: None,
+        remote_port: None,
+        state: Arc::from("LISTEN"),
+        pid: 3000,
+    });
+
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let coord = EngineCoordinator::with_config(backend, settings, EngineConfig::default()).unwrap();
+
+    // Normal search query MUST NOT trigger any listening port scans.
+    coord
+        .send_command_with_reply(EngineCommand::SetSearchQuery("node".into()))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(
+        state.list_ports_calls.load(Ordering::Acquire),
+        0,
+        "non-port search must incur strictly 0 port scans"
+    );
+
+    // Switching to `:3000` dispatches slow-lane `list_listening_ports()` and matches PID 3000.
+    coord
+        .send_command_with_reply(EngineCommand::SetSearchQuery(":3000".into()))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            let snap = coord.snapshot();
+            snap.processes
+                .rows
+                .iter()
+                .any(|r| r.kind == ProcessRowKind::Process && r.key.pid == 3000)
+        }),
+        "on-demand `:3000` query must resolve and display owning process PID 3000"
+    );
+    assert_eq!(state.list_ports_calls.load(Ordering::Acquire), 1);
+
+    // Clearing the port query stops future port scans and tests `SetHideSystemProcesses(true)`.
+    coord
+        .send_command_with_reply(EngineCommand::SetSearchQuery(String::new()))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    coord
+        .send_command_with_reply(EngineCommand::SetHideSystemProcesses(true))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let snap = coord.snapshot();
+    assert!(
+        !snap
+            .processes
+            .rows
+            .iter()
+            .any(|r| r.name.as_ref() == "svchost.exe"),
+        "svchost.exe must be hidden when hide_windows_system_processes is enabled"
+    );
+    assert!(
+        snap.processes
+            .rows
+            .iter()
+            .any(|r| r.name.as_ref() == "pwsh.exe"),
+        "interactive shell pwsh.exe must remain visible"
+    );
+
+    coord.shutdown();
+}
+
+#[test]
+fn performance_gap_sentinels_d3_asleep_and_core_kinds_propagate_accurately() {
+    let p1 = MockProcSpec::new(100, 10, 0, "app.exe");
+    let state = MockState::new(vec![p1]);
+    state.gpu_d3_asleep.store(true, Ordering::Release);
+    *state.core_kinds.lock() = vec![
+        CpuCoreKind::Performance,
+        CpuCoreKind::Performance,
+        CpuCoreKind::Efficiency,
+        CpuCoreKind::LowPowerEfficiency,
+    ];
+
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let coord = EngineCoordinator::with_config(backend, settings, EngineConfig::default()).unwrap();
+    let _perf_lease = coord.acquire_lease(MonitorDomain::Performance);
+
+    // Wait for hardware static info and initial perf tick.
+    assert!(wait_until(Duration::from_secs(2), || {
+        let s = coord.snapshot();
+        !s.performance.cpu_info.core_kinds.is_empty() && !s.performance.gpus.is_empty()
+    }));
+
+    let s0 = coord.snapshot();
+    assert_eq!(
+        s0.performance.cpu_info.core_kinds,
+        vec![
+            CpuCoreKind::Performance,
+            CpuCoreKind::Performance,
+            CpuCoreKind::Efficiency,
+            CpuCoreKind::LowPowerEfficiency,
+        ]
+    );
+    assert!(s0.performance.gpus[0].d3_asleep);
+    assert!(
+        !s0.performance
+            .cpu_history
+            .iter_ordered()
+            .any(HistoryRing::<60>::is_gap),
+        "initial samples must not contain spurious gap sentinels"
+    );
+
+    // 1. Resuming from RefreshSpeed::Paused inserts a gap sentinel on next tick.
+    coord
+        .send_command_with_reply(EngineCommand::SetRefreshSpeed(RefreshSpeed::Low2S))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let gaps_after_resume = coord
+        .snapshot()
+        .performance
+        .cpu_history
+        .iter_ordered()
+        .filter(|&v| HistoryRing::<60>::is_gap(v))
+        .count();
+    assert_eq!(
+        gaps_after_resume, 1,
+        "resuming from Paused must insert exactly one gap sentinel"
+    );
+
+    // 2. Normal refresh speed change (Low2S -> High500Ms) MUST NOT insert a false gap.
+    coord
+        .send_command_with_reply(EngineCommand::SetRefreshSpeed(RefreshSpeed::High500Ms))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let gaps_after_speed_change = coord
+        .snapshot()
+        .performance
+        .cpu_history
+        .iter_ordered()
+        .filter(|&v| HistoryRing::<60>::is_gap(v))
+        .count();
+    assert_eq!(
+        gaps_after_speed_change, 1,
+        "changing refresh speed between non-paused cadences must not insert a gap"
+    );
+
+    // 3. Sampling error inserts a gap sentinel.
+    state.fail_next_perf_sample.store(true, Ordering::Release);
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let gaps_after_error = coord
+        .snapshot()
+        .performance
+        .cpu_history
+        .iter_ordered()
+        .filter(|&v| HistoryRing::<60>::is_gap(v))
+        .count();
+    assert_eq!(
+        gaps_after_error, 2,
+        "performance sampling error must insert a gap sentinel"
+    );
+
+    // Recover with one normal tick before simulating a clock jump so gaps are separated by real data.
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    // 4. Timestamp jump > 5s (simulating system sleep / clock jump) inserts a gap sentinel.
+    *state.extra_ts_jump_100ns.lock() = 100_000_000; // +10 seconds
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let gaps_after_jump = coord
+        .snapshot()
+        .performance
+        .cpu_history
+        .iter_ordered()
+        .filter(|&v| HistoryRing::<60>::is_gap(v))
+        .count();
+    assert_eq!(
+        gaps_after_jump, 3,
+        "elapsed timestamp jump > 5s must insert a gap sentinel"
+    );
+
+    coord.shutdown();
+}
+
+#[test]
+fn new_process_controls_file_locks_etw_lease_and_app_history_save_work_end_to_end() {
+    let mut app = MockProcSpec::new(500, 10, 0, "app.exe");
+    app.category = ProcessCategory::App;
+    app.cpu_delta_per_tick = 2_000_000;
+    app.handle_count = 100_500; // triggers immediate critical handle leak warning
+    app.exe_path = Some(r"C:\Apps\app.exe".to_owned());
+
+    let mut wv = MockProcSpec::new(501, 20, 500, "msedgewebview2.exe");
+    wv.command_line =
+        Some(r#"msedgewebview2.exe --type=gpu-process --webview-exe-name=app.exe"#.to_owned());
+
+    let app_key = app.key;
+    let wv_key = wv.key;
+    let state = MockState::new(vec![app, wv]);
+    state.file_locks_result.lock().push(FileLockHolder {
+        pid: 500,
+        app_name: Arc::from("Mock Editor"),
+        service_name: None,
+        app_type: Arc::from("MainWindow"),
+        restartable: true,
+    });
+
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let config = EngineConfig {
+        app_history_flush_interval: Duration::from_millis(10),
+        leak_detector: LeakDetectorConfig {
+            check_interval: Duration::ZERO,
+            sustain_window: Duration::from_secs(600),
+        },
+        ..EngineConfig::default()
+    };
+    let coord = EngineCoordinator::with_config(backend, settings, config).unwrap();
+
+    // 1. ProcessNetwork lease gating calls set_per_process_network_enabled(true -> false -> true -> false).
+    assert!(state.per_proc_net_transitions.lock().is_empty());
+    let net_lease = coord.acquire_lease(MonitorDomain::ProcessNetwork);
+    assert!(wait_until(Duration::from_secs(1), || {
+        state.per_proc_net_transitions.lock().as_slice() == [true]
+    }));
+    // Dormancy must turn ETW off even while lease is held, then restore on wake.
+    coord
+        .send_command_with_reply(EngineCommand::SetWindowDormant(true))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(
+        state.per_proc_net_transitions.lock().as_slice(),
+        &[true, false]
+    );
+    coord
+        .send_command_with_reply(EngineCommand::SetWindowDormant(false))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(
+        state.per_proc_net_transitions.lock().as_slice(),
+        &[true, false, true]
+    );
+    drop(net_lease);
+    assert!(wait_until(Duration::from_secs(1), || {
+        state.per_proc_net_transitions.lock().as_slice() == [true, false, true, false]
+    }));
+
+    // 2. SuspendProcess (with ElevationRequired propagation), ResumeProcess, RestartExplorer, FindFileLocks.
+    state.suspend_error_elevation.store(true, Ordering::Release);
+    let susp_denied = coord
+        .send_command_with_reply(EngineCommand::SuspendProcess(app_key))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(susp_denied.kind, CommandKind::SuspendProcess);
+    assert!(susp_denied.is_elevation_required());
+
+    state
+        .suspend_error_elevation
+        .store(false, Ordering::Release);
+    let susp_ok = coord
+        .send_command_with_reply(EngineCommand::SuspendProcess(app_key))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(susp_ok.is_ok());
+    assert_eq!(state.suspended_keys.lock().as_slice(), &[app_key]);
+
+    let res_ok = coord
+        .send_command_with_reply(EngineCommand::ResumeProcess(app_key))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(res_ok.is_ok());
+    assert_eq!(state.resumed_keys.lock().as_slice(), &[app_key]);
+
+    let restart_ev = coord
+        .send_command_with_reply(EngineCommand::RestartExplorer)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(restart_ev.kind, CommandKind::RestartExplorer);
+    assert!(restart_ev.is_ok());
+    assert_eq!(state.restart_explorer_calls.load(Ordering::Acquire), 1);
+
+    let locks_ev = coord
+        .send_command_with_reply(EngineCommand::FindFileLocks {
+            path: PathBuf::from(r"C:\Temp\locked.txt"),
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(locks_ev.kind, CommandKind::FindFileLocks);
+    let Some(CommandSuccess::FileLocks(holders)) = locks_ev.outcome.as_ok() else {
+        panic!(
+            "expected CommandSuccess::FileLocks, got {:?}",
+            locks_ev.outcome
+        );
+    };
+    assert_eq!(holders.len(), 1);
+    assert_eq!(holders[0].pid, 500);
+    assert_eq!(holders[0].app_name.as_ref(), "Mock Editor");
+
+    // 3. Leak warnings, IgnoreLeakPath, SetShowLeakWarnings, parent_key, and WebView2 role.
+    assert!(wait_until(Duration::from_secs(2), || {
+        let snap = coord.snapshot();
+        let has_leak = snap.processes.rows.iter().any(|r| {
+            r.key == app_key
+                && r.leak_warning
+                    .as_ref()
+                    .is_some_and(|w| w.kind == LeakKind::Handles)
+        });
+        let has_wv = snap.processes.rows.iter().any(|r| {
+            r.key == wv_key
+                && r.webview2_role == Some(WebView2Role::Gpu)
+                && r.parent_key == Some(app_key)
+        });
+        has_leak && has_wv
+    }));
+
+    coord
+        .send_command_with_reply(EngineCommand::SetShowLeakWarnings(false))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(
+        coord
+            .snapshot()
+            .processes
+            .rows
+            .iter()
+            .find(|r| r.key == app_key)
+            .unwrap()
+            .leak_warning
+            .is_none()
+    );
+    coord
+        .send_command_with_reply(EngineCommand::SetShowLeakWarnings(true))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(
+        coord
+            .snapshot()
+            .processes
+            .rows
+            .iter()
+            .find(|r| r.key == app_key)
+            .unwrap()
+            .leak_warning
+            .is_some()
+    );
+    coord
+        .send_command_with_reply(EngineCommand::IgnoreLeakPath("APP.EXE".into()))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(
+        coord
+            .snapshot()
+            .processes
+            .rows
+            .iter()
+            .find(|r| r.key == app_key)
+            .unwrap()
+            .leak_warning
+            .is_none()
+    );
+
+    // 4. AppHistory periodic save_history while leased AND shutdown flush when dirty.
+    let _hist_lease = coord.acquire_lease(MonitorDomain::AppHistory);
+    std::thread::sleep(Duration::from_millis(20));
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            state.mgmt.save_history_calls.load(Ordering::Acquire) >= 1
+        }),
+        "periodic AppHistory save_history must trigger when leased and dirty"
+    );
+    let saves_before_shutdown = state.mgmt.save_history_calls.load(Ordering::Acquire);
+    // Accumulate one more tick so shutdown has dirty deltas to flush cleanly.
+    drop(_hist_lease);
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    coord.shutdown();
+    assert!(
+        state.mgmt.save_history_calls.load(Ordering::Acquire) > saves_before_shutdown,
+        "shutdown must flush remaining dirty AppHistory via save_history"
+    );
 }

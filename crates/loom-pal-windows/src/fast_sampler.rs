@@ -14,7 +14,9 @@ use std::mem::{size_of, transmute, zeroed};
 use std::ptr;
 use std::sync::OnceLock;
 
-use loom_pal_api::{FastSystemSampler, PalError, PerfSampleScratch, ProcessSampleScratch};
+use loom_pal_api::{
+    FastSystemSampler, PalError, PerfSampleScratch, ProcessSampleScratch, SystemOperator,
+};
 use loom_types::{
     ProcessCategory, ProcessHotSample, ProcessKey, ProcessPriority, ProcessStatusFlags,
     SystemPerfSample, Timestamp100Ns,
@@ -46,7 +48,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use windows_sys::core::BOOL;
 
+use crate::etw_net::EtwProcessNetCollector;
 use crate::handle::{filetime_to_u64, to_wide_null};
+use crate::operator::WindowsSystemOperator;
 use crate::perf::cpu::{populate_memory_list_composition, sample_cpu_frequencies};
 use crate::perf::gpu::GpuPerfSampler;
 use crate::perf::net::NetworkPerfSampler;
@@ -583,8 +587,16 @@ pub struct WindowsFastSampler {
     net_sampler: NetworkPerfSampler,
     /// Fast-lane `DXGI` + `D3DKMT` GPU telemetry sampler.
     gpu_sampler: GpuPerfSampler,
+    /// Optional elevated-only ETW per-process network byte collector (active only when leased).
+    etw_net: Option<EtwProcessNetCollector>,
     /// Cached total logical CPU count across all processor groups.
     logical_cpu_count: u32,
+}
+
+impl Drop for WindowsFastSampler {
+    fn drop(&mut self) {
+        self.etw_net = None;
+    }
 }
 
 impl std::fmt::Debug for WindowsFastSampler {
@@ -626,6 +638,7 @@ impl WindowsFastSampler {
             power_info_buf: vec![PROCESSOR_POWER_INFORMATION::default(); cpu_cap],
             net_sampler: NetworkPerfSampler::new(),
             gpu_sampler: GpuPerfSampler::new(),
+            etw_net: None,
             logical_cpu_count,
         }
     }
@@ -836,6 +849,12 @@ impl FastSystemSampler for WindowsFastSampler {
         // Collect non-blocking top-level window classification & hung status.
         self.collect_visible_windows();
 
+        // Snapshot cumulative ETW per-PID network bytes if elevated ETW collector is active.
+        let etw_totals = self
+            .etw_net
+            .as_ref()
+            .map(EtwProcessNetCollector::snapshot_totals);
+
         let base_ptr = self.raw_proc_buf.as_ptr().cast::<u8>();
         let base_addr = base_ptr as usize;
         let end_addr = base_addr.saturating_add(used_bytes);
@@ -945,6 +964,11 @@ impl FastSystemSampler for WindowsFastSampler {
                     (cat, 0, 0)
                 };
 
+            let (net_recv_bytes, net_sent_bytes) = etw_totals
+                .as_ref()
+                .and_then(|totals| totals.get(&pid).copied())
+                .unwrap_or((0, 0));
+
             let sample = ProcessHotSample {
                 key: ProcessKey::new(pid, create_time_100ns),
                 parent_pid,
@@ -958,8 +982,8 @@ impl FastSystemSampler for WindowsFastSampler {
                 commit_bytes: entry.private_page_count as u64,
                 disk_read_bytes: entry.read_transfer_count.max(0) as u64,
                 disk_write_bytes: entry.write_transfer_count.max(0) as u64,
-                net_recv_bytes: 0,
-                net_sent_bytes: 0,
+                net_recv_bytes,
+                net_sent_bytes,
                 gpu_dedicated_bytes: 0,
                 gpu_shared_bytes: 0,
                 gpu_util_permille: 0,
@@ -1060,6 +1084,32 @@ impl FastSystemSampler for WindowsFastSampler {
         scratch.sample = sample;
 
         Ok(timestamp)
+    }
+
+    fn set_per_process_network_enabled(&mut self, enabled: bool) {
+        if !enabled {
+            self.etw_net = None;
+            return;
+        }
+        if self.etw_net.is_some() {
+            return;
+        }
+        let is_elevated = WindowsSystemOperator.is_elevated();
+        if !is_elevated {
+            return;
+        }
+        let mut collector = EtwProcessNetCollector::new();
+        match collector.start(true) {
+            Ok(()) => {
+                self.etw_net = Some(collector);
+            }
+            Err(err) => {
+                tracing::debug!(
+                    %err,
+                    "per-process ETW network collector unavailable; leaving disabled"
+                );
+            }
+        }
     }
 }
 

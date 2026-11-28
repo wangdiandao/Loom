@@ -83,7 +83,6 @@ pub struct ProcessTree {
     children_keys: Vec<Vec<ProcessKey>>,
     children_indices: Vec<Vec<usize>>,
     roots: Vec<ProcessKey>,
-    root_indices: Vec<usize>,
     state_scratch: Vec<u8>,
     chain_scratch: Vec<usize>,
 }
@@ -110,7 +109,6 @@ impl ProcessTree {
         self.pid_to_idx.clear();
         self.parent_idx.clear();
         self.roots.clear();
-        self.root_indices.clear();
 
         if self.nodes.capacity() < cap {
             self.nodes.reserve(cap - self.nodes.capacity());
@@ -208,7 +206,6 @@ impl ProcessTree {
                 self.children_indices[p_idx].push(idx);
             } else {
                 self.roots.push(key);
-                self.root_indices.push(idx);
             }
         }
     }
@@ -251,11 +248,6 @@ impl ProcessTree {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
-    }
-
-    #[inline]
-    pub(crate) fn root_indices(&self) -> &[usize] {
-        &self.root_indices
     }
 
     #[inline]
