@@ -22,6 +22,7 @@ pub mod fast_sampler;
 pub mod filelock;
 pub(crate) mod handle;
 pub mod hotkey;
+pub(crate) mod install_guard;
 pub mod instance;
 pub mod operator;
 pub mod perf;

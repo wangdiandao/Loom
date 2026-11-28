@@ -747,6 +747,49 @@ pub fn format_opt_temp_celsius(val: Option<i16>, sleeping: bool) -> SharedString
     }
 }
 
+/// Formats an optional power draw in milliwatts as watts with one decimal place
+/// (e.g., `42_500` -> `"42.5 W"`), or [`UNAVAILABLE_LABEL`] (`"—"`) when sleeping
+/// or unavailable.
+#[inline]
+pub fn format_opt_power_mw(val: Option<u32>, sleeping: bool) -> SharedString {
+    if sleeping {
+        return SharedString::new_static(UNAVAILABLE_LABEL);
+    }
+    match val {
+        Some(mw) if mw > 0 => {
+            let tenths_w = (u64::from(mw) + 50) / 100;
+            SharedString::from(format!("{}.{} W", tenths_w / 10, tenths_w % 10))
+        }
+        _ => SharedString::new_static(UNAVAILABLE_LABEL),
+    }
+}
+
+/// Formats an optional fan speed percentage (`0..=100` -> `"45%"`), or
+/// [`UNAVAILABLE_LABEL`] (`"—"`) when sleeping or unavailable.
+#[inline]
+pub fn format_opt_fan_percent(val: Option<u8>, sleeping: bool) -> SharedString {
+    if sleeping {
+        return SharedString::new_static(UNAVAILABLE_LABEL);
+    }
+    match val {
+        Some(pct) if pct <= 100 => SharedString::from(format!("{pct}%")),
+        _ => SharedString::new_static(UNAVAILABLE_LABEL),
+    }
+}
+
+/// Formats an optional clock frequency in MHz (e.g., `2130` -> `"2130 MHz"`),
+/// or [`UNAVAILABLE_LABEL`] (`"—"`) when sleeping or unavailable.
+#[inline]
+pub fn format_opt_clock_mhz(val: Option<u32>, sleeping: bool) -> SharedString {
+    if sleeping {
+        return SharedString::new_static(UNAVAILABLE_LABEL);
+    }
+    match val {
+        Some(mhz) if mhz > 0 => SharedString::from(format!("{mhz} MHz")),
+        _ => SharedString::new_static(UNAVAILABLE_LABEL),
+    }
+}
+
 /// Zero-allocation fast-path byte formatter returning a [`SharedString`].
 #[inline]
 pub fn format_bytes_shared(bytes: u64) -> SharedString {

@@ -320,6 +320,14 @@ pub struct GpuAdapterSample {
     pub pci_location: Option<Arc<str>>,
     /// Core temperature in whole degrees Celsius if exposed by the driver.
     pub temperature_celsius: Option<i16>,
+    /// Optional board power draw in milliwatts (e.g., driverless user-mode NVML).
+    pub power_draw_mw: Option<u32>,
+    /// Optional primary fan speed percentage (`0..=100`).
+    pub fan_speed_percent: Option<u8>,
+    /// Optional graphics/core clock in MHz.
+    pub core_clock_mhz: Option<u32>,
+    /// Optional memory clock in MHz.
+    pub memory_clock_mhz: Option<u32>,
     /// Overall adapter utilization in permille (`0..=1000`), typically the max engine load.
     pub util_permille: u16,
     /// Dedicated video memory currently in use in bytes.
@@ -353,6 +361,14 @@ pub struct GpuAdapterSlice {
     pub pci_location: Option<Arc<str>>,
     /// Core temperature in whole degrees Celsius if exposed by the driver.
     pub temperature_celsius: Option<i16>,
+    /// Optional board power draw in milliwatts (e.g., driverless user-mode NVML).
+    pub power_draw_mw: Option<u32>,
+    /// Optional primary fan speed percentage (`0..=100`).
+    pub fan_speed_percent: Option<u8>,
+    /// Optional graphics/core clock in MHz.
+    pub core_clock_mhz: Option<u32>,
+    /// Optional memory clock in MHz.
+    pub memory_clock_mhz: Option<u32>,
     /// Overall adapter utilization in permille (`0..=1000`), typically the max engine load.
     pub util_permille: u16,
     /// Dedicated video memory currently in use in bytes.

@@ -25,7 +25,9 @@ use windows_sys::Win32::System::Ioctl::{
     STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
     StorageDeviceSeekPenaltyProperty, VOLUME_DISK_EXTENTS,
 };
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
 use windows_sys::Win32::System::WindowsProgramming::{DRIVE_CDROM, DRIVE_REMOTE};
 use windows_sys::core::GUID;
 
@@ -783,8 +785,9 @@ fn cfgmgr_api() -> Option<&'static CfgMgrApi> {
     static API: OnceLock<Option<CfgMgrApi>> = OnceLock::new();
     API.get_or_init(|| {
         let dll = to_wide_null("cfgmgr32.dll");
-        // SAFETY: `cfgmgr32.dll` is a core Windows PnP system DLL retained for process lifetime.
-        let module = unsafe { LoadLibraryW(dll.as_ptr()) };
+        // SAFETY: `cfgmgr32.dll` is a core Windows PnP system DLL loaded strictly from `System32`.
+        let module =
+            unsafe { LoadLibraryExW(dll.as_ptr(), ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
         if module.is_null() {
             return None;
         }

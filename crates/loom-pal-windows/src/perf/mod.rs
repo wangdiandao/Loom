@@ -12,4 +12,5 @@ pub mod cpu;
 pub(crate) mod disk;
 pub(crate) mod gpu;
 pub(crate) mod net;
+pub(crate) mod nvml;
 pub mod smbios;

@@ -22,7 +22,9 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_VM_READ, QueryFullProcessImageNameW,
@@ -77,10 +79,12 @@ pub(crate) struct OwnedModule(HMODULE);
 impl OwnedModule {
     pub(crate) fn load(dll_name: &str) -> Result<Self, PalError> {
         let wide = to_wide_null(dll_name);
-        // SAFETY: `wide` is a valid null-terminated UTF-16 DLL name.
-        let module = unsafe { LoadLibraryW(wide.as_ptr()) };
+        // SAFETY: `wide` is a valid null-terminated UTF-16 system DLL name loaded strictly from
+        // `%SystemRoot%\System32` to prevent DLL sideloading from user-writable directories.
+        let module =
+            unsafe { LoadLibraryExW(wide.as_ptr(), ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
         if module.is_null() {
-            // SAFETY: Reads thread-local Win32 error set by `LoadLibraryW`.
+            // SAFETY: Reads thread-local Win32 error set by `LoadLibraryExW`.
             let err = unsafe { GetLastError() };
             return Err(map_win32_error(err, None, dll_name));
         }

@@ -31,7 +31,9 @@ use windows_sys::Wdk::Graphics::Direct3D::{
 use windows_sys::Win32::Foundation::{
     DEVPROPKEY, ERROR_SUCCESS, FALSE, FreeLibrary, HMODULE, LUID, STATUS_SUCCESS,
 };
-use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
 use windows_sys::Win32::System::Power::{
     CM_POWER_DATA, PowerDeviceD0, PowerDeviceD1, PowerDeviceD2, PowerDeviceD3,
 };
@@ -43,6 +45,7 @@ use windows_sys::core::GUID;
 
 use crate::handle::{OwnedHandle, query_process_sequence_number, to_wide_null};
 use crate::perf::cpu::read_reg_string;
+use crate::perf::nvml::{NvmlState, NvmlTelemetrySample, PCI_VENDOR_NVIDIA};
 
 /// Refresh cached DXGI adapter inventory every 30 seconds to detect hot-plugged eGPUs.
 const ADAPTER_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -222,8 +225,14 @@ impl GpuApi {
         let close_ptr = unsafe { GetProcAddress(gdi, c"D3DKMTCloseAdapter".as_ptr().cast()) };
 
         let dxgi_name = to_wide_null("dxgi.dll");
-        // SAFETY: Dynamically loads `dxgi.dll` with RAII `FreeLibrary` guard.
-        let dxgi_mod = unsafe { LoadLibraryW(dxgi_name.as_ptr()) };
+        // SAFETY: Dynamically loads `dxgi.dll` strictly from `System32` with RAII `FreeLibrary` guard.
+        let dxgi_mod = unsafe {
+            LoadLibraryExW(
+                dxgi_name.as_ptr(),
+                ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
         if dxgi_mod.is_null() {
             return None;
         }
@@ -309,6 +318,7 @@ pub(crate) struct GpuPowerGate {
     is_hybrid_discrete: bool,
     last_perf_query: Option<Instant>,
     last_temperature: Option<i16>,
+    last_nvml: NvmlTelemetrySample,
 }
 
 impl GpuPowerGate {
@@ -318,10 +328,11 @@ impl GpuPowerGate {
             is_hybrid_discrete,
             last_perf_query: None,
             last_temperature: None,
+            last_nvml: NvmlTelemetrySample::default(),
         }
     }
 
-    /// Evaluates whether `KMTQAITYPE_ADAPTERPERFDATA` may be called at `now`.
+    /// Evaluates whether `KMTQAITYPE_ADAPTERPERFDATA` / NVML may be called at `now`.
     pub(crate) fn evaluate(
         &mut self,
         power_state: GpuDevicePowerState,
@@ -334,8 +345,9 @@ impl GpuPowerGate {
         }
 
         if power_state == GpuDevicePowerState::LowPowerD1ToD3 {
-            // Never open the adapter or call `KMTQAITYPE_ADAPTERPERFDATA` while sleeping.
+            // Never open the adapter or query perfdata/NVML while sleeping.
             self.last_temperature = None;
+            self.last_nvml = NvmlTelemetrySample::default();
             return PerfDataGateDecision::SkipSleeping;
         }
 
@@ -365,6 +377,18 @@ impl GpuPowerGate {
     #[inline]
     pub(crate) fn cached_temperature(&self) -> Option<i16> {
         self.last_temperature
+    }
+
+    /// Updates cached supplementary NVML readings after an allowed query.
+    #[inline]
+    pub(crate) fn record_nvml(&mut self, sample: NvmlTelemetrySample) {
+        self.last_nvml = sample;
+    }
+
+    /// Returns the most recent cached NVML readings (cleared when entering `D1`–`D3`).
+    #[inline]
+    pub(crate) fn cached_nvml(&self) -> NvmlTelemetrySample {
+        self.last_nvml
     }
 }
 
@@ -420,8 +444,9 @@ fn gpu_cfgmgr_api() -> Option<&'static GpuCfgMgrApi> {
     static API: OnceLock<Option<GpuCfgMgrApi>> = OnceLock::new();
     API.get_or_init(|| {
         let dll = to_wide_null("cfgmgr32.dll");
-        // SAFETY: `cfgmgr32.dll` is a core Windows system DLL retained for process lifetime.
-        let module = unsafe { LoadLibraryW(dll.as_ptr()) };
+        // SAFETY: `cfgmgr32.dll` is a core Windows system DLL loaded strictly from `System32`.
+        let module =
+            unsafe { LoadLibraryExW(dll.as_ptr(), ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
         if module.is_null() {
             return None;
         }
@@ -668,10 +693,12 @@ struct CachedGpuAdapter {
     index: u32,
     luid_raw: LUID,
     luid: u64,
+    vendor_id: u32,
     name: Arc<str>,
     driver_version: Option<Arc<str>>,
     directx_version: Option<Arc<str>>,
     pci_location: Option<Arc<str>>,
+    pci_bdf: Option<(u32, u32, u32)>,
     dedicated_total_bytes: u64,
     shared_total_bytes: u64,
     node_count: u32,
@@ -805,6 +832,7 @@ fn next_probe_state_after_scan(
 /// Fast-lane Windows GPU telemetry sampler owned by [`crate::WindowsFastSampler`].
 pub(crate) struct GpuPerfSampler {
     api: Option<GpuApi>,
+    nvml: NvmlState,
     adapters: Vec<CachedGpuAdapter>,
     last_discovery: Option<Instant>,
     prev_nodes: HashMap<(u64, u32), PrevNodeSample>,
@@ -830,6 +858,7 @@ impl GpuPerfSampler {
     pub(crate) fn new() -> Self {
         Self {
             api: GpuApi::load(),
+            nvml: NvmlState::Uninitialized,
             adapters: Vec::new(),
             last_discovery: None,
             prev_nodes: HashMap::with_capacity(32),
@@ -1129,14 +1158,25 @@ impl GpuPerfSampler {
                 .or_insert_with(|| GpuPowerGate::new(adapter.is_hybrid_discrete));
             let gate_decision = gate.evaluate(power_state, any_node_activity, now);
             let d3_asleep = matches!(gate_decision, PerfDataGateDecision::SkipSleeping);
-            let temperature_celsius = match gate_decision {
+            let (temperature_celsius, nvml_sample) = match gate_decision {
                 PerfDataGateDecision::Allow => {
-                    let temp = query_adapter_temperature(api, adapter.luid_raw);
+                    let nvml_sample = if adapter.vendor_id == PCI_VENDOR_NVIDIA
+                        && let Some(bdf) = adapter.pci_bdf
+                    {
+                        self.nvml.query_active_device(bdf)
+                    } else {
+                        NvmlTelemetrySample::default()
+                    };
+                    let temp = query_adapter_temperature(api, adapter.luid_raw)
+                        .or(nvml_sample.temperature_celsius);
                     gate.record_temperature(temp);
-                    temp
+                    gate.record_nvml(nvml_sample);
+                    (temp, nvml_sample)
                 }
-                PerfDataGateDecision::SkipSleeping => None,
-                PerfDataGateDecision::SkipIdleThrottled => gate.cached_temperature(),
+                PerfDataGateDecision::SkipSleeping => (None, NvmlTelemetrySample::default()),
+                PerfDataGateDecision::SkipIdleThrottled => {
+                    (gate.cached_temperature(), gate.cached_nvml())
+                }
             };
 
             out.push(GpuAdapterSample {
@@ -1147,6 +1187,10 @@ impl GpuPerfSampler {
                 directx_version: adapter.directx_version.clone(),
                 pci_location: adapter.pci_location.clone(),
                 temperature_celsius,
+                power_draw_mw: nvml_sample.power_draw_mw,
+                fan_speed_percent: nvml_sample.fan_speed_percent,
+                core_clock_mhz: nvml_sample.core_clock_mhz,
+                memory_clock_mhz: nvml_sample.memory_clock_mhz,
                 util_permille: adapter_max_util,
                 dedicated_used_bytes: dedicated_used_clamped,
                 dedicated_total_bytes: dedicated_total,
@@ -1272,10 +1316,12 @@ impl GpuPerfSampler {
                 index: display_idx,
                 luid_raw: desc.adapter_luid,
                 luid,
+                vendor_id: desc.vendor_id,
                 name,
                 driver_version,
                 directx_version: static_info.directx_version,
                 pci_location: static_info.pci_location,
+                pci_bdf: static_info.pci_bdf,
                 dedicated_total_bytes: desc.dedicated_video_memory as u64,
                 shared_total_bytes: desc.shared_system_memory as u64,
                 node_count,
@@ -1289,10 +1335,11 @@ impl GpuPerfSampler {
         }
 
         // Retain power-gate state only for currently present adapter LUIDs, and clear
-        // cached per-process GPU probe state so newly attached/hot-plugged GPUs are probed.
+        // cached per-process GPU probe state and NVML handles so hot-plugged GPUs are probed.
         self.power_gates
             .retain(|luid, _| self.adapters.iter().any(|a| a.luid == *luid));
         self.proc_probe_state.clear();
+        self.nvml.clear_device_cache();
     }
 }
 

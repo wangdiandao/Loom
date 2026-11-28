@@ -5,8 +5,9 @@ use loom_types::{
 };
 use loom_ui_kit::{
     format_bits_per_sec, format_bytes, format_freq_ghz, format_latency_us,
-    format_network_rate_mbps, format_opt_percent_permille, format_opt_temp_celsius,
-    format_permille, format_rate_bytes_per_sec, format_uptime,
+    format_network_rate_mbps, format_opt_clock_mhz, format_opt_fan_percent,
+    format_opt_percent_permille, format_opt_power_mw, format_opt_temp_celsius, format_permille,
+    format_rate_bytes_per_sec, format_uptime,
 };
 
 use crate::features::performance::state::SelectedDevice;
@@ -400,7 +401,7 @@ fn format_gpu_summary(gpu: &GpuAdapterSlice) -> String {
     };
     let temp_str = format_opt_temp_celsius(gpu.temperature_celsius, gpu.d3_asleep);
 
-    [
+    let mut lines = vec![
         format!("{title} — {name}"),
         format!("{}: {util_str}", i18n::tr("perf.gpu_utilization")),
         format!(
@@ -416,6 +417,38 @@ fn format_gpu_summary(gpu: &GpuAdapterSlice) -> String {
             format_bytes(gpu.shared_total_bytes)
         ),
         format!("{}: {temp_str}", i18n::tr("perf.gpu_temperature")),
+    ];
+    if !gpu.d3_asleep {
+        if gpu.power_draw_mw.is_some() {
+            lines.push(format!(
+                "{}: {}",
+                i18n::tr("perf.gpu_power_draw"),
+                format_opt_power_mw(gpu.power_draw_mw, gpu.d3_asleep)
+            ));
+        }
+        if gpu.fan_speed_percent.is_some() {
+            lines.push(format!(
+                "{}: {}",
+                i18n::tr("perf.gpu_fan_speed"),
+                format_opt_fan_percent(gpu.fan_speed_percent, gpu.d3_asleep)
+            ));
+        }
+        if gpu.core_clock_mhz.is_some() {
+            lines.push(format!(
+                "{}: {}",
+                i18n::tr("perf.gpu_core_clock"),
+                format_opt_clock_mhz(gpu.core_clock_mhz, gpu.d3_asleep)
+            ));
+        }
+        if gpu.memory_clock_mhz.is_some() {
+            lines.push(format!(
+                "{}: {}",
+                i18n::tr("perf.gpu_memory_clock"),
+                format_opt_clock_mhz(gpu.memory_clock_mhz, gpu.d3_asleep)
+            ));
+        }
+    }
+    lines.extend([
         format!(
             "{}: {}",
             i18n::tr("perf.gpu_driver_version"),
@@ -431,8 +464,8 @@ fn format_gpu_summary(gpu: &GpuAdapterSlice) -> String {
             i18n::tr("perf.gpu_pci_location"),
             opt_str(&gpu.pci_location)
         ),
-    ]
-    .join("\n")
+    ]);
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -535,5 +568,25 @@ mod tests {
         assert!(gpu_text.contains("Sleeping (D3)"));
         assert!(gpu_text.contains("GPU Temperature: —"));
         assert!(!gpu_text.contains("0°C"));
+        assert!(!gpu_text.contains("Power draw:"));
+
+        perf.gpus.push(GpuAdapterSlice {
+            index: 0,
+            luid: 100,
+            name: Arc::from("NVIDIA GeForce RTX 4080"),
+            temperature_celsius: Some(58),
+            power_draw_mw: Some(184_500),
+            fan_speed_percent: Some(42),
+            core_clock_mhz: Some(2520),
+            memory_clock_mhz: Some(11200),
+            util_permille: 650,
+            d3_asleep: false,
+            ..Default::default()
+        });
+        let active_gpu_text = format_performance_summary(&perf, SelectedDevice::Gpu(100));
+        assert!(active_gpu_text.contains("Power draw: 184.5 W"));
+        assert!(active_gpu_text.contains("Fan speed: 42%"));
+        assert!(active_gpu_text.contains("GPU clock: 2520 MHz"));
+        assert!(active_gpu_text.contains("Memory clock: 11200 MHz"));
     }
 }

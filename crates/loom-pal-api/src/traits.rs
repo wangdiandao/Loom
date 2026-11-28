@@ -297,6 +297,7 @@ pub trait SystemOperator: Send + Sync {
             can_restore: false,
             conflict_detail: None,
             recovery_path: None,
+            unprotected_path: false,
         })
     }
 
