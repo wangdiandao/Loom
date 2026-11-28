@@ -1,26 +1,26 @@
 //! Network adapter detail pane for the Performance view (stepped Send/Receive chart + IP/DNS specs).
 
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::v_flex;
 use gpui_kit::{
     Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
 };
 use loom_types::NetAdapterSlice;
-use loom_ui_kit::{
-    LoomSemanticColors, format_bits_per_sec, format_network_rate_mbps, stepped_network_ceiling,
-};
+use loom_ui_kit::{LoomSemanticColors, format_bits_per_sec, format_network_rate_mbps};
 
 use crate::features::performance::PerformanceView;
+use crate::features::performance::cache::PerformanceSeriesCache;
 use crate::features::performance::charts::{
-    MetricStat, SpecRow, build_dual_throughput_area_chart, chart_frame, device_header,
-    dual_throughput_rings_to_points, format_stepped_ceiling_label, legend_swatch,
-    metrics_two_column_panel,
+    MetricStat, SpecRow, build_dual_throughput_area_chart, chart_frame, copy_summary_menu_item,
+    device_header, format_stepped_ceiling_label, legend_swatch, metrics_two_column_panel,
+    non_empty_arc_shared, opt_arc_str_or_fallback,
 };
 use crate::i18n;
 
 /// Renders the Network adapter (`Ethernet` / `Wi-Fi`) detail pane.
 pub(crate) fn render_network_detail(
     adapter: &NetAdapterSlice,
+    cache: &mut PerformanceSeriesCache,
     colors: &LoomSemanticColors,
     cx: &mut Context<PerformanceView>,
 ) -> impl IntoElement {
@@ -28,32 +28,25 @@ pub(crate) fn render_network_detail(
     let conn_label = i18n::net_connection_type_label(adapter.connection_type);
 
     let description: SharedString = if !adapter.description.trim().is_empty() {
-        SharedString::from(adapter.description.as_ref().to_owned())
-    } else if !adapter.name.trim().is_empty() {
-        SharedString::from(adapter.name.as_ref().to_owned())
+        non_empty_arc_shared(&adapter.description, &unavailable)
     } else {
-        unavailable.clone().into()
+        non_empty_arc_shared(&adapter.name, &unavailable)
     };
 
-    let max_bytes_per_sec = adapter
-        .recv_history
-        .max_value()
-        .max(adapter.sent_history.max_value())
-        .max(adapter.recv_bytes_per_sec)
-        .max(adapter.sent_bytes_per_sec);
-    let (y_max_unit, unit_label, divisor) = stepped_network_ceiling(max_bytes_per_sec);
-    let scale_label = format_stepped_ceiling_label(y_max_unit, unit_label);
+    let throughput = cache.network_throughput(adapter);
+    let scale_label = format_stepped_ceiling_label(throughput.y_max_unit, throughput.unit_label);
+    let y_max_unit = throughput.y_max_unit as f32;
+    let divisor = throughput.divisor;
+    let throughput_points = throughput.points.clone();
 
     let recv_label = i18n::tr("perf.net_receive");
     let send_label = i18n::tr("perf.net_send");
 
     // Plot in the stepped ceiling's unit (Kbps / Mbps / Gbps) via `divisor`.
-    let throughput_points =
-        dual_throughput_rings_to_points(&adapter.recv_history, &adapter.sent_history, divisor);
     let throughput_chart = build_dual_throughput_area_chart(
         SharedString::from(format!("perf-net-throughput-{}", adapter.luid)),
         throughput_points,
-        y_max_unit as f32,
+        y_max_unit,
         recv_label.clone(),
         colors.chart_network,
         send_label.clone(),
@@ -70,19 +63,7 @@ pub(crate) fn render_network_detail(
     } else {
         unavailable.clone()
     };
-
-    let adapter_name = if adapter.name.trim().is_empty() {
-        unavailable.clone()
-    } else {
-        adapter.name.as_ref().to_owned()
-    };
-
-    let opt_str = |opt: &Option<std::sync::Arc<str>>| {
-        opt.as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| unavailable.clone())
-    };
+    let adapter_name = non_empty_arc_shared(&adapter.name, &unavailable);
 
     let left_stats = vec![
         MetricStat::new(
@@ -99,11 +80,17 @@ pub(crate) fn render_network_detail(
         SpecRow::new(i18n::tr("perf.net_adapter_name"), adapter_name),
         SpecRow::new(i18n::tr("perf.net_connection_type"), conn_label.clone()),
         SpecRow::new(i18n::tr("perf.net_link_speed"), link_speed_str),
-        SpecRow::new(i18n::tr("perf.net_ipv4"), opt_str(&adapter.ipv4)),
-        SpecRow::new(i18n::tr("perf.net_ipv6"), opt_str(&adapter.ipv6)),
+        SpecRow::new(
+            i18n::tr("perf.net_ipv4"),
+            opt_arc_str_or_fallback(&adapter.ipv4, &unavailable),
+        ),
+        SpecRow::new(
+            i18n::tr("perf.net_ipv6"),
+            opt_arc_str_or_fallback(&adapter.ipv6, &unavailable),
+        ),
         SpecRow::new(
             i18n::tr("perf.net_dns_suffix"),
-            opt_str(&adapter.dns_suffix),
+            opt_arc_str_or_fallback(&adapter.dns_suffix, &unavailable),
         ),
     ];
 
@@ -126,16 +113,5 @@ pub(crate) fn render_network_detail(
             colors,
         ))
         .child(metrics_two_column_panel(left_stats, right_specs, colors))
-        .context_menu(move |menu, _window, _cx| {
-            let weak_copy = weak_ctx.clone();
-            menu.item(
-                PopupMenuItem::new(i18n::tr("perf.perf_polish_copy_summary")).on_click(
-                    move |_, window, cx| {
-                        let _ = weak_copy.update(cx, |view, cx| {
-                            view.copy_selected_summary(window, cx);
-                        });
-                    },
-                ),
-            )
-        })
+        .context_menu(move |menu, _window, _cx| menu.item(copy_summary_menu_item(weak_ctx.clone())))
 }

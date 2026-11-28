@@ -1,6 +1,6 @@
 //! Disk detail pane for the Performance view (active time %, stepped Read/Write chart, latency, specs).
 
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::{
     Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
@@ -8,33 +8,29 @@ use gpui_kit::{
 };
 use loom_types::DiskDeviceSlice;
 use loom_ui_kit::{
-    LoomSemanticColors, format_bytes, format_latency_us, format_permille,
-    format_rate_bytes_per_sec, stepped_throughput_ceiling,
+    LoomSemanticColors, format_bytes, format_latency_us, format_permille, format_rate_bytes_per_sec,
 };
 
 use crate::features::performance::PerformanceView;
+use crate::features::performance::cache::PerformanceSeriesCache;
 use crate::features::performance::charts::{
     MetricStat, SpecRow, build_dual_throughput_area_chart, build_percent_area_chart, chart_frame,
-    device_header, dual_throughput_rings_to_points, format_stepped_ceiling_label,
-    history_ring_to_points, legend_swatch, metrics_two_column_panel,
+    copy_summary_menu_item, device_header, format_stepped_ceiling_label, legend_swatch,
+    metrics_two_column_panel, non_empty_arc_shared,
 };
 use crate::i18n;
 
 /// Renders the physical Disk (`Disk 0..N`) detail pane.
 pub(crate) fn render_disk_detail(
     disk: &DiskDeviceSlice,
+    cache: &mut PerformanceSeriesCache,
     colors: &LoomSemanticColors,
     cx: &mut Context<PerformanceView>,
 ) -> impl IntoElement {
     let unavailable = i18n::tr("perf.unavailable");
     let title = i18n::perf_disk_title(disk.index, disk.drive_letters.as_ref());
     let media_label = i18n::disk_media_type_label(disk.media_type);
-
-    let model: SharedString = if disk.model.trim().is_empty() {
-        unavailable.clone().into()
-    } else {
-        SharedString::from(disk.model.as_ref().to_owned())
-    };
+    let model = non_empty_arc_shared(&disk.model, &unavailable);
 
     let mut badges = h_flex().items_center().gap_1p5().child(
         div()
@@ -61,7 +57,7 @@ pub(crate) fn render_disk_detail(
         );
     }
 
-    let active_points = history_ring_to_points(&disk.active_history);
+    let active_points = cache.disk_active(disk).to_vec();
     let active_chart = build_percent_area_chart(
         SharedString::from(format!("perf-disk-active-{}", disk.index)),
         active_points,
@@ -70,23 +66,18 @@ pub(crate) fn render_disk_detail(
         true,
     );
 
-    let max_rw_bps = disk
-        .read_history
-        .max_value()
-        .max(disk.write_history.max_value())
-        .max(disk.read_bytes_per_sec)
-        .max(disk.write_bytes_per_sec);
-    let (y_max_unit, unit_label, divisor) = stepped_throughput_ceiling(max_rw_bps);
-    let scale_label = format_stepped_ceiling_label(y_max_unit, unit_label);
+    let transfer = cache.disk_transfer(disk);
+    let scale_label = format_stepped_ceiling_label(transfer.y_max_unit, transfer.unit_label);
+    let y_max_unit = transfer.y_max_unit as f32;
+    let divisor = transfer.divisor;
+    let transfer_points = transfer.points.clone();
 
     let read_label = i18n::tr("perf.disk_read");
     let write_label = i18n::tr("perf.disk_write");
-    let transfer_points =
-        dual_throughput_rings_to_points(&disk.read_history, &disk.write_history, divisor);
     let transfer_chart = build_dual_throughput_area_chart(
         SharedString::from(format!("perf-disk-transfer-{}", disk.index)),
         transfer_points,
-        y_max_unit as f32,
+        y_max_unit,
         read_label.clone(),
         colors.chart_disk,
         write_label.clone(),
@@ -103,11 +94,7 @@ pub(crate) fn render_disk_detail(
     } else {
         unavailable.clone()
     };
-    let drive_letters_str = if disk.drive_letters.trim().is_empty() {
-        unavailable
-    } else {
-        disk.drive_letters.as_ref().to_owned()
-    };
+    let drive_letters_str = non_empty_arc_shared(&disk.drive_letters, &unavailable);
 
     let left_stats = vec![
         MetricStat::new(
@@ -167,16 +154,5 @@ pub(crate) fn render_disk_detail(
             colors,
         ))
         .child(metrics_two_column_panel(left_stats, right_specs, colors))
-        .context_menu(move |menu, _window, _cx| {
-            let weak_copy = weak_ctx.clone();
-            menu.item(
-                PopupMenuItem::new(i18n::tr("perf.perf_polish_copy_summary")).on_click(
-                    move |_, window, cx| {
-                        let _ = weak_copy.update(cx, |view, cx| {
-                            view.copy_selected_summary(window, cx);
-                        });
-                    },
-                ),
-            )
-        })
+        .context_menu(move |menu, _window, _cx| menu.item(copy_summary_menu_item(weak_ctx.clone())))
 }

@@ -291,13 +291,13 @@ perf:
   cpu_l2_cache: "L2 缓存"
   cpu_l3_cache: "L3 缓存"
   cpu_core_label: "CPU %{index}"
-  cpu_sampling_cores: "正在采样逻辑处理器..."
+  cpu_sampling_cores: "正在采样逻辑处理器…"
   mem_usage_chart: "内存使用量"
   mem_composition: "内存组合"
   mem_in_use: "使用中"
   mem_modified: "已修改"
   mem_standby: "备用"
-  mem_free: "可用"
+  mem_free: "空闲"
   mem_available: "可用"
   mem_committed: "已提交"
   mem_cached: "已缓存"
@@ -380,7 +380,7 @@ services:
   menu_open_services: "打开服务"
   menu_go_to_details: "转到详细信息"
   menu_search_online: "在线搜索"
-  loading: "正在加载系统服务..."
+  loading: "正在加载系统服务…"
   empty: "未找到匹配当前筛选条件的服务。"
 
 startup:
@@ -404,7 +404,7 @@ startup:
   menu_open_file_location: "打开文件所在的位置"
   menu_properties: "属性"
   menu_search_online: "在线搜索"
-  loading: "正在扫描启动应用..."
+  loading: "正在扫描启动应用…"
   empty: "未找到匹配当前筛选条件的启动应用。"
 
 users:
@@ -429,9 +429,9 @@ users:
   menu_go_to_details: "转到详细信息"
   menu_search_online: "在线搜索"
   confirm_disconnect_title: "断开用户会话"
-  confirm_disconnect_message: "确定要断开用户“%{user}”(会话 %{session_id}) 吗？正在运行的应用程序将继续在后台运行。"
+  confirm_disconnect_message: "断开用户“%{user}”（会话 %{session_id}）？正在运行的应用程序将继续在后台运行。"
   confirm_disconnect_action: "断开连接"
-  loading: "正在加载用户会话..."
+  loading: "正在加载用户会话…"
   empty: "未找到匹配当前筛选条件的用户会话。"
 
 app_history:
@@ -444,9 +444,9 @@ app_history:
   col_metered_network: "按流量计费的网络"
   menu_search_online: "在线搜索"
   confirm_delete_title: "删除使用历史记录"
-  confirm_delete_message: "确定要清除所有累计的应用程序 CPU 时间与网络流量历史记录吗？"
+  confirm_delete_message: "将清除所有累计的应用程序 CPU 时间与网络流量历史记录，且无法撤销。"
   confirm_delete_action: "删除历史记录"
-  loading: "正在加载应用历史记录..."
+  loading: "正在加载应用历史记录…"
   empty: "未找到匹配当前筛选条件的应用历史记录。"
 
 shell_hotkeys:
