@@ -10,6 +10,7 @@ use loom_ui_kit::{
     format_rate_bytes_per_sec, format_uptime,
 };
 
+use crate::features::performance::charts::opt_arc_str_or_fallback;
 use crate::features::performance::state::SelectedDevice;
 use crate::i18n;
 
@@ -214,12 +215,7 @@ fn format_memory_summary(perf: &PerformanceSlice) -> String {
         (Some(used), _) => used.to_string(),
         _ => unavailable.clone(),
     };
-    let form_factor = info
-        .form_factor
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| unavailable.clone());
+    let form_factor = opt_arc_str_or_fallback(&info.form_factor, &unavailable);
 
     [
         format!(
@@ -338,13 +334,6 @@ fn format_network_summary(adapter: &NetAdapterSlice) -> String {
     } else {
         unavailable.clone()
     };
-    let opt_str = |opt: &Option<std::sync::Arc<str>>| {
-        opt.as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| unavailable.clone())
-    };
-
     [
         format!("{conn} — {desc}"),
         format!(
@@ -368,12 +357,20 @@ fn format_network_summary(adapter: &NetAdapterSlice) -> String {
         ),
         format!("{}: {conn}", i18n::tr("perf.net_connection_type")),
         format!("{}: {link_speed}", i18n::tr("perf.net_link_speed")),
-        format!("{}: {}", i18n::tr("perf.net_ipv4"), opt_str(&adapter.ipv4)),
-        format!("{}: {}", i18n::tr("perf.net_ipv6"), opt_str(&adapter.ipv6)),
+        format!(
+            "{}: {}",
+            i18n::tr("perf.net_ipv4"),
+            opt_arc_str_or_fallback(&adapter.ipv4, &unavailable)
+        ),
+        format!(
+            "{}: {}",
+            i18n::tr("perf.net_ipv6"),
+            opt_arc_str_or_fallback(&adapter.ipv6, &unavailable)
+        ),
         format!(
             "{}: {}",
             i18n::tr("perf.net_dns_suffix"),
-            opt_str(&adapter.dns_suffix)
+            opt_arc_str_or_fallback(&adapter.dns_suffix, &unavailable)
         ),
     ]
     .join("\n")
@@ -386,12 +383,6 @@ fn format_gpu_summary(gpu: &GpuAdapterSlice) -> String {
         unavailable.as_str()
     } else {
         gpu.name.trim()
-    };
-    let opt_str = |opt: &Option<std::sync::Arc<str>>| {
-        opt.as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| unavailable.clone())
     };
 
     let util_str = if gpu.d3_asleep {
@@ -452,17 +443,17 @@ fn format_gpu_summary(gpu: &GpuAdapterSlice) -> String {
         format!(
             "{}: {}",
             i18n::tr("perf.gpu_driver_version"),
-            opt_str(&gpu.driver_version)
+            opt_arc_str_or_fallback(&gpu.driver_version, &unavailable)
         ),
         format!(
             "{}: {}",
             i18n::tr("perf.gpu_directx_version"),
-            opt_str(&gpu.directx_version)
+            opt_arc_str_or_fallback(&gpu.directx_version, &unavailable)
         ),
         format!(
             "{}: {}",
             i18n::tr("perf.gpu_pci_location"),
-            opt_str(&gpu.pci_location)
+            opt_arc_str_or_fallback(&gpu.pci_location, &unavailable)
         ),
     ]);
     lines.join("\n")

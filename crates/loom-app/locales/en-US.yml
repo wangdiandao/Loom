@@ -291,7 +291,7 @@ perf:
   cpu_l2_cache: "L2 cache"
   cpu_l3_cache: "L3 cache"
   cpu_core_label: "CPU %{index}"
-  cpu_sampling_cores: "Sampling logical processors..."
+  cpu_sampling_cores: "Sampling logical processors…"
   mem_usage_chart: "Memory usage"
   mem_composition: "Memory composition"
   mem_in_use: "In use"
@@ -380,7 +380,7 @@ services:
   menu_open_services: "Open Services"
   menu_go_to_details: "Go to details"
   menu_search_online: "Search online"
-  loading: "Loading system services..."
+  loading: "Loading system services…"
   empty: "No services match the current filter."
 
 startup:
@@ -404,7 +404,7 @@ startup:
   menu_open_file_location: "Open file location"
   menu_properties: "Properties"
   menu_search_online: "Search online"
-  loading: "Scanning startup applications..."
+  loading: "Scanning startup applications…"
   empty: "No startup applications match the current filter."
 
 users:
@@ -429,9 +429,9 @@ users:
   menu_go_to_details: "Go to details"
   menu_search_online: "Search online"
   confirm_disconnect_title: "Disconnect user session"
-  confirm_disconnect_message: "Do you want to disconnect user \"%{user}\" (Session %{session_id})? Active applications will continue running in the background."
+  confirm_disconnect_message: "Disconnect user \"%{user}\" (Session %{session_id})? Active applications will continue running in the background."
   confirm_disconnect_action: "Disconnect"
-  loading: "Loading user sessions..."
+  loading: "Loading user sessions…"
   empty: "No user sessions match the current filter."
 
 app_history:
@@ -444,9 +444,9 @@ app_history:
   col_metered_network: "Metered network"
   menu_search_online: "Search online"
   confirm_delete_title: "Delete usage history"
-  confirm_delete_message: "Are you sure you want to clear all accumulated application CPU time and network usage history?"
+  confirm_delete_message: "Clear all accumulated application CPU time and network usage history? This cannot be undone."
   confirm_delete_action: "Delete history"
-  loading: "Loading application usage history..."
+  loading: "Loading application usage history…"
   empty: "No application history records match the current filter."
 
 shell_hotkeys:

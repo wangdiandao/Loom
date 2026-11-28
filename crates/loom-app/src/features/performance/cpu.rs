@@ -13,10 +13,11 @@ use loom_ui_kit::{
 };
 
 use crate::features::performance::PerformanceView;
+use crate::features::performance::cache::PerformanceSeriesCache;
 use crate::features::performance::charts::{
     HISTORY_WINDOW, MetricStat, SpecRow, build_dual_percent_area_chart, build_percent_area_chart,
-    chart_frame, device_header, dual_history_rings_to_points, history_ring_to_points,
-    legend_swatch, metrics_two_column_panel,
+    chart_frame, copy_summary_menu_item, device_header, legend_swatch, metrics_two_column_panel,
+    non_empty_arc_shared,
 };
 use crate::features::performance::state::CpuGraphMode;
 use crate::i18n;
@@ -73,6 +74,7 @@ pub(crate) fn render_cpu_detail(
     mode: CpuGraphMode,
     show_kernel_times: bool,
     core_grid_layout: CoreGridLayout,
+    cache: &mut PerformanceSeriesCache,
     colors: &LoomSemanticColors,
     cx: &mut Context<PerformanceView>,
 ) -> impl IntoElement {
@@ -80,21 +82,17 @@ pub(crate) fn render_cpu_detail(
     let info = &perf.cpu_info;
     let unavailable = i18n::tr("perf.unavailable");
 
-    let brand: SharedString = if info.brand_name.is_empty() {
-        unavailable.clone().into()
-    } else {
-        SharedString::from(info.brand_name.as_ref().to_owned())
-    };
+    let brand = non_empty_arc_shared(&info.brand_name, &unavailable);
 
     let chart_area = div()
         .id("perf-cpu-chart-surface")
         .w_full()
         .child(match mode {
             CpuGraphMode::Overall => {
-                render_overall_cpu_chart(perf, show_kernel_times, colors).into_any_element()
+                render_overall_cpu_chart(perf, show_kernel_times, cache, colors).into_any_element()
             }
             CpuGraphMode::LogicalProcessors => {
-                render_logical_cpu_grid(perf, core_grid_layout, colors).into_any_element()
+                render_logical_cpu_grid(perf, core_grid_layout, cache, colors).into_any_element()
             }
         });
 
@@ -243,27 +241,20 @@ pub(crate) fn render_cpu_detail(
                     }),
             )
             .separator()
-            .item(
-                PopupMenuItem::new(i18n::tr("perf.perf_polish_copy_summary")).on_click(
-                    move |_, window, cx| {
-                        let _ = weak_copy.update(cx, |view, cx| {
-                            view.copy_selected_summary(window, cx);
-                        });
-                    },
-                ),
-            )
+            .item(copy_summary_menu_item(weak_copy))
         })
 }
 
 fn render_overall_cpu_chart(
     perf: &PerformanceSlice,
     show_kernel_times: bool,
+    cache: &mut PerformanceSeriesCache,
     colors: &LoomSemanticColors,
 ) -> impl IntoElement {
     let util_label = i18n::tr("perf.cpu_utilization");
     if show_kernel_times {
         let kernel_label = i18n::tr("perf.cpu_kernel_time");
-        let points = dual_history_rings_to_points(&perf.cpu_history, &perf.cpu_kernel_history);
+        let points = cache.cpu_dual(perf).to_vec();
         let chart = build_dual_percent_area_chart(
             "perf-cpu-overall-dual-chart",
             points,
@@ -286,7 +277,7 @@ fn render_overall_cpu_chart(
             colors,
         )
     } else {
-        let points = history_ring_to_points(&perf.cpu_history);
+        let points = cache.cpu_overall(perf).to_vec();
         let chart = build_percent_area_chart(
             "perf-cpu-overall-chart",
             points,
@@ -309,6 +300,7 @@ fn render_overall_cpu_chart(
 pub(crate) fn render_logical_cpu_grid(
     perf: &PerformanceSlice,
     layout: CoreGridLayout,
+    cache: &mut PerformanceSeriesCache,
     colors: &LoomSemanticColors,
 ) -> impl IntoElement {
     let core_count = perf.per_core_history.len();
@@ -375,6 +367,7 @@ pub(crate) fn render_logical_cpu_grid(
         grid = grid.child(legend_row);
     }
 
+    let cached_cores = cache.cpu_per_core(perf);
     for (row_ix, chunk) in perf.per_core_history.chunks(cols).enumerate() {
         let mut row = h_flex().w_full().gap_2();
         for (col_ix, ring) in chunk.iter().enumerate() {
@@ -412,7 +405,7 @@ pub(crate) fn render_logical_cpu_grid(
                 (_, opt) => format_opt_percent_permille(opt),
             };
 
-            let points = history_ring_to_points(ring);
+            let points = cached_cores.get(core_ix).cloned().unwrap_or_default();
             let chart = build_percent_area_chart(
                 SharedString::from(format!("perf-cpu-core-{core_ix}")),
                 points,

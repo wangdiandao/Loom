@@ -14,9 +14,10 @@ use loom_ui_kit::{
 };
 
 use crate::features::performance::PerformanceView;
+use crate::features::performance::cache::PerformanceSeriesCache;
 use crate::features::performance::charts::{
-    MetricStat, SpecRow, build_percent_area_chart, chart_frame, device_header,
-    history_ring_to_points, metrics_two_column_panel,
+    MetricStat, SpecRow, build_percent_area_chart, chart_frame, copy_summary_menu_item,
+    device_header, metrics_two_column_panel, non_empty_arc_shared, opt_arc_str_or_fallback,
 };
 use crate::features::performance::state::MAX_GPU_ENGINE_PANES;
 use crate::i18n;
@@ -68,16 +69,13 @@ pub(crate) fn render_gpu_detail(
     engine_indices: [usize; MAX_GPU_ENGINE_PANES],
     pane_count_select: &Entity<SelectState<Vec<GpuPaneCountOption>>>,
     engine_selects: &[Entity<SelectState<Vec<GpuEngineOption>>>; MAX_GPU_ENGINE_PANES],
+    cache: &mut PerformanceSeriesCache,
     colors: &LoomSemanticColors,
     cx: &mut Context<PerformanceView>,
 ) -> impl IntoElement {
     let unavailable = i18n::tr("perf.unavailable");
     let title = i18n::perf_gpu_title(gpu.index);
-    let name: SharedString = if gpu.name.trim().is_empty() {
-        unavailable.clone().into()
-    } else {
-        SharedString::from(gpu.name.as_ref().to_owned())
-    };
+    let name = non_empty_arc_shared(&gpu.name, &unavailable);
 
     let sleep_badge = gpu.d3_asleep.then(|| {
         div()
@@ -106,7 +104,7 @@ pub(crate) fn render_gpu_detail(
         .id(SharedString::from(format!("perf-gpu-engines-{}", gpu.luid)))
         .w_full()
         .child(if gpu.engines.is_empty() || effective_count == 0 {
-            let points = history_ring_to_points(&gpu.util_history);
+            let points = cache.gpu_overall(gpu).to_vec();
             let chart = build_percent_area_chart(
                 SharedString::from(format!("perf-gpu-overall-{}", gpu.luid)),
                 points,
@@ -125,11 +123,18 @@ pub(crate) fn render_gpu_detail(
             )
             .into_any_element()
         } else if effective_count == 1 {
-            render_gpu_single_engine(gpu, engine_indices[0], &engine_selects[0], colors)
+            render_gpu_single_engine(gpu, engine_indices[0], &engine_selects[0], cache, colors)
                 .into_any_element()
         } else {
-            render_gpu_engine_grid(gpu, effective_count, engine_indices, engine_selects, colors)
-                .into_any_element()
+            render_gpu_engine_grid(
+                gpu,
+                effective_count,
+                engine_indices,
+                engine_selects,
+                cache,
+                colors,
+            )
+            .into_any_element()
         });
 
     // Dedicated & Shared VRAM 60s charts side by side.
@@ -148,14 +153,14 @@ pub(crate) fn render_gpu_detail(
 
     let ded_chart = build_percent_area_chart(
         SharedString::from(format!("perf-gpu-ded-mem-{}", gpu.luid)),
-        history_ring_to_points(&gpu.dedicated_mem_history),
+        cache.gpu_dedicated_mem(gpu).to_vec(),
         ded_title.clone(),
         colors.chart_gpu,
         true,
     );
     let shared_chart = build_percent_area_chart(
         SharedString::from(format!("perf-gpu-shared-mem-{}", gpu.luid)),
-        history_ring_to_points(&gpu.shared_mem_history),
+        cache.gpu_shared_mem(gpu).to_vec(),
         shared_title.clone(),
         colors.chart_gpu_shared,
         true,
@@ -197,13 +202,6 @@ pub(crate) fn render_gpu_detail(
     let util_metric = format_opt_percent_permille((!gpu.d3_asleep).then_some(gpu.util_permille));
     let temp_metric = format_opt_temp_celsius(gpu.temperature_celsius, gpu.d3_asleep);
 
-    let opt_str = |opt: &Option<std::sync::Arc<str>>| {
-        opt.as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| unavailable.clone())
-    };
-
     let mut left_stats = vec![
         MetricStat::new(i18n::tr("perf.gpu_utilization"), util_metric),
         MetricStat::new(ded_title, ded_metric),
@@ -228,15 +226,15 @@ pub(crate) fn render_gpu_detail(
     let mut right_specs = vec![
         SpecRow::new(
             i18n::tr("perf.gpu_driver_version"),
-            opt_str(&gpu.driver_version),
+            opt_arc_str_or_fallback(&gpu.driver_version, &unavailable),
         ),
         SpecRow::new(
             i18n::tr("perf.gpu_directx_version"),
-            opt_str(&gpu.directx_version),
+            opt_arc_str_or_fallback(&gpu.directx_version, &unavailable),
         ),
         SpecRow::new(
             i18n::tr("perf.gpu_pci_location"),
-            opt_str(&gpu.pci_location),
+            opt_arc_str_or_fallback(&gpu.pci_location, &unavailable),
         ),
     ];
     if !gpu.d3_asleep {
@@ -291,15 +289,7 @@ pub(crate) fn render_gpu_detail(
                     )
                     .separator();
             }
-            menu.item(
-                PopupMenuItem::new(i18n::tr("perf.perf_polish_copy_summary")).on_click(
-                    move |_, window, cx| {
-                        let _ = weak_copy.update(cx, |view, cx| {
-                            view.copy_selected_summary(window, cx);
-                        });
-                    },
-                ),
-            )
+            menu.item(copy_summary_menu_item(weak_copy))
         })
 }
 
@@ -308,18 +298,21 @@ fn render_gpu_engine_grid(
     pane_count: usize,
     engine_indices: [usize; MAX_GPU_ENGINE_PANES],
     engine_selects: &[Entity<SelectState<Vec<GpuEngineOption>>>; MAX_GPU_ENGINE_PANES],
+    cache: &mut PerformanceSeriesCache,
     colors: &LoomSemanticColors,
 ) -> impl IntoElement {
     let visible_count = pane_count.min(MAX_GPU_ENGINE_PANES);
     let chart_height = if visible_count <= 2 { 150.0 } else { 110.0 };
     let select_a11y = i18n::tr("perf.gpu_select_engine");
 
-    let make_pane = |slot: usize| {
+    let mut make_pane = |slot: usize| {
         let engine_ix = engine_indices[slot].min(gpu.engines.len().saturating_sub(1));
         let engine = &gpu.engines[engine_ix];
         let chart = build_percent_area_chart(
             SharedString::from(format!("perf-gpu-{}-pane-{slot}", gpu.luid)),
-            history_ring_to_points(&engine.history),
+            cache
+                .gpu_engine(gpu.luid, engine_ix, &engine.history)
+                .to_vec(),
             SharedString::from(engine.name.as_ref().to_owned()),
             colors.chart_gpu,
             true,
@@ -384,13 +377,16 @@ fn render_gpu_single_engine(
     gpu: &GpuAdapterSlice,
     single_index: usize,
     single_select: &Entity<SelectState<Vec<GpuEngineOption>>>,
+    cache: &mut PerformanceSeriesCache,
     colors: &LoomSemanticColors,
 ) -> impl IntoElement {
     let engine_ix = single_index.min(gpu.engines.len().saturating_sub(1));
     let engine = &gpu.engines[engine_ix];
     let chart = build_percent_area_chart(
         SharedString::from(format!("perf-gpu-{}-single", gpu.luid)),
-        history_ring_to_points(&engine.history),
+        cache
+            .gpu_engine(gpu.luid, engine_ix, &engine.history)
+            .to_vec(),
         SharedString::from(engine.name.as_ref().to_owned()),
         colors.chart_gpu,
         true,

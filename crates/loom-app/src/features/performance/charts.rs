@@ -1,22 +1,44 @@
-//! Shared stateless `gpui-kit` chart builders and metric layout helpers for the Performance view.
+//! Shared stateless `gpui-kit` chart builders, gap-aware point converters,
+//! and metric layout helpers for the Performance view.
 //!
 //! All plots compose `gpui-kit`'s [`AreaChart`] directly without custom `Canvas` or GPU shaders,
 //! using gap-aware point conversion so paused/sleep sentinels never fabricate spikes or flat
 //! baseline artifacts.
 
+use std::sync::Arc;
+
 use gpui_kit::component::chart::AreaChart;
+use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, Div, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _, div,
-    linear_color_stop, linear_gradient, px,
+    AnyElement, Div, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _, WeakEntity,
+    div, linear_color_stop, linear_gradient, px,
 };
-use loom_types::{HistoryRing, ThroughputRing};
-use loom_ui_kit::{LoomSemanticColors, PERMILLE_GAP_SENTINEL, SparklinePoint, UNAVAILABLE_LABEL};
+use loom_types::{HistoryRing, NetAdapterSlice, ThroughputRing};
+use loom_ui_kit::{LoomSemanticColors, SparklinePoint, UNAVAILABLE_LABEL};
 
+use crate::features::performance::PerformanceView;
 use crate::i18n;
 
 /// Fixed 60-sample horizontal window matching Windows Task Manager's 60-second history.
 pub(crate) const HISTORY_WINDOW: usize = 60;
+
+/// Static x-axis slot labels (`"0"`..`"59"`) avoiding per-point `String` allocations during paint.
+const INDEX_LABELS: [&str; HISTORY_WINDOW] = [
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+    "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32",
+    "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46", "47", "48",
+    "49", "50", "51", "52", "53", "54", "55", "56", "57", "58", "59",
+];
+
+#[inline]
+fn index_label(index: usize) -> SharedString {
+    INDEX_LABELS
+        .get(index)
+        .copied()
+        .map(SharedString::new_static)
+        .unwrap_or_else(|| SharedString::from(index.to_string()))
+}
 
 /// Single-series gap-aware data point for 60-second [`AreaChart`] plots.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -34,6 +56,66 @@ pub(crate) struct DualPoint {
     pub(crate) secondary: Option<f32>,
 }
 
+/// Returns the trimmed optional `Arc<str>` value or `fallback` when absent/blank.
+#[inline]
+pub(crate) fn opt_arc_str_or_fallback(opt: &Option<Arc<str>>, fallback: &str) -> String {
+    opt.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
+/// Returns a [`SharedString`] reusing `Arc<str>` when already non-empty and trimmed,
+/// or `fallback` when blank.
+#[inline]
+pub(crate) fn non_empty_arc_shared(value: &Arc<str>, fallback: &str) -> SharedString {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        SharedString::from(fallback.to_owned())
+    } else if trimmed.len() == value.len() {
+        SharedString::from(Arc::clone(value))
+    } else {
+        SharedString::from(trimmed.to_owned())
+    }
+}
+
+/// Builds the shared "Copy summary" context menu item for Performance detail panes.
+pub(crate) fn copy_summary_menu_item(weak_view: WeakEntity<PerformanceView>) -> PopupMenuItem {
+    PopupMenuItem::new(i18n::tr("perf.perf_polish_copy_summary")).on_click(move |_, window, cx| {
+        let _ = weak_view.update(cx, |view, cx| {
+            view.copy_selected_summary(window, cx);
+        });
+    })
+}
+
+/// Computes the gap-safe peak combined network throughput (recv + sent) in bytes/sec.
+pub(crate) fn network_combined_peak_bytes(net: &NetAdapterSlice) -> u64 {
+    let history_peak = net
+        .recv_history
+        .iter()
+        .zip(net.sent_history.iter())
+        .map(|(r, s)| {
+            let rv = if ThroughputRing::<HISTORY_WINDOW>::is_gap(r) {
+                0
+            } else {
+                r
+            };
+            let sv = if ThroughputRing::<HISTORY_WINDOW>::is_gap(s) {
+                0
+            } else {
+                s
+            };
+            rv.saturating_add(sv)
+        })
+        .max()
+        .unwrap_or(0);
+    history_peak.max(
+        net.recv_bytes_per_sec
+            .saturating_add(net.sent_bytes_per_sec),
+    )
+}
+
 /// Formats a stepped ceiling label from `(y_max, unit)` returned by
 /// [`loom_ui_kit::stepped_throughput_ceiling`] or [`loom_ui_kit::stepped_network_ceiling`].
 pub(crate) fn format_stepped_ceiling_label(y_max: f64, unit: &str) -> SharedString {
@@ -44,48 +126,79 @@ pub(crate) fn format_stepped_ceiling_label(y_max: f64, unit: &str) -> SharedStri
     }
 }
 
-/// Converts a [`HistoryRing<60>`] (permille `0..=1000` + [`HistoryRing::GAP_SENTINEL`])
-/// into a right-aligned 60-point gap-aware percentage (`0.0..=100.0`) series.
-///
-/// Leading unfilled slots and `GAP_SENTINEL` (`PERMILLE_GAP_SENTINEL`) entries map to `None`
-/// rather than fabricating spikes or misleading zero baselines.
-pub(crate) fn history_ring_to_points(ring: &HistoryRing<HISTORY_WINDOW>) -> Vec<SinglePoint> {
-    let window = SparklinePoint::from_opt_f32_window(ring.to_vec_opt_f32(), HISTORY_WINDOW);
-    window
-        .into_iter()
-        .map(|slot| SinglePoint {
-            index: slot.index,
-            value: slot.value,
-        })
-        .collect()
+#[inline]
+fn permille_to_opt_percent(raw: u16) -> Option<f32> {
+    if HistoryRing::<HISTORY_WINDOW>::is_gap(raw) {
+        None
+    } else {
+        Some((f32::from(raw.min(1000))) / 10.0)
+    }
 }
 
-/// Converts a [`HistoryRing<60>`] into gap-safe [`SparklinePoint`] entries for sidebar cards.
+#[inline]
+fn throughput_to_opt_scaled(raw: u64, safe_div: f64) -> Option<f32> {
+    if ThroughputRing::<HISTORY_WINDOW>::is_gap(raw) {
+        None
+    } else {
+        Some((raw as f64 / safe_div) as f32)
+    }
+}
+
+/// Converts a [`HistoryRing<60>`] (permille `0..=1000` + [`HistoryRing::GAP_SENTINEL`])
+/// into a right-aligned 60-point gap-aware percentage (`0.0..=100.0`) series in a single pass.
 ///
-/// Uses [`SparklinePoint::from_permille_sentinel_segments`] so `PERMILLE_GAP_SENTINEL`
-/// entries never create `6553.5%` spikes, and returns an empty vector when no valid samples
-/// exist (e.g., while a discrete GPU is sleeping in D3).
+/// Leading unfilled slots and `GAP_SENTINEL` entries map to `None` rather than fabricating
+/// spikes or misleading zero baselines.
+pub(crate) fn history_ring_to_points(ring: &HistoryRing<HISTORY_WINDOW>) -> Vec<SinglePoint> {
+    let mut points = Vec::with_capacity(HISTORY_WINDOW);
+    let len = ring.len().min(HISTORY_WINDOW);
+    let pad = HISTORY_WINDOW - len;
+    for index in 0..pad {
+        points.push(SinglePoint { index, value: None });
+    }
+    let skip = ring.len().saturating_sub(HISTORY_WINDOW);
+    for (offset, raw) in ring.iter_ordered().skip(skip).enumerate() {
+        points.push(SinglePoint {
+            index: pad + offset,
+            value: permille_to_opt_percent(raw),
+        });
+    }
+    points
+}
+
+/// Converts a [`HistoryRing<60>`] into gap-safe [`SparklinePoint`] entries for sidebar cards
+/// in a single pass.
+///
+/// Returns an empty vector when no valid (non-gap) samples exist (e.g., while a discrete GPU
+/// is sleeping in D3), ensuring gap sentinels never fabricate `6553.5%` spikes or flat baselines.
 pub(crate) fn history_ring_to_sparkline_points(
     ring: &HistoryRing<HISTORY_WINDOW>,
 ) -> Vec<SparklinePoint> {
-    let segments = SparklinePoint::from_permille_sentinel_segments(
-        ring.iter_ordered().map(|raw| {
-            if HistoryRing::<HISTORY_WINDOW>::is_gap(raw) {
-                PERMILLE_GAP_SENTINEL
-            } else {
-                raw
-            }
-        }),
-        HISTORY_WINDOW,
-    );
-    if segments.is_empty() {
+    let len = ring.len().min(HISTORY_WINDOW);
+    if len == 0 {
         return Vec::new();
     }
-    let window = SparklinePoint::from_opt_f32_window(ring.to_vec_opt_f32(), HISTORY_WINDOW);
-    window
-        .into_iter()
-        .map(|slot| SparklinePoint::new(slot.index, slot.value.unwrap_or(0.0)))
-        .collect()
+    let skip = ring.len().saturating_sub(HISTORY_WINDOW);
+    let pad = HISTORY_WINDOW - len;
+    let mut has_valid = false;
+    let mut points = Vec::with_capacity(HISTORY_WINDOW);
+    for index in 0..pad {
+        points.push(SparklinePoint::new(index, 0.0));
+    }
+    for (offset, raw) in ring.iter_ordered().skip(skip).enumerate() {
+        let value = match permille_to_opt_percent(raw) {
+            Some(v) => {
+                has_valid = true;
+                v
+            }
+            None => 0.0,
+        };
+        points.push(SparklinePoint::new(pad + offset, value));
+    }
+    if !has_valid {
+        return Vec::new();
+    }
+    points
 }
 
 /// Converts two [`ThroughputRing<60>`] buffers (bytes/sec) into gap-safe combined
@@ -100,50 +213,101 @@ pub(crate) fn throughput_pair_to_sparkline_points(
     } else {
         1.0
     };
-    let r_vals = recv.to_vec_opt();
-    let s_vals = sent.to_vec_opt();
-    let len = r_vals.len().max(s_vals.len());
-    let mut combined: Vec<Option<f32>> = Vec::with_capacity(len);
-    for idx in 0..len {
-        let r = r_vals.get(idx).copied().flatten();
-        let s = s_vals.get(idx).copied().flatten();
-        let entry = match (r, s) {
-            (Some(rv), Some(sv)) => Some((rv.saturating_add(sv) as f64 / safe_div) as f32),
-            (Some(rv), None) => Some((rv as f64 / safe_div) as f32),
-            (None, Some(sv)) => Some((sv as f64 / safe_div) as f32),
-            (None, None) => None,
-        };
-        combined.push(entry);
-    }
-
-    let window = SparklinePoint::from_opt_f32_window(combined, HISTORY_WINDOW);
-    if window.iter().all(|slot| slot.is_gap()) {
+    let r_len = recv.len().min(HISTORY_WINDOW);
+    let s_len = sent.len().min(HISTORY_WINDOW);
+    let max_len = r_len.max(s_len);
+    if max_len == 0 {
         return Vec::new();
     }
-    window
-        .into_iter()
-        .map(|slot| SparklinePoint::new(slot.index, slot.value.unwrap_or(0.0)))
-        .collect()
+
+    let mut r_buf = [None::<u64>; HISTORY_WINDOW];
+    let r_pad = HISTORY_WINDOW - r_len;
+    for (offset, raw) in recv
+        .iter()
+        .skip(recv.len().saturating_sub(HISTORY_WINDOW))
+        .enumerate()
+    {
+        if !ThroughputRing::<HISTORY_WINDOW>::is_gap(raw) {
+            r_buf[r_pad + offset] = Some(raw);
+        }
+    }
+
+    let mut s_buf = [None::<u64>; HISTORY_WINDOW];
+    let s_pad = HISTORY_WINDOW - s_len;
+    for (offset, raw) in sent
+        .iter()
+        .skip(sent.len().saturating_sub(HISTORY_WINDOW))
+        .enumerate()
+    {
+        if !ThroughputRing::<HISTORY_WINDOW>::is_gap(raw) {
+            s_buf[s_pad + offset] = Some(raw);
+        }
+    }
+
+    let mut has_valid = false;
+    let mut points = Vec::with_capacity(HISTORY_WINDOW);
+    for index in 0..HISTORY_WINDOW {
+        let value = match (r_buf[index], s_buf[index]) {
+            (Some(rv), Some(sv)) => {
+                has_valid = true;
+                (rv.saturating_add(sv) as f64 / safe_div) as f32
+            }
+            (Some(rv), None) => {
+                has_valid = true;
+                (rv as f64 / safe_div) as f32
+            }
+            (None, Some(sv)) => {
+                has_valid = true;
+                (sv as f64 / safe_div) as f32
+            }
+            (None, None) => 0.0,
+        };
+        points.push(SparklinePoint::new(index, value));
+    }
+
+    if !has_valid {
+        return Vec::new();
+    }
+    points
 }
 
 /// Converts two [`HistoryRing<60>`] buffers (permille `0..=1000` + `GAP_SENTINEL`)
-/// into a right-aligned 60-point gap-aware dual percentage series.
+/// into a right-aligned 60-point gap-aware dual percentage series in a single pass.
 pub(crate) fn dual_history_rings_to_points(
     primary: &HistoryRing<HISTORY_WINDOW>,
     secondary: &HistoryRing<HISTORY_WINDOW>,
 ) -> Vec<DualPoint> {
-    let p_win = SparklinePoint::from_opt_f32_window(primary.to_vec_opt_f32(), HISTORY_WINDOW);
-    let s_win = SparklinePoint::from_opt_f32_window(secondary.to_vec_opt_f32(), HISTORY_WINDOW);
+    let mut p_buf = [None::<f32>; HISTORY_WINDOW];
+    let p_len = primary.len().min(HISTORY_WINDOW);
+    let p_pad = HISTORY_WINDOW - p_len;
+    for (offset, raw) in primary
+        .iter_ordered()
+        .skip(primary.len().saturating_sub(HISTORY_WINDOW))
+        .enumerate()
+    {
+        p_buf[p_pad + offset] = permille_to_opt_percent(raw);
+    }
 
-    p_win
-        .into_iter()
-        .zip(s_win)
-        .map(|(p, s)| DualPoint {
-            index: p.index,
-            primary: p.value,
-            secondary: s.value,
-        })
-        .collect()
+    let mut s_buf = [None::<f32>; HISTORY_WINDOW];
+    let s_len = secondary.len().min(HISTORY_WINDOW);
+    let s_pad = HISTORY_WINDOW - s_len;
+    for (offset, raw) in secondary
+        .iter_ordered()
+        .skip(secondary.len().saturating_sub(HISTORY_WINDOW))
+        .enumerate()
+    {
+        s_buf[s_pad + offset] = permille_to_opt_percent(raw);
+    }
+
+    let mut points = Vec::with_capacity(HISTORY_WINDOW);
+    for index in 0..HISTORY_WINDOW {
+        points.push(DualPoint {
+            index,
+            primary: p_buf[index],
+            secondary: s_buf[index],
+        });
+    }
+    points
 }
 
 /// Converts two [`ThroughputRing<60>`] buffers (bytes/sec + `GAP_SENTINEL`) into a
@@ -159,30 +323,38 @@ pub(crate) fn dual_throughput_rings_to_points(
     } else {
         1.0
     };
-    let p_win = SparklinePoint::from_opt_f32_window(
-        primary
-            .to_vec_opt()
-            .into_iter()
-            .map(|opt| opt.map(|v| (v as f64 / safe_div) as f32)),
-        HISTORY_WINDOW,
-    );
-    let s_win = SparklinePoint::from_opt_f32_window(
-        secondary
-            .to_vec_opt()
-            .into_iter()
-            .map(|opt| opt.map(|v| (v as f64 / safe_div) as f32)),
-        HISTORY_WINDOW,
-    );
 
-    p_win
-        .into_iter()
-        .zip(s_win)
-        .map(|(p, s)| DualPoint {
-            index: p.index,
-            primary: p.value,
-            secondary: s.value,
-        })
-        .collect()
+    let mut p_buf = [None::<f32>; HISTORY_WINDOW];
+    let p_len = primary.len().min(HISTORY_WINDOW);
+    let p_pad = HISTORY_WINDOW - p_len;
+    for (offset, raw) in primary
+        .iter()
+        .skip(primary.len().saturating_sub(HISTORY_WINDOW))
+        .enumerate()
+    {
+        p_buf[p_pad + offset] = throughput_to_opt_scaled(raw, safe_div);
+    }
+
+    let mut s_buf = [None::<f32>; HISTORY_WINDOW];
+    let s_len = secondary.len().min(HISTORY_WINDOW);
+    let s_pad = HISTORY_WINDOW - s_len;
+    for (offset, raw) in secondary
+        .iter()
+        .skip(secondary.len().saturating_sub(HISTORY_WINDOW))
+        .enumerate()
+    {
+        s_buf[s_pad + offset] = throughput_to_opt_scaled(raw, safe_div);
+    }
+
+    let mut points = Vec::with_capacity(HISTORY_WINDOW);
+    for index in 0..HISTORY_WINDOW {
+        points.push(DualPoint {
+            index,
+            primary: p_buf[index],
+            secondary: s_buf[index],
+        });
+    }
+    points
 }
 
 /// Builds a 60-second single-series percentage (`0..100%`) [`AreaChart`].
@@ -204,7 +376,7 @@ pub(crate) fn build_percent_area_chart(
 
     AreaChart::new(data)
         .id(id.into())
-        .x(|p: &SinglePoint| SharedString::from(p.index.to_string()))
+        .x(|p: &SinglePoint| index_label(p.index))
         .y(|p: &SinglePoint| p.value.unwrap_or(0.0))
         .name(series_name)
         .linear()
@@ -257,7 +429,7 @@ pub(crate) fn build_dual_percent_area_chart(
 
     AreaChart::new(data)
         .id(id.into())
-        .x(|p: &DualPoint| SharedString::from(p.index.to_string()))
+        .x(|p: &DualPoint| index_label(p.index))
         .y(|p: &DualPoint| p.primary.unwrap_or(0.0))
         .name(primary_name)
         .linear()
@@ -333,7 +505,7 @@ pub(crate) fn build_dual_throughput_area_chart(
 
     AreaChart::new(data)
         .id(id.into())
-        .x(|p: &DualPoint| SharedString::from(p.index.to_string()))
+        .x(|p: &DualPoint| index_label(p.index))
         .y(|p: &DualPoint| p.primary.unwrap_or(0.0))
         .name(primary_name)
         .linear()
