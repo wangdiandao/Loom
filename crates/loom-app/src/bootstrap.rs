@@ -28,6 +28,7 @@ use crate::shell::{
     AppShell, NavigationIntent, Route, TRAY_OVERVIEW_HEIGHT, TRAY_OVERVIEW_WIDTH, TrayAction,
     TrayController, TrayEventSignal, TrayOverviewView,
 };
+use crate::startup_trace::{self, StartupTraceTarget};
 
 icon_assets!(
     LoomExtraIcons,
@@ -84,6 +85,8 @@ pub(crate) struct LaunchArgs {
     pub(crate) config_path: Option<PathBuf>,
     /// Skip the OS single-instance lock when `--allow-multiple` is passed (testing / automation).
     pub(crate) allow_multiple: bool,
+    /// Optional opt-in startup phase trace destination via `--startup-trace[=<path>]`.
+    pub(crate) startup_trace: Option<StartupTraceTarget>,
 }
 
 impl LaunchArgs {
@@ -94,7 +97,7 @@ impl LaunchArgs {
         S: AsRef<str>,
     {
         let mut parsed = Self::default();
-        let mut iter = args.into_iter();
+        let mut iter = args.into_iter().peekable();
         while let Some(raw) = iter.next() {
             let arg = raw.as_ref();
             if let Some(val) = arg.strip_prefix("--restore-route=") {
@@ -115,6 +118,24 @@ impl LaunchArgs {
                 }
             } else if arg == "--allow-multiple" {
                 parsed.allow_multiple = true;
+            } else if let Some(val) = arg.strip_prefix("--startup-trace=") {
+                let trimmed = val.trim();
+                parsed.startup_trace = Some(if trimmed.is_empty() {
+                    StartupTraceTarget::Stderr
+                } else {
+                    StartupTraceTarget::File(PathBuf::from(trimmed))
+                });
+            } else if arg == "--startup-trace" {
+                let next_is_path = iter.peek().is_some_and(|next| {
+                    !next.as_ref().starts_with("--") && !next.as_ref().trim().is_empty()
+                });
+                if next_is_path && let Some(next) = iter.next() {
+                    parsed.startup_trace = Some(StartupTraceTarget::File(PathBuf::from(
+                        next.as_ref().trim(),
+                    )));
+                } else {
+                    parsed.startup_trace = Some(StartupTraceTarget::Stderr);
+                }
             }
         }
         parsed
@@ -267,31 +288,29 @@ struct AppRuntime {
     pending_details_highlight: Option<ProcessKey>,
     hiding_to_tray: bool,
     explicit_exit: bool,
+    post_frame_initialized: bool,
+    initial_hotkey: Option<String>,
     tray: Option<TrayController>,
     hotkey: Option<GlobalHotkeyController>,
     hotkey_signal: Option<HotkeyWakeSignal>,
     activation_signal: Option<ActivationWakeSignal>,
     _window_closed_sub: Option<Subscription>,
-    _single_instance: Option<SingleInstanceGuard>,
+    single_instance: Option<SingleInstanceGuard>,
 }
 
 impl Global for AppRuntime {}
 
 /// Launches the Loom desktop application using the progressive startup pipeline.
 pub(crate) fn run(args: LaunchArgs, raw_args: Vec<String>) {
-    // 1. Optional cross-UIPI single-instance lock (bypassed when `--allow-multiple` is set for testing).
+    // 1. Optional cross-UIPI single-instance mutex lock (bypassed when `--allow-multiple` is set).
+    //    Pass `on_activate = None` here so we acquire only the named mutex without creating a
+    //    hidden receiver window or thread on the cold-start critical path; the `WM_COPYDATA`
+    //    receiver starts non-blockingly once the first UI frame paints.
     let activation_signal = ActivationWakeSignal::default();
     let single_instance = if args.allow_multiple {
         None
     } else {
-        let wake_signal = activation_signal.clone();
-        match SingleInstanceGuard::acquire_or_notify(
-            SINGLE_INSTANCE_ID,
-            &raw_args,
-            Some(Arc::new(move |forwarded_args| {
-                wake_signal.push(forwarded_args);
-            })),
-        ) {
+        match SingleInstanceGuard::acquire_or_notify(SINGLE_INSTANCE_ID, &raw_args, None) {
             Ok(guard) if guard.is_single() => Some(guard),
             Ok(_) => {
                 tracing::info!(
@@ -305,6 +324,7 @@ pub(crate) fn run(args: LaunchArgs, raw_args: Vec<String>) {
             }
         }
     };
+    startup_trace::mark("single_instance_lock");
 
     // If this is a fresh cold start (no existing primary instance) and persistent administrator
     // startup is enabled on this account, hand off to the elevated scheduled-task broker before
@@ -326,6 +346,7 @@ pub(crate) fn run(args: LaunchArgs, raw_args: Vec<String>) {
     if let Some(err) = load_err {
         tracing::warn!(%err, path = %config_store.path().display(), "corrupt settings.toml; fell back to defaults");
     }
+    startup_trace::mark("config_loaded");
 
     // 3. Apply initial localization immediately before creating UI or tray items.
     i18n::apply_locale(settings.language);
@@ -334,8 +355,8 @@ pub(crate) fn run(args: LaunchArgs, raw_args: Vec<String>) {
         .restore_route
         .unwrap_or_else(|| Route::from_startup_page(settings.startup_page));
 
-    // 4. Initialize NativeBackend + EngineCoordinator BEFORE opening the window so Tick 0
-    //    executes on `loom-fast-sampler` in parallel with DX12 / GPUI window creation!
+    // 4. Spawn EngineCoordinator BEFORE opening the window so sampler construction, slow-pool
+    //    creation, and Tick 0 execute on `loom-fast-sampler` in parallel with GPUI/DirectX init!
     //    Enable MonitorDomain::Processes lease gating so switching away from the Processes
     //    tab (with no tray quick-overview open) skips per-tick Processes table projection.
     let engine_config = loom_engine::EngineConfig {
@@ -352,6 +373,7 @@ pub(crate) fn run(args: LaunchArgs, raw_args: Vec<String>) {
             std::process::exit(1);
         }
     };
+    startup_trace::mark("engine_spawned");
 
     // 5. Launch GPUI Kit application event loop and open the main window.
     //    Use `QuitMode::Explicit` so closing the window with `close_to_tray` / `minimize_to_tray`
@@ -360,11 +382,13 @@ pub(crate) fn run(args: LaunchArgs, raw_args: Vec<String>) {
         .with_assets(LoomAssets)
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
+            startup_trace::mark("gpui_app_ready");
             gpui_kit::init(cx);
-            apply_theme(settings.theme, settings.accent_color, None, cx);
+            startup_trace::mark("gpui_kit_init");
 
             let initial_hotkey = settings.global_hotkey.clone();
             let store = cx.new(|cx| UiStore::new(coordinator, config_store, settings, cx));
+            startup_trace::mark("store_created");
 
             cx.set_global(AppRuntime {
                 store,
@@ -376,12 +400,14 @@ pub(crate) fn run(args: LaunchArgs, raw_args: Vec<String>) {
                 pending_details_highlight: None,
                 hiding_to_tray: false,
                 explicit_exit: false,
+                post_frame_initialized: false,
+                initial_hotkey,
                 tray: None,
                 hotkey: None,
                 hotkey_signal: None,
-                activation_signal: Some(activation_signal.clone()),
+                activation_signal: Some(activation_signal),
                 _window_closed_sub: None,
-                _single_instance: single_instance,
+                single_instance,
             });
 
             let closed_sub = cx.on_window_closed(|cx, closed_id| {
@@ -391,58 +417,84 @@ pub(crate) fn run(args: LaunchArgs, raw_args: Vec<String>) {
                 runtime._window_closed_sub = Some(closed_sub);
             });
 
-            // Open the main window first before registering Explorer tray icon / global hotkey
-            // so Shell_NotifyIconW IPC never delays first-frame window appearance.
+            // Open the main window first (applying theme/accent once with `Some(window)`).
+            // Single-instance receiver, Explorer tray icon, and global hotkey are deferred
+            // strictly past first-frame paint via `window.on_next_frame` inside `open_main_window`.
             if let Err(err) = open_main_window(cx) {
                 tracing::error!(%err, "failed to open Loom main window");
                 cx.quit();
                 return;
             }
+            startup_trace::mark("main_window_opened");
 
             // Complete any pending startup Task Manager readiness handshake and acknowledge any
             // persistent administrator broker waiting for this window to appear.
             complete_taskmgr_handshakes(false, cx);
             loom_pal::admin::acknowledge(&raw_args);
-
-            let activation_signal_loop = activation_signal.clone();
-            cx.defer(move |cx| {
-                if !cx.has_global::<AppRuntime>() || cx.global::<AppRuntime>().explicit_exit {
-                    return;
-                }
-
-                let (tray, tray_signal) = match TrayController::new() {
-                    Ok((controller, signal)) => (Some(controller), Some(signal)),
-                    Err(err) => {
-                        tracing::warn!(%err, "failed to initialize system tray icon");
-                        (None, None)
-                    }
-                };
-
-                let hotkey_signal = HotkeyWakeSignal::default();
-                let trigger_signal = hotkey_signal.clone();
-                let mut hotkey = GlobalHotkeyController::new(Arc::new(move || {
-                    trigger_signal.trigger();
-                }));
-                if NativeBackend::CAPABILITIES.contains(CapabilityFlags::GLOBAL_HOTKEY)
-                    && let Some(ref spec) = initial_hotkey
-                    && let Err(err) = hotkey.set_hotkey(Some(spec))
-                {
-                    tracing::warn!(%err, hotkey = %spec, "failed to register configured global wakeup hotkey");
-                }
-
-                cx.update_global::<AppRuntime, _>(|runtime, _| {
-                    runtime.tray = tray;
-                    runtime.hotkey = Some(hotkey);
-                    runtime.hotkey_signal = Some(hotkey_signal.clone());
-                });
-
-                if let Some(signal) = tray_signal {
-                    spawn_tray_event_loop(signal, cx);
-                }
-                spawn_hotkey_event_loop(hotkey_signal, cx);
-                spawn_activation_event_loop(activation_signal_loop, cx);
-            });
         });
+}
+
+/// Completes non-critical desktop shell integrations strictly after the first frame has painted:
+/// starts the deferred cross-UIPI `WM_COPYDATA` receiver, registers the system tray icon, and
+/// registers any configured global wakeup hotkey.
+fn initialize_post_frame_shell(cx: &mut App) {
+    if !cx.has_global::<AppRuntime>() {
+        return;
+    }
+    let (activation_signal, initial_hotkey) = {
+        let runtime = cx.global_mut::<AppRuntime>();
+        if runtime.explicit_exit || runtime.post_frame_initialized {
+            return;
+        }
+        runtime.post_frame_initialized = true;
+        let activation_signal = runtime.activation_signal.clone();
+        if let (Some(guard), Some(wake_signal)) =
+            (runtime.single_instance.as_mut(), activation_signal.clone())
+            && let Err(err) = guard.start_activation_receiver(Arc::new(move |forwarded_args| {
+                wake_signal.push(forwarded_args);
+            }))
+        {
+            tracing::warn!(%err, "failed to start deferred single-instance activation receiver");
+        }
+        (activation_signal, runtime.initial_hotkey.take())
+    };
+    startup_trace::mark("post_frame_receiver_started");
+
+    let (tray, tray_signal) = match TrayController::new() {
+        Ok((controller, signal)) => (Some(controller), Some(signal)),
+        Err(err) => {
+            tracing::warn!(%err, "failed to initialize system tray icon");
+            (None, None)
+        }
+    };
+    startup_trace::mark("post_frame_tray_ready");
+
+    let hotkey_signal = HotkeyWakeSignal::default();
+    let trigger_signal = hotkey_signal.clone();
+    let mut hotkey = GlobalHotkeyController::new(Arc::new(move || {
+        trigger_signal.trigger();
+    }));
+    if NativeBackend::CAPABILITIES.contains(CapabilityFlags::GLOBAL_HOTKEY)
+        && let Some(ref spec) = initial_hotkey
+        && let Err(err) = hotkey.set_hotkey(Some(spec))
+    {
+        tracing::warn!(%err, hotkey = %spec, "failed to register configured global wakeup hotkey");
+    }
+    startup_trace::mark("post_frame_hotkey_ready");
+
+    cx.update_global::<AppRuntime, _>(|runtime, _| {
+        runtime.tray = tray;
+        runtime.hotkey = Some(hotkey);
+        runtime.hotkey_signal = Some(hotkey_signal.clone());
+    });
+
+    if let Some(signal) = tray_signal {
+        spawn_tray_event_loop(signal, cx);
+    }
+    spawn_hotkey_event_loop(hotkey_signal, cx);
+    if let Some(signal) = activation_signal {
+        spawn_activation_event_loop(signal, cx);
+    }
 }
 
 fn spawn_tray_event_loop(signal: TrayEventSignal, cx: &mut App) {
@@ -649,9 +701,31 @@ fn open_main_window(cx: &mut App) -> gpui_kit::Result<()> {
     };
 
     let options = build_window_options(&settings);
+    let needs_post_frame = !cx.global::<AppRuntime>().post_frame_initialized;
     let (window_handle, shell) = gpui_kit::open_window(options, cx, move |window, cx| {
-        apply_theme(settings.theme, settings.accent_color, Some(window), cx);
-        cx.new(|cx| AppShell::new_with_highlight(store, route, pending_highlight, window, cx))
+        let initial_system_accent =
+            apply_theme(settings.theme, settings.accent_color, Some(window), cx);
+        if needs_post_frame {
+            // Two-hop `on_next_frame`: first hop runs at Frame 0 start, second hop runs strictly
+            // after Frame 0 has completed layout, paint, and swapchain presentation.
+            window.on_next_frame(move |window, _cx| {
+                startup_trace::mark("first_frame_begin");
+                window.on_next_frame(move |_window, cx| {
+                    startup_trace::mark("first_frame_painted");
+                    initialize_post_frame_shell(cx);
+                });
+            });
+        }
+        cx.new(|cx| {
+            AppShell::new_with_highlight(
+                store,
+                route,
+                pending_highlight,
+                initial_system_accent,
+                window,
+                cx,
+            )
+        })
     })?;
 
     cx.update_global::<AppRuntime, _>(|runtime, _| {
@@ -808,7 +882,7 @@ fn quit_application(cx: &mut App) {
         }
         runtime.hotkey = None;
         runtime.tray = None;
-        runtime._single_instance = None;
+        runtime.single_instance = None;
         runtime.active_shell = None;
         runtime.main_window_visible = false;
         (
@@ -923,6 +997,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::shell::Route;
+    use crate::startup_trace::StartupTraceTarget;
 
     use super::LaunchArgs;
 
@@ -933,6 +1008,7 @@ mod tests {
             "--restore-route=details",
             "--config=/var/lib/loom/settings.toml",
             "--allow-multiple",
+            "--startup-trace=/tmp/loom-startup.log",
         ]);
         assert_eq!(posix_args.restore_route, Some(Route::Details));
         assert_eq!(
@@ -940,20 +1016,38 @@ mod tests {
             Some(PathBuf::from("/var/lib/loom/settings.toml"))
         );
         assert!(posix_args.allow_multiple);
+        assert_eq!(
+            posix_args.startup_trace,
+            Some(StartupTraceTarget::File(PathBuf::from(
+                "/tmp/loom-startup.log"
+            )))
+        );
 
-        // Split `--flag value` syntax with a Windows-style path.
+        // Split `--flag value` syntax with a Windows-style path and bare `--startup-trace`.
         let windows_args = LaunchArgs::parse_from([
             "--restore-route",
             "settings",
             "--config",
             r"C:\ProgramData\Loom\settings.toml",
+            "--startup-trace",
+            "--allow-multiple",
         ]);
         assert_eq!(windows_args.restore_route, Some(Route::Settings));
         assert_eq!(
             windows_args.config_path,
             Some(PathBuf::from(r"C:\ProgramData\Loom\settings.toml"))
         );
-        assert!(!windows_args.allow_multiple);
+        assert!(windows_args.allow_multiple);
+        assert_eq!(windows_args.startup_trace, Some(StartupTraceTarget::Stderr));
+
+        // Split `--startup-trace <path>` syntax.
+        let split_trace = LaunchArgs::parse_from(["--startup-trace", r"C:\Temp\startup_trace.txt"]);
+        assert_eq!(
+            split_trace.startup_trace,
+            Some(StartupTraceTarget::File(PathBuf::from(
+                r"C:\Temp\startup_trace.txt"
+            )))
+        );
 
         let empty = LaunchArgs::parse_from(Vec::<&str>::new());
         assert_eq!(empty, LaunchArgs::default());

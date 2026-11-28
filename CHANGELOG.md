@@ -4,6 +4,19 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ## Unreleased
 
+### Startup & Performance
+
+- Enabled Windows GUI subsystem (`#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`) in `loom-app` release builds (eliminating console host allocation latency on GUI launches) and added tuned workspace Cargo profiles (`[profile.release]` with `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`, and `[profile.dev]` / `[profile.dev.package."*"]` dependency optimization).
+- Eliminated synchronous main-thread startup blockers prior to first frame:
+  - Decoupled Windows single-instance named mutex acquisition from hidden `WM_COPYDATA` receiver window creation via non-blocking `SingleInstanceGuard::start_activation_receiver` (`WindowsSingleInstance::start_activation_receiver`).
+  - Moved `create_fast_sampler()`, `create_slow_prober()`, and `SlowLanePool::spawn(...)` off the calling thread into `loom-fast-sampler` in `EngineCoordinator::with_config` so engine initialization overlaps completely with GPUI/DirectX startup.
+  - Deferred `WM_COPYDATA` activation receiver, system tray (`TrayController`), and global wakeup hotkey registration strictly past first-frame paint (`window.on_next_frame`), and eliminated redundant startup theme/system-accent queries (`apply_theme` & `system_accent_rgb`).
+- Accelerated Tick 0 boot snapshots, steady-state fast-lane scans, and icon backfill:
+  - Added defaulted additive `FastSystemSampler::set_per_process_gpu_enabled` in `loom-pal-api` so `EngineCoordinator` bypasses cold DXGI/D3DKMT per-process GPU discovery on Tick 0 and enables it on Tick 1 (`+250 ms`).
+  - Added `ProcessGpuProbeState` negative-probe & active-adapter caching (`AccessDenied`, staggered `NoGpuContext` cooldown with immediate `App`-category promotion re-probe, and active adapter bitmask) in `loom-pal-windows::perf::gpu`, cutting warm `sample_processes` latency well below the `10 ms` release budget on 450+ process hosts.
+  - Prioritized slow-lane cold metadata probing for foreground `App` processes (descending private working set) ahead of background/system processes in `loom-engine` so visible apps receive icons and descriptions first.
+- Added zero-overhead opt-in `--startup-trace` / `--startup-trace=<path>` phase instrumentation in `loom-app` for measuring cold-start milestones from `main_start` to `first_frame_painted` and `tick0_snapshot_ready`.
+
 ### Engine & PAL
 
 - Extended `loom-types` additively while keeping `Copy` hot-sample layouts intact: added `GAP_SENTINEL` discontinuity markers (`push_gap`, `is_gap`, `to_vec_opt_f32` / `to_vec_opt`, gap-aware `max_value`) on `HistoryRing<N>` and `ThroughputRing<N>`, heterogeneous `CpuCoreKind` (`CpuStaticInfo::core_kinds`), `d3_asleep` on `GpuAdapterSample`/`GpuAdapterSlice`, `SocketProtocol`/`ProcessSocketRecord`, `FileLockHolder`, `LeakKind`/`LeakWarning`, `WebView2Role`, `MonitorDomain::ProcessNetwork`, and `CapabilityFlags::{SUSPEND_RESUME, FILE_LOCKS, PROCESS_SOCKETS, ELEVATED_PROCESS_NET}`.

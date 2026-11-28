@@ -314,6 +314,28 @@ impl SingleInstanceGuard {
     pub fn is_single(&self) -> bool {
         self.inner.is_single()
     }
+
+    /// Starts the OS activation receiver (e.g., Windows cross-UIPI `WM_COPYDATA` window)
+    /// non-blockingly for an already-acquired primary single-instance lock.
+    ///
+    /// Calling [`Self::acquire_or_notify`] with `on_activate = None` during early startup
+    /// and invoking this method after the first UI frame paints avoids creating hidden OS
+    /// windows or threads on the cold-start critical path while still allowing duplicate
+    /// launches to forward activation arguments.
+    pub fn start_activation_receiver(
+        &mut self,
+        on_activate: ActivationCallback,
+    ) -> Result<(), PalError> {
+        #[cfg(windows)]
+        {
+            self.inner.start_activation_receiver(on_activate)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = on_activate;
+            Ok(())
+        }
+    }
 }
 
 /// Cross-platform global wakeup hotkey controller.

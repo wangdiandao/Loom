@@ -33,22 +33,30 @@ pub(crate) fn resolve_accent_rgb(accent: AccentColorPreference) -> (u8, u8, u8) 
 }
 
 /// Applies a [`ThemePreference`] (`System` / `Light` / `Dark`) and [`AccentColorPreference`]
-/// to GPUI Kit immediately.
+/// to GPUI Kit immediately, returning the queried OS system accent color when `accent` tracks
+/// the system accent so callers do not repeat registry/DWM queries on startup.
 pub(crate) fn apply_theme(
     pref: ThemePreference,
     accent: AccentColorPreference,
     window: Option<&mut Window>,
     cx: &mut App,
-) {
+) -> Option<(u8, u8, u8)> {
     match pref {
         ThemePreference::System => Theme::sync_system_appearance(window, cx),
         ThemePreference::Light => Theme::change(ThemeMode::Light, window, cx),
         ThemePreference::Dark => Theme::change(ThemeMode::Dark, window, cx),
     }
-    let accent_rgb = resolve_accent_rgb(accent);
+    let (accent_rgb, queried_sys) = match accent.rgb() {
+        Some(custom) => (custom, None),
+        None => {
+            let sys = system_accent_rgb();
+            (sys, Some(sys))
+        }
+    };
     Theme::update(cx, |theme| {
         apply_accent_to_theme(theme, accent_rgb);
     });
+    queried_sys
 }
 
 /// Ergonomic namespace of typed UI command & preference mutation helpers.

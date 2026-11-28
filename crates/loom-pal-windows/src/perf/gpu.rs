@@ -13,7 +13,9 @@ use std::ptr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use loom_types::{GpuAdapterSample, GpuEngineSample, ProcessHotSample, ProcessKey};
+use loom_types::{
+    GpuAdapterSample, GpuEngineSample, ProcessCategory, ProcessHotSample, ProcessKey,
+};
 use windows_sys::Wdk::Graphics::Direct3D::{
     D3DKMT_ADAPTER_PERFDATA, D3DKMT_ADAPTERADDRESS, D3DKMT_ADAPTERTYPE, D3DKMT_CLOSEADAPTER,
     D3DKMT_NODEMETADATA, D3DKMT_OPENADAPTERFROMLUID, D3DKMT_QUERYADAPTERINFO,
@@ -708,6 +710,98 @@ pub(crate) struct PrimaryGpuSummary {
     pub(crate) shared_used_bytes: u64,
 }
 
+/// Minimum tick stride before re-probing an `App`-category process that previously had no GPU context.
+const APP_NOGPU_RECHECK_STRIDE: u64 = 3;
+/// Minimum tick stride before re-probing a `Background`/`System` process that previously had no GPU context.
+const BG_NOGPU_RECHECK_STRIDE: u64 = 10;
+/// Minimum tick stride before re-scanning all adapters for a GPU-active process (detects secondary GPU attachment).
+const ACTIVE_FULL_RECHECK_STRIDE: u64 = 8;
+
+/// Cached per-process D3DKMT attachment state eliminating redundant `OpenProcess` +
+/// `D3DKMTQueryStatistics` kernel roundtrips on hundreds of non-GPU background processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessGpuProbeState {
+    /// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` failed (protected/system process).
+    AccessDenied,
+    /// Process had no DxgKrnl context on any adapter; skip probing until `next_recheck_tick`,
+    /// unless promoted from non-`App` to `ProcessCategory::App`.
+    NoGpuContext {
+        next_recheck_tick: u64,
+        was_app: bool,
+    },
+    /// Process had an active DxgKrnl context on adapters in `adapter_mask`; probe every tick.
+    Active {
+        adapter_mask: u64,
+        full_recheck_tick: u64,
+    },
+}
+
+/// Decides whether a process should be probed on `tick` and which adapter bitmask to scan.
+///
+/// Returns `None` to skip probing on this tick, `Some(None)` to scan all adapters, or
+/// `Some(Some(mask))` to scan only adapters whose bit is set in `mask`.
+#[inline]
+fn should_probe_process(
+    state: Option<ProcessGpuProbeState>,
+    category: ProcessCategory,
+    tick: u64,
+) -> Option<Option<u64>> {
+    match state {
+        None => Some(None),
+        Some(ProcessGpuProbeState::AccessDenied) => None,
+        Some(ProcessGpuProbeState::NoGpuContext {
+            next_recheck_tick,
+            was_app,
+        }) => {
+            if (category == ProcessCategory::App && !was_app) || tick >= next_recheck_tick {
+                Some(None)
+            } else {
+                None
+            }
+        }
+        Some(ProcessGpuProbeState::Active {
+            adapter_mask,
+            full_recheck_tick,
+        }) => {
+            if adapter_mask == 0 || tick >= full_recheck_tick {
+                Some(None)
+            } else {
+                Some(Some(adapter_mask))
+            }
+        }
+    }
+}
+
+/// Computes the next [`ProcessGpuProbeState`] after probing a process on `tick`.
+#[inline]
+fn next_probe_state_after_scan(
+    attached_mask: u64,
+    attached_any: bool,
+    pid: u32,
+    category: ProcessCategory,
+    tick: u64,
+) -> ProcessGpuProbeState {
+    if attached_any {
+        let stagger = u64::from(pid) % ACTIVE_FULL_RECHECK_STRIDE;
+        ProcessGpuProbeState::Active {
+            adapter_mask: attached_mask,
+            full_recheck_tick: tick.saturating_add(ACTIVE_FULL_RECHECK_STRIDE + stagger),
+        }
+    } else {
+        let is_app = category == ProcessCategory::App;
+        let stride = if is_app {
+            APP_NOGPU_RECHECK_STRIDE
+        } else {
+            BG_NOGPU_RECHECK_STRIDE
+        };
+        let stagger = u64::from(pid) % stride;
+        ProcessGpuProbeState::NoGpuContext {
+            next_recheck_tick: tick.saturating_add(stride + stagger),
+            was_app: is_app,
+        }
+    }
+}
+
 /// Fast-lane Windows GPU telemetry sampler owned by [`crate::WindowsFastSampler`].
 pub(crate) struct GpuPerfSampler {
     api: Option<GpuApi>,
@@ -717,6 +811,10 @@ pub(crate) struct GpuPerfSampler {
     power_gates: HashMap<u64, GpuPowerGate>,
     /// Reusable per-process GPU engine running-time delta map (zero steady-state reallocation).
     prev_proc_nodes: HashMap<ProcessGpuNodeKey, PrevNodeSample>,
+    /// Reusable per-process negative-probe & active-adapter state cache.
+    proc_probe_state: HashMap<ProcessKey, ProcessGpuProbeState>,
+    /// Monotonic counter of per-process GPU sampling ticks.
+    proc_sample_tick: u64,
     /// Reusable set of live `ProcessKey`s observed on the current tick for stale-key pruning.
     live_proc_keys: HashSet<ProcessKey>,
 }
@@ -737,6 +835,8 @@ impl GpuPerfSampler {
             prev_nodes: HashMap::with_capacity(32),
             power_gates: HashMap::with_capacity(4),
             prev_proc_nodes: HashMap::with_capacity(256),
+            proc_probe_state: HashMap::with_capacity(512),
+            proc_sample_tick: 0,
             live_proc_keys: HashSet::with_capacity(512),
         }
     }
@@ -757,6 +857,10 @@ impl GpuPerfSampler {
     /// (`PROCESS` / `PROCESS_ADAPTER` / `PROCESS_SEGMENT` / `PROCESS_NODE`) with short-lived
     /// `PROCESS_QUERY_LIMITED_INFORMATION` handles (immediately dropped per process).
     ///
+    /// Caches access-denied and non-GPU processes with staggered cooldowns so warm ticks
+    /// avoid redundant `OpenProcess` / `D3DKMT` syscalls on hundreds of idle background
+    /// processes while probing active GPU processes on every tick.
+    ///
     /// Gracefully reports zeros for inaccessible/kernel processes or systems without hardware GPUs.
     pub(crate) fn sample_process_gpu_metrics(&mut self, samples: &mut [ProcessHotSample<()>]) {
         if self.api.is_none() || samples.is_empty() {
@@ -772,6 +876,8 @@ impl GpuPerfSampler {
             return;
         };
 
+        self.proc_sample_tick = self.proc_sample_tick.saturating_add(1);
+        let tick = self.proc_sample_tick;
         self.live_proc_keys.clear();
 
         for sample in samples.iter_mut() {
@@ -780,12 +886,20 @@ impl GpuPerfSampler {
                 continue;
             }
 
+            let prev_state = self.proc_probe_state.get(&sample.key).copied();
+            let Some(adapter_mask_filter) = should_probe_process(prev_state, sample.category, tick)
+            else {
+                continue;
+            };
+
             // Open a strictly short-lived handle (`PROCESS_QUERY_LIMITED_INFORMATION`) that is
             // closed immediately when `proc_handle` drops at the end of this iteration.
             // SAFETY: `OpenProcess` takes plain integer arguments and returns null on error.
             let raw_handle =
                 unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, sample.key.pid) };
             let Some(proc_handle) = OwnedHandle::from_raw(raw_handle) else {
+                self.proc_probe_state
+                    .insert(sample.key, ProcessGpuProbeState::AccessDenied);
                 continue;
             };
 
@@ -793,8 +907,17 @@ impl GpuPerfSampler {
             let mut shared_bytes: u64 = 0;
             let mut max_util_permille: u16 = 0;
             let mut cached_seq_num: Option<Option<u64>> = None;
+            let mut attached_mask: u64 = 0;
+            let mut attached_any = false;
 
-            for adapter in &self.adapters {
+            for (adapter_idx, adapter) in self.adapters.iter().enumerate() {
+                if let Some(mask) = adapter_mask_filter
+                    && adapter_idx < 64
+                    && (mask & (1u64 << adapter_idx)) == 0
+                {
+                    continue;
+                }
+
                 // 1. Fast kernel pre-check (`D3DKMT_QUERYSTATISTICS_PROCESS`): skip immediately
                 // if this process has no DxgKrnl GPU context on this adapter.
                 let proc_query = D3DKMT_QUERYSTATISTICS {
@@ -819,6 +942,11 @@ impl GpuPerfSampler {
                 // SAFETY: Configured for `D3DKMT_QUERYSTATISTICS_PROCESS_ADAPTER`.
                 if unsafe { (api.d3dkmt_query_statistics)(&proc_adapter_query) } != STATUS_SUCCESS {
                     continue;
+                }
+
+                attached_any = true;
+                if adapter_idx < 64 {
+                    attached_mask |= 1u64 << adapter_idx;
                 }
 
                 let sequence_number = *cached_seq_num
@@ -885,12 +1013,23 @@ impl GpuPerfSampler {
                 }
             }
 
+            let next_state = next_probe_state_after_scan(
+                attached_mask,
+                attached_any,
+                sample.key.pid,
+                sample.category,
+                tick,
+            );
+            self.proc_probe_state.insert(sample.key, next_state);
+
             sample.gpu_dedicated_bytes = dedicated_bytes;
             sample.gpu_shared_bytes = shared_bytes;
             sample.gpu_util_permille = max_util_permille;
         }
 
         prune_stale_process_gpu_nodes(&mut self.prev_proc_nodes, &self.live_proc_keys);
+        self.proc_probe_state
+            .retain(|k, _| self.live_proc_keys.contains(k));
     }
 
     /// Samples all hardware GPU adapters into `out` and returns the primary GPU summary.
@@ -1149,9 +1288,11 @@ impl GpuPerfSampler {
             display_idx += 1;
         }
 
-        // Retain power-gate state only for currently present adapter LUIDs.
+        // Retain power-gate state only for currently present adapter LUIDs, and clear
+        // cached per-process GPU probe state so newly attached/hot-plugged GPUs are probed.
         self.power_gates
             .retain(|luid, _| self.adapters.iter().any(|a| a.luid == *luid));
+        self.proc_probe_state.clear();
     }
 }
 
@@ -1776,5 +1917,60 @@ mod tests {
         prune_stale_process_gpu_nodes(&mut prev, &live);
         assert!(prev.contains_key(&k1));
         assert!(!prev.contains_key(&k2));
+    }
+
+    #[test]
+    fn process_gpu_probe_state_skips_denied_and_cools_down_non_gpu_with_app_promotion() {
+        // Brand-new process always probes all adapters.
+        assert_eq!(
+            should_probe_process(None, ProcessCategory::Background, 1),
+            Some(None)
+        );
+
+        // AccessDenied never re-probes for the lifetime of that ProcessKey.
+        assert_eq!(
+            should_probe_process(
+                Some(ProcessGpuProbeState::AccessDenied),
+                ProcessCategory::App,
+                999,
+            ),
+            None
+        );
+
+        // Non-GPU background process cools down for at least BG_NOGPU_RECHECK_STRIDE ticks.
+        let bg_state = next_probe_state_after_scan(0, false, 100, ProcessCategory::Background, 1);
+        assert_eq!(
+            should_probe_process(Some(bg_state), ProcessCategory::Background, 2),
+            None
+        );
+        // Promoting the same process to ProcessCategory::App triggers an immediate re-probe.
+        assert_eq!(
+            should_probe_process(Some(bg_state), ProcessCategory::App, 2),
+            Some(None)
+        );
+        // Once cooldown expires, background process re-probes all adapters.
+        assert_eq!(
+            should_probe_process(
+                Some(bg_state),
+                ProcessCategory::Background,
+                1 + BG_NOGPU_RECHECK_STRIDE * 2,
+            ),
+            Some(None)
+        );
+
+        // Active GPU process probes only its attached adapter bitmask until full_recheck_tick.
+        let active_state = next_probe_state_after_scan(0b01, true, 42, ProcessCategory::App, 1);
+        assert_eq!(
+            should_probe_process(Some(active_state), ProcessCategory::App, 2),
+            Some(Some(0b01))
+        );
+        assert_eq!(
+            should_probe_process(
+                Some(active_state),
+                ProcessCategory::App,
+                1 + ACTIVE_FULL_RECHECK_STRIDE * 2,
+            ),
+            Some(None)
+        );
     }
 }

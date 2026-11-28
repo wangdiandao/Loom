@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crossbeam_channel::Receiver;
 use gpui_kit::{Context, EventEmitter, Task};
@@ -13,6 +14,9 @@ use loom_pal::NativeBackend;
 use loom_types::{AppSnapshot, DomainRevisions, MonitorDomain, RefreshSpeed};
 
 use crate::bridge::ScopedMonitorLease;
+use crate::startup_trace;
+
+static TICK0_SNAPSHOT_MARKED: AtomicBool = AtomicBool::new(false);
 
 /// Structured events emitted by [`UiStore`] for shell and feature subscribers.
 #[derive(Debug, Clone)]
@@ -67,6 +71,9 @@ impl UiStore {
     ) -> Self {
         let snapshot = coordinator.snapshot();
         let last_revisions = snapshot.revisions;
+        if last_revisions.processes >= 1 || last_revisions.performance >= 1 {
+            startup_trace::mark_once(&TICK0_SNAPSHOT_MARKED, "tick0_snapshot_ready");
+        }
         let event_rx = coordinator.subscribe_events();
         let last_active_refresh_speed = match settings.refresh_speed {
             RefreshSpeed::Paused => RefreshSpeed::Normal1S,
@@ -297,6 +304,9 @@ impl UiStore {
     pub(crate) fn sync_from_coordinator(&mut self, cx: &mut Context<Self>) {
         let next = self.coordinator.snapshot();
         if self.apply_snapshot_if_changed(next) {
+            if self.last_revisions.processes >= 1 || self.last_revisions.performance >= 1 {
+                startup_trace::mark_once(&TICK0_SNAPSHOT_MARKED, "tick0_snapshot_ready");
+            }
             cx.emit(UiStoreEvent::SnapshotUpdated(self.last_revisions));
         }
 

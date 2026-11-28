@@ -589,6 +589,8 @@ pub struct WindowsFastSampler {
     gpu_sampler: GpuPerfSampler,
     /// Optional elevated-only ETW per-process network byte collector (active only when leased).
     etw_net: Option<EtwProcessNetCollector>,
+    /// Whether per-process `D3DKMT` GPU telemetry runs during [`Self::sample_processes`].
+    per_process_gpu_enabled: bool,
     /// Cached total logical CPU count across all processor groups.
     logical_cpu_count: u32,
 }
@@ -639,6 +641,7 @@ impl WindowsFastSampler {
             net_sampler: NetworkPerfSampler::new(),
             gpu_sampler: GpuPerfSampler::new(),
             etw_net: None,
+            per_process_gpu_enabled: true,
             logical_cpu_count,
         }
     }
@@ -1015,8 +1018,12 @@ impl FastSystemSampler for WindowsFastSampler {
 
         // Populate pure kernel-mode D3DKMT per-process GPU telemetry (VRAM & utilization)
         // using strictly short-lived `PROCESS_QUERY_LIMITED_INFORMATION` handles.
-        self.gpu_sampler
-            .sample_process_gpu_metrics(&mut scratch.samples);
+        // Skipped on Tick 0 when disabled by the coordinator so cold startup publishes
+        // immediately before DXGI/D3DKMT adapter discovery runs on Tick 1.
+        if self.per_process_gpu_enabled {
+            self.gpu_sampler
+                .sample_process_gpu_metrics(&mut scratch.samples);
+        }
 
         // Populate system-wide performance summary alongside the process snapshot.
         let (cpu_total_permille, cpu_kernel_permille) = Self::sample_cpu_counters(
@@ -1110,6 +1117,10 @@ impl FastSystemSampler for WindowsFastSampler {
                 );
             }
         }
+    }
+
+    fn set_per_process_gpu_enabled(&mut self, enabled: bool) {
+        self.per_process_gpu_enabled = enabled;
     }
 }
 
