@@ -523,3 +523,83 @@ impl From<&Theme> for LoomSemanticColors {
         Self::from_theme(theme)
     }
 }
+
+/// Compact fingerprint of the [`Theme`] fields that feed [`LoomSemanticColors::from_theme`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ThemePaletteKey {
+    is_dark: bool,
+    background: Hsla,
+    foreground: Hsla,
+    muted: Hsla,
+    muted_foreground: Hsla,
+    primary: Hsla,
+    border: Hsla,
+    list_active: Hsla,
+    list_hover: Hsla,
+}
+
+impl ThemePaletteKey {
+    #[inline]
+    fn from_theme(theme: &Theme) -> Self {
+        Self {
+            is_dark: theme.is_dark(),
+            background: theme.background,
+            foreground: theme.foreground,
+            muted: theme.muted,
+            muted_foreground: theme.muted_foreground,
+            primary: theme.primary,
+            border: theme.border,
+            list_active: theme.list_active,
+            list_hover: theme.list_hover,
+        }
+    }
+}
+
+/// Theme-keyed cache around [`LoomSemanticColors::from_theme`].
+///
+/// Computing WCAG-verified semantic colors performs iterative binary-search
+/// luminance calculations (`powf(2.4)`). Calling `from_theme` per table cell
+/// wastes tens of thousands of floating-point power calls per frame. Storing a
+/// [`CachedSemanticColors`] inside a view or table delegate recomputes the
+/// palette only when the active theme's visual tokens actually change.
+#[derive(Debug, Default, Clone)]
+pub struct CachedSemanticColors {
+    cached: Option<(ThemePaletteKey, LoomSemanticColors)>,
+}
+
+impl CachedSemanticColors {
+    /// Creates an empty [`CachedSemanticColors`] cache.
+    #[inline]
+    pub const fn new() -> Self {
+        Self { cached: None }
+    }
+
+    /// Returns a reference to the cached [`LoomSemanticColors`] for `theme`,
+    /// recomputing only if the relevant theme fields changed since the last call.
+    #[inline]
+    pub fn get(&mut self, theme: &Theme) -> &LoomSemanticColors {
+        let key = ThemePaletteKey::from_theme(theme);
+        if let Some((prev_key, _)) = &self.cached
+            && *prev_key != key
+        {
+            self.cached = None;
+        }
+        &self
+            .cached
+            .get_or_insert_with(|| (key, LoomSemanticColors::from_theme(theme)))
+            .1
+    }
+
+    /// Convenience wrapper around [`Self::get`] returning the [`Copy`] palette
+    /// by value, avoiding borrow conflicts inside GPUI table delegates.
+    #[inline]
+    pub fn get_copy(&mut self, theme: &Theme) -> LoomSemanticColors {
+        *self.get(theme)
+    }
+
+    /// Clears the cached palette so the next call recomputes from scratch.
+    #[inline]
+    pub fn invalidate(&mut self) {
+        self.cached = None;
+    }
+}

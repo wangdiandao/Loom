@@ -1,5 +1,7 @@
 //! Formatting helpers and semantic intensity buckets for resource metrics.
 
+use std::sync::{Arc, OnceLock};
+
 use gpui_kit::SharedString;
 use loom_types::ResourceDisplayMode;
 
@@ -7,6 +9,107 @@ const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
 const GIB: u64 = 1024 * MIB;
 const TIB: u64 = 1024 * GIB;
+
+/// Maximum `u32` value covered by the zero-allocation static integer table.
+pub const SMALL_U32_TABLE_MAX: u32 = 512;
+
+/// Maximum child count covered by the zero-allocation static `"(N)"` table.
+pub const CHILD_COUNT_TABLE_MAX: u32 = 256;
+
+/// Default single-line character cap applied to long table cell preview strings
+/// (such as command lines or executable paths) before passing them to text shaping.
+pub const DEFAULT_CELL_PREVIEW_CHARS: usize = 256;
+
+/// Pre-formatted permille strings covering `"0.0%" ..= "100.0%"`.
+static PERMILLE_TABLE: OnceLock<[SharedString; 1001]> = OnceLock::new();
+
+/// Pre-formatted small unsigned integer strings covering `"0" ..= "512"`.
+static SMALL_U32_TABLE: OnceLock<[SharedString; 513]> = OnceLock::new();
+
+/// Pre-formatted child-count badge strings covering `"(0)" ..= "(256)"`.
+static CHILD_COUNT_TABLE: OnceLock<[SharedString; 257]> = OnceLock::new();
+
+#[inline]
+fn permille_table() -> &'static [SharedString; 1001] {
+    PERMILLE_TABLE.get_or_init(|| {
+        std::array::from_fn(|p| match p {
+            0 => SharedString::new_static("0.0%"),
+            1_000 => SharedString::new_static("100.0%"),
+            _ => SharedString::from(format!("{}.{}%", p / 10, p % 10)),
+        })
+    })
+}
+
+#[inline]
+fn small_u32_table() -> &'static [SharedString; 513] {
+    SMALL_U32_TABLE.get_or_init(|| {
+        std::array::from_fn(|n| match n {
+            0 => SharedString::new_static("0"),
+            _ => SharedString::from(n.to_string()),
+        })
+    })
+}
+
+#[inline]
+fn child_count_table() -> &'static [SharedString; 257] {
+    CHILD_COUNT_TABLE.get_or_init(|| std::array::from_fn(|n| SharedString::from(format!("({n})"))))
+}
+
+/// Exact integer division rounded to nearest integer with ties-to-even.
+#[inline]
+const fn div_round_ties_even_u128(num: u128, den: u128) -> u64 {
+    let q = num / den;
+    let r = num % den;
+    let twice_r = r * 2;
+    let rounded = if twice_r > den || (twice_r == den && (q & 1) == 1) {
+        q + 1
+    } else {
+        q
+    };
+    rounded as u64
+}
+
+/// Formats a quantized tenths value (e.g. `124` -> `"12.4"`) strictly using
+/// ASCII digits and `'.'` so `gpui-fast::NumberShaping` always hits.
+#[inline]
+fn format_tenths_shared(tenths: u64) -> SharedString {
+    SharedString::from(format!("{}.{}", tenths / 10, tenths % 10))
+}
+
+/// Split numeric value and static unit suffix for high-frequency table cells.
+///
+/// `gpui-fast`'s `NumberShaping` fast path only matches strings whose bytes
+/// belong to `b"0123456789.,+-%$KMBT"` (excluding spaces, `'G'`, `'/'`, `'s'`,
+/// `'p'`, etc.). Keeping the numeric portion in [`Self::value`] and the unit
+/// suffix in [`Self::unit`] lets the value hit `NumberShaping` on every frame
+/// while the static unit hits `LineLayoutCache` with zero re-shaping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricDisplay {
+    /// Pure numeric text (bytes strictly in `b"0123456789.,+-%"`).
+    pub value: SharedString,
+    /// Static trailing unit string (e.g. `" MB"`, `" MB/s"`, `" Mbps"`, or `""`).
+    pub unit: &'static str,
+}
+
+impl MetricDisplay {
+    /// Creates a new [`MetricDisplay`] from a numeric string and static unit suffix.
+    #[inline]
+    pub fn new(value: impl Into<SharedString>, unit: &'static str) -> Self {
+        Self {
+            value: value.into(),
+            unit,
+        }
+    }
+
+    /// Creates a [`MetricDisplay`] backed entirely by static string slices.
+    #[inline]
+    pub const fn from_static(value: &'static str, unit: &'static str) -> Self {
+        Self {
+            value: SharedString::new_static(value),
+            unit,
+        }
+    }
+}
 
 /// 100 KB/s threshold for [`HeatmapLevel::Low`] throughput cells.
 const RATE_LOW_BPS: u64 = 100 * KIB;
@@ -183,13 +286,289 @@ pub fn format_cpu_time(ticks_100ns: u64) -> String {
 
 /// Zero-allocation fast-path permille formatter returning a [`SharedString`].
 ///
-/// Avoids heap allocations for the common `0.0%` and `100.0%` values in hot table cells.
+/// Uses a static lookup table covering `"0.0%" ..= "100.0%"` so values in
+/// `0..=1000` perform zero heap allocations; values above `1000` fall back to
+/// dynamic formatting.
 #[inline]
 pub fn format_permille_shared(permille: u16) -> SharedString {
-    match permille {
-        0 => SharedString::new_static("0.0%"),
-        1_000 => SharedString::new_static("100.0%"),
-        _ => format_permille(permille).into(),
+    if permille <= 1_000 {
+        permille_table()[usize::from(permille)].clone()
+    } else {
+        format_permille(permille).into()
+    }
+}
+
+/// Zero-allocation fast-path unsigned integer formatter returning a [`SharedString`].
+///
+/// Values in `0..=512` clone from a pre-initialized lookup table; larger values
+/// format dynamically.
+#[inline]
+pub fn format_u32_shared(val: u32) -> SharedString {
+    if val <= SMALL_U32_TABLE_MAX {
+        small_u32_table()[val as usize].clone()
+    } else {
+        val.to_string().into()
+    }
+}
+
+/// Zero-allocation fast-path process group child-count formatter returning `"(N)"`.
+///
+/// Values in `0..=256` clone from a pre-initialized lookup table; larger counts
+/// format dynamically.
+#[inline]
+pub fn format_child_count_shared(count: u32) -> SharedString {
+    if count <= CHILD_COUNT_TABLE_MAX {
+        child_count_table()[count as usize].clone()
+    } else {
+        format!("({count})").into()
+    }
+}
+
+#[inline]
+const fn quantize_bytes_parts(bytes: u64) -> (u8, u64) {
+    if bytes == 0 {
+        (0, 0)
+    } else if bytes < KIB {
+        (1, bytes)
+    } else if bytes < MIB {
+        (2, bytes / KIB)
+    } else if bytes < GIB {
+        (
+            3,
+            div_round_ties_even_u128((bytes as u128) * 10, MIB as u128),
+        )
+    } else if bytes < TIB {
+        (
+            4,
+            div_round_ties_even_u128((bytes as u128) * 10, GIB as u128),
+        )
+    } else {
+        (
+            5,
+            div_round_ties_even_u128((bytes as u128) * 10, TIB as u128),
+        )
+    }
+}
+
+#[inline]
+const fn quantize_rate_bps_parts(bytes_per_sec: u64) -> (u8, u64) {
+    if bytes_per_sec == 0 {
+        (0, 0)
+    } else if bytes_per_sec < KIB {
+        (1, bytes_per_sec)
+    } else if bytes_per_sec < MIB {
+        (
+            2,
+            div_round_ties_even_u128((bytes_per_sec as u128) * 10, KIB as u128),
+        )
+    } else if bytes_per_sec < GIB {
+        (
+            3,
+            div_round_ties_even_u128((bytes_per_sec as u128) * 10, MIB as u128),
+        )
+    } else {
+        (
+            4,
+            div_round_ties_even_u128((bytes_per_sec as u128) * 10, GIB as u128),
+        )
+    }
+}
+
+#[inline]
+const fn quantize_net_bps_parts(bytes_per_sec: u64) -> (u8, u64) {
+    if bytes_per_sec == 0 {
+        return (0, 0);
+    }
+    let bits_per_sec = (bytes_per_sec as u128) * 8;
+    if bits_per_sec < 1_000 {
+        (1, bits_per_sec as u64)
+    } else if bits_per_sec < 100_000 {
+        (2, div_round_ties_even_u128(bits_per_sec, 100))
+    } else if bits_per_sec < 1_000_000_000 {
+        (3, div_round_ties_even_u128(bits_per_sec, 100_000))
+    } else {
+        (4, div_round_ties_even_u128(bits_per_sec, 100_000_000))
+    }
+}
+
+/// Encodes the display unit tier and rounded numeric value for [`format_bytes_metric`].
+///
+/// Two byte counts produce the same key if and only if they render identically
+/// via [`format_bytes_metric`].
+#[inline]
+pub const fn quantize_bytes_display(bytes: u64) -> u64 {
+    let (tier, val) = quantize_bytes_parts(bytes);
+    ((tier as u64) << 60) | val
+}
+
+/// Encodes the display unit tier and rounded numeric value for [`format_rate_bytes_per_sec_metric`].
+///
+/// Two byte rates produce the same key if and only if they render identically
+/// via [`format_rate_bytes_per_sec_metric`].
+#[inline]
+pub const fn quantize_rate_bps_display(bytes_per_sec: u64) -> u64 {
+    let (tier, val) = quantize_rate_bps_parts(bytes_per_sec);
+    ((tier as u64) << 60) | val
+}
+
+/// Encodes the display unit tier and rounded numeric value for [`format_network_rate_mbps_metric`].
+///
+/// Two network byte rates produce the same key if and only if they render
+/// identically via [`format_network_rate_mbps_metric`].
+#[inline]
+pub const fn quantize_net_bps_display(bytes_per_sec: u64) -> u64 {
+    let (tier, val) = quantize_net_bps_parts(bytes_per_sec);
+    ((tier as u64) << 60) | val
+}
+
+/// Quantizes cumulative CPU time in 100-nanosecond ticks down to whole display seconds.
+#[inline]
+pub const fn quantize_cpu_time_secs(ticks_100ns: u64) -> u64 {
+    ticks_100ns / TICKS_PER_SECOND
+}
+
+/// Formats a permille value (`0..=1000`) into a [`MetricDisplay`] whose `value`
+/// hits `gpui-fast::NumberShaping` directly (with an empty unit suffix).
+#[inline]
+pub fn format_permille_metric(permille: u16) -> MetricDisplay {
+    MetricDisplay::new(format_permille_shared(permille), "")
+}
+
+/// Formats a byte count into a split [`MetricDisplay`] (`value` strictly numeric,
+/// `unit` in `{" B", " KB", " MB", " GB", " TB"}`).
+pub fn format_bytes_metric(bytes: u64) -> MetricDisplay {
+    let (tier, val) = quantize_bytes_parts(bytes);
+    match tier {
+        0 => MetricDisplay::from_static("0", " B"),
+        1 => MetricDisplay::new(format_u32_shared(val as u32), " B"),
+        2 => MetricDisplay::new(format_u32_shared(val as u32), " KB"),
+        3 => MetricDisplay::new(format_tenths_shared(val), " MB"),
+        4 => MetricDisplay::new(format_tenths_shared(val), " GB"),
+        _ => MetricDisplay::new(format_tenths_shared(val), " TB"),
+    }
+}
+
+/// Formats a storage/transfer throughput in bytes per second into a split
+/// [`MetricDisplay`] (`value` strictly numeric, `unit` in `{" B/s", " KB/s", " MB/s", " GB/s"}`).
+pub fn format_rate_bytes_per_sec_metric(bytes_per_sec: u64) -> MetricDisplay {
+    let (tier, val) = quantize_rate_bps_parts(bytes_per_sec);
+    match tier {
+        0 => MetricDisplay::from_static("0", " MB/s"),
+        1 => MetricDisplay::new(format_u32_shared(val as u32), " B/s"),
+        2 => MetricDisplay::new(format_tenths_shared(val), " KB/s"),
+        3 => MetricDisplay::new(format_tenths_shared(val), " MB/s"),
+        _ => MetricDisplay::new(format_tenths_shared(val), " GB/s"),
+    }
+}
+
+/// Formats a network throughput (in bytes per second) into a split
+/// [`MetricDisplay`] (`value` strictly numeric, `unit` in `{" bps", " Kbps", " Mbps", " Gbps"}`).
+pub fn format_network_rate_mbps_metric(bytes_per_sec: u64) -> MetricDisplay {
+    let (tier, val) = quantize_net_bps_parts(bytes_per_sec);
+    match tier {
+        0 => MetricDisplay::from_static("0", " Mbps"),
+        1 => MetricDisplay::new(format_u32_shared(val as u32), " bps"),
+        2 => MetricDisplay::new(format_tenths_shared(val), " Kbps"),
+        3 => MetricDisplay::new(format_tenths_shared(val), " Mbps"),
+        _ => MetricDisplay::new(format_tenths_shared(val), " Gbps"),
+    }
+}
+
+/// Formats a memory table cell as a [`MetricDisplay`] according to [`ResourceDisplayMode`].
+#[inline]
+pub fn format_memory_cell_metric(
+    bytes: u64,
+    permille: u16,
+    mode: ResourceDisplayMode,
+) -> MetricDisplay {
+    match mode {
+        ResourceDisplayMode::Percent => format_permille_metric(permille),
+        ResourceDisplayMode::Values => format_bytes_metric(bytes),
+    }
+}
+
+/// Formats a disk throughput table cell as a [`MetricDisplay`] according to [`ResourceDisplayMode`].
+#[inline]
+pub fn format_disk_cell_metric(
+    bytes_per_sec: u64,
+    permille: u16,
+    mode: ResourceDisplayMode,
+) -> MetricDisplay {
+    match mode {
+        ResourceDisplayMode::Percent => format_permille_metric(permille),
+        ResourceDisplayMode::Values => format_rate_bytes_per_sec_metric(bytes_per_sec),
+    }
+}
+
+/// Formats a network throughput table cell as a [`MetricDisplay`] according to [`ResourceDisplayMode`].
+#[inline]
+pub fn format_network_cell_metric(
+    bytes_per_sec: u64,
+    permille: u16,
+    mode: ResourceDisplayMode,
+) -> MetricDisplay {
+    match mode {
+        ResourceDisplayMode::Percent => format_permille_metric(permille),
+        ResourceDisplayMode::Values => format_network_rate_mbps_metric(bytes_per_sec),
+    }
+}
+
+/// Produces a UTF-8 safe single-line preview capped at `max_chars` Unicode
+/// scalar values, replacing any control characters (including `\r` and `\n`)
+/// with spaces and appending `'…'` if truncated.
+///
+/// Returns `None` when `s` already has `<= max_chars` characters and contains
+/// no control characters, allowing callers to reuse the original string without
+/// allocating.
+pub fn cap_single_line_preview(s: &str, max_chars: usize) -> Option<String> {
+    let mut has_control = false;
+    let mut truncated = false;
+    let mut prefix_end = s.len();
+
+    for (count, (byte_idx, ch)) in s.char_indices().enumerate() {
+        if count == max_chars {
+            truncated = true;
+            prefix_end = byte_idx;
+            break;
+        }
+        if ch.is_control() {
+            has_control = true;
+        }
+    }
+
+    if !truncated && !has_control {
+        return None;
+    }
+
+    let prefix = &s[..prefix_end];
+    let extra = if truncated { '…'.len_utf8() } else { 0 };
+    let mut out = String::with_capacity(prefix.len() + extra);
+    if has_control {
+        for ch in prefix.chars() {
+            if ch.is_control() {
+                out.push(' ');
+            } else {
+                out.push(ch);
+            }
+        }
+    } else {
+        out.push_str(prefix);
+    }
+    if truncated {
+        out.push('…');
+    }
+    Some(out)
+}
+
+/// Returns a single-line, length-capped [`SharedString`] preview of `arc`.
+///
+/// When `arc` fits within `max_chars` and contains no control characters,
+/// returns `SharedString::from(Arc::clone(arc))` with zero heap allocation.
+#[inline]
+pub fn display_preview_shared(arc: &Arc<str>, max_chars: usize) -> SharedString {
+    match cap_single_line_preview(arc, max_chars) {
+        Some(capped) => SharedString::from(capped),
+        None => SharedString::from(Arc::clone(arc)),
     }
 }
 

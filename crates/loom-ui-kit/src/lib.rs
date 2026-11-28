@@ -13,20 +13,27 @@ pub mod heatmap;
 pub mod icon;
 pub mod logic;
 pub mod memory_bar;
+pub mod row_cache;
 pub mod sparkline;
 pub mod status_badge;
 pub mod theme;
 
 pub use format::{
-    HeatmapLevel, UNAVAILABLE_LABEL, adaptive_network_scale, adaptive_throughput_scale,
-    format_bits_per_sec, format_bytes, format_bytes_shared, format_cpu_time,
-    format_cpu_time_shared, format_disk_cell, format_disk_cell_shared, format_freq_ghz,
-    format_latency_us, format_memory_cell, format_memory_cell_shared, format_network_cell,
-    format_network_cell_shared, format_network_rate_mbps, format_network_rate_mbps_shared,
-    format_opt_percent_permille, format_opt_temp_celsius, format_permille, format_permille_shared,
-    format_rate_bytes_per_sec, format_rate_bytes_per_sec_shared, format_uptime,
+    CHILD_COUNT_TABLE_MAX, DEFAULT_CELL_PREVIEW_CHARS, HeatmapLevel, MetricDisplay,
+    SMALL_U32_TABLE_MAX, UNAVAILABLE_LABEL, adaptive_network_scale, adaptive_throughput_scale,
+    cap_single_line_preview, display_preview_shared, format_bits_per_sec, format_bytes,
+    format_bytes_metric, format_bytes_shared, format_child_count_shared, format_cpu_time,
+    format_cpu_time_shared, format_disk_cell, format_disk_cell_metric, format_disk_cell_shared,
+    format_freq_ghz, format_latency_us, format_memory_cell, format_memory_cell_metric,
+    format_memory_cell_shared, format_network_cell, format_network_cell_metric,
+    format_network_cell_shared, format_network_rate_mbps, format_network_rate_mbps_metric,
+    format_network_rate_mbps_shared, format_opt_percent_permille, format_opt_temp_celsius,
+    format_permille, format_permille_metric, format_permille_shared, format_rate_bytes_per_sec,
+    format_rate_bytes_per_sec_metric, format_rate_bytes_per_sec_shared, format_u32_shared,
+    format_uptime, quantize_bytes_display, quantize_cpu_time_secs, quantize_net_bps_display,
+    quantize_rate_bps_display,
 };
-pub use heatmap::heatmap_cell;
+pub use heatmap::{heatmap_cell, heatmap_cell_metric, heatmap_cell_mono};
 pub use icon::rgba_icon_to_render_image;
 pub use logic::{
     CSV_UTF8_BOM, CoreCardHeaderMode, CoreGridLayout, GPU_ENGINE_ACTIVE_THRESHOLD_PERMILLE,
@@ -34,14 +41,19 @@ pub use logic::{
     select_active_gpu_engines, stepped_network_ceiling, stepped_throughput_ceiling,
 };
 pub use memory_bar::{MemoryBarLabels, MemoryBarSegments, memory_composition_bar};
+pub use row_cache::{DEFAULT_ROW_TEXT_CACHE_CAPACITY, RowTextCache};
 pub use sparkline::{
     GapAwareSparklinePoint, PERMILLE_GAP_SENTINEL, SparklineCardProps, SparklinePoint,
     sparkline_card,
 };
-pub use status_badge::{ECO_LEAF_ICON_PATH, ECO_LEAF_SVG, StatusLabels, status_badges};
+pub use status_badge::{
+    ECO_LEAF_ICON_PATH, ECO_LEAF_SVG, StatusLabels, has_visible_status_badges, status_badges,
+    status_badges_with_a11y,
+};
 pub use theme::{
-    LoomSemanticColors, WCAG_AA_TEXT_CONTRAST, WCAG_AA_UI_CONTRAST, WCAG_AAA_TEXT_CONTRAST,
-    ensure_wcag_contrast, hsla_to_srgb, srgb_relative_luminance, wcag_contrast_ratio,
+    CachedSemanticColors, LoomSemanticColors, WCAG_AA_TEXT_CONTRAST, WCAG_AA_UI_CONTRAST,
+    WCAG_AAA_TEXT_CONTRAST, ensure_wcag_contrast, hsla_to_srgb, srgb_relative_luminance,
+    wcag_contrast_ratio,
 };
 
 #[cfg(test)]
@@ -881,6 +893,480 @@ mod tests {
         assert_eq!(
             padded,
             vec![SparklinePoint::new(2, 10.0), SparklinePoint::new(4, 30.0)]
+        );
+    }
+
+    #[test]
+    fn cached_semantic_colors_hits_and_invalidates_on_theme_changes() {
+        let mut cache = CachedSemanticColors::new();
+        let light = light_theme();
+        let dark = dark_theme();
+
+        let expected_light = LoomSemanticColors::from_theme(&light);
+        let expected_dark = LoomSemanticColors::from_theme(&dark);
+
+        // First call computes and matches direct derivation.
+        assert_eq!(*cache.get(&light), expected_light);
+        assert_eq!(cache.get_copy(&light), expected_light);
+
+        // Switching to dark theme invalidates and recomputes.
+        assert_eq!(*cache.get(&dark), expected_dark);
+        assert_eq!(cache.get_copy(&dark), expected_dark);
+
+        // Mutating individual keyed fields invalidates the cache.
+        let mut modified = dark.clone();
+        modified.primary = gpui_kit::hsla(0.5, 0.8, 0.5, 1.0);
+        let updated = cache.get_copy(&modified);
+        assert_eq!(updated.card_selected_border, modified.primary);
+        assert_ne!(updated, expected_dark);
+
+        let mut modified_border = modified.clone();
+        modified_border.border = gpui_kit::hsla(0.25, 0.5, 0.4, 1.0);
+        assert_eq!(
+            cache.get_copy(&modified_border).card_border,
+            modified_border.border
+        );
+
+        let mut modified_hover = modified_border.clone();
+        modified_hover.list_hover = gpui_kit::hsla(0.1, 0.2, 0.3, 1.0);
+        assert_eq!(
+            cache.get_copy(&modified_hover).card_hover_bg,
+            modified_hover.list_hover
+        );
+
+        cache.invalidate();
+        assert_eq!(*cache.get(&light), expected_light);
+    }
+
+    #[test]
+    fn static_lookup_tables_cover_full_ranges_with_pointer_reuse() {
+        // Static endpoints ("0.0%", "100.0%") point directly into static .rodata.
+        assert_eq!(
+            format_permille_shared(0).as_ptr(),
+            format_permille_shared(0).as_ptr()
+        );
+        assert_eq!(
+            format_permille_shared(1_000).as_ptr(),
+            format_permille_shared(1_000).as_ptr()
+        );
+
+        for p in 0..=1_000u16 {
+            let a = format_permille_shared(p);
+            let b = format_permille_shared(p);
+            assert_eq!(a.as_ref(), format_permille(p));
+            assert_eq!(a, b);
+        }
+        assert_eq!(format_permille_shared(1_001).as_ref(), "100.1%");
+        assert_eq!(format_permille_shared(2_500).as_ref(), "250.0%");
+
+        assert_eq!(format_u32_shared(0).as_ptr(), format_u32_shared(0).as_ptr());
+        for n in 0..=SMALL_U32_TABLE_MAX {
+            let a = format_u32_shared(n);
+            let b = format_u32_shared(n);
+            assert_eq!(a.as_ref(), n.to_string());
+            assert_eq!(a, b);
+        }
+        assert_eq!(format_u32_shared(SMALL_U32_TABLE_MAX + 1).as_ref(), "513");
+        assert_eq!(format_u32_shared(u32::MAX).as_ref(), u32::MAX.to_string());
+
+        for c in 0..=CHILD_COUNT_TABLE_MAX {
+            let a = format_child_count_shared(c);
+            let b = format_child_count_shared(c);
+            assert_eq!(a.as_ref(), format!("({c})"));
+            assert_eq!(a, b);
+        }
+        assert_eq!(
+            format_child_count_shared(CHILD_COUNT_TABLE_MAX + 1).as_ref(),
+            "(257)"
+        );
+    }
+
+    #[test]
+    fn metric_display_values_obey_number_shaping_ascii_invariant() {
+        const ALLOWED: &[u8] = b"0123456789.,+-%";
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * KIB;
+        const GIB: u64 = 1024 * MIB;
+        const TIB: u64 = 1024 * GIB;
+
+        let assert_number_shaping = |m: &MetricDisplay, ctx: &str| {
+            assert!(
+                !m.value.is_empty(),
+                "{ctx}: MetricDisplay.value must not be empty"
+            );
+            for &b in m.value.as_bytes() {
+                assert!(
+                    ALLOWED.contains(&b),
+                    "{ctx}: byte {:?} in {:?} violates gpui-fast::NumberShaping invariant",
+                    b as char,
+                    m.value.as_ref()
+                );
+            }
+        };
+
+        let samples: &[u64] = &[
+            0,
+            1,
+            512,
+            513,
+            KIB - 1,
+            KIB,
+            124,
+            125,
+            1_250,
+            12_500,
+            512 * KIB,
+            MIB - 1,
+            MIB,
+            1_468_006,
+            1_550_000,
+            1536 * KIB,
+            125_000_000,
+            GIB - 1,
+            GIB,
+            16 * GIB + 512 * MIB,
+            TIB - 1,
+            TIB,
+            2 * TIB + 512 * GIB,
+            u64::MAX,
+        ];
+
+        for &s in samples {
+            let bm = format_bytes_metric(s);
+            assert_number_shaping(&bm, "bytes");
+            let rm = format_rate_bytes_per_sec_metric(s);
+            assert_number_shaping(&rm, "rate");
+            let nm = format_network_rate_mbps_metric(s);
+            assert_number_shaping(&nm, "network");
+
+            for mode in [ResourceDisplayMode::Values, ResourceDisplayMode::Percent] {
+                assert_number_shaping(&format_memory_cell_metric(s, 425, mode), "memory_cell");
+                assert_number_shaping(&format_disk_cell_metric(s, 425, mode), "disk_cell");
+                assert_number_shaping(&format_network_cell_metric(s, 425, mode), "network_cell");
+            }
+        }
+
+        for p in [0u16, 5, 125, 999, 1_000, 1_250] {
+            let pm = format_permille_metric(p);
+            assert_number_shaping(&pm, "permille");
+            assert_eq!(pm.unit, "");
+        }
+
+        // Exact split formatting parity with existing string formatters.
+        assert_eq!(
+            format_bytes_metric(0),
+            MetricDisplay::from_static("0", " B")
+        );
+        assert_eq!(format_bytes_metric(512), MetricDisplay::new("512", " B"));
+        assert_eq!(format_bytes_metric(KIB), MetricDisplay::new("1", " KB"));
+        assert_eq!(
+            format_bytes_metric(1536 * KIB),
+            MetricDisplay::new("1.5", " MB")
+        );
+        assert_eq!(
+            format_bytes_metric(16 * GIB + 512 * MIB),
+            MetricDisplay::new("16.5", " GB")
+        );
+        assert_eq!(
+            format_bytes_metric(2 * TIB + 512 * GIB),
+            MetricDisplay::new("2.5", " TB")
+        );
+
+        assert_eq!(
+            format_rate_bytes_per_sec_metric(0),
+            MetricDisplay::from_static("0", " MB/s")
+        );
+        assert_eq!(
+            format_rate_bytes_per_sec_metric(512),
+            MetricDisplay::new("512", " B/s")
+        );
+        assert_eq!(
+            format_rate_bytes_per_sec_metric(512 * KIB),
+            MetricDisplay::new("512.0", " KB/s")
+        );
+        assert_eq!(
+            format_rate_bytes_per_sec_metric(1_468_006),
+            MetricDisplay::new("1.4", " MB/s")
+        );
+        assert_eq!(
+            format_rate_bytes_per_sec_metric(2 * GIB),
+            MetricDisplay::new("2.0", " GB/s")
+        );
+
+        assert_eq!(
+            format_network_rate_mbps_metric(0),
+            MetricDisplay::from_static("0", " Mbps")
+        );
+        assert_eq!(
+            format_network_rate_mbps_metric(100),
+            MetricDisplay::new("800", " bps")
+        );
+        assert_eq!(
+            format_network_rate_mbps_metric(1_250),
+            MetricDisplay::new("10.0", " Kbps")
+        );
+        assert_eq!(
+            format_network_rate_mbps_metric(1_550_000),
+            MetricDisplay::new("12.4", " Mbps")
+        );
+        assert_eq!(
+            format_network_rate_mbps_metric(125_000_000),
+            MetricDisplay::new("1.0", " Gbps")
+        );
+    }
+
+    #[test]
+    fn quantization_keys_match_display_resolution_buckets() {
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * KIB;
+
+        // Same display bucket ("1.0 MB") -> identical key.
+        assert_eq!(
+            quantize_bytes_display(MIB),
+            quantize_bytes_display(MIB + 50)
+        );
+        assert_eq!(format_bytes_metric(MIB), format_bytes_metric(MIB + 50));
+
+        // Adjacent display bucket ("1.0 MB" vs "1.1 MB") -> distinct key.
+        assert_ne!(
+            quantize_bytes_display(MIB),
+            quantize_bytes_display(MIB + 120 * KIB)
+        );
+        assert_ne!(
+            format_bytes_metric(MIB),
+            format_bytes_metric(MIB + 120 * KIB)
+        );
+
+        // Tier boundaries remain distinct.
+        assert_ne!(quantize_bytes_display(0), quantize_bytes_display(1));
+        assert_ne!(quantize_bytes_display(KIB - 1), quantize_bytes_display(KIB));
+        assert_ne!(quantize_bytes_display(MIB - 1), quantize_bytes_display(MIB));
+
+        // Throughput quantization buckets.
+        assert_eq!(
+            quantize_rate_bps_display(MIB),
+            quantize_rate_bps_display(MIB + 100)
+        );
+        assert_ne!(quantize_rate_bps_display(0), quantize_rate_bps_display(1));
+
+        // Network quantization buckets.
+        assert_eq!(
+            quantize_net_bps_display(1_550_000),
+            quantize_net_bps_display(1_550_100)
+        );
+        assert_ne!(
+            quantize_net_bps_display(1_550_000),
+            quantize_net_bps_display(1_565_000)
+        );
+
+        // CPU time quantization buckets by whole seconds.
+        assert_eq!(quantize_cpu_time_secs(0), 0);
+        assert_eq!(quantize_cpu_time_secs(9_999_999), 0);
+        assert_eq!(quantize_cpu_time_secs(10_000_000), 1);
+        assert_eq!(quantize_cpu_time_secs(19_999_999), 1);
+        assert_eq!(quantize_cpu_time_secs(20_000_000), 2);
+    }
+
+    #[test]
+    fn single_line_preview_capping_handles_ascii_cjk_newlines_and_boundaries() {
+        assert_eq!(DEFAULT_CELL_PREVIEW_CHARS, 256);
+
+        // Empty and within limit with no control chars -> None (zero-alloc path).
+        assert_eq!(cap_single_line_preview("", 0), None);
+        assert_eq!(cap_single_line_preview("", 256), None);
+        assert_eq!(cap_single_line_preview("abcd", 4), None);
+        assert_eq!(cap_single_line_preview("你好世界", 4), None);
+
+        // Exact overflow by 1 char appends ellipsis without splitting UTF-8.
+        assert_eq!(cap_single_line_preview("abcde", 4), Some("abcd…".into()));
+        assert_eq!(
+            cap_single_line_preview("你好世界啊", 4),
+            Some("你好世界…".into())
+        );
+        assert_eq!(cap_single_line_preview("a", 0), Some("…".into()));
+
+        // Control chars / newlines replaced with spaces even without truncation.
+        assert_eq!(
+            cap_single_line_preview("line1\nline2", 256),
+            Some("line1 line2".into())
+        );
+        assert_eq!(
+            cap_single_line_preview("a\r\nb\tc", 256),
+            Some("a  b c".into())
+        );
+
+        // Combined control replacement + truncation.
+        assert_eq!(cap_single_line_preview("a\nbcd", 3), Some("a b…".into()));
+
+        // display_preview_shared avoids allocation when un-truncated and clean.
+        let clean: Arc<str> = Arc::from("C:\\Windows\\System32\\svchost.exe");
+        let reused = display_preview_shared(&clean, DEFAULT_CELL_PREVIEW_CHARS);
+        assert_eq!(reused.as_ptr(), clean.as_ptr());
+
+        let long: Arc<str> = Arc::from("x".repeat(300));
+        let capped = display_preview_shared(&long, DEFAULT_CELL_PREVIEW_CHARS);
+        assert_eq!(capped.chars().count(), DEFAULT_CELL_PREVIEW_CHARS + 1);
+        assert!(capped.ends_with('…'));
+    }
+
+    #[test]
+    fn row_text_cache_hits_reuses_invalidates_and_evicts_oldest_epochs() {
+        use loom_types::ProcessKey;
+
+        const MIB: u64 = 1024 * 1024;
+        let p1 = ProcessKey::new(4096, 100);
+        let p1_recycled = ProcessKey::new(4096, 200);
+        let p2 = ProcessKey::new(8192, 150);
+        let p3 = ProcessKey::new(9999, 250);
+
+        let mut cache = RowTextCache::with_capacity(2);
+        assert!(cache.is_empty());
+        assert_eq!(cache.capacity(), 2);
+
+        cache.begin_epoch();
+        assert_eq!(cache.epoch(), 1);
+
+        // PID text caches once per ProcessKey.
+        let pid_a = cache.pid_text(p1);
+        let pid_b = cache.pid_text(p1);
+        assert_eq!(pid_a.as_ref(), "4096");
+        assert_eq!(pid_a, pid_b);
+
+        // Memory metric hits cache inside the same quantized bucket.
+        let mem1 = cache.memory_metric(p1, 128 * MIB, 42, ResourceDisplayMode::Values);
+        let mem2 = cache.memory_metric(p1, 128 * MIB + 64, 42, ResourceDisplayMode::Values);
+        assert_eq!(mem1, MetricDisplay::new("128.0", " MB"));
+        assert_eq!(mem1, mem2);
+
+        // Mode switch invalidates and reformats.
+        let mem_pct = cache.memory_metric(p1, 128 * MIB + 64, 42, ResourceDisplayMode::Percent);
+        assert_eq!(mem_pct, MetricDisplay::new("4.2%", ""));
+
+        // Disk & network metrics cache and invalidate cleanly.
+        let d1 = cache.disk_metric(p1, 2 * MIB, 10, ResourceDisplayMode::Values);
+        let d2 = cache.disk_metric(p1, 2 * MIB + 16, 10, ResourceDisplayMode::Values);
+        assert_eq!(d1, MetricDisplay::new("2.0", " MB/s"));
+        assert_eq!(d1, d2);
+
+        let n1 = cache.network_metric(p1, 1_550_000, 124, ResourceDisplayMode::Values);
+        let n2 = cache.network_metric(p1, 1_550_050, 124, ResourceDisplayMode::Values);
+        assert_eq!(n1, MetricDisplay::new("12.4", " Mbps"));
+        assert_eq!(n1, n2);
+
+        // Numbered byte slots stay independent per slot.
+        let ws1 = cache.bytes_metric_slot(p1, 0, 64 * MIB);
+        let commit1 = cache.bytes_metric_slot(p1, 1, 256 * MIB);
+        let ws2 = cache.bytes_metric_slot(p1, 0, 64 * MIB + 10);
+        assert_eq!(ws1, MetricDisplay::new("64.0", " MB"));
+        assert_eq!(commit1, MetricDisplay::new("256.0", " MB"));
+        assert_eq!(ws1, ws2);
+
+        // CPU time reformats only when whole seconds advance.
+        let t1 = cache.cpu_time_text(p1, 10_000_000);
+        let t2 = cache.cpu_time_text(p1, 19_999_999);
+        let t3 = cache.cpu_time_text(p1, 20_000_000);
+        assert_eq!(t1.as_ref(), "00:00:01");
+        assert_eq!(t1, t2);
+        assert_eq!(t3.as_ref(), "00:00:02");
+
+        // u32_slot uses LUT for <= 512 and caches > 512.
+        let small = cache.u32_slot(p1, 0, 42);
+        assert_eq!(small.as_ref(), "42");
+        let big1 = cache.u32_slot(p1, 0, 12_345);
+        let big2 = cache.u32_slot(p1, 0, 12_345);
+        let big3 = cache.u32_slot(p1, 0, 12_346);
+        assert_eq!(big1.as_ref(), "12345");
+        assert_eq!(big1, big2);
+        assert_eq!(big3.as_ref(), "12346");
+
+        // preview_slot reuses the exact heap-allocated SharedString across identical Arc<str>.
+        let long_cmd: Arc<str> = Arc::from(format!("cmd.exe --arg={}", "a".repeat(300)));
+        let prev1 = cache.preview_slot(p1, 0, &long_cmd, 48);
+        let prev2 = cache.preview_slot(p1, 0, &long_cmd, 48);
+        assert_eq!(prev1.chars().count(), 49);
+        assert!(prev1.ends_with('…'));
+        assert_eq!(prev1.as_ptr(), prev2.as_ptr());
+
+        // Changing max_chars or Arc invalidates the preview slot.
+        let prev_longer = cache.preview_slot(p1, 0, &long_cmd, 64);
+        assert_eq!(prev_longer.chars().count(), 65);
+        let short_cmd: Arc<str> = Arc::from("C:\\Windows\\System32\\notepad.exe --launch");
+        let prev_short = cache.preview_slot(p1, 0, &short_cmd, 64);
+        assert_eq!(prev_short.as_ptr(), short_cmd.as_ptr());
+
+        // Epoch-based eviction removes oldest untouched entries while keeping recent ones.
+        cache.begin_epoch(); // epoch 2: touch p2 and p1_recycled
+        let _ = cache.pid_text(p2);
+        let _ = cache.pid_text(p1_recycled);
+
+        cache.begin_epoch(); // epoch 3: touch p3 and refresh p1_recycled
+        let _ = cache.pid_text(p3);
+        let _ = cache.pid_text(p1_recycled);
+
+        assert_eq!(cache.len(), 4);
+        cache.prune_if_needed();
+        assert_eq!(cache.len(), 2);
+
+        // p1 (epoch 1) and p2 (epoch 2) were evicted; p1_recycled & p3 (epoch 3) remain.
+        let p3_again = cache.pid_text(p3);
+        assert_eq!(p3_again.as_ref(), "9999");
+        assert_eq!(cache.len(), 2);
+
+        cache.clear();
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn status_badge_fast_check_and_mono_heatmap_widgets() {
+        assert!(!has_visible_status_badges(ProcessStatusFlags::empty()));
+        assert!(!has_visible_status_badges(
+            ProcessStatusFlags::ELEVATED
+                | ProcessStatusFlags::PROTECTED
+                | ProcessStatusFlags::CRITICAL
+                | ProcessStatusFlags::SYSTEM_IDLE
+                | ProcessStatusFlags::KERNEL
+        ));
+        assert!(has_visible_status_badges(
+            ProcessStatusFlags::NOT_RESPONDING
+        ));
+        assert!(has_visible_status_badges(ProcessStatusFlags::SUSPENDED));
+        assert!(has_visible_status_badges(
+            ProcessStatusFlags::EFFICIENCY_MODE
+        ));
+        assert!(has_visible_status_badges(
+            ProcessStatusFlags::ELEVATED | ProcessStatusFlags::EFFICIENCY_MODE
+        ));
+
+        let colors = LoomSemanticColors::from_theme(&dark_theme());
+        let mono = gpui_kit::SharedString::new_static("Consolas");
+        let _m = heatmap_cell_metric(
+            format_bytes_metric(64 * 1024 * 1024),
+            HeatmapLevel::Low,
+            &colors,
+            mono.clone(),
+        );
+        let _p = heatmap_cell_metric(
+            format_permille_metric(425),
+            HeatmapLevel::Medium,
+            &colors,
+            mono.clone(),
+        );
+        let _t = heatmap_cell_mono("00:01:23", HeatmapLevel::None, &colors, mono);
+
+        let labels = StatusLabels::new("Efficiency mode", "Suspended", "Not responding");
+        let _no_a11y = status_badges_with_a11y(
+            7,
+            ProcessStatusFlags::EFFICIENCY_MODE,
+            &labels,
+            &colors,
+            false,
+        );
+        let _with_a11y = status_badges_with_a11y(
+            7,
+            ProcessStatusFlags::SUSPENDED | ProcessStatusFlags::NOT_RESPONDING,
+            &labels,
+            &colors,
+            true,
         );
     }
 }

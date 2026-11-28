@@ -47,15 +47,31 @@ impl StatusLabels {
     }
 }
 
+/// Fast constant-time check indicating whether [`status_badges`] or
+/// [`status_badges_with_a11y`] will emit at least one visible badge icon.
+///
+/// Callers in high-density tables can skip constructing an empty badge flex
+/// container for the common case where none of `NOT_RESPONDING`, `SUSPENDED`,
+/// or `EFFICIENCY_MODE` is set.
+#[inline]
+pub const fn has_visible_status_badges(status: ProcessStatusFlags) -> bool {
+    status.intersects(
+        ProcessStatusFlags::NOT_RESPONDING
+            .union(ProcessStatusFlags::SUSPENDED)
+            .union(ProcessStatusFlags::EFFICIENCY_MODE),
+    )
+}
+
 fn status_icon_badge(
     id: (&'static str, usize),
     icon: Icon,
     label: SharedString,
     bg: Hsla,
     fg: Hsla,
+    attach_a11y: bool,
 ) -> impl IntoElement {
     let tooltip_label = label.clone();
-    h_flex()
+    let mut badge = h_flex()
         .id(id)
         .size(px(22.0))
         .flex_shrink_0()
@@ -63,19 +79,28 @@ fn status_icon_badge(
         .justify_center()
         .rounded_full()
         .bg(bg)
-        .aria_label(label)
         .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
-        .child(icon.xsmall().text_color(fg))
+        .child(icon.xsmall().text_color(fg));
+
+    if attach_a11y {
+        badge = badge.aria_label(label);
+    }
+
+    badge
 }
 
 /// Renders compact icon-only status badges (with hover tooltips) for any active
-/// `EFFICIENCY_MODE`, `SUSPENDED`, or `NOT_RESPONDING` flags in [`ProcessStatusFlags`].
-pub fn status_badges(
+/// `EFFICIENCY_MODE`, `SUSPENDED`, or `NOT_RESPONDING` flags in [`ProcessStatusFlags`],
+/// conditionally attaching `.aria_label(...)` only when `a11y_active` is `true`
+/// or the `test-support` Cargo feature is enabled.
+pub fn status_badges_with_a11y(
     row_id: usize,
     status: ProcessStatusFlags,
     labels: &StatusLabels,
     colors: &LoomSemanticColors,
+    a11y_active: bool,
 ) -> impl IntoElement {
+    let attach_a11y = a11y_active || cfg!(feature = "test-support");
     let mut row = h_flex().gap_1().items_center().overflow_hidden();
 
     if status.contains(ProcessStatusFlags::NOT_RESPONDING) {
@@ -85,6 +110,7 @@ pub fn status_badges(
             labels.not_responding.clone(),
             colors.status_hung_bg,
             colors.status_hung_fg,
+            attach_a11y,
         ));
     }
 
@@ -95,6 +121,7 @@ pub fn status_badges(
             labels.suspended.clone(),
             colors.status_suspended_bg,
             colors.status_suspended_fg,
+            attach_a11y,
         ));
     }
 
@@ -105,8 +132,21 @@ pub fn status_badges(
             labels.eco_mode.clone(),
             colors.status_eco_bg,
             colors.status_eco_fg,
+            attach_a11y,
         ));
     }
 
     row
+}
+
+/// Renders compact icon-only status badges (with hover tooltips and ARIA labels)
+/// for any active `EFFICIENCY_MODE`, `SUSPENDED`, or `NOT_RESPONDING` flags in
+/// [`ProcessStatusFlags`].
+pub fn status_badges(
+    row_id: usize,
+    status: ProcessStatusFlags,
+    labels: &StatusLabels,
+    colors: &LoomSemanticColors,
+) -> impl IntoElement {
+    status_badges_with_a11y(row_id, status, labels, colors, true)
 }
