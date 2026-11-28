@@ -13,7 +13,7 @@ Loom 是一款基于 **Rust** 与 **GPUI Kit (`gpui-kit` / `gpui-component`)** �
 3. **快慢双通道舱壁隔离（Dual-Lane Bulkhead Isolation）**：将亚毫秒级纯内存态内核调用（快通道）与可能发生磁盘、Shell 或驱动阻塞的元数据探测（慢通道）隔离，配合 `300 ms` 设备级超时熔断器，降低启动与运行期卡死风险。
 4. **冷热数据分离与缓冲区复用**：以 `(pid, create_time_100ns)` 复合键标识进程生命周期；高频热指标使用 `Copy` 值结构覆写复用缓冲区，低频冷元数据（图标、PE 发布者、命令行）按路径二级共享缓存并仅解析一次。
 5. **UI 垂直功能切片与组件组合**：`loom-app` 按 `shell` + `features/*` 切片组织，直接组合 `gpui-kit` 现成控件（`Table`、`AreaChart`、`LineChart`、`Sidebar`、`TitleBar`、`Dialog`、`PopupMenu`、`Tree`、`Select`）与 Flexbox 布局，避免根视图全局大状态、全局弹窗大枚举以及手写自定义 `Canvas`/Shader。
-6. **分域只读快照与按需监控租约（RAII `MonitorLease`）**：通过 `ArcSwap<AppSnapshot>` 配合单调递增的分域 `Revision` 无锁发布视图投影；按需管理域（服务、启动应用、用户、应用历史、多核网格）通过 RAII `MonitorLease` 引用计数按需激活，离开页面或最小化窗口时自动停采或降频。
+6. **分域只读快照、事件驱动唤醒与按需监控租约（RAII `MonitorLease`）**：通过 `ArcSwap<AppSnapshot>` 配合单调递增的分域 `Revision` 与零轮询 `SnapshotWakeSignal` 推送唤醒 `UiStore`；按需管理域（服务、启动应用、用户、应用历史、多核网格、管理员专属 `ProcessNetwork` ETW）通过 RAII `MonitorLease` 引用计数按需激活，离开页面或最小化窗口时自动停采或降频。
 7. **普通权限启动与按需提权**：默认以普通用户权限启动，避免冷启动阶段弹出 UAC 确认框；仅在操作高完整性进程、启停系统服务或勾选以管理员运行新任务时触发 `runas` 或提权重启恢复当前视图。
 
 <a id="performance-budgets-and-anti-hang-architecture"></a>
@@ -61,7 +61,7 @@ sequenceDiagram
 
 1. **不依赖 WMI 与 PDH**：不调用 `IWbemServices`（跨进程 RPC 至 `Winmgmt`）与 `PdhOpenQuery`（加载第三方性能计数器 DLL 并争抢全局注册表锁）。CPU/进程调用 `ntdll`，网卡调用 `iphlpapi`，磁盘调用带隔离保护的 `IOCTL`，GPU 调用 `DXGI + gdi32!D3DKMT`，内存频率与插槽直接解析 `GetSystemFirmwareTable('RSMB')` 原始 SMBIOS 表（`< 0.05 ms`）。
 2. **不跨进程发送同步窗口消息**：不调用 `GetWindowTextW` 或阻塞式 `SendMessageW`（桌面上存在未响应程序时可能长时间阻塞调用线程）。统一使用 `InternalGetWindowText` 与非阻塞 `IsHungAppWindow`。
-3. **慢速磁盘与断连网络盘舱壁熔断**：对 UNC 路径或 `DRIVE_REMOTE` 网络映射盘跳过打开远程文件提取图标/签名，退回 `SHGFI_USEFILEATTRIBUTES` 内存级扩展名图标；磁盘静态属性与卷映射（`IOCTL_STORAGE_QUERY_PROPERTY`、`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`）、每设备 `IOCTL_DISK_PERFORMANCE` 采样以及 Shell 图标/PE 版本读取均隔离在慢通道舱壁池中，单次探测超过 `300 ms` 触发设备级 `CircuitBreaker` 冷却 60 秒并旁路跳过，避免阻塞快通道。
+3. **慢速磁盘、安全弹出与断连网络盘舱壁熔断**：对 UNC 路径或 `DRIVE_REMOTE` 网络映射盘跳过打开远程文件提取图标/签名，退回 `SHGFI_USEFILEATTRIBUTES` 内存级扩展名图标；对存储控制器驱动实施白名单校验（`stornvme`、`storahci`、`atapi`），对机械盘增加活动变化守卫避免空转唤醒，并通过 `CM_Register_Notification`（`DEVICEQUERYREMOVE`）配合 USB 安全弹出；磁盘静态属性与卷映射（`IOCTL_STORAGE_QUERY_PROPERTY`、`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`）、每设备 `IOCTL_DISK_PERFORMANCE` 采样、Restart Manager 文件占用查询以及 Shell 图标/PE 版本读取均隔离在慢通道舱壁池中，单次探测超过 `300 ms` 触发设备级 `CircuitBreaker` 冷却 60 秒并旁路跳过，避免阻塞快通道。
 4. **不使用 `ReadProcessMemory` 跨进程读目标 PEB**：进程命令行统一通过 `NtQueryInformationProcess(ProcessCommandLineInformation)` 获取，规避目标进程挂起或换页锁导致的等待。
 5. **发布者解析不触发外网吊销检查**：优先读取本地 PE `VersionInfo`（`CompanyName` / `FileDescription`）；若校验 Authenticode 签名，附加 `WTD_CACHE_ONLY_URL_RETRIEVAL` 避免发起 CRL/OCSP 网络请求。
 6. **不长期持有目标进程句柄**：大部分动态指标直接取自 `SystemProcessInformation` 缓冲；按需打开 `PROCESS_QUERY_LIMITED_INFORMATION` 后立即 `CloseHandle`，避免句柄泄漏与目录占用。
@@ -176,15 +176,15 @@ flowchart BT
 
 | Crate | 类型 | 核心职责 | 依赖约束与边界 |
 | :--- | :--- | :--- | :--- |
-| `loom-types` | lib | 跨平台紧凑领域模型（`ProcessKey`、`ProcessHotSample`、`ProcessColdMeta`、五大硬件快照、服务/启动项/用户/历史记录、`CapabilityFlags`） | 无 OS 依赖、无 UI 依赖；高频热结构使用 `Copy` 紧凑内存布局 |
-| `loom-config` | lib | 本地配置持久化（`settings.toml`：启动页、刷新周期、主题、语言、窗口几何、置顶/托盘行为、列偏好、全局热键）、冻结的 `v1`（`CONFIG_CONTRACT_VERSION = "1.0"`）向前迁移与原子落盘 | 同步加载目标 `< 1 ms`，不依赖平台后端或 UI；忽略未知未来可选键并结构化拒绝更高 `schema_version` |
-| `loom-pal-api` | lib | 冻结的 `v1`（`PAL_API_CONTRACT_VERSION = 1`）静态平台抽象 Trait 族（`PlatformBackend`、`FastSystemSampler`、`SlowMetadataProber`、`ServiceManager`、`StartupManager`、`SessionManager`、`AppHistoryReader`、`SystemOperator`）、调用方复用缓冲 `SampleScratch` 与 `PalError` | 仅依赖 `loom-types`，不暴露特定操作系统句柄或头文件类型 |
-| `loom-pal-windows` | lib | Windows 采集与系统控制实现（`ntdll` / `D3DKMT` / `IOCTL` / `SMBIOS` / `SCM` / `WTS` / `WCT` / `MiniDump`） | 仅 `cfg(windows)` 编译；采用 `windows-sys`，内部收敛 `unsafe` FFI，遵守六项防卡死约束 |
+| `loom-types` | lib | 跨平台紧凑领域模型（`ProcessKey`、`ProcessHotSample`、`ProcessColdMeta`、缺口感知 `HistoryRing`/`ThroughputRing`、`CpuCoreKind`、`d3_asleep`、`ProcessSocketRecord`、`FileLockHolder`、`LeakWarning`、`WebView2Role`、五大硬件快照、服务/启动项/用户/历史记录、`CapabilityFlags`） | 无 OS 依赖、无 UI 依赖；高频热结构使用 `Copy` 紧凑内存布局 |
+| `loom-config` | lib | 本地配置持久化（`settings.toml`：启动页、刷新周期、主题、语言、窗口几何、置顶/托盘行为、列偏好、全局热键、增量 v1 进程与诊断开关）、冻结的 `v1`（`CONFIG_CONTRACT_VERSION = "1.0"`）向前迁移与原子落盘 | 同步加载目标 `< 1 ms`，不依赖平台后端或 UI；忽略未知未来可选键并结构化拒绝更高 `schema_version` |
+| `loom-pal-api` | lib | 冻结的 `v1`（`PAL_API_CONTRACT_VERSION = 1`）静态平台抽象 Trait 族（`PlatformBackend`、`FastSystemSampler`、`SlowMetadataProber`、`ServiceManager`、`StartupManager`、`SessionManager`、`AppHistoryReader`、`SystemOperator`，并仅以默认实现扩展挂起/恢复、重启资源管理器、文件占用查询、监听端口与管理员 ETW 门控）、调用方复用缓冲 `SampleScratch` 与 `PalError` | 仅依赖 `loom-types`，不暴露特定操作系统句柄或头文件类型 |
+| `loom-pal-windows` | lib | Windows 采集与系统控制实现（`ntdll` Idle-Cycle CPU 与 `ProcessSequenceNumber`、纯 `D3DKMT` 每进程 GPU 与 `D3` 电源门控、防护 `IOCTL`、`SMBIOS`、`SCM`、`WTS`、`WCT`、`MiniDump`、`iphlpapi` 端口、Restart Manager 文件占用、管理员专属 ETW 进程网络） | 仅 `cfg(windows)` 编译；采用 `windows-sys`，内部收敛 `unsafe` FFI，遵守六项防卡死约束 |
 | `loom-pal-macos` | lib | macOS 后端预留骨架（`Mach` / `libproc` / `IOKit` / `launchd` 映射位） | 仅 `cfg(target_os = "macos")` 编译；当前提供编译期契约占位桩，计划于 `0.3.0` 实现 |
 | `loom-pal-linux` | lib | Linux 后端预留骨架（`procfs` / `sysfs` / `netlink` / `drm` / `systemd` 映射位） | 仅 `cfg(target_os = "linux")` 编译；当前提供编译期契约占位桩，计划于 `0.2.0` 实现 |
 | `loom-pal` | lib | 平台编译期静态门面（导出 `pub type NativeBackend = ...`）及跨平台单实例锁、系统托盘与电源/显示状态适配 | 消除上层代码中的 `#[cfg(target_os)]` 分支，无虚表动态包装 |
-| `loom-engine` | lib | 无头采样与业务编排引擎（`EngineCoordinator<B>`、差分计算、60 点定长量化环形队列、防复用进程树、预排序视图投影、`MonitorLease`） | 禁止依赖 GPUI Crate 或多线程 Tokio；支持注入 `MockBackend` 进行无头基准与故障注入测试 |
-| `loom-ui-kit` | lib | 基于 `gpui-kit` 的薄组合层：热力图单元格、性能侧边栏微缩 `AreaChart` 卡片、逻辑核响应式网格、内存四段比例条、主题语义色与 `rust-i18n` 辅助 | 隔离上游 `gpui-kit` 细节，无自定义 `Canvas`/Shader 绘制，不持有业务领域状态 |
+| `loom-engine` | lib | 无头采样与业务编排引擎（`EngineCoordinator<B>`、`SnapshotWakeSignal` 推送唤醒、差分计算、缺口感知 60 点定长环、防复用进程树、结构化搜索与按需 `:PORT`、行序与按住 `Ctrl` 冻结、WebView2 宿主归因、零系统调用泄漏预警、预排序视图投影、`MonitorLease`） | 禁止依赖 GPUI Crate 或多线程 Tokio；支持注入 `MockBackend` 进行无头基准与故障注入测试 |
+| `loom-ui-kit` | lib | 基于 `gpui-kit` 的薄组合层：WCAG 2.1 对比度校验语义色（`cpu_core_p`/`e`/`lp_e`、`leak_warning`、`sort_paused`）、热力图单元格、缺口感知微缩波形卡片、阶梯坐标上限、自适应多核网格求解器（`8%` 迟滞）、活跃 GPU 引擎优选、打开期稳定排序、防公式注入 CSV 导出、内存四段条与 `rust-i18n` 辅助 | 隔离上游 `gpui-kit` 细节，无自定义 `Canvas`/Shader 绘制，不持有业务领域状态 |
 | `loom-app` | bin | 桌面组合根与垂直功能切片 UI：入口优先级提升、渐进启动管线、`AppShell` 与 8 个独立 `features/*` 模块 | 各 `feature` 模块不互相 import 内部实现，跨页导航（`转到详细信息` / `转到服务`）经由 `ShellHandle` 与 `NavigationIntent` 完成 |
 
 <a id="feature-sliced-ui-architecture"></a>
@@ -233,15 +233,15 @@ crates/loom-app/src/
 
 | 界面区域 / 视觉元素 | 选用的 `gpui-kit` (`gpui-component`) 控件 | 组合实现方式（无自定义绘制） |
 | :--- | :--- | :--- |
-| **窗口顶栏与全局搜索** | `Root` + `TitleBar` + `Input` | 居中搜索框开启 `.cleanable(true)`，支持名称/发布者/PID 防抖过滤 |
+| **窗口顶栏与全局搜索** | `Root` + `TitleBar` + `Input` | 居中搜索框支持结构化语法（`,` 或、空格与、`!`/`-` 取反、`pid:`、`user:`、`cpu:`、`mem:`、`status:`、按需 `:PORT`）与键盘快捷键（`Ctrl+F`、`Ctrl+1..8`、`F5`、`Space`、按住 `Ctrl` 临时冻结） |
 | **左侧导航与底部设置** | `Sidebar`、`SidebarMenu`、`SidebarMenuItem`、`SidebarFooter` | 汉堡按钮控制 `.collapsed(bool)` 展开/图标态，底部固定「设置」 |
-| **虚拟化业务表格与树表** | `DataTable` + `TableState<D>` + `TableDelegate` | 首列左固定（`fixed_left`）通过 `h_flex().pl(px(depth * 16.))` + 折叠箭头 `Button` + 降采样 `Img` 呈现进程树/用户树；滚动列双向虚拟化；表级单一右键菜单；热力图列按占用分档设置单元格背景色透明度 |
-| **多级右键菜单** | `PopupMenu` / `.context_menu(...)` | 支持勾选标记（`✓ 效能模式`）、分隔线与二级子菜单（`设置优先级 >`、`资源值 >`） |
-| **性能页左栏设备微缩波形图** | `v_virtual_list` + `AreaChart` | 配置 `AreaChart::new(pts).linear().y_domain(0., 100.).point_count(60).x_axis(false).grid(false).interactive(false)` |
-| **CPU 总体+内核双层图 & 多核网格** | 多序列 `AreaChart` + 响应式网格容器 | 单一 `AreaChart` 挂载总利用率与内核时间双 `.y(...)` 渐变序列；多核模式按逻辑核数排列紧凑 `AreaChart` 单元 |
-| **磁盘双图 / 网卡吞吐 / GPU 多引擎** | `AreaChart` / `LineChart` + `Select` | 动态 `y_domain` 实现自适应量纲刻度；GPU `2×2` 子图标题嵌入无边框 `Select` 切换引擎 |
+| **虚拟化业务表格与树表** | `DataTable` + `TableState<D>` + `TableDelegate` | 首列左固定（`fixed_left`）组合 `h_flex().pl(px(depth * 16.))` + 折叠箭头 + 降采样 `Img`；滚动列双向虚拟化；悬停暂停排序防跳行；防公式注入 UTF-8 BOM CSV 导出；WebView2 宿主归因与零系统调用泄漏预警标识；表级单一右键菜单 |
+| **多级右键菜单** | `PopupMenu` / `.context_menu(...)` | 支持勾选标记（`✓ 效能模式`）、挂起/恢复、重启资源管理器、文件占用查找、复制摘要、分隔线与二级子菜单（`设置优先级 >`、`资源值 >`） |
+| **性能页左栏设备微缩波形图** | `v_virtual_list` + `AreaChart` | 缺口感知 `AreaChart` 卡片，磁盘/网卡保持打开期稳定排序（`merge_stable_order`）、阶梯网卡坐标与诚实的「休眠 (D3)」/ `—` GPU 读数 |
+| **CPU 总体+内核双层图 & 多核网格** | 多序列 `AreaChart` + 自适应网格容器 | 双 `.y(...)` 渲染总利用率与内核时间渐变；自适应逻辑核网格（`compute_core_grid_layout`，`8%` 缩放迟滞与 `Full`/`Short`/`Hidden` 渐进标题）按 `P`/`E`/`LP-E` 异构着色 |
+| **磁盘双图 / 网卡吞吐 / GPU 多引擎** | `AreaChart` / `LineChart` + `Select` | 阶梯纵轴上限（`stepped_throughput_ceiling` / `stepped_network_ceiling`）消除抖动；GPU `2×2` 网格按 `>= 1%` 峰值自动优选活跃引擎（`select_active_gpu_engines`）并尊重用户 `Select` 覆盖 |
 | **内存组成四段比例条** | `h_flex` + `relative(ratio)` + `Tooltip` | Flexbox 相对宽度色块拼接「使用中 / 已修改 / 备用 / 可用」，每段挂载 `Tooltip` |
-| **运行新任务 / 相关性 / 等待链弹窗** | `Dialog`、`Input`、`Checkbox`、`Tree`、`Notification` | 等待链阻塞树使用 `Tree` 控件；遇 `ElevationRequired` 弹出附带「以管理员重启」按钮的 `Notification` |
+| **运行新任务 / 相关性 / 等待链 / 文件占用 / 托盘** | `Dialog`、`Input`、`Checkbox`、`Tree`、`Notification` | 等待链阻塞树使用 `Tree`；Restart Manager 文件占用弹窗列出锁持有进程；`ElevationRequired` 弹出提权 `Notification`；`0%` GPU 托盘速览浮窗无需打开主窗口即可查看 CPU/内存与高占用进程 |
 
 <a id="core-backend-subsystems"></a>
 
@@ -257,11 +257,12 @@ Windows 内核会高频复用已退出进程的 `PID`。Loom 统一使用 `Proce
 
 ### 6.2 无 WMI/PDH 五大硬件实时采样 (`loom-pal-windows::performance`)
 
-- **CPU**：`NtQuerySystemInformation(SystemProcessorPerformanceInformation)` 获取每逻辑核 `Idle/Kernel/User` 时间片；`GetLogicalProcessorInformationEx` 启动缓存插槽、物理核、NUMA 与 L1/L2/L3 缓存；`CallNtPowerInformation` 计算实时主频（GHz）。
+- **CPU**：优先使用 `NtQuerySystemInformationEx(SystemProcessorIdleCycleTimeInformation)` 配合 QPC 校验的处理器组周期基线（不可用时平滑退回 `SystemProcessorPerformanceInformation`）；`GetLogicalProcessorInformationEx` 启动缓存插槽、物理核、NUMA、L1/L2/L3 缓存并基于 `EfficiencyClass` 与 L3 共享识别异构 `P`/`E`/`LP-E` 核心拓扑；`CallNtPowerInformation` 计算实时主频（GHz）。
 - **内存**：`GlobalMemoryStatusEx` + `GetPerformanceInfo` + `SystemMemoryListInformation` 获取内存组成；解析 `GetSystemFirmwareTable('RSMB')` 获取内存频率（MT/s）、插槽数与外形规格。
-- **磁盘**：通过 `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` 建立物理盘与盘符映射（如 `磁盘 0 (C: D:)`），`IOCTL_STORAGE_QUERY_PROPERTY` 识别 NVMe / SATA SSD / HDD 与型号，`IOCTL_DISK_PERFORMANCE` 读取活动时间、读写速率与平均响应延迟，并按设备隔离受 `300 ms` 熔断器保护。
-- **网络**：`GetIfTable2` + `GetAdaptersAddresses` 采集 64 位收发字节计数、链路速率、连接类型（以太网 / Wi-Fi）及 IPv4/IPv6/DNS。
-- **GPU**：厂商中立的 `DXGI` + `gdi32!D3DKMTQueryStatistics` 采集各 Node 引擎（`3D`、`Copy`、`Video Encode`、`Video Decode` 等）时间片差分与全局/每进程专享及共享显存，配合 `D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERPERFDATA)` 读取核心温度与 PCI 总线位置。
+- **磁盘**：通过 `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` 建立物理盘与盘符映射（如 `磁盘 0 (C: D:)`），`IOCTL_STORAGE_QUERY_PROPERTY` 识别 NVMe / SATA SSD / HDD 与型号，`IOCTL_DISK_PERFORMANCE` 读取活动时间、读写速率与平均响应延迟，并具备 `checked_sub` 计数回绕防护、PnP 驱动白名单、机械盘活动守卫、`CM_Register_Notification` 安全弹出配合与 `300 ms` 设备级熔断保护。
+- **网络**：`GetIfTable2` + `GetAdaptersAddresses` 采集 64 位收发字节计数（`checked_sub` 回绕防护）、链路速率、连接类型（以太网 / Wi-Fi）及 IPv4/IPv6/DNS；按需 `iphlpapi`（`GetExtendedTcpTable` / `GetExtendedUdpTable`）支撑 `:PORT` 监听端口搜索；可选管理员专属单线程 ETW 采集器（`Microsoft-Windows-Kernel-Network`，受 `MonitorDomain::ProcessNetwork` 租约门控）在按需启用时提供每进程网络吞吐。
+- **GPU**：厂商中立的 `DXGI` + 纯内核态 `gdi32!D3DKMTQueryStatistics` 采集各 Node 引擎（`3D`、`Copy`、`Video Encode`、`Video Decode` 等）时间片差分与全局及每进程专享/共享显存和 GPU 利用率；`GpuPowerGate`（`cfgmgr32.dll` `DEVPKEY_Device_PowerData`）对处于 `D1`–`D3` 休眠态的混合独显跳过 `KMTQAITYPE_ADAPTERPERFDATA`（诚实回报 `d3_asleep` 与 `—` 温度而不唤醒独显），并对空闲 `D0` 适配器的性能查询限频至 `20 s`。
+- **缺口感知历史环与进程诊断**：`HistoryRing<N>` 与 `ThroughputRing<N>` 在暂停恢复、采样异常或时钟跳变（`> max(interval * 3, 5 s)`）时写入 `GAP_SENTINEL` 断档标记且保持 `Copy` 内存布局不变；`ProcessSequenceNumber`（`NtQueryInformationProcess` class `92`）进一步加固 PID 复用防护；`rstrtmgr.dll` 提供 Restart Manager 文件占用排查；零系统调用的 `webview2.rs` 与 `leaks.rs` 实现 WebView2 宿主归因与句柄/子进程/孤儿泄漏预警。
 
 ### 6.3 跨平台归一化映射（面向 `0.2.0` Linux 与 `0.3.0` macOS）
 

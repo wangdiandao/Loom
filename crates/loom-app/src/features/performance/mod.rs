@@ -11,30 +11,38 @@ mod gpu;
 mod memory;
 mod network;
 mod state;
+mod summary;
 
 use std::sync::Arc;
 
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{SelectEvent, SelectState};
-use gpui_kit::component::{ActiveTheme as _, IndexPath, v_flex};
+use gpui_kit::component::{ActiveTheme as _, IndexPath, WindowExt as _, v_flex};
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Window, div, px,
+    AnyElement, AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Window, div, px,
 };
-use loom_types::{LanguagePreference, MonitorDomain, NetAdapterSlice, PerformanceSlice};
+use loom_types::{
+    GpuAdapterSlice, LanguagePreference, MonitorDomain, NetAdapterSlice, PerformanceSlice,
+    ThroughputRing,
+};
 use loom_ui_kit::{
-    LoomSemanticColors, SparklineCardProps, SparklinePoint, adaptive_network_scale, format_bytes,
-    format_freq_ghz, format_network_rate_mbps, sparkline_card,
+    LoomSemanticColors, SparklineCardProps, format_bytes, format_freq_ghz,
+    format_network_rate_mbps, format_opt_temp_celsius, sparkline_card, stepped_network_ceiling,
 };
 
 use crate::bridge::{ScopedMonitorLease, UiStore, UiStoreEvent};
 use crate::i18n;
 
-use charts::HISTORY_WINDOW;
+use charts::{
+    HISTORY_WINDOW, history_ring_to_sparkline_points, throughput_pair_to_sparkline_points,
+};
 use gpu::GpuEngineOption;
 use state::{CpuGraphMode, GpuViewMode, PerformanceViewState, SelectedDevice};
+use summary::format_performance_summary;
 
 /// Hardware Performance view (`CPU`, `Memory`, `Disk 0..N`, `Network 0..N`, `GPU 0..N`).
 pub(crate) struct PerformanceView {
@@ -48,6 +56,7 @@ pub(crate) struct PerformanceView {
     gpu_single_select: Entity<SelectState<Vec<GpuEngineOption>>>,
     synced_gpu_luid: Option<u64>,
     synced_gpu_engines: Vec<Arc<str>>,
+    synced_gpu_grid_indices: [usize; 4],
     _subscriptions: Vec<Subscription>,
 }
 
@@ -112,6 +121,7 @@ impl PerformanceView {
                         if let Some(gpu) = perf.gpus.iter().find(|g| g.luid == luid) {
                             this.state
                                 .set_gpu_grid_engine(luid, slot, *engine_index, &gpu.engines);
+                            this.synced_gpu_grid_indices[slot] = *engine_index;
                             cx.notify();
                         }
                     }
@@ -148,10 +158,14 @@ impl PerformanceView {
             gpu_single_select,
             synced_gpu_luid: None,
             synced_gpu_engines: Vec::new(),
+            synced_gpu_grid_indices: [0; 4],
             _subscriptions: subscriptions,
         };
 
         let initial_perf = view.store.read(cx).snapshot().performance.clone();
+        // Pin open-time Disk and Network adapter ordering immediately.
+        let _ = view.state.ordered_disk_indices(&initial_perf.disks);
+        let _ = view.state.ordered_network_indices(&initial_perf.networks);
         view.sync_gpu_selects(&initial_perf, window, cx);
         view
     }
@@ -211,8 +225,21 @@ impl PerformanceView {
         cx.notify();
     }
 
-    /// Synchronizes the GPU engine dropdown `SelectState`s whenever the active GPU
-    /// or its engine inventory changes.
+    /// Copies a plain-text summary of the currently selected hardware pane to
+    /// the system clipboard and shows a confirmation [`Notification`].
+    pub(crate) fn copy_selected_summary(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let perf = self.store.read(cx).snapshot().performance.clone();
+        let selected = self.state.selected_device.resolve(&perf);
+        let text = format_performance_summary(&perf, selected);
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        window.push_notification(
+            Notification::success(i18n::tr("perf.perf_polish_copied_summary")),
+            cx,
+        );
+    }
+
+    /// Synchronizes the GPU engine dropdown `SelectState`s whenever the active GPU,
+    /// its engine inventory, or auto-selected active engines change.
     fn sync_gpu_selects(
         &mut self,
         perf: &PerformanceSlice,
@@ -227,44 +254,58 @@ impl PerformanceView {
         };
 
         let engine_names: Vec<Arc<str>> = gpu.engines.iter().map(|e| e.name.clone()).collect();
-        if self.synced_gpu_luid == Some(luid) && self.synced_gpu_engines == engine_names {
-            return;
-        }
-
         let grid_indices = self.state.ensure_gpu_grid_engines(luid, &gpu.engines);
         let single_index = self.state.ensure_gpu_single_engine(luid, &gpu.engines);
 
-        let options: Vec<GpuEngineOption> = gpu
-            .engines
-            .iter()
-            .enumerate()
-            .map(|(index, eng)| GpuEngineOption {
-                index,
-                label: SharedString::from(eng.name.as_ref().to_owned()),
-            })
-            .collect();
+        let inventory_changed =
+            self.synced_gpu_luid != Some(luid) || self.synced_gpu_engines != engine_names;
 
-        for (slot, select) in self.gpu_grid_selects.iter().enumerate() {
-            let items = options.clone();
-            let chosen = (!items.is_empty()).then(|| IndexPath::default().row(grid_indices[slot]));
-            select.update(cx, |state, cx| {
-                state.set_items(items, window, cx);
-                state.set_selected_index(chosen, window, cx);
+        if inventory_changed {
+            let options: Vec<GpuEngineOption> = gpu
+                .engines
+                .iter()
+                .enumerate()
+                .map(|(index, eng)| GpuEngineOption {
+                    index,
+                    label: SharedString::from(eng.name.as_ref().to_owned()),
+                })
+                .collect();
+
+            for (slot, select) in self.gpu_grid_selects.iter().enumerate() {
+                let items = options.clone();
+                let chosen =
+                    (!items.is_empty()).then(|| IndexPath::default().row(grid_indices[slot]));
+                select.update(cx, |state, cx| {
+                    state.set_items(items, window, cx);
+                    state.set_selected_index(chosen, window, cx);
+                });
+            }
+
+            let single_chosen =
+                (!options.is_empty()).then(|| IndexPath::default().row(single_index));
+            self.gpu_single_select.update(cx, |state, cx| {
+                state.set_items(options, window, cx);
+                state.set_selected_index(single_chosen, window, cx);
             });
+
+            self.synced_gpu_luid = Some(luid);
+            self.synced_gpu_engines = engine_names;
+            self.synced_gpu_grid_indices = grid_indices;
+        } else if self.synced_gpu_grid_indices != grid_indices && !gpu.engines.is_empty() {
+            for (slot, select) in self.gpu_grid_selects.iter().enumerate() {
+                if self.synced_gpu_grid_indices[slot] != grid_indices[slot] {
+                    let chosen = Some(IndexPath::default().row(grid_indices[slot]));
+                    select.update(cx, |state, cx| {
+                        state.set_selected_index(chosen, window, cx);
+                    });
+                }
+            }
+            self.synced_gpu_grid_indices = grid_indices;
         }
-
-        let single_chosen = (!options.is_empty()).then(|| IndexPath::default().row(single_index));
-        self.gpu_single_select.update(cx, |state, cx| {
-            state.set_items(options, window, cx);
-            state.set_selected_index(single_chosen, window, cx);
-        });
-
-        self.synced_gpu_luid = Some(luid);
-        self.synced_gpu_engines = engine_names;
     }
 
     fn render_device_sidebar(
-        &self,
+        &mut self,
         perf: &PerformanceSlice,
         selected: SelectedDevice,
         colors: &LoomSemanticColors,
@@ -289,10 +330,7 @@ impl PerformanceView {
                     title: i18n::tr("perf.cpu").into(),
                     subtitle: cpu_subtitle,
                     primary_metric: cpu_pct.into(),
-                    points: SparklinePoint::from_permille_padded(
-                        perf.cpu_history.iter_ordered(),
-                        HISTORY_WINDOW,
-                    ),
+                    points: history_ring_to_sparkline_points(&perf.cpu_history),
                     y_max: 100.0,
                     accent_color: colors.chart_cpu,
                     selected: selected == SelectedDevice::Cpu,
@@ -319,10 +357,7 @@ impl PerformanceView {
                     title: i18n::tr("perf.memory").into(),
                     subtitle: mem_subtitle.into(),
                     primary_metric: mem_pct.into(),
-                    points: SparklinePoint::from_permille_padded(
-                        perf.mem_history.iter_ordered(),
-                        HISTORY_WINDOW,
-                    ),
+                    points: history_ring_to_sparkline_points(&perf.mem_history),
                     y_max: 100.0,
                     accent_color: colors.chart_memory,
                     selected: selected == SelectedDevice::Memory,
@@ -334,8 +369,10 @@ impl PerformanceView {
             })),
         );
 
-        // 3. Disk 0..N cards
-        for disk in &perf.disks {
+        // 3. Disk 0..N cards (stable open-time ordering via merge_stable_order)
+        let disk_order = self.state.ordered_disk_indices(&perf.disks);
+        for disk_slice_idx in disk_order {
+            let disk = &perf.disks[disk_slice_idx];
             let disk_index = disk.index;
             let title = i18n::perf_disk_title(disk.index, disk.drive_letters.as_ref());
             let active_pct = format!("{:.0}%", f32::from(disk.active_time_permille) / 10.0);
@@ -347,10 +384,7 @@ impl PerformanceView {
                         title: title.into(),
                         subtitle: media.into(),
                         primary_metric: active_pct.into(),
-                        points: SparklinePoint::from_permille_padded(
-                            disk.active_history.iter_ordered(),
-                            HISTORY_WINDOW,
-                        ),
+                        points: history_ring_to_sparkline_points(&disk.active_history),
                         y_max: 100.0,
                         accent_color: colors.chart_disk,
                         selected: selected == SelectedDevice::Disk(disk_index),
@@ -363,10 +397,12 @@ impl PerformanceView {
             );
         }
 
-        // 4. Network 0..N cards
+        // 4. Network 0..N cards (stable open-time ordering + stepped ceiling + gap-safe max)
         let send_short = i18n::tr("perf.send_short");
         let recv_short = i18n::tr("perf.recv_short");
-        for net in &perf.networks {
+        let net_order = self.state.ordered_network_indices(&perf.networks);
+        for net_slice_idx in net_order {
+            let net = &perf.networks[net_slice_idx];
             let luid = net.luid;
             let title = format_network_card_title(net);
             let subtitle = format!(
@@ -374,19 +410,10 @@ impl PerformanceView {
                 format_network_rate_mbps(net.sent_bytes_per_sec),
                 format_network_rate_mbps(net.recv_bytes_per_sec)
             );
-            let combined_points = network_sparkline_points(net);
-            let max_bytes = net
-                .recv_history
-                .iter()
-                .zip(net.sent_history.iter())
-                .map(|(r, s)| r.saturating_add(s))
-                .max()
-                .unwrap_or(0)
-                .max(
-                    net.recv_bytes_per_sec
-                        .saturating_add(net.sent_bytes_per_sec),
-                );
-            let (y_max_bps, _) = adaptive_network_scale(max_bytes);
+            let max_bytes = network_combined_peak_bytes(net);
+            let (y_max_unit, _unit, divisor) = stepped_network_ceiling(max_bytes);
+            let combined_points =
+                throughput_pair_to_sparkline_points(&net.recv_history, &net.sent_history, divisor);
 
             list = list.child(
                 sparkline_card(
@@ -396,7 +423,7 @@ impl PerformanceView {
                         subtitle: subtitle.into(),
                         primary_metric: SharedString::new_static(""),
                         points: combined_points,
-                        y_max: y_max_bps,
+                        y_max: y_max_unit as f32,
                         accent_color: colors.chart_network,
                         selected: selected == SelectedDevice::Network(luid),
                     },
@@ -408,15 +435,11 @@ impl PerformanceView {
             );
         }
 
-        // 5. GPU 0..N cards
+        // 5. GPU 0..N cards (honest D3-asleep readout without fake 0°C)
         for gpu in &perf.gpus {
             let luid = gpu.luid;
             let title = i18n::perf_gpu_title(gpu.index);
-            let util_pct = format!("{:.0}%", f32::from(gpu.util_permille) / 10.0);
-            let primary_metric = match gpu.temperature_celsius {
-                Some(temp) => format!("{util_pct} · {temp}°C"),
-                None => util_pct,
-            };
+            let primary_metric = format_gpu_sidebar_metric(gpu);
             let subtitle: SharedString = if gpu.name.trim().is_empty() {
                 i18n::tr("perf.unavailable").into()
             } else {
@@ -428,11 +451,8 @@ impl PerformanceView {
                         id: SharedString::from(format!("perf-card-gpu-{luid}")),
                         title: title.into(),
                         subtitle,
-                        primary_metric: primary_metric.into(),
-                        points: SparklinePoint::from_permille_padded(
-                            gpu.util_history.iter_ordered(),
-                            HISTORY_WINDOW,
-                        ),
+                        primary_metric,
+                        points: history_ring_to_sparkline_points(&gpu.util_history),
                         y_max: 100.0,
                         accent_color: colors.chart_gpu,
                         selected: selected == SelectedDevice::Gpu(luid),
@@ -455,8 +475,14 @@ impl PerformanceView {
 }
 
 impl Render for PerformanceView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let perf = self.store.read(cx).snapshot().performance.clone();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (perf, sidebar_collapsed) = {
+            let store = self.store.read(cx);
+            (
+                store.snapshot().performance.clone(),
+                store.settings().sidebar_collapsed,
+            )
+        };
         let colors = LoomSemanticColors::from_theme(cx.theme());
 
         // Gracefully resolve selected device in case hardware disappeared between ticks.
@@ -464,26 +490,38 @@ impl Render for PerformanceView {
 
         let left_sidebar = self.render_device_sidebar(&perf, selected, &colors, cx);
 
+        // Compute adaptive logical-core grid layout from current viewport dimensions,
+        // persisting `prev_core_grid_columns` for the 8% resize hysteresis dead-band.
+        let viewport = window.viewport_size();
+        let nav_width = if sidebar_collapsed { 56.0 } else { 200.0 };
+        let avail_width = (viewport.width.as_f32() - nav_width - 268.0 - 40.0).max(240.0);
+        let avail_height = (viewport.height.as_f32() - 380.0).clamp(220.0, 900.0);
+        let core_grid_layout =
+            self.state
+                .compute_core_grid(perf.per_core_history.len(), avail_width, avail_height);
+
         let detail_content = match selected {
             SelectedDevice::Cpu => cpu::render_cpu_detail(
                 &perf,
                 self.state.cpu_graph_mode,
                 self.state.show_kernel_times,
+                core_grid_layout,
                 &colors,
                 cx,
             )
             .into_any_element(),
             SelectedDevice::Memory => {
-                memory::render_memory_detail(&perf, &colors).into_any_element()
+                memory::render_memory_detail(&perf, &colors, cx).into_any_element()
             }
             SelectedDevice::Disk(index) => {
                 if let Some(disk_slice) = perf.disks.iter().find(|d| d.index == index) {
-                    disk::render_disk_detail(disk_slice, &colors).into_any_element()
+                    disk::render_disk_detail(disk_slice, &colors, cx).into_any_element()
                 } else {
                     cpu::render_cpu_detail(
                         &perf,
                         self.state.cpu_graph_mode,
                         self.state.show_kernel_times,
+                        core_grid_layout,
                         &colors,
                         cx,
                     )
@@ -492,12 +530,13 @@ impl Render for PerformanceView {
             }
             SelectedDevice::Network(luid) => {
                 if let Some(net_slice) = perf.networks.iter().find(|n| n.luid == luid) {
-                    network::render_network_detail(net_slice, &colors).into_any_element()
+                    network::render_network_detail(net_slice, &colors, cx).into_any_element()
                 } else {
                     cpu::render_cpu_detail(
                         &perf,
                         self.state.cpu_graph_mode,
                         self.state.show_kernel_times,
+                        core_grid_layout,
                         &colors,
                         cx,
                     )
@@ -526,6 +565,7 @@ impl Render for PerformanceView {
                         &perf,
                         self.state.cpu_graph_mode,
                         self.state.show_kernel_times,
+                        core_grid_layout,
                         &colors,
                         cx,
                     )
@@ -562,33 +602,68 @@ fn format_network_card_title(net: &NetAdapterSlice) -> String {
     }
 }
 
-fn network_sparkline_points(net: &NetAdapterSlice) -> Vec<SparklinePoint> {
-    let recv: Vec<u64> = net.recv_history.iter().collect();
-    let sent: Vec<u64> = net.sent_history.iter().collect();
-    let len = recv.len().max(sent.len());
-    let mut combined_bps = Vec::with_capacity(len);
-    for idx in 0..len {
-        let r = recv.get(idx).copied().unwrap_or(0);
-        let s = sent.get(idx).copied().unwrap_or(0);
-        combined_bps.push(r.saturating_add(s) as f32 * 8.0);
+/// Computes the gap-safe peak combined network throughput (recv + sent) in bytes/sec.
+fn network_combined_peak_bytes(net: &NetAdapterSlice) -> u64 {
+    let history_peak = net
+        .recv_history
+        .iter()
+        .zip(net.sent_history.iter())
+        .map(|(r, s)| {
+            let rv = if ThroughputRing::<HISTORY_WINDOW>::is_gap(r) {
+                0
+            } else {
+                r
+            };
+            let sv = if ThroughputRing::<HISTORY_WINDOW>::is_gap(s) {
+                0
+            } else {
+                s
+            };
+            rv.saturating_add(sv)
+        })
+        .max()
+        .unwrap_or(0);
+    history_peak.max(
+        net.recv_bytes_per_sec
+            .saturating_add(net.sent_bytes_per_sec),
+    )
+}
+
+/// Formats the primary metric displayed on a sidebar GPU sparkline card,
+/// rendering an honest localized `"Sleeping (D3)"` label when powered down.
+pub(crate) fn format_gpu_sidebar_metric(gpu: &GpuAdapterSlice) -> SharedString {
+    if gpu.d3_asleep {
+        return i18n::tr("perf.perf_polish_gpu_sleeping").into();
     }
-    SparklinePoint::from_f32_padded(combined_bps, HISTORY_WINDOW)
+    let util_pct = format!("{:.0}%", f32::from(gpu.util_permille) / 10.0);
+    if gpu.temperature_celsius.is_some() {
+        let temp = format_opt_temp_celsius(gpu.temperature_celsius, gpu.d3_asleep);
+        format!("{util_pct} · {temp}").into()
+    } else {
+        util_pct.into()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use gpui_kit::component::ActiveTheme as _;
     use gpui_kit::{AppContext as _, TestAppContext, VisualTestContext};
     use loom_config::{AppSettings, ConfigStore};
     use loom_engine::EngineCoordinator;
     use loom_pal::{NativeBackend, PlatformBackend};
-    use loom_types::MonitorDomain;
+    use loom_types::{
+        CpuCoreKind, CpuStaticInfo, GpuAdapterSlice, GpuEngineSlice, HistoryRing,
+        LanguagePreference, MonitorDomain, PerformanceSlice,
+    };
+    use loom_ui_kit::{LoomSemanticColors, compute_core_grid_layout};
 
     use crate::bridge::UiStore;
+    use crate::i18n;
 
-    use super::PerformanceView;
-    use super::state::CpuGraphMode;
+    use super::state::{CpuGraphMode, GpuViewMode, SelectedDevice};
+    use super::{PerformanceView, cpu, format_gpu_sidebar_metric, gpu};
 
     #[gpui_kit::test]
     fn performance_view_acquires_and_releases_performance_and_per_core_leases(
@@ -665,6 +740,138 @@ mod tests {
             "PerCoreCpu lease must be released when PerformanceView drops"
         );
 
+        coordinator.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn performance_view_copy_summary_writes_clipboard_and_renders_hybrid_and_d3_gpu(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        i18n::apply_locale(LanguagePreference::EnUs);
+
+        let dir = tempfile::tempdir().expect("create temp config dir");
+        let config_store = ConfigStore::new(dir.path().join("settings.toml"));
+        let settings = AppSettings::default();
+        let backend = NativeBackend::initialize().expect("initialize native backend");
+        let coordinator =
+            Arc::new(EngineCoordinator::new(backend, settings.clone()).expect("start coordinator"));
+
+        let store = cx.new(|cx| UiStore::new(coordinator.clone(), config_store, settings, cx));
+
+        let mut perf_view_handle = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| PerformanceView::new(store.clone(), window, cx));
+                perf_view_handle = Some(view.clone());
+                cx.new(|cx| gpui_kit::base::Root::new(view, window, cx))
+            })
+            .expect("open performance test window")
+        });
+        let perf_view = perf_view_handle.expect("PerformanceView constructed");
+
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // Verify Copy summary copies CPU summary to clipboard cleanly.
+        vcx.update(|window, cx| {
+            perf_view.update(cx, |view, cx| {
+                view.copy_selected_summary(window, cx);
+            });
+        });
+        let copied_cpu = vcx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard should contain CPU summary");
+        assert!(copied_cpu.contains("CPU"));
+        assert!(copied_cpu.contains("Utilization:"));
+
+        // Switch to Memory and verify Copy summary updates clipboard.
+        vcx.update(|window, cx| {
+            perf_view.update(cx, |view, cx| {
+                view.select_device(SelectedDevice::Memory, window, cx);
+                view.copy_selected_summary(window, cx);
+            });
+        });
+        let copied_mem = vcx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard should contain Memory summary");
+        assert!(copied_mem.contains("Memory"));
+        assert!(copied_mem.contains("In use:"));
+
+        // Exercise rendering synthetic hybrid P/E/LP-E logical core grid and sleeping D3 GPU pane.
+        vcx.update(|_window, cx| {
+            let colors = LoomSemanticColors::from_theme(cx.theme());
+
+            let mut hybrid_perf = PerformanceSlice {
+                cpu_info: CpuStaticInfo {
+                    brand_name: Arc::from("Hybrid Test CPU"),
+                    core_kinds: vec![
+                        CpuCoreKind::Performance,
+                        CpuCoreKind::Performance,
+                        CpuCoreKind::Efficiency,
+                        CpuCoreKind::LowPowerEfficiency,
+                    ],
+                    ..Default::default()
+                },
+                per_core_permille: vec![420, 180, 95, HistoryRing::<60>::GAP_SENTINEL],
+                per_core_history: vec![
+                    {
+                        let mut r = HistoryRing::<60>::new();
+                        r.push(420);
+                        r.push_gap();
+                        r.push(350);
+                        r
+                    },
+                    HistoryRing::<60>::new(),
+                    HistoryRing::<60>::new(),
+                    HistoryRing::<60>::new(),
+                ],
+                ..Default::default()
+            };
+            let layout = compute_core_grid_layout(4, 900.0, 500.0, None);
+            assert!(layout.columns >= 1);
+            let grid_el = cpu::render_logical_cpu_grid(&hybrid_perf, layout, &colors);
+            drop(grid_el);
+
+            let sleeping_gpu = GpuAdapterSlice {
+                index: 1,
+                luid: 9999,
+                name: Arc::from("Discrete RTX Test GPU"),
+                temperature_celsius: Some(0),
+                util_permille: 0,
+                d3_asleep: true,
+                engines: vec![GpuEngineSlice {
+                    name: Arc::from("3D"),
+                    util_permille: 0,
+                    history: HistoryRing::<60>::new(),
+                }],
+                ..Default::default()
+            };
+            assert_eq!(
+                format_gpu_sidebar_metric(&sleeping_gpu).as_ref(),
+                "Sleeping (D3)"
+            );
+            hybrid_perf.gpus.push(sleeping_gpu);
+
+            perf_view.update(cx, |view, cx| {
+                let _gpu_el = gpu::render_gpu_detail(
+                    &hybrid_perf.gpus[0],
+                    GpuViewMode::Grid2x2,
+                    [0, 0, 0, 0],
+                    0,
+                    &view.gpu_grid_selects,
+                    &view.gpu_single_select,
+                    &colors,
+                    cx,
+                );
+            });
+        });
+
+        drop(perf_view);
+        vcx.update(|window, _| window.remove_window());
+        vcx.run_until_parked();
         coordinator.shutdown();
     }
 }

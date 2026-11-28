@@ -1,15 +1,20 @@
-//! Network adapter detail pane for the Performance view (adaptive Send/Receive chart + IP/DNS specs).
+//! Network adapter detail pane for the Performance view (stepped Send/Receive chart + IP/DNS specs).
 
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::v_flex;
-use gpui_kit::{IntoElement, ParentElement as _, SharedString, Styled as _};
+use gpui_kit::{
+    Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
+};
 use loom_types::NetAdapterSlice;
 use loom_ui_kit::{
-    LoomSemanticColors, adaptive_network_scale, format_bits_per_sec, format_network_rate_mbps,
+    LoomSemanticColors, format_bits_per_sec, format_network_rate_mbps, stepped_network_ceiling,
 };
 
+use crate::features::performance::PerformanceView;
 use crate::features::performance::charts::{
     MetricStat, SpecRow, build_dual_throughput_area_chart, chart_frame, device_header,
-    dual_throughput_rings_to_points, legend_swatch, metrics_two_column_panel,
+    dual_throughput_rings_to_points, format_stepped_ceiling_label, legend_swatch,
+    metrics_two_column_panel,
 };
 use crate::i18n;
 
@@ -17,6 +22,7 @@ use crate::i18n;
 pub(crate) fn render_network_detail(
     adapter: &NetAdapterSlice,
     colors: &LoomSemanticColors,
+    cx: &mut Context<PerformanceView>,
 ) -> impl IntoElement {
     let unavailable = i18n::tr("perf.unavailable");
     let conn_label = i18n::net_connection_type_label(adapter.connection_type);
@@ -35,23 +41,24 @@ pub(crate) fn render_network_detail(
         .max(adapter.sent_history.max_value())
         .max(adapter.recv_bytes_per_sec)
         .max(adapter.sent_bytes_per_sec);
-    let (y_max_bps, scale_label) = adaptive_network_scale(max_bytes_per_sec);
+    let (y_max_unit, unit_label, divisor) = stepped_network_ceiling(max_bytes_per_sec);
+    let scale_label = format_stepped_ceiling_label(y_max_unit, unit_label);
 
     let recv_label = i18n::tr("perf.net_receive");
     let send_label = i18n::tr("perf.net_send");
 
-    // Plot in decimal bits/sec so the Y domain aligns with `adaptive_network_scale`.
+    // Plot in the stepped ceiling's unit (Kbps / Mbps / Gbps) via `divisor`.
     let throughput_points =
-        dual_throughput_rings_to_points(&adapter.recv_history, &adapter.sent_history, 8.0);
+        dual_throughput_rings_to_points(&adapter.recv_history, &adapter.sent_history, divisor);
     let throughput_chart = build_dual_throughput_area_chart(
         SharedString::from(format!("perf-net-throughput-{}", adapter.luid)),
         throughput_points,
-        y_max_bps,
+        y_max_unit as f32,
         recv_label.clone(),
         colors.chart_network,
         send_label.clone(),
         colors.chart_network_send,
-        |bps| format_bits_per_sec(bps.max(0.0) as u64),
+        move |val| format_bits_per_sec(((val.max(0.0) * divisor) * 8.0) as u64),
     );
     let legend = vec![
         legend_swatch(recv_label.clone(), colors.chart_network, colors).into_any_element(),
@@ -100,7 +107,12 @@ pub(crate) fn render_network_detail(
         ),
     ];
 
+    let weak_ctx = cx.entity().downgrade();
     v_flex()
+        .id(SharedString::from(format!(
+            "perf-net-detail-{}",
+            adapter.luid
+        )))
         .w_full()
         .gap_4()
         .child(device_header(conn_label, description, None, colors))
@@ -114,4 +126,16 @@ pub(crate) fn render_network_detail(
             colors,
         ))
         .child(metrics_two_column_panel(left_stats, right_specs, colors))
+        .context_menu(move |menu, _window, _cx| {
+            let weak_copy = weak_ctx.clone();
+            menu.item(
+                PopupMenuItem::new(i18n::tr("perf.perf_polish_copy_summary")).on_click(
+                    move |_, window, cx| {
+                        let _ = weak_copy.update(cx, |view, cx| {
+                            view.copy_selected_summary(window, cx);
+                        });
+                    },
+                ),
+            )
+        })
 }

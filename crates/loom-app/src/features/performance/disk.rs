@@ -1,17 +1,22 @@
-//! Disk detail pane for the Performance view (active time %, adaptive Read/Write chart, latency, specs).
+//! Disk detail pane for the Performance view (active time %, stepped Read/Write chart, latency, specs).
 
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
-use gpui_kit::{IntoElement, ParentElement as _, SharedString, Styled as _, div};
+use gpui_kit::{
+    Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
+    div,
+};
 use loom_types::DiskDeviceSlice;
 use loom_ui_kit::{
-    LoomSemanticColors, adaptive_throughput_scale, format_bytes, format_latency_us,
-    format_permille, format_rate_bytes_per_sec,
+    LoomSemanticColors, format_bytes, format_latency_us, format_permille,
+    format_rate_bytes_per_sec, stepped_throughput_ceiling,
 };
 
+use crate::features::performance::PerformanceView;
 use crate::features::performance::charts::{
     MetricStat, SpecRow, build_dual_throughput_area_chart, build_percent_area_chart, chart_frame,
-    device_header, dual_throughput_rings_to_points, history_ring_to_points, legend_swatch,
-    metrics_two_column_panel,
+    device_header, dual_throughput_rings_to_points, format_stepped_ceiling_label,
+    history_ring_to_points, legend_swatch, metrics_two_column_panel,
 };
 use crate::i18n;
 
@@ -19,6 +24,7 @@ use crate::i18n;
 pub(crate) fn render_disk_detail(
     disk: &DiskDeviceSlice,
     colors: &LoomSemanticColors,
+    cx: &mut Context<PerformanceView>,
 ) -> impl IntoElement {
     let unavailable = i18n::tr("perf.unavailable");
     let title = i18n::perf_disk_title(disk.index, disk.drive_letters.as_ref());
@@ -70,21 +76,22 @@ pub(crate) fn render_disk_detail(
         .max(disk.write_history.max_value())
         .max(disk.read_bytes_per_sec)
         .max(disk.write_bytes_per_sec);
-    let (y_max_bps, scale_label) = adaptive_throughput_scale(max_rw_bps);
+    let (y_max_unit, unit_label, divisor) = stepped_throughput_ceiling(max_rw_bps);
+    let scale_label = format_stepped_ceiling_label(y_max_unit, unit_label);
 
     let read_label = i18n::tr("perf.disk_read");
     let write_label = i18n::tr("perf.disk_write");
     let transfer_points =
-        dual_throughput_rings_to_points(&disk.read_history, &disk.write_history, 1.0);
+        dual_throughput_rings_to_points(&disk.read_history, &disk.write_history, divisor);
     let transfer_chart = build_dual_throughput_area_chart(
         SharedString::from(format!("perf-disk-transfer-{}", disk.index)),
         transfer_points,
-        y_max_bps,
+        y_max_unit as f32,
         read_label.clone(),
         colors.chart_disk,
         write_label.clone(),
         colors.chart_disk_write,
-        |val| format_rate_bytes_per_sec(val.max(0.0) as u64),
+        move |val| format_rate_bytes_per_sec((val.max(0.0) * divisor) as u64),
     );
     let transfer_legend = vec![
         legend_swatch(read_label, colors.chart_disk, colors).into_any_element(),
@@ -127,7 +134,12 @@ pub(crate) fn render_disk_detail(
         SpecRow::new(i18n::tr("perf.disk_type"), media_label),
     ];
 
+    let weak_ctx = cx.entity().downgrade();
     v_flex()
+        .id(SharedString::from(format!(
+            "perf-disk-detail-{}",
+            disk.index
+        )))
         .w_full()
         .gap_4()
         .child(device_header(
@@ -155,4 +167,16 @@ pub(crate) fn render_disk_detail(
             colors,
         ))
         .child(metrics_two_column_panel(left_stats, right_specs, colors))
+        .context_menu(move |menu, _window, _cx| {
+            let weak_copy = weak_ctx.clone();
+            menu.item(
+                PopupMenuItem::new(i18n::tr("perf.perf_polish_copy_summary")).on_click(
+                    move |_, window, cx| {
+                        let _ = weak_copy.update(cx, |view, cx| {
+                            view.copy_selected_summary(window, cx);
+                        });
+                    },
+                ),
+            )
+        })
 }
