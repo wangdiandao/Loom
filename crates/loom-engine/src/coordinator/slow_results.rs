@@ -202,15 +202,22 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                         if self.leases.is_active(MonitorDomain::Performance) {
                             self.projection.record_disk_performance(&disks);
                             *perf_updated = true;
+                        } else {
+                            self.last_disk_poll_tick = 0;
                         }
                     }
                     Err(err) => {
+                        self.last_disk_poll_tick = 0;
                         tracing::warn!(%err, "slow-lane disk performance poll failed");
                     }
                 }
             }
             SlowResult::DiskPerformanceSkipped => {
                 self.pending_disk_perf = false;
+                self.last_disk_poll_tick = 0;
+                if !self.window_dormant && !self.temp_frozen {
+                    self.enqueue_performance_slow_probes();
+                }
             }
             SlowResult::ListeningPortsPolled(result) => {
                 self.pending_port_scan = false;
@@ -234,42 +241,62 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 }
             }
             SlowResult::DomainPollSkipped(domain) => {
-                self.pending_domains[domain.index()] = false;
+                let idx = domain.index();
+                self.pending_domains[idx] = false;
+                self.last_domain_poll_tick[idx] = 0;
+                if !self.window_dormant && !self.temp_frozen {
+                    self.enqueue_leased_slow_domains();
+                }
             }
             SlowResult::ServicesPolled(result) => {
-                self.pending_domains[MonitorDomain::Services.index()] = false;
+                let idx = MonitorDomain::Services.index();
+                self.pending_domains[idx] = false;
                 if let Ok(items) = result
                     && self.leases.is_active(MonitorDomain::Services)
-                    && self.apply_services_snapshot(items)
                 {
-                    *snapshot_dirty = true;
+                    if self.apply_services_snapshot(items) {
+                        *snapshot_dirty = true;
+                    }
+                } else {
+                    self.last_domain_poll_tick[idx] = 0;
                 }
             }
             SlowResult::StartupPolled(result) => {
-                self.pending_domains[MonitorDomain::Startup.index()] = false;
+                let idx = MonitorDomain::Startup.index();
+                self.pending_domains[idx] = false;
                 if let Ok((last_bios_time_ms, items)) = result
                     && self.leases.is_active(MonitorDomain::Startup)
-                    && self.apply_startup_snapshot(last_bios_time_ms, items)
                 {
-                    *snapshot_dirty = true;
+                    if self.apply_startup_snapshot(last_bios_time_ms, items) {
+                        *snapshot_dirty = true;
+                    }
+                } else {
+                    self.last_domain_poll_tick[idx] = 0;
                 }
             }
             SlowResult::UsersPolled(result) => {
-                self.pending_domains[MonitorDomain::Users.index()] = false;
+                let idx = MonitorDomain::Users.index();
+                self.pending_domains[idx] = false;
                 if let Ok(sessions) = result
                     && self.leases.is_active(MonitorDomain::Users)
                 {
                     self.apply_users_snapshot(sessions);
                     *snapshot_dirty = true;
+                } else {
+                    self.last_domain_poll_tick[idx] = 0;
                 }
             }
             SlowResult::AppHistoryPolled(result) => {
-                self.pending_domains[MonitorDomain::AppHistory.index()] = false;
+                let idx = MonitorDomain::AppHistory.index();
+                self.pending_domains[idx] = false;
                 if let Ok((since_epoch_secs, items)) = result
                     && self.leases.is_active(MonitorDomain::AppHistory)
-                    && self.apply_app_history_snapshot(since_epoch_secs, items)
                 {
-                    *snapshot_dirty = true;
+                    if self.apply_app_history_snapshot(since_epoch_secs, items) {
+                        *snapshot_dirty = true;
+                    }
+                } else {
+                    self.last_domain_poll_tick[idx] = 0;
                 }
             }
             SlowResult::MgmtOpCompleted {

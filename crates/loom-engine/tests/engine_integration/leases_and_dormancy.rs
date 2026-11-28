@@ -742,3 +742,74 @@ fn unchanged_mgmt_polls_and_noop_freeze_do_not_bump_revisions() {
 
     coord.shutdown();
 }
+
+#[test]
+fn rapid_lease_drop_and_reacquire_while_paused_recovers_after_skipped_poll() {
+    // Use a single slow worker blocked briefly by a slow probe so the queued
+    // PollOnDemandDomain(Services) and PollDiskPerformance jobs observe a dropped lease
+    // (producing DomainPollSkipped / DiskPerformanceSkipped) and then must re-poll cleanly
+    // when the leases are re-acquired on the exact same paused tick_count.
+    let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+    let blocker = MockProcSpec::new(100, 10, 0, "blocker.exe");
+    let mut raw = MockState::new_raw(vec![blocker]);
+    raw.slow_probe_block_pid = Some(100);
+    raw.slow_probe_sleep = Duration::from_secs(5);
+    raw.slow_probe_release = Some(release_rx);
+    raw.mgmt.services.lock().push(ServiceRecord {
+        name: Arc::from("Spooler"),
+        display_name: Arc::from("Print Spooler"),
+        description: None,
+        pid: Some(100),
+        state: ServiceState::Running,
+        group: None,
+    });
+    let state = Arc::new(raw);
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let config = EngineConfig {
+        slow_workers: 1,
+        ..EngineConfig::default()
+    };
+    let coord = EngineCoordinator::with_config(backend, settings, config).unwrap();
+
+    // Wait until the sole slow worker is blocked inside probe_process(100).
+    assert!(wait_until(Duration::from_secs(2), || {
+        state.probe_proc_calls.load(Ordering::Acquire) >= 1
+    }));
+
+    // Acquire Services + Performance leases so coordinator enqueues PollOnDemandDomain(Services)
+    // and PollDiskPerformance while the worker is busy; give the fast lane a moment to enqueue.
+    let svc_lease = coord.acquire_lease(MonitorDomain::Services);
+    let perf_lease = coord.acquire_lease(MonitorDomain::Performance);
+    assert!(wait_until(Duration::from_secs(1), || {
+        state.sample_perf_calls.load(Ordering::Acquire) >= 1
+    }));
+
+    // Drop both leases BEFORE releasing the slow worker so the queued jobs take the *Skipped path.
+    drop(svc_lease);
+    drop(perf_lease);
+    let _ = release_tx.send(());
+
+    // Wait briefly so the worker drains the skipped jobs with zero backend calls.
+    std::thread::sleep(Duration::from_millis(40));
+    assert_eq!(state.mgmt.list_services_calls.load(Ordering::Acquire), 0);
+    assert_eq!(state.probe_disk_calls.load(Ordering::Acquire), 0);
+
+    // Re-acquire both leases on the exact same paused tick_count -> must NOT get stuck!
+    let _svc_lease_2 = coord.acquire_lease(MonitorDomain::Services);
+    let _perf_lease_2 = coord.acquire_lease(MonitorDomain::Performance);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            coord.snapshot().revisions.services >= 1
+                && state.probe_disk_calls.load(Ordering::Acquire) >= 1
+                && !coord.snapshot().performance.disks.is_empty()
+        }),
+        "re-acquiring Services/Performance after *Skipped on the same paused tick must re-poll"
+    );
+
+    coord.shutdown();
+}
