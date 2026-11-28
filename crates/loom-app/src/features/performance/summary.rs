@@ -474,6 +474,7 @@ mod tests {
 
     #[test]
     fn performance_summary_formats_all_devices_and_honest_d3_sleep() {
+        let _locale_guard = i18n::locale_test_lock();
         i18n::apply_locale(LanguagePreference::EnUs);
 
         let mut perf = PerformanceSlice {

@@ -150,6 +150,7 @@ fn performance_view_acquires_and_releases_performance_and_per_core_leases(cx: &m
 fn performance_view_copy_summary_writes_clipboard_and_renders_hybrid_and_d3_gpu(
     cx: &mut TestAppContext,
 ) {
+    let _locale_guard = i18n::locale_test_lock();
     cx.update(gpui_kit::init);
     i18n::apply_locale(LanguagePreference::EnUs);
 
@@ -297,6 +298,7 @@ fn performance_view_copy_summary_writes_clipboard_and_renders_hybrid_and_d3_gpu(
 
 #[gpui_kit::test]
 fn gpu_engine_count_dropdown_syncs_caps_and_relocalizes(cx: &mut TestAppContext) {
+    let _locale_guard = i18n::locale_test_lock();
     cx.update(gpui_kit::init);
 
     let dir = tempfile::tempdir().expect("create temp config dir");

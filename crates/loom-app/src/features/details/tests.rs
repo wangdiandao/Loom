@@ -215,6 +215,7 @@ fn priority_menu_ordering_and_localized_labels() {
         (ProcessPriority::Idle, "details.priority_idle", "Low", "低"),
     ];
 
+    let _locale_guard = i18n::locale_test_lock();
     for (priority, key, en, zh) in expected {
         assert_eq!(rust_i18n::t!(key, locale = "en-US"), en);
         assert_eq!(rust_i18n::t!(key, locale = "zh-CN"), zh);
@@ -757,6 +758,7 @@ fn details_view_right_click_column_coord_long_paths_and_viewport_dirty_skip(
 
 #[test]
 fn details_locale_cache_and_working_set_delta_column_alignment() {
+    let _locale_guard = i18n::locale_test_lock();
     let all_cols = [
         (DetailsColumn::Name, "details.col_name"),
         (DetailsColumn::Pid, "details.col_pid"),

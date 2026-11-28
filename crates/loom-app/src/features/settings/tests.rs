@@ -42,6 +42,7 @@ fn custom_accent_hex_validation_accepts_valid_and_rejects_malformed() {
 
 #[test]
 fn admin_startup_and_taskmgr_presentations_handle_all_status_variants() {
+    let _locale_guard = crate::i18n::locale_test_lock();
     // Loading (None) disables switches cleanly with no spurious badges.
     let admin_loading = AdminStartupPresentation::from_status(None, false);
     assert!(!admin_loading.checked);

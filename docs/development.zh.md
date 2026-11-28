@@ -17,9 +17,9 @@
 Loom 通过 10-Crate Workspace 约束编译期单向依赖 DAG，完整拓扑见[系统架构](architecture.zh.md#workspace-module-layout-and-dependency-dag)：
 
 - **领域模型与配置底座（`crates/loom-{types,config}`）**：纯数据结构与快速（目标 `< 1 ms`）本地配置持久化，无 OS API 与 UI 依赖。
-- **静态平台抽象与各端实现（`crates/loom-{pal-api,pal-windows,pal-macos,pal-linux,pal}`）**：`loom-pal-api` 定义编译期单态化 Trait 与复用缓冲契约；各平台独立 Crate 实现具体系统调用；`loom-pal` 通过 `#[cfg(target_os)]` 静态导出 `NativeBackend`。
-- **无头采样与业务引擎（`crates/loom-engine`）**：承载快慢双通道调度、60 点定长量化时序环、防复用进程树、预排序视图投影与 `MonitorLease` 租约管理，**禁止引入 GPUI 或多线程 Tokio 依赖**。
-- **组合式 UI 底座与桌面主程序（`crates/loom-{ui-kit,app}`）**：`loom-ui-kit` 基于 `gpui-kit` 封装复合控件；`loom-app` 采用 **Shell + 垂直功能切片** 结构（`shell/` + `features/{processes,performance,app_history,startup,users,details,services,settings}/`）。
+- **静态平台抽象与各端实现（`crates/loom-{pal-api,pal-windows,pal-macos,pal-linux,pal}`）**：`loom-pal-api` 定义编译期单态化 Trait 与复用缓冲契约；各平台独立 Crate 按职责子模块隔离具体系统调用（如 `loom-pal-windows/src/{fast_sampler,slow_prober,operator,startup,filelock,perf/{disk,gpu},taskmgr,admin}/`）；`loom-pal` 通过 `#[cfg(target_os)]` 静态导出 `NativeBackend`。
+- **无头采样与业务引擎（`crates/loom-engine`）**：按 `coordinator/`、`projection/`、`slow_lane/` 等子模块承载快慢双通道调度、60 点定长量化时序环、防复用进程树、结构化查询、预排序视图投影与 `MonitorLease` 租约管理，**禁止引入 GPUI 或多线程 Tokio 依赖**。
+- **组合式 UI 底座与桌面主程序（`crates/loom-{ui-kit,app}`）**：`loom-ui-kit` 按 `theme/`、`format/`、`heatmap`、`sparkline`、`logic` 等模块基于 `gpui-kit` 封装复合控件；`loom-app` 采用 **Bootstrap + Shell + 垂直功能切片** 结构（`bootstrap/`、`shell/{window,dialogs}/` 与 `features/{table_columns,processes,performance,app_history,startup,users,details,services,settings}/`）。
 
 <a id="coding-conventions"></a>
 
@@ -54,6 +54,7 @@ Loom 通过 10-Crate Workspace 约束编译期单向依赖 DAG，完整拓扑见
 测试编写约定：
 
 - 不依赖 GPUI `App` / `Window` 时优先使用普通 `#[test]`。
+- 在 `loom-app` 中任何修改全局 `rust_i18n` 语言环境或断言本地化文本的测试均应持有 `i18n::locale_test_lock()`，确保默认并行 `cargo test` 100% 确定性通过。
 - 每个防卡死机制（如 `CircuitBreaker` 熔断、PID 快速回收复用）均应配备确定性回归测试。
 - 验证结束后清理临时转储文件、日志与截图产物。
 

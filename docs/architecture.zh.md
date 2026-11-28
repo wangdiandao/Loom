@@ -183,12 +183,12 @@ flowchart BT
 | `loom-types` | lib | 跨平台紧凑领域模型（`ProcessKey`、`ProcessHotSample`、`ProcessColdMeta`、缺口感知 `HistoryRing`/`ThroughputRing`、`CpuCoreKind`、`d3_asleep`、`ProcessSocketRecord`、`FileLockHolder`、`LeakWarning`、`WebView2Role`、`TaskManagerReplacementStatus`、`AdminStartupStatus`、五大硬件快照、服务/启动项/用户/历史记录、`CapabilityFlags`） | 无 OS 依赖、无 UI 依赖；高频热结构使用 `Copy` 紧凑内存布局 |
 | `loom-config` | lib | 本地配置持久化（`settings.toml`：启动页、刷新周期、主题、语言、窗口几何、置顶/托盘行为、列偏好、全局热键、增量 v1 进程与诊断开关）、冻结的 `v1`（`CONFIG_CONTRACT_VERSION = "1.0"`）向前迁移与原子落盘 | 同步加载目标 `< 1 ms`，不依赖平台后端或 UI；忽略未知未来可选键并结构化拒绝更高 `schema_version` |
 | `loom-pal-api` | lib | 冻结的 `v1`（`PAL_API_CONTRACT_VERSION = 1`）静态平台抽象 Trait 族（`PlatformBackend`、`FastSystemSampler`、`SlowMetadataProber`、`ServiceManager`、`StartupManager`、`SessionManager`、`AppHistoryReader`、`SystemOperator`，并仅以默认实现扩展挂起/恢复、重启资源管理器、文件占用查询、监听端口、管理员 ETW 门控、系统任务管理器替换与常驻管理员启动）、调用方复用缓冲 `SampleScratch` 与 `PalError` | 仅依赖 `loom-types`，不暴露特定操作系统句柄或头文件类型 |
-| `loom-pal-windows` | lib | Windows 采集与系统控制实现（`ntdll` Idle-Cycle CPU 与 `ProcessSequenceNumber`、纯 `D3DKMT` 每进程 GPU 与 `D3` 电源门控、防护 `IOCTL`、`SMBIOS`、`SCM`、`WTS`、`WCT`、`MiniDump`、`iphlpapi` 端口、Restart Manager 文件占用、管理员专属 ETW 进程网络，以及 IFEO 系统任务管理器替换、Task Scheduler 常驻管理员启动与跨 UIPI 单实例唤醒） | 仅 `cfg(windows)` 编译；采用 `windows-sys`，内部收敛 `unsafe` FFI，遵守六项防卡死约束 |
+| `loom-pal-windows` | lib | 按职责拆分的 Windows 采集与系统控制实现（`fast_sampler/`、`slow_prober/`、`operator/`、`startup/`、`filelock/`、`perf/{cpu,disk,gpu,mem,net,nvml}`、`services`、`sessions`、`app_history`、`ports`、`etw_net`、`diagnostics`、`taskmgr/`、`admin/`、`install_guard`、`handle`），涵盖 `ntdll` Idle-Cycle CPU 与 `ProcessSequenceNumber`、延迟加载 `dxgi.dll` 的纯 `D3DKMT` 每进程 GPU 与 `D3` 电源门控、防护 `IOCTL`、`SMBIOS`、`SCM`、`WTS`、`WCT`、`MiniDump`、`iphlpapi` 端口、Restart Manager + 内核句柄文件占用、管理员专属 ETW 进程网络、IFEO 系统任务管理器替换、Task Scheduler 常驻管理员启动与跨 UIPI 单实例唤醒 | 仅 `cfg(windows)` 编译；采用 `windows-sys`，通过统一 RAII 守卫（`OwnedHandle`、`OwnedRegKey`、`OwnedModule`、`LocalAllocGuard`、`D3dkmtAdapterGuard`）收敛 `unsafe` FFI，遵守六项防卡死约束 |
 | `loom-pal-macos` | lib | macOS 后端预留骨架（`Mach` / `libproc` / `IOKit` / `launchd` 映射位） | 仅 `cfg(target_os = "macos")` 编译；当前提供编译期契约占位桩，计划于 `0.3.0` 实现 |
 | `loom-pal-linux` | lib | Linux 后端预留骨架（`procfs` / `sysfs` / `netlink` / `drm` / `systemd` 映射位） | 仅 `cfg(target_os = "linux")` 编译；当前提供编译期契约占位桩，计划于 `0.2.0` 实现 |
 | `loom-pal` | lib | 平台编译期静态门面（导出 `pub type NativeBackend = ...`）及跨平台单实例锁、系统托盘与电源/显示状态适配 | 消除上层代码中的 `#[cfg(target_os)]` 分支，无虚表动态包装 |
-| `loom-engine` | lib | 无头采样与业务编排引擎（`EngineCoordinator<B>`、`SnapshotWakeSignal` 推送唤醒、差分计算、缺口感知 60 点定长环、防复用进程树、结构化搜索与按需 `:PORT`、行序与按住 `Ctrl` 冻结、默认开启的传递性安全排序迟滞（Sort Deadband）、可复用 `ProjectionScratch`、WebView2 宿主归因、零系统调用泄漏预警、全表格预排序视图投影、`MonitorLease`） | 禁止依赖 GPUI Crate 或多线程 Tokio；支持注入 `MockBackend` 进行无头基准与故障注入测试 |
-| `loom-ui-kit` | lib | 基于 `gpui-kit` 的薄组合层：WCAG 2.1 对比度校验语义色与按主题缓存（`CachedSemanticColors`）、统一等宽数字快速整形（`MetricDisplay` / 静态查找表）、有界行文本缓存（`RowTextCache`）、热力图单元格、单行预览截断、缺口感知微缩波形卡片、阶梯坐标上限、自适应多核网格求解器（`8%` 迟滞）、活跃 GPU 引擎优选、打开期稳定排序、防公式注入 CSV 导出、内存四段条与 `rust-i18n` 辅助 | 隔离上游 `gpui-kit` 细节，无自定义 `Canvas`/Shader 绘制，不持有业务领域状态 |
+| `loom-engine` | lib | 按子模块解耦的无头采样与业务编排引擎（`coordinator/`、`projection/`、`slow_lane/`、`tree`、`query`、`wake`、`webview2`、`leaks`、`lease`）：`EngineCoordinator<B>`、`SnapshotWakeSignal` 推送唤醒、差分计算、缺口感知 60 点定长环、防复用进程树、结构化搜索与按需 `:PORT`、行序与按住 `Ctrl` 冻结、默认开启的传递性安全排序迟滞（Sort Deadband）、可复用 `ProjectionScratch`、WebView2 宿主归因、零系统调用泄漏预警、全表格预排序视图投影与 `MonitorLease` | 禁止依赖 GPUI Crate 或多线程 Tokio；支持注入 `MockBackend` 进行无头基准与故障注入测试 |
+| `loom-ui-kit` | lib | 基于 `gpui-kit` 的薄组合层（按 `theme/`、`format/`、`heatmap`、`sparkline`、`memory_bar`、`row_cache`、`logic` 组织）：WCAG 2.1 对比度校验语义色与按主题缓存（`CachedSemanticColors`）、统一等宽数字快速整形（`MetricDisplay` / 静态查找表）、有界行文本缓存（`RowTextCache`）、热力图单元格、单行预览截断、缺口感知微缩波形卡片、阶梯坐标上限、自适应多核网格求解器（`8%` 迟滞）、活跃 GPU 引擎优选、打开期稳定排序、防公式注入 CSV 导出与内存四段条 | 隔离上游 `gpui-kit` 细节，无自定义 `Canvas`/Shader 绘制，不持有业务领域状态 |
 | `loom-app` | bin | 桌面组合根与垂直功能切片 UI：入口优先级提升、渐进启动管线、`AppShell` 与 8 个独立 `features/*` 模块 | 各 `feature` 模块不互相 import 内部实现，跨页导航（`转到详细信息` / `转到服务`）经由 `ShellHandle` 与 `NavigationIntent` 完成 |
 
 <a id="feature-sliced-ui-architecture"></a>
@@ -197,26 +197,29 @@ flowchart BT
 
 ```text
 crates/loom-app/src/
-├── main.rs                  # 入口：HIGH_PRIORITY_CLASS 提升、单实例唤醒、组合根启动
-├── bootstrap.rs             # 配置加载 + EngineCoordinator<NativeBackend> + GPUI 窗口并行拉起
+├── main.rs                  # 入口：CLI 快路径分发、HIGH_PRIORITY_CLASS 提升、组合根启动
+├── bootstrap/               # 渐进启动管线（mod.rs、assets.rs、cli.rs、signals.rs）
 ├── bridge/
 │   ├── store.rs             # UiStore：按域持有 Arc<*Slice> 与 Revision 增量订阅
 │   ├── commands.rs          # EngineCommand 派发与权限拦截反馈 (ElevationRequired -> 提权通知)
 │   └── monitor_lease.rs     # RAII MonitorLease 封装（视图卸载或最小化自动释放按需采样）
 ├── shell/
-│   ├── window.rs            # Root 包裹的主窗口（TitleBar 搜索栏 + 可折叠 Sidebar + 页面出口）
+│   ├── window/              # Root 包裹的主窗口（mod.rs、chrome.rs、shortcuts.rs）
 │   ├── nav.rs               # 声明式路由表与跨页定位总线 (JumpToDetails / JumpToServices)
-│   ├── dialogs.rs           # 仅放置跨页通用壳层弹窗（运行新任务 / 通用确认）
-│   └── tray.rs              # 托盘常驻控制器（关窗销毁 GPUI 窗口释放显存）
-└── features/                # 8 个独立垂直功能切片，互不直接依赖
+│   ├── dialogs/             # 跨页通用壳层弹窗（run_new_task、confirm_end_task、minidump、file_locks）
+│   ├── diagnostic_summary.rs# 隐私安全诊断摘要与列表渲染遥测汇总
+│   ├── tray.rs              # 托盘常驻控制器（关窗销毁 GPUI 窗口释放显存）
+│   └── tray_overview.rs     # 关窗零 GPU 轻量级托盘速览浮窗
+└── features/                # 共享表格底座 + 8 个独立垂直功能切片（互不直接依赖）
+    ├── table_columns/       # 共享列布局、列菜单、配额图标缓存、IME 键入搜索、视口脏检查与遥测
     ├── processes/           # 进程页（三段分类视图 / 父子进程树切换 + 热力图表格 + 右键菜单）
-    ├── performance/         # 性能页（左微缩波形栏 + 右 CPU/内存/磁盘/网络/GPU 子视图）
+    ├── performance/         # 性能页（左微缩波形栏 + 按 Revision 缓存序列 + CPU/内存/磁盘/网络/GPU 子视图）
     ├── app_history/         # 应用历史记录页（累计资源表 + 清空历史）
     ├── startup/             # 启动应用页（上次 BIOS 耗时 + 启用/禁用管理）
     ├── users/               # 用户页（会话级聚合行 + 可展开会话进程树 + 断开连接）
     ├── details/             # 详细信息页（全字段虚拟化表/树 + 局部相关性/等待链弹窗 + 菜单）
     ├── services/            # 服务页（SCM 服务表 + 启停重启工具栏 + 进程联动）
-    └── settings/            # 设置页（启动页 / 刷新速度 / 窗口置顶与托盘 / 主题与语言）
+    └── settings/            # 设置页（启动页 / 刷新速度 / 窗口置顶与托盘 / 主题与语言 / 权限集成）
 ```
 
 特定功能弹窗（如 `features/details/` 中的「设置相关性」与「分析等待链」）保留在各自功能切片内，通过 `gpui-kit` 的 `Root` 弹窗层挂载，不在 `shell/` 中维护全局弹窗大枚举。
