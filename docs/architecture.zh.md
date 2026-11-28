@@ -183,8 +183,8 @@ flowchart BT
 | `loom-pal-macos` | lib | macOS 后端预留骨架（`Mach` / `libproc` / `IOKit` / `launchd` 映射位） | 仅 `cfg(target_os = "macos")` 编译；当前提供编译期契约占位桩，计划于 `0.3.0` 实现 |
 | `loom-pal-linux` | lib | Linux 后端预留骨架（`procfs` / `sysfs` / `netlink` / `drm` / `systemd` 映射位） | 仅 `cfg(target_os = "linux")` 编译；当前提供编译期契约占位桩，计划于 `0.2.0` 实现 |
 | `loom-pal` | lib | 平台编译期静态门面（导出 `pub type NativeBackend = ...`）及跨平台单实例锁、系统托盘与电源/显示状态适配 | 消除上层代码中的 `#[cfg(target_os)]` 分支，无虚表动态包装 |
-| `loom-engine` | lib | 无头采样与业务编排引擎（`EngineCoordinator<B>`、`SnapshotWakeSignal` 推送唤醒、差分计算、缺口感知 60 点定长环、防复用进程树、结构化搜索与按需 `:PORT`、行序与按住 `Ctrl` 冻结、WebView2 宿主归因、零系统调用泄漏预警、预排序视图投影、`MonitorLease`） | 禁止依赖 GPUI Crate 或多线程 Tokio；支持注入 `MockBackend` 进行无头基准与故障注入测试 |
-| `loom-ui-kit` | lib | 基于 `gpui-kit` 的薄组合层：WCAG 2.1 对比度校验语义色（`cpu_core_p`/`e`/`lp_e`、`leak_warning`、`sort_paused`）、热力图单元格、缺口感知微缩波形卡片、阶梯坐标上限、自适应多核网格求解器（`8%` 迟滞）、活跃 GPU 引擎优选、打开期稳定排序、防公式注入 CSV 导出、内存四段条与 `rust-i18n` 辅助 | 隔离上游 `gpui-kit` 细节，无自定义 `Canvas`/Shader 绘制，不持有业务领域状态 |
+| `loom-engine` | lib | 无头采样与业务编排引擎（`EngineCoordinator<B>`、`SnapshotWakeSignal` 推送唤醒、差分计算、缺口感知 60 点定长环、防复用进程树、结构化搜索与按需 `:PORT`、行序与按住 `Ctrl` 冻结、默认开启的传递性安全排序迟滞（Sort Deadband）、可复用 `ProjectionScratch`、WebView2 宿主归因、零系统调用泄漏预警、全表格预排序视图投影、`MonitorLease`） | 禁止依赖 GPUI Crate 或多线程 Tokio；支持注入 `MockBackend` 进行无头基准与故障注入测试 |
+| `loom-ui-kit` | lib | 基于 `gpui-kit` 的薄组合层：WCAG 2.1 对比度校验语义色与按主题缓存（`CachedSemanticColors`）、统一等宽数字快速整形（`MetricDisplay` / 静态查找表）、有界行文本缓存（`RowTextCache`）、热力图单元格、单行预览截断、缺口感知微缩波形卡片、阶梯坐标上限、自适应多核网格求解器（`8%` 迟滞）、活跃 GPU 引擎优选、打开期稳定排序、防公式注入 CSV 导出、内存四段条与 `rust-i18n` 辅助 | 隔离上游 `gpui-kit` 细节，无自定义 `Canvas`/Shader 绘制，不持有业务领域状态 |
 | `loom-app` | bin | 桌面组合根与垂直功能切片 UI：入口优先级提升、渐进启动管线、`AppShell` 与 8 个独立 `features/*` 模块 | 各 `feature` 模块不互相 import 内部实现，跨页导航（`转到详细信息` / `转到服务`）经由 `ShellHandle` 与 `NavigationIntent` 完成 |
 
 <a id="feature-sliced-ui-architecture"></a>
@@ -224,10 +224,18 @@ crates/loom-app/src/
 - `processes: Arc<ProcessTableSlice>`（已按当前排序列、搜索词与展开态扁平化的 `Vec<ProcessRowProjection>`，选中态与右键菜单锚定 `ProcessKey`，避免行重排导致误操作；`ProjectionEngine` 绑定 `PlatformBackend::PLATFORM`，仅在 `PlatformKind::Windows` 分组视图下启用对齐任务管理器的壳层解嵌套与多进程应用聚合，不影响 Linux/macOS 分组与通用 `Process Tree`）
 - `details: Arc<DetailsTableSlice>`（仅在 `Details` 页激活持有租约时构建投影）
 - `performance: Arc<PerformanceSlice>`（五大类硬件摘要、60 点定长量化历史环与设备元数据）
-- `services: Arc<ServicesSlice>` / `startup: Arc<StartupSlice>` / `users: Arc<UsersSlice>` / `app_history: Arc<AppHistorySlice>`（均受 `MonitorLease` 门控，未查看时无后台轮询与投影开销）
+- `services: Arc<ServicesSlice>` / `startup: Arc<StartupSlice>` / `users: Arc<UsersSlice>` / `app_history: Arc<AppHistorySlice>`（均受 `MonitorLease` 门控，未查看时无后台轮询与投影开销；激活时同样在引擎后台线程完成过滤、施瓦茨排序与 `Users` 会话树扁平化投影，消除 UI 主线程排序过滤抖动）
 - `settings: Arc<SettingsSlice>`（当前生效配置的只读投影）
 
-`loom-app` 启用 `gpui-kit` 的 `gpui-fast` 渲染后端（保留子树与局部 Splice、Taffy 布局节点跨帧复用、`NumberShaping` 数字快速整形、GPU Scroll Layers 瓦片缓存与 D3D11 状态去重），并将静态页面工具栏与高频刷新的二维虚拟化 `DataTable`（`Entity<TableState<D>>`）解耦。GPUI 主线程在 `TableDelegate::render_td` 中仅对视口可见行与可见列做 `O(1)` 索引读取（目标 UI 线程单帧 `< 0.5 ms`，交互滚动稳跑 `120 FPS`）。
+**引擎侧与渲染热路径分层优化**：
+
+- **引擎投影稳定性与低分配**：默认开启传递性安全的 **排序微抖动迟滞（Sort Deadband）**（CPU/GPU `< 0.2%`、磁盘/网络 `< 16 KiB/s` 在排序前以 `O(N)` 预计算稠密迟滞键 `ProjectionScratch::dense_deadband`，排序比较阶段纯 `O(1)` 索引零哈希查询），配合跨帧复用缓冲 `ProjectionScratch`（含冲突安全的 `HashGroupIndex` 与 `FoldedKeyArena`）及 `ColdMetaCache` 预计算（`webview2_role`、`webview2_host_exe`、`user_name_short`）。
+- **UI 渲染管线与 `gpui-fast` 协同**：`loom-app` 启用 `gpui-kit` 的 `gpui-fast` 渲染后端（保留子树与局部 Splice、Taffy 布局节点跨帧复用、`NumberShaping` 数字快速整形、GPU Scroll Layers 瓦片缓存与 D3D11 状态去重），并将静态页面工具栏与高频刷新的二维虚拟化 `DataTable`（`Entity<TableState<D>>`）解耦。表体渲染通过以下机制消除热路径分配与无效重绘：
+  - 按主题/版本缓存 19 项 WCAG 语义色（`CachedSemanticColors`）与表头本地化字符串（`*LocaleCache`）；
+  - 指标与热力图列统一使用等宽字体（`mono_font_family`）+ `MetricDisplay`（数值部分严格限定在 `gpui-fast::NumberShaping` 字符集内，辅以静态查找表与有界 `RowTextCache`）；
+  - `CommandLine`/`ExePath` 等长文本列在单元格渲染层按 256 字符做单行安全截断（Tooltip、复制与 CSV 导出仍保留完整文本）；
+  - 表级单一右键捕获结合 `TableColumnLayout::column_index_at_x` 动态定位点击列（替代逐单元格事件监听器）、轻量折叠箭头、空状态微章短路与条件化 `a11y` 拼接；
+  - 基于 `visible_rows_changed`/`visible_columns_changed` 与 `ViewportFingerprint` 的视口脏检查、`O(1)` 选中行重锚定，以及 `ScrollBurstCoalescer`（`150 ms` 静默防抖 / `500 ms` 强制上限，用户主动操作立即旁路）在快速滚动期间保护 `gpui-fast` GPU Scroll Layers 瓦片命中。GPUI 主线程在 `TableDelegate::render_td` 中仅对视口可见行与可见列做 `O(1)` 索引读取（目标 UI 线程单帧 `< 0.5 ms`，交互滚动稳跑 `120 FPS`）。
 
 ### 5.2 `gpui-kit` 组件映射
 
@@ -235,7 +243,7 @@ crates/loom-app/src/
 | :--- | :--- | :--- |
 | **窗口顶栏与全局搜索** | `Root` + `TitleBar` + `Input` | 居中搜索框支持结构化语法（`,` 或、空格与、`!`/`-` 取反、`pid:`、`user:`、`cpu:`、`mem:`、`status:`、按需 `:PORT`）与键盘快捷键（`Ctrl+F`、`Ctrl+1..8`、`F5`、`Space`、按住 `Ctrl` 临时冻结） |
 | **左侧导航与底部设置** | `Sidebar`、`SidebarMenu`、`SidebarMenuItem`、`SidebarFooter` | 汉堡按钮控制 `.collapsed(bool)` 展开/图标态，底部固定「设置」 |
-| **虚拟化业务表格与树表** | `DataTable` + `TableState<D>` + `TableDelegate` | 首列左固定（`fixed_left`）组合 `h_flex().pl(px(depth * 16.))` + 折叠箭头 + 降采样 `Img`；滚动列双向虚拟化；悬停暂停排序防跳行；防公式注入 UTF-8 BOM CSV 导出；WebView2 宿主归因与零系统调用泄漏预警标识；表级单一右键菜单 |
+| **虚拟化业务表格与树表** | `DataTable` + `TableState<D>` + `TableDelegate` | 首列左固定（`fixed_left`）组合 `h_flex().pl(px(depth * 16.))` + 轻量折叠箭头 + 降采样 `Img`；指标列统一等宽字体（`NumberShaping` 友好）；滚动列双向虚拟化与视口脏检查 + 滚动突发合并；默认排序迟滞 + 悬停暂停排序防跳行；防公式注入 UTF-8 BOM CSV 导出；WebView2 宿主归因与零系统调用泄漏预警标识；表级单一右键菜单与坐标列命中 |
 | **多级右键菜单** | `PopupMenu` / `.context_menu(...)` | 支持勾选标记（`✓ 效能模式`）、挂起/恢复、重启资源管理器、文件占用查找、复制摘要、分隔线与二级子菜单（`设置优先级 >`、`资源值 >`） |
 | **性能页左栏设备微缩波形图** | `v_virtual_list` + `AreaChart` | 缺口感知 `AreaChart` 卡片，磁盘/网卡保持打开期稳定排序（`merge_stable_order`）、阶梯网卡坐标与诚实的「休眠 (D3)」/ `—` GPU 读数 |
 | **CPU 总体+内核双层图 & 多核网格** | 多序列 `AreaChart` + 自适应网格容器 | 双 `.y(...)` 渲染总利用率与内核时间渐变；自适应逻辑核网格（`compute_core_grid_layout`，`8%` 缩放迟滞与 `Full`/`Short`/`Hidden` 渐进标题）按 `P`/`E`/`LP-E` 异构着色 |
