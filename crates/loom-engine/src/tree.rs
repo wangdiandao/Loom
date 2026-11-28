@@ -31,6 +31,11 @@ impl FastHasher {
     const K: u64 = 0x517c_c1b7_2722_0a95;
 
     #[inline]
+    pub(crate) const fn new() -> Self {
+        Self(0)
+    }
+
+    #[inline]
     fn mix(&mut self, word: u64) {
         self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(Self::K);
     }

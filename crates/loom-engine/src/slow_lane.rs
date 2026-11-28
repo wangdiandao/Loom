@@ -22,12 +22,13 @@ use loom_pal_api::{
 use loom_types::{
     AppHistoryRecord, DiskDeviceSample, ExeStaticAsset, HardwareStaticInfo, MonitorDomain,
     ProcessColdMeta, ProcessKey, ProcessSocketRecord, RunTaskRequest, ServiceRecord, StartupEntry,
-    UacVirtualization, UserSessionRecord,
+    UacVirtualization, UserSessionRecord, WebView2Role,
 };
 use parking_lot::{Condvar, Mutex};
 
 use crate::command::{CommandEvent, CommandKind, CommandOutcome, CommandSuccess, EventBus};
 use crate::lease::MonitorLeaseRegistry;
+use crate::webview2::{classify_webview2, is_webview2_image};
 
 /// Maximum number of path-deduplicated static assets retained in Level-2 cache.
 const MAX_ASSET_CACHE_ENTRIES: usize = 4_096;
@@ -159,14 +160,100 @@ pub fn normalize_exe_path_key(path: &str) -> Arc<str> {
     }
 }
 
+/// Cached Level-1 per-process cold metadata paired with precomputed derived fields.
+///
+/// Precomputing [`Self::webview2_role`], [`Self::webview2_host_exe`], and
+/// [`Self::user_name_short`] on insertion eliminates repeated command-line scanning
+/// and domain-prefix parsing during fast-lane projection ticks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedProcessMeta {
+    /// Underlying per-process cold metadata resolved on the slow lane.
+    pub meta: Arc<ProcessColdMeta>,
+    /// Precomputed WebView2 subprocess role when this process is `msedgewebview2.exe`.
+    pub webview2_role: Option<WebView2Role>,
+    /// Precomputed WebView2 host executable filename from `--webview-exe-name=`, if present.
+    pub webview2_host_exe: Option<Arc<str>>,
+    /// Precomputed short user account name with any leading `DOMAIN\` or `HOST\` prefix stripped.
+    pub user_name_short: Option<Arc<str>>,
+}
+
+impl CachedProcessMeta {
+    fn from_meta(meta: Arc<ProcessColdMeta>) -> Self {
+        let (webview2_role, webview2_host_exe) = precompute_webview2_fields(&meta);
+        let user_name_short = meta.user_name.as_ref().and_then(strip_user_domain_prefix);
+        Self {
+            meta,
+            webview2_role,
+            webview2_host_exe,
+            user_name_short,
+        }
+    }
+}
+
+/// Extracts the executable filename from a path or command-line `argv[0]` token.
+#[inline]
+fn extract_exe_basename(raw: &str) -> &str {
+    raw.rsplit(['\\', '/']).next().unwrap_or(raw).trim()
+}
+
+/// Extracts the leading executable token (`argv[0]`) from a command line, supporting quoted paths.
+fn extract_cmdline_argv0(cmd: &str) -> &str {
+    let trimmed = cmd.trim_start();
+    if let Some(after_quote) = trimmed.strip_prefix('"') {
+        let end = after_quote.find('"').unwrap_or(after_quote.len());
+        &after_quote[..end]
+    } else {
+        let end = trimmed
+            .find(|c: char| c.is_ascii_whitespace())
+            .unwrap_or(trimmed.len());
+        &trimmed[..end]
+    }
+}
+
+fn precompute_webview2_fields(meta: &ProcessColdMeta) -> (Option<WebView2Role>, Option<Arc<str>>) {
+    let is_wv2 =
+        meta.exe_path
+            .as_deref()
+            .is_some_and(|p| is_webview2_image(extract_exe_basename(p)))
+            || meta.command_line.as_deref().is_some_and(|cmd| {
+                is_webview2_image(extract_exe_basename(extract_cmdline_argv0(cmd)))
+            });
+    if !is_wv2 {
+        return (None, None);
+    }
+    match classify_webview2("msedgewebview2.exe", meta.command_line.as_deref()) {
+        Some(parsed) => (
+            Some(parsed.role),
+            parsed.host_exe_name.map(Arc::<str>::from),
+        ),
+        None => (None, None),
+    }
+}
+
+fn strip_user_domain_prefix(raw: &Arc<str>) -> Option<Arc<str>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let short = match trimmed.rsplit_once('\\') {
+        Some((_, account)) if !account.trim().is_empty() => account.trim(),
+        _ => trimmed,
+    };
+    if short.len() == raw.len() {
+        Some(Arc::clone(raw))
+    } else {
+        Some(Arc::from(short))
+    }
+}
+
 /// Two-level deduplicated cold metadata cache owned exclusively by the fast-lane thread.
 ///
-/// - **Level 1**: `ProcessKey -> Arc<ProcessColdMeta>` (evicts exited processes on tick).
+/// - **Level 1**: `ProcessKey -> CachedProcessMeta` (evicts exited processes on tick).
 /// - **Level 2**: `normalized_path -> Arc<ExeStaticAsset>` (persists across process instances
 ///   so dozens of instances of the same executable share a single `Arc<ExeStaticAsset>`).
 #[derive(Debug, Default)]
 pub struct ColdMetaCache {
-    proc_meta: HashMap<ProcessKey, Arc<ProcessColdMeta>>,
+    proc_meta: HashMap<ProcessKey, CachedProcessMeta>,
     exe_assets: HashMap<Arc<str>, Arc<ExeStaticAsset>>,
     eco_overrides: HashMap<ProcessKey, bool>,
     uac_overrides: HashMap<ProcessKey, UacVirtualization>,
@@ -184,14 +271,43 @@ impl ColdMetaCache {
         if self.proc_meta.is_empty() {
             return None;
         }
+        self.proc_meta.get(&key).map(|entry| &entry.meta)
+    }
+
+    /// Looks up the full Level-1 cache entry (including precomputed derived fields) for `key`.
+    #[inline]
+    pub fn get_entry(&self, key: ProcessKey) -> Option<&CachedProcessMeta> {
+        if self.proc_meta.is_empty() {
+            return None;
+        }
         self.proc_meta.get(&key)
+    }
+
+    /// Returns the precomputed [`WebView2Role`] for `key`, if classified on insertion.
+    #[inline]
+    pub fn webview2_role(&self, key: ProcessKey) -> Option<WebView2Role> {
+        self.get_entry(key).and_then(|entry| entry.webview2_role)
+    }
+
+    /// Returns the precomputed WebView2 host executable name for `key`, if extracted on insertion.
+    #[inline]
+    pub fn webview2_host_exe(&self, key: ProcessKey) -> Option<&str> {
+        self.get_entry(key)
+            .and_then(|entry| entry.webview2_host_exe.as_deref())
+    }
+
+    /// Returns the precomputed short user name (with `DOMAIN\` / `HOST\` stripped) for `key`.
+    #[inline]
+    pub fn user_name_short(&self, key: ProcessKey) -> Option<&str> {
+        self.get_entry(key)
+            .and_then(|entry| entry.user_name_short.as_deref())
     }
 
     /// Returns whether Efficiency Mode (`EcoQoS`) is known to be enabled for `key`.
     #[inline]
     pub fn efficiency_mode(&self, key: ProcessKey) -> bool {
-        if let Some(meta) = self.proc_meta.get(&key) {
-            return meta.efficiency_mode;
+        if let Some(entry) = self.proc_meta.get(&key) {
+            return entry.meta.efficiency_mode;
         }
         self.eco_overrides.get(&key).copied().unwrap_or(false)
     }
@@ -201,7 +317,7 @@ impl ColdMetaCache {
     pub fn is_elevated(&self, key: ProcessKey) -> bool {
         self.proc_meta
             .get(&key)
-            .is_some_and(|meta| meta.is_elevated)
+            .is_some_and(|entry| entry.meta.is_elevated)
     }
 
     /// Immediately updates the cached Efficiency Mode (`EcoQoS`) flag for `key`.
@@ -210,11 +326,11 @@ impl ColdMetaCache {
     /// immediately; otherwise, the state is staged in `eco_overrides` until the slow-lane
     /// probe populates the entry (preventing stale in-flight probes from clobbering the toggle).
     pub fn set_efficiency_mode(&mut self, key: ProcessKey, enabled: bool) {
-        if let Some(meta_arc) = self.proc_meta.get_mut(&key) {
-            if meta_arc.efficiency_mode != enabled {
-                let mut cloned = (**meta_arc).clone();
+        if let Some(entry) = self.proc_meta.get_mut(&key) {
+            if entry.meta.efficiency_mode != enabled {
+                let mut cloned = (*entry.meta).clone();
                 cloned.efficiency_mode = enabled;
-                *meta_arc = Arc::new(cloned);
+                entry.meta = Arc::new(cloned);
             }
             self.eco_overrides.remove(&key);
         } else {
@@ -232,11 +348,11 @@ impl ColdMetaCache {
         } else {
             UacVirtualization::Disabled
         };
-        if let Some(meta_arc) = self.proc_meta.get_mut(&key) {
-            if meta_arc.uac_virtualization != next {
-                let mut cloned = (**meta_arc).clone();
+        if let Some(entry) = self.proc_meta.get_mut(&key) {
+            if entry.meta.uac_virtualization != next {
+                let mut cloned = (*entry.meta).clone();
                 cloned.uac_virtualization = next;
-                *meta_arc = Arc::new(cloned);
+                entry.meta = Arc::new(cloned);
             }
             self.uac_overrides.remove(&key);
         } else {
@@ -263,6 +379,9 @@ impl ColdMetaCache {
     }
 
     /// Inserts resolved [`ProcessColdMeta`] into Level 1 and reconciles Level 2.
+    ///
+    /// Precomputes [`CachedProcessMeta::webview2_role`], [`CachedProcessMeta::webview2_host_exe`],
+    /// and [`CachedProcessMeta::user_name_short`] once at insertion time.
     ///
     /// Returns `Some((raw_exe_path, normalized_cache_key))` when the executable's
     /// static asset is not yet present in Level 2 and should be probed.
@@ -295,7 +414,8 @@ impl ColdMetaCache {
         if let Some(overridden_uac) = self.uac_overrides.remove(&proc_key) {
             meta.uac_virtualization = overridden_uac;
         }
-        self.proc_meta.insert(proc_key, Arc::new(meta));
+        let entry = CachedProcessMeta::from_meta(Arc::new(meta));
+        self.proc_meta.insert(proc_key, entry);
         needs_asset_probe
     }
 
@@ -312,15 +432,16 @@ impl ColdMetaCache {
         }
 
         let mut updated_any = false;
-        for meta_arc in self.proc_meta.values_mut() {
-            let matches_path = meta_arc
+        for entry in self.proc_meta.values_mut() {
+            let matches_path = entry
+                .meta
                 .exe_path
                 .as_ref()
                 .is_some_and(|p| normalize_exe_path_key(p) == cache_key);
-            if matches_path && meta_arc.asset.is_none() {
-                let mut cloned = (**meta_arc).clone();
+            if matches_path && entry.meta.asset.is_none() {
+                let mut cloned = (*entry.meta).clone();
                 cloned.asset = Some(Arc::clone(&shared));
-                *meta_arc = Arc::new(cloned);
+                entry.meta = Arc::new(cloned);
                 updated_any = true;
             }
         }
@@ -1051,5 +1172,106 @@ mod tests {
         assert_eq!(cache.proc_cache_len(), 1);
         assert_eq!(cache.asset_cache_len(), 1);
         assert!(!cache.efficiency_mode(p3));
+    }
+
+    #[test]
+    fn cold_meta_cache_precomputes_webview2_role_host_exe_and_short_user_name() {
+        let mut cache = ColdMetaCache::new();
+        let k_wv1 = ProcessKey::new(100, 10);
+        let k_wv2 = ProcessKey::new(101, 20);
+        let k_chrome = ProcessKey::new(102, 30);
+        let k_sys = ProcessKey::new(103, 40);
+        let k_blank = ProcessKey::new(104, 50);
+
+        cache.insert_process(ProcessColdMeta {
+            key: k_wv1,
+            exe_path: Some(Arc::from(r"C:\Program Files\WebView2\msedgewebview2.exe")),
+            command_line: Some(Arc::from(
+                r#"msedgewebview2.exe --type=renderer --webview-exe-name=Teams.exe"#,
+            )),
+            user_name: Some(Arc::from(r"CORP\Alice")),
+            arch: ProcessArch::X64,
+            uac_virtualization: UacVirtualization::NotAllowed,
+            efficiency_mode: false,
+            is_elevated: false,
+            app_group_id: None,
+            asset: None,
+        });
+        cache.insert_process(ProcessColdMeta {
+            key: k_wv2,
+            exe_path: None,
+            command_line: Some(Arc::from(
+                r#""C:\Program Files\WebView2\msedgewebview2.exe" --type=gpu-process --webview-exe-name="My Cool App.exe""#,
+            )),
+            user_name: Some(Arc::from(r"  WORKSTATION\  Bob  ")),
+            arch: ProcessArch::X64,
+            uac_virtualization: UacVirtualization::NotAllowed,
+            efficiency_mode: false,
+            is_elevated: false,
+            app_group_id: None,
+            asset: None,
+        });
+        cache.insert_process(ProcessColdMeta {
+            key: k_chrome,
+            exe_path: Some(Arc::from(r"C:\Program Files\Chrome\chrome.exe")),
+            command_line: Some(Arc::from("chrome.exe --type=renderer")),
+            user_name: Some(Arc::from("SYSTEM")),
+            arch: ProcessArch::X64,
+            uac_virtualization: UacVirtualization::NotAllowed,
+            efficiency_mode: false,
+            is_elevated: true,
+            app_group_id: None,
+            asset: None,
+        });
+        cache.insert_process(ProcessColdMeta {
+            key: k_sys,
+            exe_path: None,
+            command_line: None,
+            user_name: Some(Arc::from(r"NT AUTHORITY\LOCAL SERVICE")),
+            arch: ProcessArch::X64,
+            uac_virtualization: UacVirtualization::Unknown,
+            efficiency_mode: false,
+            is_elevated: true,
+            app_group_id: None,
+            asset: None,
+        });
+        cache.insert_process(ProcessColdMeta {
+            key: k_blank,
+            exe_path: None,
+            command_line: None,
+            user_name: Some(Arc::from("   ")),
+            arch: ProcessArch::Unknown,
+            uac_virtualization: UacVirtualization::Unknown,
+            efficiency_mode: false,
+            is_elevated: false,
+            app_group_id: None,
+            asset: None,
+        });
+
+        assert_eq!(cache.webview2_role(k_wv1), Some(WebView2Role::Renderer));
+        assert_eq!(cache.webview2_host_exe(k_wv1), Some("Teams.exe"));
+        assert_eq!(cache.user_name_short(k_wv1), Some("Alice"));
+
+        assert_eq!(cache.webview2_role(k_wv2), Some(WebView2Role::Gpu));
+        assert_eq!(cache.webview2_host_exe(k_wv2), Some("My Cool App.exe"));
+        assert_eq!(cache.user_name_short(k_wv2), Some("Bob"));
+
+        assert_eq!(cache.webview2_role(k_chrome), None);
+        assert_eq!(cache.webview2_host_exe(k_chrome), None);
+        assert_eq!(cache.user_name_short(k_chrome), Some("SYSTEM"));
+        let chrome_entry = cache.get_entry(k_chrome).unwrap();
+        assert!(Arc::ptr_eq(
+            chrome_entry.meta.user_name.as_ref().unwrap(),
+            chrome_entry.user_name_short.as_ref().unwrap()
+        ));
+
+        assert_eq!(cache.user_name_short(k_sys), Some("LOCAL SERVICE"));
+        assert_eq!(cache.user_name_short(k_blank), None);
+
+        // In-place updates (EcoQoS, UAC, asset backfill) preserve precomputed fields.
+        cache.set_efficiency_mode(k_wv1, true);
+        cache.set_uac_virtualization(k_wv1, true);
+        assert_eq!(cache.webview2_role(k_wv1), Some(WebView2Role::Renderer));
+        assert_eq!(cache.user_name_short(k_wv1), Some("Alice"));
     }
 }

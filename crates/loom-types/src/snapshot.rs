@@ -5,10 +5,11 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CapabilityFlags, DetailsSortColumn, DetailsViewMode, ExeIconRgba, LeakWarning,
-    PerformanceSlice, PlatformProfile, ProcessArch, ProcessCategory, ProcessKey, ProcessPriority,
-    ProcessSortColumn, ProcessStatusFlags, ProcessViewMode, SortDirection, Timestamp100Ns,
-    UacVirtualization, WebView2Role,
+    AppHistorySortColumn, CapabilityFlags, DetailsSortColumn, DetailsViewMode, ExeIconRgba,
+    LeakWarning, PerformanceSlice, PlatformProfile, ProcessArch, ProcessCategory, ProcessKey,
+    ProcessPriority, ProcessSortColumn, ProcessStatusFlags, ProcessViewMode, ServicesSortColumn,
+    SortDirection, StartupSortColumn, Timestamp100Ns, UacVirtualization, UsersSortColumn,
+    WebView2Role,
 };
 
 /// On-demand monitoring domains gated by RAII `MonitorLease` reference counts.
@@ -297,14 +298,36 @@ pub struct ServiceRecord {
 }
 
 /// Published snapshot slice for the Services view.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServicesSlice {
     /// Monotonic revision counter for this slice.
     pub revision: u64,
     /// Timestamp of the last service enumeration.
     pub timestamp: Timestamp100Ns,
+    /// Active sort column used to build [`Self::visible_indices`].
+    pub sort_column: ServicesSortColumn,
+    /// Active sort direction used to build [`Self::visible_indices`].
+    pub sort_direction: SortDirection,
+    /// Optional hosting process ID filter currently applied to [`Self::visible_indices`].
+    pub filter_pid: Option<u32>,
     /// Enumerated system services.
     pub items: Vec<ServiceRecord>,
+    /// Pre-filtered and pre-sorted indices into [`Self::items`] ready for O(1) virtualized rendering.
+    pub visible_indices: Vec<usize>,
+}
+
+impl Default for ServicesSlice {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            timestamp: Timestamp100Ns::default(),
+            sort_column: ServicesSortColumn::Name,
+            sort_direction: SortDirection::Ascending,
+            filter_pid: None,
+            items: Vec::new(),
+            visible_indices: Vec::new(),
+        }
+    }
 }
 
 /// Estimated boot impact rating of a startup application.
@@ -343,7 +366,7 @@ pub struct StartupEntry {
 }
 
 /// Published snapshot slice for the Startup Applications view.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupSlice {
     /// Monotonic revision counter for this slice.
     pub revision: u64,
@@ -351,8 +374,28 @@ pub struct StartupSlice {
     pub timestamp: Timestamp100Ns,
     /// Last BIOS/firmware boot time in milliseconds, if reported by the OS.
     pub last_bios_time_ms: Option<u64>,
+    /// Active sort column used to build [`Self::visible_indices`].
+    pub sort_column: StartupSortColumn,
+    /// Active sort direction used to build [`Self::visible_indices`].
+    pub sort_direction: SortDirection,
     /// Enumerated startup entries.
     pub items: Vec<StartupEntry>,
+    /// Pre-filtered and pre-sorted indices into [`Self::items`] ready for O(1) virtualized rendering.
+    pub visible_indices: Vec<usize>,
+}
+
+impl Default for StartupSlice {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            timestamp: Timestamp100Ns::default(),
+            last_bios_time_ms: None,
+            sort_column: StartupSortColumn::Name,
+            sort_direction: SortDirection::Ascending,
+            items: Vec::new(),
+            visible_indices: Vec::new(),
+        }
+    }
 }
 
 /// Connection state of a logged-in OS user session.
@@ -413,15 +456,69 @@ pub struct UserSessionRecord {
     pub processes: Vec<UserSessionProcess>,
 }
 
+/// Pre-computed flattened row projection for O(1) virtualized rendering in the Users table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsersRowProjection {
+    /// Top-level expandable user session header row.
+    Session {
+        /// OS session identifier.
+        session_id: u32,
+        /// Logged-in user account name.
+        user_name: Arc<str>,
+        /// Current session connection state.
+        state: UserSessionState,
+        /// Number of running processes belonging to this session.
+        process_count: u32,
+        /// Aggregated CPU utilization in permille (`0..=1000`).
+        cpu_permille: u16,
+        /// Aggregated private working set memory in bytes.
+        memory_bytes: u64,
+        /// Aggregated disk throughput in bytes per second.
+        disk_bytes_per_sec: u64,
+        /// Aggregated network throughput in bytes per second.
+        net_bytes_per_sec: u64,
+        /// Whether this session has child processes that can be expanded.
+        has_children: bool,
+        /// Whether this session's child processes are currently expanded.
+        is_expanded: bool,
+    },
+    /// Indented child process row nested under an expanded user session.
+    Process {
+        /// Owning OS session identifier.
+        session_id: u32,
+        /// Live process metrics and identity.
+        process: UserSessionProcess,
+    },
+}
+
 /// Published snapshot slice for the Users view.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsersSlice {
     /// Monotonic revision counter for this slice.
     pub revision: u64,
     /// Timestamp of the last session aggregation.
     pub timestamp: Timestamp100Ns,
+    /// Active sort column used to build [`Self::rows`].
+    pub sort_column: UsersSortColumn,
+    /// Active sort direction used to build [`Self::rows`].
+    pub sort_direction: SortDirection,
     /// Active and disconnected user sessions.
     pub sessions: Vec<UserSessionRecord>,
+    /// Pre-filtered, pre-sorted, and pre-flattened session and expanded child process rows.
+    pub rows: Vec<UsersRowProjection>,
+}
+
+impl Default for UsersSlice {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            timestamp: Timestamp100Ns::default(),
+            sort_column: UsersSortColumn::Cpu,
+            sort_direction: SortDirection::Descending,
+            sessions: Vec::new(),
+            rows: Vec::new(),
+        }
+    }
 }
 
 /// Cumulative historical resource usage record for an application.
@@ -440,7 +537,7 @@ pub struct AppHistoryRecord {
 }
 
 /// Published snapshot slice for the App History view.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppHistorySlice {
     /// Monotonic revision counter for this slice.
     pub revision: u64,
@@ -448,8 +545,28 @@ pub struct AppHistorySlice {
     pub timestamp: Timestamp100Ns,
     /// Unix epoch timestamp (in seconds) since which history has been accumulated.
     pub since_epoch_secs: Option<u64>,
+    /// Active sort column used to build [`Self::visible_indices`].
+    pub sort_column: AppHistorySortColumn,
+    /// Active sort direction used to build [`Self::visible_indices`].
+    pub sort_direction: SortDirection,
     /// Cumulative per-application history entries.
     pub items: Vec<AppHistoryRecord>,
+    /// Pre-filtered and pre-sorted indices into [`Self::items`] ready for O(1) virtualized rendering.
+    pub visible_indices: Vec<usize>,
+}
+
+impl Default for AppHistorySlice {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            timestamp: Timestamp100Ns::default(),
+            since_epoch_secs: None,
+            sort_column: AppHistorySortColumn::CpuTime,
+            sort_direction: SortDirection::Descending,
+            items: Vec::new(),
+            visible_indices: Vec::new(),
+        }
+    }
 }
 
 /// Root lock-free immutable snapshot published via `ArcSwap<AppSnapshot>`.

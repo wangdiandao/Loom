@@ -100,6 +100,68 @@ pub enum DetailsSortColumn {
     CommandLine,
 }
 
+/// Sortable columns in the Services table.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ServicesSortColumn {
+    /// Internal service name.
+    #[default]
+    Name,
+    /// Hosting process identifier.
+    Pid,
+    /// Service description or display name.
+    Description,
+    /// Service lifecycle status.
+    Status,
+    /// Service load-order or host group.
+    Group,
+}
+
+/// Sortable columns in the Startup Applications table.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StartupSortColumn {
+    /// Display name of the startup application.
+    #[default]
+    Name,
+    /// Publisher or vendor name.
+    Publisher,
+    /// Enabled or disabled status.
+    Status,
+    /// Estimated boot latency impact.
+    Impact,
+}
+
+/// Sortable columns in the Users table.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UsersSortColumn {
+    /// User account or process display name.
+    User,
+    /// Session connection state or process running status.
+    Status,
+    /// Aggregated or per-process CPU utilization.
+    #[default]
+    Cpu,
+    /// Aggregated or per-process memory usage.
+    Memory,
+    /// Aggregated or per-process disk I/O throughput.
+    Disk,
+    /// Aggregated or per-process network throughput.
+    Network,
+}
+
+/// Sortable columns in the App History table.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AppHistorySortColumn {
+    /// Application display name.
+    Name,
+    /// Cumulative CPU time.
+    #[default]
+    CpuTime,
+    /// Cumulative total network traffic.
+    Network,
+    /// Cumulative metered network traffic.
+    MeteredNetwork,
+}
+
 /// Sort ordering direction for tables.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SortDirection {

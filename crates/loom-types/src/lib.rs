@@ -26,8 +26,9 @@ pub use performance::{
 };
 pub use platform::{PlatformKind, PlatformProfile};
 pub use prefs::{
-    DetailsSortColumn, DetailsViewMode, LanguagePreference, ProcessSortColumn, ProcessViewMode,
-    RefreshSpeed, ResourceDisplayMode, SortDirection, StartupPage, ThemePreference,
+    AppHistorySortColumn, DetailsSortColumn, DetailsViewMode, LanguagePreference,
+    ProcessSortColumn, ProcessViewMode, RefreshSpeed, ResourceDisplayMode, ServicesSortColumn,
+    SortDirection, StartupPage, StartupSortColumn, ThemePreference, UsersSortColumn,
 };
 pub use process::{
     CpuAffinityMask, ExeIconRgba, ExeStaticAsset, LeakKind, LeakWarning, ProcessArch,
@@ -38,7 +39,7 @@ pub use snapshot::{
     AppHistoryRecord, AppHistorySlice, AppSnapshot, DetailsRowProjection, DetailsTableSlice,
     DomainRevisions, MonitorDomain, ProcessRowKind, ProcessRowProjection, ProcessTableSlice,
     ServiceRecord, ServiceState, ServicesSlice, StartupEntry, StartupImpact, StartupSlice,
-    UserSessionProcess, UserSessionRecord, UserSessionState, UsersSlice,
+    UserSessionProcess, UserSessionRecord, UserSessionState, UsersRowProjection, UsersSlice,
 };
 pub use time::Timestamp100Ns;
 

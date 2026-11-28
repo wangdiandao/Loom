@@ -15,8 +15,8 @@ use loom_pal_api::{
     ProcessSampleScratch, SystemOperator,
 };
 use loom_types::{
-    AppHistoryRecord, AppSnapshot, MonitorDomain, ProcessKey, RefreshSpeed, ServicesSlice,
-    StartupSlice, Timestamp100Ns, UserSessionRecord,
+    AppHistoryRecord, AppSnapshot, MonitorDomain, ProcessKey, RefreshSpeed, ServiceRecord,
+    StartupEntry, Timestamp100Ns, UserSessionRecord,
 };
 use parking_lot::Mutex;
 
@@ -237,10 +237,20 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
                     pending_hardware_info: false,
                     pending_disk_perf: false,
                     last_disk_poll_tick: 0,
+                    cached_services: Vec::new(),
+                    services_polled_once: false,
+                    services_projection_dirty: false,
+                    cached_startup_bios_ms: None,
+                    cached_startup_entries: Vec::new(),
+                    startup_polled_once: false,
+                    startup_projection_dirty: false,
                     cached_user_sessions: Vec::new(),
+                    users_polled_once: false,
+                    users_projection_dirty: false,
                     persisted_app_history_since: None,
                     persisted_app_history: Vec::new(),
                     app_history_polled_once: false,
+                    app_history_projection_dirty: false,
                     app_history_dirty: false,
                     pending_app_history_save: false,
                     last_app_history_flush: Instant::now(),
@@ -426,10 +436,20 @@ struct FastLaneRunner<B: PlatformBackend> {
     pending_hardware_info: bool,
     pending_disk_perf: bool,
     last_disk_poll_tick: u64,
+    cached_services: Vec<ServiceRecord>,
+    services_polled_once: bool,
+    services_projection_dirty: bool,
+    cached_startup_bios_ms: Option<u64>,
+    cached_startup_entries: Vec<StartupEntry>,
+    startup_polled_once: bool,
+    startup_projection_dirty: bool,
     cached_user_sessions: Vec<UserSessionRecord>,
+    users_polled_once: bool,
+    users_projection_dirty: bool,
     persisted_app_history_since: Option<u64>,
     persisted_app_history: Vec<AppHistoryRecord>,
     app_history_polled_once: bool,
+    app_history_projection_dirty: bool,
     app_history_dirty: bool,
     pending_app_history_save: bool,
     last_app_history_flush: Instant,
@@ -592,7 +612,13 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
 
         // Project and publish snapshot, updating Details ONLY when leased.
         let details_leased = self.leases.is_active(MonitorDomain::Details);
-        self.publish_slices(true, details_leased, true, per_core_leased);
+        self.publish_slices(SliceUpdateMask {
+            processes: true,
+            details: details_leased,
+            performance: true,
+            include_per_core: per_core_leased,
+            ..SliceUpdateMask::default()
+        });
     }
 
     fn maybe_enqueue_listening_ports(&mut self, now: Instant) {
@@ -618,7 +644,12 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             .unwrap_or_else(current_unix_epoch_secs);
         let merged = self
             .projection
-            .project_app_history(Some(since), &self.persisted_app_history, 0)
+            .project_app_history(
+                Some(since),
+                &self.persisted_app_history,
+                &self.view_config,
+                0,
+            )
             .items;
         self.persisted_app_history_since = Some(since);
         self.persisted_app_history = merged.clone();
@@ -813,8 +844,31 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             self.sample_full_performance(per_core_leased);
         }
 
-        if need_details || need_perf {
-            self.publish_slices(false, need_details, need_perf, per_core_leased);
+        let need_services = self.services_projection_dirty
+            && self.services_polled_once
+            && self.leases.is_active(MonitorDomain::Services);
+        let need_startup = self.startup_projection_dirty
+            && self.startup_polled_once
+            && self.leases.is_active(MonitorDomain::Startup);
+        let need_users = self.users_projection_dirty
+            && (self.users_polled_once || !self.cached_user_sessions.is_empty())
+            && self.leases.is_active(MonitorDomain::Users);
+        let need_app_history = self.app_history_projection_dirty
+            && self.app_history_polled_once
+            && self.leases.is_active(MonitorDomain::AppHistory);
+
+        let lease_mask = SliceUpdateMask {
+            details: need_details,
+            performance: need_perf,
+            include_per_core: per_core_leased,
+            services: need_services,
+            startup: need_startup,
+            users: need_users,
+            app_history: need_app_history,
+            ..SliceUpdateMask::default()
+        };
+        if lease_mask.any() {
+            self.publish_slices(lease_mask);
         }
 
         self.enqueue_performance_slow_probes();
@@ -853,7 +907,13 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 let details_leased = cold_updated && self.leases.is_active(MonitorDomain::Details);
                 let per_core_leased =
                     perf_updated && self.leases.is_active(MonitorDomain::PerCoreCpu);
-                self.publish_slices(cold_updated, details_leased, perf_updated, per_core_leased);
+                self.publish_slices(SliceUpdateMask {
+                    processes: cold_updated,
+                    details: details_leased,
+                    performance: perf_updated,
+                    include_per_core: per_core_leased,
+                    ..SliceUpdateMask::default()
+                });
             } else if snapshot_dirty {
                 self.snapshot_store
                     .store(Arc::new(self.current_snapshot.clone()));
@@ -1080,37 +1140,43 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         }
     }
 
-    fn apply_services_snapshot(&mut self, items: Vec<loom_types::ServiceRecord>) {
+    fn apply_services_snapshot(&mut self, items: Vec<ServiceRecord>) {
+        self.cached_services = items;
+        self.services_polled_once = true;
+        self.services_projection_dirty = false;
         let rev = self.current_snapshot.revisions.services.saturating_add(1);
         self.current_snapshot.revisions.services = rev;
-        self.current_snapshot.services = Arc::new(ServicesSlice {
-            revision: rev,
-            timestamp: self.projection.latest_timestamp(),
-            items,
-        });
+        self.current_snapshot.services = Arc::new(self.projection.project_services(
+            &self.cached_services,
+            &self.view_config,
+            rev,
+        ));
     }
 
-    fn apply_startup_snapshot(
-        &mut self,
-        last_bios_time_ms: Option<u64>,
-        items: Vec<loom_types::StartupEntry>,
-    ) {
+    fn apply_startup_snapshot(&mut self, last_bios_time_ms: Option<u64>, items: Vec<StartupEntry>) {
+        self.cached_startup_bios_ms = last_bios_time_ms;
+        self.cached_startup_entries = items;
+        self.startup_polled_once = true;
+        self.startup_projection_dirty = false;
         let rev = self.current_snapshot.revisions.startup.saturating_add(1);
         self.current_snapshot.revisions.startup = rev;
-        self.current_snapshot.startup = Arc::new(StartupSlice {
-            revision: rev,
-            timestamp: self.projection.latest_timestamp(),
-            last_bios_time_ms,
-            items,
-        });
+        self.current_snapshot.startup = Arc::new(self.projection.project_startup(
+            self.cached_startup_bios_ms,
+            &self.cached_startup_entries,
+            &self.view_config,
+            rev,
+        ));
     }
 
     fn apply_users_snapshot(&mut self, sessions: Vec<UserSessionRecord>) {
         self.cached_user_sessions = sessions;
+        self.users_polled_once = true;
+        self.users_projection_dirty = false;
         let rev = self.current_snapshot.revisions.users.saturating_add(1);
         self.current_snapshot.revisions.users = rev;
         self.current_snapshot.users = Arc::new(self.projection.project_users(
             &self.cached_user_sessions,
+            &self.view_config,
             &self.cold_cache,
             rev,
         ));
@@ -1124,6 +1190,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         self.persisted_app_history_since = since_epoch_secs;
         self.persisted_app_history = items;
         self.app_history_polled_once = true;
+        self.app_history_projection_dirty = false;
         let rev = self
             .current_snapshot
             .revisions
@@ -1133,6 +1200,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         self.current_snapshot.app_history = Arc::new(self.projection.project_app_history(
             self.persisted_app_history_since,
             &self.persisted_app_history,
+            &self.view_config,
             rev,
         ));
     }
@@ -1142,8 +1210,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
     ///
     /// Returns `true` if `EngineCommand::Shutdown` was received.
     fn handle_command_batch(&mut self, first: CommandEnvelope) -> bool {
-        let mut need_reproject_processes = false;
-        let mut need_reproject_details = false;
+        let mut dirty = SliceUpdateMask::default();
         let mut need_sample_tick = false;
         let mut pending_acks: Vec<(CommandKind, Sender<CommandEvent>)> = Vec::new();
         let mut pending_events: Vec<(CommandEvent, Option<Sender<CommandEvent>>)> = Vec::new();
@@ -1151,8 +1218,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
 
         if self.apply_single_command(
             first,
-            &mut need_reproject_processes,
-            &mut need_reproject_details,
+            &mut dirty,
             &mut need_sample_tick,
             &mut pending_acks,
             &mut pending_events,
@@ -1162,8 +1228,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             while let Ok(next) = self.cmd_rx.try_recv() {
                 if self.apply_single_command(
                     next,
-                    &mut need_reproject_processes,
-                    &mut need_reproject_details,
+                    &mut dirty,
                     &mut need_sample_tick,
                     &mut pending_acks,
                     &mut pending_events,
@@ -1175,17 +1240,56 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         }
 
         if !shutdown_requested {
+            if dirty.services {
+                self.services_projection_dirty = true;
+            }
+            if dirty.startup {
+                self.startup_projection_dirty = true;
+            }
+            if dirty.users {
+                self.users_projection_dirty = true;
+            }
+            if dirty.app_history {
+                self.app_history_projection_dirty = true;
+            }
             if need_sample_tick {
                 self.run_sample_tick();
                 self.schedule_after_tick(self.tick_count <= 1);
-            } else if !self.window_dormant
-                && !self.temp_frozen
-                && (need_reproject_processes || need_reproject_details)
-            {
-                let details_dirty =
-                    need_reproject_details && self.leases.is_active(MonitorDomain::Details);
-                if need_reproject_processes || details_dirty {
-                    self.publish_slices(need_reproject_processes, details_dirty, false, false);
+                if !self.window_dormant && !self.temp_frozen {
+                    let post_mask = SliceUpdateMask {
+                        services: dirty.services
+                            && self.leases.is_active(MonitorDomain::Services)
+                            && self.services_polled_once,
+                        startup: dirty.startup
+                            && self.leases.is_active(MonitorDomain::Startup)
+                            && self.startup_polled_once,
+                        ..SliceUpdateMask::default()
+                    };
+                    if post_mask.any() {
+                        self.publish_slices(post_mask);
+                    }
+                }
+            } else if !self.window_dormant && !self.temp_frozen {
+                let mask = SliceUpdateMask {
+                    processes: dirty.processes,
+                    details: dirty.details && self.leases.is_active(MonitorDomain::Details),
+                    performance: false,
+                    include_per_core: false,
+                    services: dirty.services
+                        && self.leases.is_active(MonitorDomain::Services)
+                        && self.services_polled_once,
+                    startup: dirty.startup
+                        && self.leases.is_active(MonitorDomain::Startup)
+                        && self.startup_polled_once,
+                    users: dirty.users
+                        && self.leases.is_active(MonitorDomain::Users)
+                        && (self.users_polled_once || !self.cached_user_sessions.is_empty()),
+                    app_history: dirty.app_history
+                        && self.leases.is_active(MonitorDomain::AppHistory)
+                        && self.app_history_polled_once,
+                };
+                if mask.any() {
+                    self.publish_slices(mask);
                 }
             }
         }
@@ -1208,8 +1312,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
     fn apply_single_command(
         &mut self,
         envelope: CommandEnvelope,
-        need_reproject_processes: &mut bool,
-        need_reproject_details: &mut bool,
+        dirty: &mut SliceUpdateMask,
         need_sample_tick: &mut bool,
         pending_acks: &mut Vec<(CommandKind, Sender<CommandEvent>)>,
         pending_events: &mut Vec<(CommandEvent, Option<Sender<CommandEvent>>)>,
@@ -1243,15 +1346,19 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                         self.projection.clear_listening_ports();
                         self.last_port_scan_at = None;
                     }
-                    *need_reproject_processes = true;
-                    *need_reproject_details = true;
+                    dirty.processes = true;
+                    dirty.details = true;
+                    dirty.services = true;
+                    dirty.startup = true;
+                    dirty.users = true;
+                    dirty.app_history = true;
                 }
                 push_ack(kind, reply, pending_acks);
             }
             EngineCommand::SetProcessViewMode(mode) => {
                 if self.view_config.process_view_mode != mode {
                     self.view_config.process_view_mode = mode;
-                    *need_reproject_processes = true;
+                    dirty.processes = true;
                 }
                 push_ack(kind, reply, pending_acks);
             }
@@ -1261,7 +1368,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 {
                     self.view_config.process_sort_column = column;
                     self.view_config.process_sort_direction = direction;
-                    *need_reproject_processes = true;
+                    dirty.processes = true;
                 }
                 push_ack(kind, reply, pending_acks);
             }
@@ -1269,13 +1376,13 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 if !self.view_config.process_expanded.remove(&key) {
                     self.view_config.process_expanded.insert(key);
                 }
-                *need_reproject_processes = true;
+                dirty.processes = true;
                 push_ack(kind, reply, pending_acks);
             }
             EngineCommand::SetDetailsViewMode(mode) => {
                 if self.view_config.details_view_mode != mode {
                     self.view_config.details_view_mode = mode;
-                    *need_reproject_details = true;
+                    dirty.details = true;
                 }
                 push_ack(kind, reply, pending_acks);
             }
@@ -1285,7 +1392,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 {
                     self.view_config.details_sort_column = column;
                     self.view_config.details_sort_direction = direction;
-                    *need_reproject_details = true;
+                    dirty.details = true;
                 }
                 push_ack(kind, reply, pending_acks);
             }
@@ -1293,7 +1400,61 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 if !self.view_config.details_expanded.remove(&key) {
                     self.view_config.details_expanded.insert(key);
                 }
-                *need_reproject_details = true;
+                dirty.details = true;
+                push_ack(kind, reply, pending_acks);
+            }
+            EngineCommand::SetServicesSort { column, direction } => {
+                if self.view_config.services_sort_column != column
+                    || self.view_config.services_sort_direction != direction
+                {
+                    self.view_config.services_sort_column = column;
+                    self.view_config.services_sort_direction = direction;
+                    dirty.services = true;
+                }
+                push_ack(kind, reply, pending_acks);
+            }
+            EngineCommand::SetServicesFilterPid(pid) => {
+                if self.view_config.services_filter_pid != pid {
+                    self.view_config.services_filter_pid = pid;
+                    dirty.services = true;
+                }
+                push_ack(kind, reply, pending_acks);
+            }
+            EngineCommand::SetStartupSort { column, direction } => {
+                if self.view_config.startup_sort_column != column
+                    || self.view_config.startup_sort_direction != direction
+                {
+                    self.view_config.startup_sort_column = column;
+                    self.view_config.startup_sort_direction = direction;
+                    dirty.startup = true;
+                }
+                push_ack(kind, reply, pending_acks);
+            }
+            EngineCommand::SetUsersSort { column, direction } => {
+                if self.view_config.users_sort_column != column
+                    || self.view_config.users_sort_direction != direction
+                {
+                    self.view_config.users_sort_column = column;
+                    self.view_config.users_sort_direction = direction;
+                    dirty.users = true;
+                }
+                push_ack(kind, reply, pending_acks);
+            }
+            EngineCommand::ToggleUserSessionExpanded(session_id) => {
+                if !self.view_config.users_expanded.remove(&session_id) {
+                    self.view_config.users_expanded.insert(session_id);
+                }
+                dirty.users = true;
+                push_ack(kind, reply, pending_acks);
+            }
+            EngineCommand::SetAppHistorySort { column, direction } => {
+                if self.view_config.app_history_sort_column != column
+                    || self.view_config.app_history_sort_direction != direction
+                {
+                    self.view_config.app_history_sort_column = column;
+                    self.view_config.app_history_sort_direction = direction;
+                    dirty.app_history = true;
+                }
                 push_ack(kind, reply, pending_acks);
             }
             EngineCommand::SetWindowDormant(dormant) => {
@@ -1316,7 +1477,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                     self.view_config.process_order_frozen = false;
                     self.view_config.frozen_process_order.clear();
                 }
-                *need_reproject_processes = true;
+                dirty.processes = true;
                 push_ack(kind, reply, pending_acks);
             }
             EngineCommand::SetDetailsOrderFreeze(frozen) => {
@@ -1339,7 +1500,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                     self.view_config.details_order_frozen = false;
                     self.view_config.frozen_details_order.clear();
                 }
-                *need_reproject_details = true;
+                dirty.details = true;
                 push_ack(kind, reply, pending_acks);
             }
             EngineCommand::SetTempFreeze(frozen) => {
@@ -1428,16 +1589,16 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             EngineCommand::SetWebView2HostGrouping(enabled) => {
                 if self.view_config.webview2_host_grouping != enabled {
                     self.view_config.webview2_host_grouping = enabled;
-                    *need_reproject_processes = true;
-                    *need_reproject_details = true;
+                    dirty.processes = true;
+                    dirty.details = true;
                 }
                 push_ack(kind, reply, pending_acks);
             }
             EngineCommand::SetShowLeakWarnings(enabled) => {
                 if self.view_config.show_leak_warnings != enabled {
                     self.view_config.show_leak_warnings = enabled;
-                    *need_reproject_processes = true;
-                    *need_reproject_details = true;
+                    dirty.processes = true;
+                    dirty.details = true;
                 }
                 push_ack(kind, reply, pending_acks);
             }
@@ -1451,16 +1612,16 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                         .any(|existing| existing.eq_ignore_ascii_case(trimmed))
                 {
                     self.view_config.leak_ignored_paths.push(trimmed.to_owned());
-                    *need_reproject_processes = true;
-                    *need_reproject_details = true;
+                    dirty.processes = true;
+                    dirty.details = true;
                 }
                 push_ack(kind, reply, pending_acks);
             }
             EngineCommand::SetHideSystemProcesses(hidden) => {
                 if self.view_config.hide_windows_system_processes != hidden {
                     self.view_config.hide_windows_system_processes = hidden;
-                    *need_reproject_processes = true;
-                    *need_reproject_details = true;
+                    dirty.processes = true;
+                    dirty.details = true;
                 }
                 push_ack(kind, reply, pending_acks);
             }
@@ -1468,8 +1629,8 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 match self.backend.operator().set_efficiency_mode(key, enabled) {
                     Ok(()) => {
                         self.cold_cache.set_efficiency_mode(key, enabled);
-                        *need_reproject_processes = true;
-                        *need_reproject_details = true;
+                        dirty.processes = true;
+                        dirty.details = true;
                         pending_events.push((
                             CommandEvent::new(
                                 kind,
@@ -1528,7 +1689,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 match self.backend.operator().set_uac_virtualization(key, enabled) {
                     Ok(()) => {
                         self.cold_cache.set_uac_virtualization(key, enabled);
-                        *need_reproject_details = true;
+                        dirty.details = true;
                         pending_events.push((
                             CommandEvent::new(
                                 kind,
@@ -1673,16 +1834,10 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         }
     }
 
-    fn publish_slices(
-        &mut self,
-        update_processes: bool,
-        update_details: bool,
-        update_performance: bool,
-        include_per_core: bool,
-    ) {
+    fn publish_slices(&mut self, mask: SliceUpdateMask) {
         let mut next = self.current_snapshot.clone();
 
-        if update_processes {
+        if mask.processes {
             let rev = next.revisions.processes.saturating_add(1);
             next.revisions.processes = rev;
             next.processes = Arc::new(self.projection.project_processes(
@@ -1691,15 +1846,18 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 rev,
             ));
 
-            if self.leases.is_active(MonitorDomain::Users) && !self.cached_user_sessions.is_empty()
+            if self.leases.is_active(MonitorDomain::Users)
+                && (self.users_polled_once || !self.cached_user_sessions.is_empty())
             {
                 let users_rev = next.revisions.users.saturating_add(1);
                 next.revisions.users = users_rev;
                 next.users = Arc::new(self.projection.project_users(
                     &self.cached_user_sessions,
+                    &self.view_config,
                     &self.cold_cache,
                     users_rev,
                 ));
+                self.users_projection_dirty = false;
             }
 
             if self.leases.is_active(MonitorDomain::AppHistory) && self.app_history_polled_once {
@@ -1708,12 +1866,14 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 next.app_history = Arc::new(self.projection.project_app_history(
                     self.persisted_app_history_since,
                     &self.persisted_app_history,
+                    &self.view_config,
                     hist_rev,
                 ));
+                self.app_history_projection_dirty = false;
             }
         }
 
-        if update_details {
+        if mask.details {
             let rev = next.revisions.details.saturating_add(1);
             next.revisions.details = rev;
             next.details = Arc::new(self.projection.project_details(
@@ -1724,15 +1884,103 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             self.last_details_projected_tick = self.tick_count;
         }
 
-        if update_performance {
+        if mask.performance {
             let rev = next.revisions.performance.saturating_add(1);
             next.revisions.performance = rev;
-            next.performance = Arc::new(self.projection.project_performance(include_per_core, rev));
+            next.performance = Arc::new(
+                self.projection
+                    .project_performance(mask.include_per_core, rev),
+            );
+        }
+
+        if mask.services
+            && self.leases.is_active(MonitorDomain::Services)
+            && self.services_polled_once
+        {
+            let rev = next.revisions.services.saturating_add(1);
+            next.revisions.services = rev;
+            next.services = Arc::new(self.projection.project_services(
+                &self.cached_services,
+                &self.view_config,
+                rev,
+            ));
+            self.services_projection_dirty = false;
+        }
+
+        if mask.startup && self.leases.is_active(MonitorDomain::Startup) && self.startup_polled_once
+        {
+            let rev = next.revisions.startup.saturating_add(1);
+            next.revisions.startup = rev;
+            next.startup = Arc::new(self.projection.project_startup(
+                self.cached_startup_bios_ms,
+                &self.cached_startup_entries,
+                &self.view_config,
+                rev,
+            ));
+            self.startup_projection_dirty = false;
+        }
+
+        if mask.users
+            && !mask.processes
+            && self.leases.is_active(MonitorDomain::Users)
+            && (self.users_polled_once || !self.cached_user_sessions.is_empty())
+        {
+            let users_rev = next.revisions.users.saturating_add(1);
+            next.revisions.users = users_rev;
+            next.users = Arc::new(self.projection.project_users(
+                &self.cached_user_sessions,
+                &self.view_config,
+                &self.cold_cache,
+                users_rev,
+            ));
+            self.users_projection_dirty = false;
+        }
+
+        if mask.app_history
+            && !mask.processes
+            && self.leases.is_active(MonitorDomain::AppHistory)
+            && self.app_history_polled_once
+        {
+            let hist_rev = next.revisions.app_history.saturating_add(1);
+            next.revisions.app_history = hist_rev;
+            next.app_history = Arc::new(self.projection.project_app_history(
+                self.persisted_app_history_since,
+                &self.persisted_app_history,
+                &self.view_config,
+                hist_rev,
+            ));
+            self.app_history_projection_dirty = false;
         }
 
         self.current_snapshot = next.clone();
         self.snapshot_store.store(Arc::new(next));
         self.wake_signal.notify();
+    }
+}
+
+/// Bitmask of domain slices to re-project and publish in a single atomic snapshot update.
+#[derive(Debug, Default, Clone, Copy)]
+struct SliceUpdateMask {
+    processes: bool,
+    details: bool,
+    performance: bool,
+    include_per_core: bool,
+    services: bool,
+    startup: bool,
+    users: bool,
+    app_history: bool,
+}
+
+impl SliceUpdateMask {
+    #[inline]
+    const fn any(self) -> bool {
+        self.processes
+            || self.details
+            || self.performance
+            || self.services
+            || self.startup
+            || self.users
+            || self.app_history
     }
 }
 
