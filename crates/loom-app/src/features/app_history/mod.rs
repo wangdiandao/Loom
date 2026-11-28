@@ -10,6 +10,8 @@ mod table;
 #[cfg(test)]
 mod tests;
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,8 +42,12 @@ use table::AppHistoryTableDelegate;
 /// Opens a confirmation dialog before clearing cumulative application usage history.
 fn open_clear_history_dialog(store: &Entity<UiStore>, window: &mut Window, cx: &mut App) {
     let store = store.clone();
+    let confirmed = Rc::new(Cell::new(false));
     window.open_dialog(cx, move |dialog, _window, cx| {
+        let store_for_ok = store.clone();
         let store_confirm = store.clone();
+        let confirmed_ok = Rc::clone(&confirmed);
+        let confirmed_btn = Rc::clone(&confirmed);
         let muted_fg = cx.theme().muted_foreground;
         let warning = cx.theme().warning;
         let danger = cx.theme().danger;
@@ -49,6 +55,7 @@ fn open_clear_history_dialog(store: &Entity<UiStore>, window: &mut Window, cx: &
 
         dialog
             .w(px(440.))
+            .centered()
             .title(i18n::tr("app_history.confirm_delete_title"))
             .child(
                 h_flex()
@@ -74,8 +81,15 @@ fn open_clear_history_dialog(store: &Entity<UiStore>, window: &mut Window, cx: &
                             .child(i18n::tr("app_history.confirm_delete_message")),
                     ),
             )
+            .on_ok(move |_, _, cx| {
+                if !confirmed_ok.replace(true) {
+                    UiCommands::clear_app_history(&store_for_ok, cx);
+                }
+                true
+            })
             .footer(
                 DialogFooter::new()
+                    .gap_2()
                     .child(
                         Button::new("app-history-clear-cancel")
                             .outline()
@@ -89,7 +103,9 @@ fn open_clear_history_dialog(store: &Entity<UiStore>, window: &mut Window, cx: &
                             .danger()
                             .label(i18n::tr("app_history.confirm_delete_action"))
                             .on_click(move |_, window, cx| {
-                                UiCommands::clear_app_history(&store_confirm, cx);
+                                if !confirmed_btn.replace(true) {
+                                    UiCommands::clear_app_history(&store_confirm, cx);
+                                }
                                 window.close_dialog(cx);
                             }),
                     ),

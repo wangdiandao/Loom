@@ -316,7 +316,6 @@ impl TableDelegate for UsersTableDelegate {
             .text_xs()
             .text_color(if is_active { fg } else { muted_fg })
             .when(is_active, |d| d.font_semibold())
-            .cursor_pointer()
             .on_click(cx.listener(move |table, _, _, cx| {
                 table.delegate_mut().trigger_sort(col_ix, cx);
             }))
@@ -397,7 +396,6 @@ impl TableDelegate for UsersTableDelegate {
                                     .size(px(18.))
                                     .flex_shrink_0()
                                     .rounded_sm()
-                                    .cursor_pointer()
                                     .hover(move |s| s.bg(list_hover))
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                         cx.stop_propagation();

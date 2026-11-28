@@ -1,15 +1,17 @@
 //! Confirmation dialogs and OS account actions for the Users feature slice.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
-use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex};
 use gpui_kit::{App, Entity, ParentElement as _, Styled as _, Window, div, px};
 use loom_types::{RunTaskRequest, UserSessionProcess};
 
 use crate::bridge::{UiCommands, UiStore};
 use crate::i18n;
+use crate::shell::dialogs::open_confirm_end_task_dialog;
 
 use super::state::is_critical_or_system_process;
 
@@ -22,8 +24,12 @@ pub(super) fn open_disconnect_session_dialog(
     cx: &mut App,
 ) {
     let store = store.clone();
+    let confirmed = Rc::new(Cell::new(false));
     window.open_dialog(cx, move |dialog, _window, cx| {
+        let store_for_ok = store.clone();
         let store_confirm = store.clone();
+        let confirmed_ok = Rc::clone(&confirmed);
+        let confirmed_btn = Rc::clone(&confirmed);
         let muted_fg = cx.theme().muted_foreground;
         let warning = cx.theme().warning;
         let danger = cx.theme().danger;
@@ -37,6 +43,7 @@ pub(super) fn open_disconnect_session_dialog(
 
         dialog
             .w(px(440.))
+            .centered()
             .title(i18n::tr("users.confirm_disconnect_title"))
             .child(
                 h_flex()
@@ -62,8 +69,15 @@ pub(super) fn open_disconnect_session_dialog(
                             .child(message),
                     ),
             )
+            .on_ok(move |_, _, cx| {
+                if !confirmed_ok.replace(true) {
+                    UiCommands::disconnect_session(&store_for_ok, session_id, cx);
+                }
+                true
+            })
             .footer(
                 DialogFooter::new()
+                    .gap_2()
                     .child(
                         Button::new("users-confirm-disconnect-cancel")
                             .outline()
@@ -77,7 +91,9 @@ pub(super) fn open_disconnect_session_dialog(
                             .danger()
                             .label(i18n::tr("users.confirm_disconnect_action"))
                             .on_click(move |_, window, cx| {
-                                UiCommands::disconnect_session(&store_confirm, session_id, cx);
+                                if !confirmed_btn.replace(true) {
+                                    UiCommands::disconnect_session(&store_confirm, session_id, cx);
+                                }
                                 window.close_dialog(cx);
                             }),
                     ),
@@ -85,7 +101,7 @@ pub(super) fn open_disconnect_session_dialog(
     });
 }
 
-/// Terminates a child process directly, or opens a confirmation dialog for critical processes.
+/// Terminates a child process directly, or opens the shared critical-process confirmation dialog.
 pub(super) fn request_end_user_process(
     store: &Entity<UiStore>,
     process: &UserSessionProcess,
@@ -97,76 +113,14 @@ pub(super) fn request_end_user_process(
         return;
     }
 
-    let store = store.clone();
-    let key = process.key;
-    let name = process.name.to_string();
-    window.open_dialog(cx, move |dialog, _window, cx| {
-        let store_confirm = store.clone();
-        let warning = cx.theme().warning;
-        let danger = cx.theme().danger;
-        let muted_fg = cx.theme().muted_foreground;
-        let radius = cx.theme().radius;
-        let message = rust_i18n::t!(
-            "processes.confirm_end_message",
-            name = name.as_str(),
-            pid = key.pid
-        )
-        .into_owned();
-
-        dialog
-            .w(px(440.))
-            .title(i18n::tr("processes.confirm_end_title"))
-            .child(
-                v_flex()
-                    .w_full()
-                    .gap_3()
-                    .child(div().text_sm().text_color(muted_fg).child(message))
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_start()
-                            .gap_2()
-                            .p_2p5()
-                            .rounded(radius)
-                            .bg(warning.opacity(0.14))
-                            .border_1()
-                            .border_color(warning.opacity(0.4))
-                            .child(
-                                Icon::new(IconName::TriangleAlert)
-                                    .small()
-                                    .text_color(danger),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_xs()
-                                    .text_color(danger)
-                                    .child(i18n::tr("processes.confirm_end_critical")),
-                            ),
-                    ),
-            )
-            .footer(
-                DialogFooter::new()
-                    .child(
-                        Button::new("users-confirm-end-cancel")
-                            .outline()
-                            .label(i18n::tr("common.cancel"))
-                            .on_click(|_, window, cx| {
-                                window.close_dialog(cx);
-                            }),
-                    )
-                    .child(
-                        Button::new("users-confirm-end-ok")
-                            .danger()
-                            .label(i18n::tr("processes.confirm_end_action"))
-                            .on_click(move |_, window, cx| {
-                                UiCommands::terminate_process(&store_confirm, key, cx);
-                                window.close_dialog(cx);
-                            }),
-                    ),
-            )
-    });
+    open_confirm_end_task_dialog(
+        store.clone(),
+        process.key,
+        process.name.to_string(),
+        true,
+        window,
+        cx,
+    );
 }
 
 /// Launches the native Windows user accounts management applet (`netplwiz`).
