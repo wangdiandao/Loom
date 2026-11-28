@@ -38,24 +38,28 @@ Loom 是一款基于 **Rust** 与 **GPUI Kit (`gpui-kit` / `gpui-component`)** �
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Main as "GPUI 主线程 (loom-app)"
+    participant Main as "GPUI 主线程 (loom-app, GUI 子系统)"
     participant Fast as "快通道内核采样线程 (HIGH / ABOVE_NORMAL)"
     participant Slow as "慢通道探测舱壁池 (最多2线程, 低优先级)"
 
-    Note over Main: T = 0 ~ 2 ms (优先级提升与配置加载)
+    Note over Main: T = 0 ~ 2 ms (无控制台窗口、优先级提升、互斥锁与配置加载)
     Main->>Main: SetPriorityClass(HIGH_PRIORITY_CLASS) 防止 100% 负载时被饿死
+    Main->>Main: 仅获取跨 UIPI 单实例命名互斥锁 (不创建隐藏窗口或等待线程)
     Main->>Main: 加载轻量级 settings.toml (小于 4 KB, 无注册表/COM 阻塞)
-    par 窗口初始化与首帧快照并行执行
-        Main->>Main: gpui_kit::open_window 创建 DX12 窗口与首屏骨架 (5~30 ms)
+    par 窗口初始化与引擎构建/首帧快照并行执行
+        Main->>Main: gpui_kit::open_window 创建窗口、单次应用主题/强调色与首屏骨架
     and
-        Main->>Fast: 启动快采线程执行首次 NtQuerySystemInformation (~1 ms)
+        Main->>Fast: 立即返回主线程；后台线程构建快采/慢探与舱壁池并执行 Tick 0 (~1~2 ms, 跳过 GPU 发现)
         Fast-->>Main: 发布首帧进程表 (PID / 映像名 / 专用工作集 / 状态)
     end
-    Note over Main: T ≈ 30 ~ 45 ms: 首帧可交互 (可搜索并执行结束任务)
-    Fast->>Fast: T = +250 ms 二次校准采样，产出初始 CPU% / I/O 速率后切入 1s 稳态周期
-    Fast-)Slow: 异步投递新 ProcessKey 冷元数据与硬件静态信息探测任务
+    Note over Main: 首帧绘制完成后 (window.on_next_frame) 挂载 WM_COPYDATA 接收窗、托盘图标与全局热键
+    Fast->>Fast: T = +250 ms 二次校准采样，启用带负缓存冷却的 D3DKMT 每进程 GPU 遥测后切入 1s 稳态周期
+    Fast-)Slow: 按 App > Background > System 与专用工作集降序优先投递冷元数据探测任务
     Slow-->>Main: 分批异步回填 20x20 图标、PE 发布者、SMBIOS 与磁盘型号
 ```
+
+- Release 构建在 Windows 上启用 `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`，并配置 `lto = "thin"`、`codegen-units = 1` 与符号裁剪，消除启动时分配控制台宿主的额外延迟并缩减可执行文件体积。
+- `loom-app` 提供零开销按需开启的启动阶段诊断参数 `--startup-trace` / `--startup-trace=<path>`（未开启时为单次松弛原子读，开启后按微秒精度记录从 `main_start` 到 `first_frame_painted` / `tick0_snapshot_ready` 的完整时间线）。
 
 ### 2.3 Windows 六项防卡死约束
 

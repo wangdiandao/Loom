@@ -111,6 +111,8 @@ struct MockState {
     gpu_d3_asleep: AtomicBool,
     core_kinds: Mutex<Vec<CpuCoreKind>>,
     per_proc_net_transitions: Mutex<Vec<bool>>,
+    per_proc_gpu_transitions: Mutex<Vec<bool>>,
+    probed_proc_order: Mutex<Vec<ProcessKey>>,
     list_ports_calls: AtomicUsize,
     listening_ports: Mutex<Vec<ProcessSocketRecord>>,
     probe_proc_calls: AtomicUsize,
@@ -162,6 +164,8 @@ impl MockState {
             gpu_d3_asleep: AtomicBool::new(false),
             core_kinds: Mutex::new(Vec::new()),
             per_proc_net_transitions: Mutex::new(Vec::new()),
+            per_proc_gpu_transitions: Mutex::new(Vec::new()),
+            probed_proc_order: Mutex::new(Vec::new()),
             list_ports_calls: AtomicUsize::new(0),
             listening_ports: Mutex::new(Vec::new()),
             probe_proc_calls: AtomicUsize::new(0),
@@ -389,6 +393,10 @@ impl FastSystemSampler for MockFastSampler {
     fn set_per_process_network_enabled(&mut self, enabled: bool) {
         self.state.per_proc_net_transitions.lock().push(enabled);
     }
+
+    fn set_per_process_gpu_enabled(&mut self, enabled: bool) {
+        self.state.per_proc_gpu_transitions.lock().push(enabled);
+    }
 }
 
 struct MockSlowProber {
@@ -399,6 +407,7 @@ struct MockSlowProber {
 impl SlowMetadataProber for MockSlowProber {
     fn probe_process(&self, key: ProcessKey) -> Result<ProcessColdMeta, PalError> {
         self.state.probe_proc_calls.fetch_add(1, Ordering::AcqRel);
+        self.state.probed_proc_order.lock().push(key);
         if self.state.slow_probe_block_pid == Some(key.pid) {
             if let Some(ref rx) = self.state.slow_probe_release {
                 let _ = rx.recv_timeout(self.state.slow_probe_sleep);
@@ -3990,6 +3999,72 @@ fn processes_domain_lease_gates_projection_while_details_stays_independent() {
     assert!(wait_until(Duration::from_secs(2), || {
         coord.snapshot().revisions.processes > rev_while_leased
     }));
+
+    coord.shutdown();
+}
+
+#[test]
+fn startup_tick0_defers_per_process_gpu_and_prioritizes_app_slow_probes() {
+    let mut sys_proc = MockProcSpec::new(100, 1, 0, "svchost.exe");
+    sys_proc.category = ProcessCategory::System;
+    sys_proc.private_mem_bytes = 200 * 1024 * 1024;
+
+    let mut bg_proc = MockProcSpec::new(200, 2, 0, "worker.exe");
+    bg_proc.category = ProcessCategory::Background;
+    bg_proc.private_mem_bytes = 150 * 1024 * 1024;
+
+    let mut small_app = MockProcSpec::new(300, 3, 0, "notepad.exe");
+    small_app.category = ProcessCategory::App;
+    small_app.private_mem_bytes = 24 * 1024 * 1024;
+
+    let mut big_app = MockProcSpec::new(400, 4, 0, "chrome.exe");
+    big_app.category = ProcessCategory::App;
+    big_app.private_mem_bytes = 512 * 1024 * 1024;
+
+    let state = MockState::new(vec![
+        sys_proc.clone(),
+        bg_proc.clone(),
+        small_app.clone(),
+        big_app.clone(),
+    ]);
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let config = EngineConfig {
+        slow_workers: 1,
+        startup_calibration_delay: Duration::from_millis(20),
+        ..EngineConfig::default()
+    };
+    let coord = EngineCoordinator::with_config(backend, AppSettings::default(), config).unwrap();
+
+    // Wait for all 4 processes to be probed in order on the single slow worker.
+    assert!(wait_until(Duration::from_secs(2), || {
+        state.probed_proc_order.lock().len() >= 4
+            && state.per_proc_gpu_transitions.lock().len() >= 2
+    }));
+
+    let gpu_transitions = state.per_proc_gpu_transitions.lock().clone();
+    assert_eq!(
+        &gpu_transitions[..2],
+        &[false, true],
+        "Tick 0 must disable per-process GPU queries and re-enable immediately after Tick 0"
+    );
+
+    let probed = state.probed_proc_order.lock().clone();
+    assert_eq!(
+        probed[0], big_app.key,
+        "heaviest App process must be probed first"
+    );
+    assert_eq!(
+        probed[1], small_app.key,
+        "remaining App process must be probed before Background/System"
+    );
+    assert_eq!(
+        probed[2], bg_proc.key,
+        "Background process must be probed before System"
+    );
+    assert_eq!(
+        probed[3], sys_proc.key,
+        "System process must be probed last"
+    );
 
     coord.shutdown();
 }

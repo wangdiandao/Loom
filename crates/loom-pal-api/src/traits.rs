@@ -118,6 +118,13 @@ pub trait FastSystemSampler: Send {
 
     /// Enables or disables optional elevated per-process network byte attribution.
     fn set_per_process_network_enabled(&mut self, _enabled: bool) {}
+
+    /// Enables or disables per-process GPU telemetry during [`Self::sample_processes`].
+    ///
+    /// Newly created samplers default to enabled. Coordinators may temporarily disable
+    /// per-process GPU queries on Tick 0 so the initial boot snapshot publishes immediately
+    /// before cold GPU adapter discovery and per-process kernel queries run on Tick 1.
+    fn set_per_process_gpu_enabled(&mut self, _enabled: bool) {}
 }
 
 /// Slow-lane bulkhead metadata prober for operations that may touch disk or Shell APIs.

@@ -127,7 +127,7 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_with_highlight(store, initial_route, None, window, cx)
+        Self::new_with_highlight(store, initial_route, None, None, window, cx)
     }
 
     /// Constructs a new [`AppShell`] positioned on `initial_route`, optionally highlighting
@@ -136,6 +136,7 @@ impl AppShell {
         store: Entity<UiStore>,
         initial_route: Route,
         initial_details_highlight: Option<ProcessKey>,
+        initial_system_accent: Option<(u8, u8, u8)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -315,7 +316,7 @@ impl AppShell {
             syntax_help_open: false,
             last_locale: initial_settings.language,
             last_elevated: initial_elevated,
-            last_system_accent: Some(system_accent_rgb()),
+            last_system_accent: initial_system_accent,
             _subscriptions: subscriptions,
         }
     }

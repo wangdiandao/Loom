@@ -1242,6 +1242,17 @@ impl ProjectionEngine {
         self.computed.iter().map(|p| p.key)
     }
 
+    /// Iterates over `(key, category, private_working_set_bytes)` for all live processes
+    /// so the coordinator can prioritize slow-lane metadata probes for foreground apps first.
+    #[inline]
+    pub fn live_probe_candidates(
+        &self,
+    ) -> impl Iterator<Item = (ProcessKey, ProcessCategory, u64)> + '_ {
+        self.computed
+            .iter()
+            .map(|p| (p.key, p.category, p.private_working_set_bytes))
+    }
+
     /// Builds a pre-sorted, pre-filtered [`ProcessTableSlice`].
     pub fn project_processes(
         &mut self,

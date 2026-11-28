@@ -38,24 +38,28 @@ Target budgets measured against modern multi-core desktops (16 cores / 32 logica
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Main as "GPUI Main Thread (loom-app)"
+    participant Main as "GPUI Main Thread (loom-app, GUI Subsystem)"
     participant Fast as "Fast Kernel Sampler (HIGH / ABOVE_NORMAL)"
     participant Slow as "Slow Probe Bulkhead Pool (max 2 Threads, Low Priority)"
 
-    Note over Main: T = 0 ~ 2 ms (Priority Boost & Config Load)
+    Note over Main: T = 0 ~ 2 ms (GUI Subsystem, Priority Boost, Mutex Lock & Config Load)
     Main->>Main: SetPriorityClass(HIGH_PRIORITY_CLASS) to preempt 100%-CPU workloads
+    Main->>Main: Acquire cross-UIPI named mutex only (defer receiver window & thread)
     Main->>Main: Load settings.toml (under 4 KB, no Registry/COM wait)
-    par Parallel Window Init & First Kernel Snapshot
-        Main->>Main: gpui_kit::open_window initializes DX12 surface & shell (under 30 ms)
+    par Parallel Window Init & Background Engine/Tick-0 Boot
+        Main->>Main: gpui_kit::open_window initializes surface, single theme/accent pass & shell
     and
-        Main->>Fast: Spawn Fast Sampler & run first NtQuerySystemInformation (~1 ms)
+        Main->>Fast: Return immediately; construct samplers/pool off-thread & run Tick 0 (~1-2 ms, skip GPU discovery)
         Fast-->>Main: Publish Frame-1 Process Slice (PID / image name / memory / status)
     end
-    Note over Main: T ≈ 30 ~ 45 ms: Interactive Frame 1 (Search & End Task ready)
-    Fast->>Fast: T = +250 ms calibration tick computes initial CPU% / I/O deltas, then enters 1s cadence
-    Fast-)Slow: Enqueue cold metadata probes (20x20 icons, PE publisher, SMBIOS, disk models)
+    Note over Main: Strictly after first frame paint (window.on_next_frame): start WM_COPYDATA receiver, tray icon & global hotkey
+    Fast->>Fast: T = +250 ms calibration tick enables cooldown-cached D3DKMT per-process GPU telemetry, then enters 1s cadence
+    Fast-)Slow: Prioritize cold metadata probes (App > Background > System, descending private WS)
     Slow-->>Main: Backfill icons & descriptions asynchronously without blocking UI
 ```
+
+- Release builds enable `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]` on Windows alongside `[profile.release]` (`lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`), avoiding Windows console host allocation overhead and shrinking binary footprint.
+- `loom-app` exposes an opt-in, zero-overhead-when-disabled `--startup-trace` / `--startup-trace=<path>` CLI flag recording microsecond phase milestones from `main_start` through `first_frame_painted`, `post_frame_shell_init`, and `tick0_snapshot_ready`.
 
 ### 2.3 Six Windows anti-hang constraints
 

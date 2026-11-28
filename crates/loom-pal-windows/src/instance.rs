@@ -9,7 +9,8 @@
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::{Arc, LazyLock, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -50,7 +51,8 @@ pub struct WindowsSingleInstance {
     app_id: String,
     mutex: OwnedHandle,
     is_owner: bool,
-    receiver_hwnd: isize,
+    receiver_hwnd: Arc<AtomicIsize>,
+    receiver_shutdown: Arc<AtomicBool>,
     receiver_thread: Option<JoinHandle<()>>,
 }
 
@@ -67,7 +69,9 @@ impl WindowsSingleInstance {
     ///
     /// - If this process acquires ownership (`is_single() == true`), optionally starts a
     ///   lightweight hidden `WM_COPYDATA` receiver window that invokes `on_activate` whenever
-    ///   a duplicate instance launches.
+    ///   a duplicate instance launches. Callers may pass `None` to keep startup strictly
+    ///   mutex-only and later call [`Self::start_activation_receiver`] once the first UI frame
+    ///   has painted.
     /// - If another instance already owns the mutex (`is_single() == false`), forwards
     ///   `forward_args` to the existing instance's hidden window via `WM_COPYDATA` and grants
     ///   it foreground focus via `AllowSetForegroundWindow`.
@@ -117,33 +121,26 @@ impl WindowsSingleInstance {
             }
         };
 
-        let class_name = format!("{app_id}-sic");
-        let title_name = format!("{app_id}-siw");
+        let receiver_hwnd = Arc::new(AtomicIsize::new(0));
+        let receiver_shutdown = Arc::new(AtomicBool::new(false));
 
         if is_owner {
-            let receiver = if let Some(cb) = on_activate {
-                match spawn_receiver_thread(class_name, title_name, cb) {
-                    Ok(res) => res,
-                    Err(err) => {
-                        OWNED_IDS.lock().remove(app_id);
-                        unsafe {
-                            let _ = ReleaseMutex(mutex.as_raw());
-                        }
-                        return Err(err);
-                    }
-                }
-            } else {
-                (0, None)
-            };
-            return Ok(Self {
+            let mut guard = Self {
                 app_id: app_id.to_owned(),
                 mutex,
                 is_owner: true,
-                receiver_hwnd: receiver.0,
-                receiver_thread: receiver.1,
-            });
+                receiver_hwnd,
+                receiver_shutdown,
+                receiver_thread: None,
+            };
+            if let Some(cb) = on_activate {
+                guard.start_activation_receiver(cb)?;
+            }
+            return Ok(guard);
         }
 
+        let class_name = format!("{app_id}-sic");
+        let title_name = format!("{app_id}-siw");
         // Duplicate instance: notify the running owner via `WM_COPYDATA` (wait briefly for
         // its receiver window if it just started).
         let _ = notify_existing_instance(&class_name, &title_name, forward_args);
@@ -152,9 +149,36 @@ impl WindowsSingleInstance {
             app_id: app_id.to_owned(),
             mutex,
             is_owner: false,
-            receiver_hwnd: 0,
+            receiver_hwnd,
+            receiver_shutdown,
             receiver_thread: None,
         })
+    }
+
+    /// Starts the hidden cross-UIPI `WM_COPYDATA` receiver window non-blockingly on a
+    /// dedicated background thread for an already-acquired primary single-instance lock.
+    ///
+    /// Calling this after the first UI frame paints eliminates hidden Win32 window creation
+    /// and thread handshakes from the cold-start critical path while preserving duplicate
+    /// launch wakeup (secondary launches poll `FindWindowW` for up to `3 s`).
+    pub fn start_activation_receiver(
+        &mut self,
+        on_activate: ActivationCallback,
+    ) -> Result<(), PalError> {
+        if !self.is_owner || self.receiver_thread.is_some() {
+            return Ok(());
+        }
+        let class_name = format!("{}-sic", self.app_id);
+        let title_name = format!("{}-siw", self.app_id);
+        let handle = spawn_receiver_thread(
+            class_name,
+            title_name,
+            on_activate,
+            Arc::clone(&self.receiver_hwnd),
+            Arc::clone(&self.receiver_shutdown),
+        )?;
+        self.receiver_thread = Some(handle);
+        Ok(())
     }
 
     /// Returns `true` if this guard owns the primary single-instance lock.
@@ -166,8 +190,13 @@ impl WindowsSingleInstance {
 
 impl Drop for WindowsSingleInstance {
     fn drop(&mut self) {
-        if self.receiver_hwnd != 0 {
-            let hwnd = self.receiver_hwnd as HWND;
+        // SeqCst pair with the receiver thread's store(hwnd) -> load(shutdown) ensures
+        // either Drop sees the live HWND and posts WM_CLOSE, or the receiver thread sees
+        // `receiver_shutdown == true` and destroys the window before entering GetMessageW.
+        self.receiver_shutdown.store(true, Ordering::SeqCst);
+        let hwnd_raw = self.receiver_hwnd.load(Ordering::SeqCst);
+        if hwnd_raw != 0 {
+            let hwnd = hwnd_raw as HWND;
             // SAFETY: Posts `WM_CLOSE` to cleanly tear down our own hidden receiver window.
             unsafe {
                 let _ = PostMessageW(hwnd, WM_CLOSE, 0, 0);
@@ -268,11 +297,15 @@ fn spawn_receiver_thread(
     class_name: String,
     title_name: String,
     callback: ActivationCallback,
-) -> Result<(isize, Option<JoinHandle<()>>), PalError> {
-    let (tx, rx) = mpsc::sync_channel::<Result<isize, u32>>(1);
-    let handle = thread::Builder::new()
+    receiver_hwnd: Arc<AtomicIsize>,
+    receiver_shutdown: Arc<AtomicBool>,
+) -> Result<JoinHandle<()>, PalError> {
+    thread::Builder::new()
         .name("loom-single-instance".into())
         .spawn(move || {
+            if receiver_shutdown.load(Ordering::SeqCst) {
+                return;
+            }
             let wide_class = to_wide_null(&class_name);
             let wide_title = to_wide_null(&title_name);
             // SAFETY: Gets the current executable module handle.
@@ -313,7 +346,10 @@ fn spawn_receiver_thread(
             };
             if hwnd.is_null() {
                 let code = unsafe { GetLastError() };
-                let _ = tx.send(Err(code));
+                tracing::warn!(
+                    os_error = code,
+                    "failed to create single-instance receiver window"
+                );
                 return;
             }
 
@@ -324,10 +360,13 @@ fn spawn_receiver_thread(
             };
             if allowed == 0 {
                 let code = unsafe { GetLastError() };
+                tracing::warn!(
+                    os_error = code,
+                    "ChangeWindowMessageFilterEx(WM_COPYDATA) failed for single-instance receiver"
+                );
                 unsafe {
                     let _ = DestroyWindow(hwnd);
                 }
-                let _ = tx.send(Err(code));
                 return;
             }
 
@@ -337,7 +376,14 @@ fn spawn_receiver_thread(
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, cb_box);
             }
 
-            let _ = tx.send(Ok(hwnd as isize));
+            // Publish HWND before checking `receiver_shutdown` (SeqCst pair with Drop).
+            receiver_hwnd.store(hwnd as isize, Ordering::SeqCst);
+            if receiver_shutdown.load(Ordering::SeqCst) {
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+                return;
+            }
 
             let mut msg: MSG = unsafe { std::mem::zeroed() };
             // SAFETY: Standard Win32 message loop blocking with 0% CPU until `WM_CLOSE`.
@@ -348,27 +394,7 @@ fn spawn_receiver_thread(
                 }
             }
         })
-        .map_err(PalError::Io)?;
-
-    match rx.recv() {
-        Ok(Ok(hwnd)) => Ok((hwnd, Some(handle))),
-        Ok(Err(code)) => {
-            let _ = handle.join();
-            Err(PalError::OsError {
-                code: code as i32,
-                message: format!(
-                    "failed to initialize single-instance receiver window (os error {code})"
-                ),
-            })
-        }
-        Err(_) => {
-            let _ = handle.join();
-            Err(PalError::OsError {
-                code: -1,
-                message: "single-instance receiver thread exited unexpectedly".into(),
-            })
-        }
-    }
+        .map_err(PalError::Io)
 }
 
 unsafe extern "system" fn receiver_wnd_proc(
@@ -421,6 +447,8 @@ unsafe extern "system" fn receiver_wnd_proc(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use super::*;
 
     #[test]
@@ -458,5 +486,44 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .expect("primary must receive forwarded args");
         assert_eq!(received, forwarded);
+    }
+
+    #[test]
+    fn deferred_activation_receiver_forwards_args_and_drops_cleanly() {
+        let id = format!(
+            "loom-test-si-deferred-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut primary = WindowsSingleInstance::acquire(&id, &[], None).expect("acquire primary");
+        assert!(primary.is_single());
+
+        let (tx, rx) = mpsc::channel();
+        primary
+            .start_activation_receiver(Arc::new(move |args| {
+                let _ = tx.send(args);
+            }))
+            .expect("start deferred receiver");
+
+        let forwarded = vec!["--restore-route=details".to_owned()];
+        let secondary =
+            WindowsSingleInstance::acquire(&id, &forwarded, None).expect("acquire secondary");
+        assert!(!secondary.is_single());
+
+        let received = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("deferred receiver must deliver forwarded args");
+        assert_eq!(received, forwarded);
+
+        // Immediate spawn-and-drop race check must never deadlock.
+        let id2 = format!("{id}-drop");
+        let mut quick = WindowsSingleInstance::acquire(&id2, &[], None).expect("acquire quick");
+        quick
+            .start_activation_receiver(Arc::new(|_| {}))
+            .expect("start quick receiver");
+        drop(quick);
     }
 }

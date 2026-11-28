@@ -15,8 +15,8 @@ use loom_pal_api::{
     ProcessSampleScratch, SystemOperator,
 };
 use loom_types::{
-    AppHistoryRecord, AppSnapshot, MonitorDomain, ProcessKey, RefreshSpeed, ServiceRecord,
-    StartupEntry, Timestamp100Ns, UserSessionRecord,
+    AppHistoryRecord, AppSnapshot, MonitorDomain, ProcessCategory, ProcessKey, RefreshSpeed,
+    ServiceRecord, StartupEntry, Timestamp100Ns, UserSessionRecord,
 };
 use parking_lot::Mutex;
 
@@ -149,7 +149,7 @@ pub struct EngineCoordinator<B: PlatformBackend> {
     events: Arc<EventBus>,
     event_channel_capacity: usize,
     fast_handle: Mutex<Option<JoinHandle<()>>>,
-    shutdown_sent: AtomicBool,
+    shutdown_sent: Arc<AtomicBool>,
 }
 
 impl<B: PlatformBackend> EngineCoordinator<B> {
@@ -160,14 +160,16 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
     }
 
     /// Initializes an [`EngineCoordinator`] with explicit [`EngineConfig`] parameters.
+    ///
+    /// Fast-sampler construction, slow-prober initialization, and slow-lane bulkhead thread
+    /// creation all execute on the `loom-fast-sampler` background thread so the caller
+    /// returns immediately and can initialize the UI window in parallel with Tick 0.
     pub fn with_config(
         backend: B,
         settings: AppSettings,
         config: EngineConfig,
     ) -> Result<Self, PalError> {
         let backend = Arc::new(backend);
-        let fast_sampler = backend.create_fast_sampler()?;
-        let slow_prober = Arc::new(backend.create_slow_prober()?);
 
         let initial_snapshot = AppSnapshot {
             platform: B::PLATFORM,
@@ -183,16 +185,7 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
         let wake_signal = SnapshotWakeSignal::new();
         let leases = Arc::new(MonitorLeaseRegistry::with_wakeup(wake_tx));
         let events = Arc::new(EventBus::with_wake_signal(wake_signal.clone()));
-
-        let slow_pool = SlowLanePool::spawn(
-            Arc::clone(&backend),
-            slow_prober,
-            Arc::clone(&leases),
-            Arc::clone(&events),
-            config.slow_workers,
-            config.slow_queue_capacity,
-            config.slow_shutdown_timeout,
-        )?;
+        let shutdown_sent = Arc::new(AtomicBool::new(false));
 
         let logical_cpu_count = backend.operator().logical_cpu_count().max(1);
         let view_config = ViewProjectionConfig::from_settings(&settings);
@@ -204,10 +197,47 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
         let runner_wake_signal = wake_signal.clone();
         let runner_leases = Arc::clone(&leases);
         let runner_events = Arc::clone(&events);
+        let runner_shutdown = Arc::clone(&shutdown_sent);
 
         let fast_handle = thread::Builder::new()
             .name("loom-fast-sampler".to_owned())
             .spawn(move || {
+                if runner_shutdown.load(Ordering::Acquire) {
+                    runner_wake_signal.close();
+                    return;
+                }
+                let fast_sampler = match runner_backend.create_fast_sampler() {
+                    Ok(sampler) => sampler,
+                    Err(err) => {
+                        tracing::error!(%err, "failed to create platform fast sampler");
+                        runner_wake_signal.close();
+                        return;
+                    }
+                };
+                let slow_prober = match runner_backend.create_slow_prober() {
+                    Ok(prober) => Arc::new(prober),
+                    Err(err) => {
+                        tracing::error!(%err, "failed to create platform slow metadata prober");
+                        runner_wake_signal.close();
+                        return;
+                    }
+                };
+                let slow_pool = match SlowLanePool::spawn(
+                    Arc::clone(&runner_backend),
+                    slow_prober,
+                    Arc::clone(&runner_leases),
+                    Arc::clone(&runner_events),
+                    config.slow_workers,
+                    config.slow_queue_capacity,
+                    config.slow_shutdown_timeout,
+                ) {
+                    Ok(pool) => pool,
+                    Err(err) => {
+                        tracing::error!(%err, "failed to spawn slow-lane bulkhead pool");
+                        runner_wake_signal.close();
+                        return;
+                    }
+                };
                 let leak_cfg = config.leak_detector;
                 let mut runner = FastLaneRunner {
                     backend: runner_backend,
@@ -239,6 +269,7 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
                     process_scratch: ProcessSampleScratch::with_capacity(512, 16 * 1024),
                     perf_scratch: PerfSampleScratch::new(),
                     live_keys_scratch: HashSet::with_capacity(512),
+                    probe_candidates_scratch: Vec::with_capacity(512),
                     logical_cpu_count,
                     refresh_speed,
                     window_dormant: false,
@@ -295,7 +326,7 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
             events,
             event_channel_capacity,
             fast_handle: Mutex::new(Some(fast_handle)),
-            shutdown_sent: AtomicBool::new(false),
+            shutdown_sent,
         })
     }
 
@@ -442,6 +473,8 @@ struct FastLaneRunner<B: PlatformBackend> {
     process_scratch: ProcessSampleScratch<B::ProcessExt>,
     perf_scratch: PerfSampleScratch,
     live_keys_scratch: HashSet<ProcessKey>,
+    /// Reusable prioritized probe candidate scratch `(category_rank, private_ws_bytes, key)`.
+    probe_candidates_scratch: Vec<(u8, u64, ProcessKey)>,
     logical_cpu_count: u32,
     refresh_speed: RefreshSpeed,
     window_dormant: bool,
@@ -490,7 +523,11 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         self.sync_process_network_state();
 
         // Tick 0: publish first interactive frame immediately before entering the event loop.
+        // Skip per-process GPU discovery/D3DKMT queries on Tick 0 (GPU utilization deltas are
+        // zero on the first sample anyway) and re-enable immediately for Tick 1 (+250 ms).
+        self.fast_sampler.set_per_process_gpu_enabled(false);
         self.run_sample_tick();
+        self.fast_sampler.set_per_process_gpu_enabled(true);
         self.schedule_after_tick(true);
 
         loop {
@@ -857,13 +894,29 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             .details_expanded
             .retain(|k| self.live_keys_scratch.contains(k));
 
-        for key in self.projection.live_keys() {
+        self.probe_candidates_scratch.clear();
+        for (key, category, private_ws_bytes) in self.projection.live_probe_candidates() {
             if self.cold_cache.get_process(key).is_some()
                 || self.pending_procs.contains(&key)
                 || self.failed_procs.contains_key(&key)
             {
                 continue;
             }
+            let tier = match category {
+                ProcessCategory::App => 0,
+                ProcessCategory::Background => 1,
+                ProcessCategory::System => 2,
+            };
+            self.probe_candidates_scratch
+                .push((tier, private_ws_bytes, key));
+        }
+
+        // Prioritize foreground `App` processes (and heavier memory footprints first) so visible
+        // top rows backfill icons and descriptions ahead of background/system services.
+        self.probe_candidates_scratch
+            .sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+
+        for &(_, _, key) in &self.probe_candidates_scratch {
             if self
                 .slow_pool
                 .try_enqueue_probe(SlowProbeJob::ProbeProcess(key))

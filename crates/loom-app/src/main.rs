@@ -1,5 +1,6 @@
 //! Loom desktop task manager binary entry point (composition root).
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![warn(missing_docs)]
 
 mod bootstrap;
@@ -7,6 +8,7 @@ mod bridge;
 mod features;
 mod i18n;
 mod shell;
+mod startup_trace;
 
 use loom_pal::{NativeBackend, PlatformBackend};
 
@@ -24,15 +26,21 @@ fn main() {
         std::process::exit(exit_code);
     }
 
-    // 1. Boost process scheduling priority immediately to stay responsive under 100% CPU load.
-    NativeBackend::boost_self_priority();
+    // 1. Parse optional CLI flags (`--restore-route`, `--config`, `--allow-multiple`,
+    //    `--startup-trace`) and arm the opt-in startup tracer before any OS/UI work.
+    let args = bootstrap::LaunchArgs::parse_from(&raw_args);
+    startup_trace::init(args.startup_trace.clone());
 
-    // 2. Initialize lightweight non-blocking tracing output.
+    // 2. Boost process scheduling priority immediately to stay responsive under 100% CPU load.
+    NativeBackend::boost_self_priority();
+    startup_trace::mark("priority_boost");
+
+    // 3. Initialize lightweight non-blocking tracing output.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
+    startup_trace::mark("tracing_init");
 
-    // 3. Parse optional CLI flags (`--restore-route`, `--config`, `--allow-multiple`) and run.
-    let args = bootstrap::LaunchArgs::parse_from(&raw_args);
+    // 4. Execute the progressive startup pipeline.
     bootstrap::run(args, raw_args);
 }
