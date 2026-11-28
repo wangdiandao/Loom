@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
@@ -20,11 +20,11 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Size, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
-    App, AppContext as _, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, GlobalElementId, Hsla, InspectorElementId,
-    InteractiveElement as _, IntoElement, LayoutId, ParentElement as _, Pixels, Position, Render,
-    RenderImage, SharedString, StatefulInteractiveElement as _, Style, Styled as _, Window, div,
-    px,
+    App, AppContext as _, Bounds, ClickEvent, ClipboardItem, Context, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, GlobalElementId, Hsla,
+    InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, MouseButton,
+    ParentElement as _, Pixels, Position, Render, RenderImage, SharedString,
+    StatefulInteractiveElement as _, Style, Styled as _, Window, div, px,
 };
 use loom_config::TableColumnSetting;
 use loom_engine::EngineCommand;
@@ -396,6 +396,87 @@ impl<C: ColumnKey> TableColumnLayout<C> {
         true
     }
 
+    /// Returns the number of leading left-pinned (`locked == true`) visible columns.
+    #[inline]
+    pub(crate) fn pinned_count(&self) -> usize {
+        self.visible.iter().take_while(|c| c.locked).count()
+    }
+
+    /// Computes a 64-bit bitmask of visible column display indices currently inside the viewport.
+    ///
+    /// Leading pinned columns (`0..pinned_count`) are always marked visible. When `scrollable_range`
+    /// is empty (before the first horizontal virtual-list measurement), all visible columns are
+    /// included so viewport fingerprinting stays conservative on initial paint.
+    pub(crate) fn visible_cols_mask(&self, scrollable_range: &Range<usize>) -> u64 {
+        let total = self.visible.len().min(64);
+        if total == 0 {
+            return 0;
+        }
+        if scrollable_range.is_empty() {
+            return if total == 64 {
+                u64::MAX
+            } else {
+                (1u64 << total) - 1
+            };
+        }
+        let pinned = self.pinned_count().min(total);
+        let mut mask = if pinned == 64 {
+            u64::MAX
+        } else if pinned == 0 {
+            0
+        } else {
+            (1u64 << pinned) - 1
+        };
+        let start = pinned.saturating_add(scrollable_range.start).min(total);
+        let end = pinned.saturating_add(scrollable_range.end).min(total);
+        for ix in start..end {
+            mask |= 1u64 << ix;
+        }
+        mask
+    }
+
+    /// Resolves the visible column display index hit by a pointer click at `local_x`
+    /// relative to the table's left edge, accounting for leading left-pinned columns
+    /// and horizontal scroll distance `scroll_x_positive` (`(-offset.x).max(0.0)`).
+    ///
+    /// Returns `None` if `local_x` is negative, non-finite, or past the right edge of
+    /// the last visible column.
+    pub(crate) fn column_index_at_x(&self, local_x: f32, scroll_x_positive: f32) -> Option<usize> {
+        if !local_x.is_finite() || local_x < 0.0 || self.visible.is_empty() {
+            return None;
+        }
+
+        let mut pinned_width = 0.0_f32;
+        let mut pinned_count = 0usize;
+        for (ix, spec) in self.visible.iter().enumerate() {
+            if !spec.locked {
+                break;
+            }
+            let next = pinned_width + spec.width;
+            if local_x < next {
+                return Some(ix);
+            }
+            pinned_width = next;
+            pinned_count = ix + 1;
+        }
+
+        let scroll_x = if scroll_x_positive.is_finite() {
+            scroll_x_positive.max(0.0)
+        } else {
+            0.0
+        };
+        let content_x = (local_x - pinned_width) + scroll_x;
+        let mut cursor = 0.0_f32;
+        for (ix, spec) in self.visible.iter().enumerate().skip(pinned_count) {
+            let next = cursor + spec.width;
+            if content_x < next {
+                return Some(ix);
+            }
+            cursor = next;
+        }
+        None
+    }
+
     fn visible_to_all_index(&self, vis_ix: usize) -> Option<usize> {
         self.columns
             .iter()
@@ -761,11 +842,14 @@ impl OrderFreezeState {
 }
 
 /// Renders a subtle amber paused-sort indicator icon on the active sort column header.
+///
+/// Accepts a pre-cached `tooltip` string from the table's locale cache to avoid
+/// per-frame `i18n::tr` allocations during header rendering.
 pub(crate) fn sort_paused_indicator(
     id: (&'static str, usize),
     accent_color: Hsla,
+    tooltip: SharedString,
 ) -> impl IntoElement {
-    let tip = SharedString::from(i18n::tr("proc_ux_sort_paused_tooltip"));
     h_flex()
         .id(id)
         .flex_shrink_0()
@@ -774,13 +858,272 @@ pub(crate) fn sort_paused_indicator(
         .size(px(16.0))
         .rounded_full()
         .bg(accent_color.opacity(0.16))
-        .aria_label(tip.clone())
-        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .aria_label(tooltip.clone())
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
         .child(
             Icon::new(IconName::Pause)
                 .size(px(10.0))
                 .text_color(accent_color),
         )
+}
+
+/// Lightweight interactive expand/collapse chevron replacing the full `Button` widget
+/// inside high-density tree table rows.
+pub(crate) fn expand_chevron_button(
+    id: (&'static str, usize),
+    is_expanded: bool,
+    hover_bg: Hsla,
+    muted_fg: Hsla,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .size(px(20.0))
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover_bg))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_click(on_click)
+        .child(
+            Icon::new(if is_expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            })
+            .xsmall()
+            .text_color(muted_fg),
+        )
+}
+
+// ---------------------------------------------------------------------------
+// Scroll-burst coalescer & deterministic viewport fingerprint hasher
+// ---------------------------------------------------------------------------
+
+/// Default quiet period after the latest scroll tick before deferred snapshots flush (`150 ms`).
+pub(crate) const DEFAULT_SCROLL_QUIET_WINDOW: Duration = Duration::from_millis(150);
+
+/// Default upper bound on snapshot deferral during continuous scrolling (`500 ms`).
+pub(crate) const DEFAULT_MAX_DEFER_WINDOW: Duration = Duration::from_millis(500);
+
+/// Pure, deterministic state machine that defers periodic live snapshot notifications
+/// during active table scroll bursts so `gpui-fast`'s GPU scroll layers remain intact.
+///
+/// User-initiated updates (search filter, sort change, view mode change, expand/collapse,
+/// or jump-to-row navigation) always bypass deferral immediately.
+#[derive(Debug, Clone)]
+pub(crate) struct ScrollBurstCoalescer {
+    scroll_quiet_window: Duration,
+    max_defer_window: Duration,
+    last_scroll_at: Option<Instant>,
+    first_deferred_at: Option<Instant>,
+    has_pending: bool,
+}
+
+impl Default for ScrollBurstCoalescer {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScrollBurstCoalescer {
+    /// Creates a [`ScrollBurstCoalescer`] with the default `150 ms` quiet window and
+    /// `500 ms` maximum deferral cap.
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self::with_windows(DEFAULT_SCROLL_QUIET_WINDOW, DEFAULT_MAX_DEFER_WINDOW)
+    }
+
+    /// Creates a [`ScrollBurstCoalescer`] with custom quiet and maximum deferral windows.
+    #[inline]
+    pub(crate) const fn with_windows(
+        scroll_quiet_window: Duration,
+        max_defer_window: Duration,
+    ) -> Self {
+        Self {
+            scroll_quiet_window,
+            max_defer_window,
+            last_scroll_at: None,
+            first_deferred_at: None,
+            has_pending: false,
+        }
+    }
+
+    /// Records a scroll event at `now`.
+    #[inline]
+    pub(crate) fn on_scroll(&mut self, now: Instant) {
+        self.last_scroll_at = Some(now);
+    }
+
+    /// Returns `true` if a live snapshot arriving at `now` should be deferred until scrolling
+    /// settles or the maximum deferral window elapses.
+    ///
+    /// User-initiated updates (`is_user_initiated == true`) clear any pending deferred state
+    /// and always return `false`.
+    pub(crate) fn should_defer_snapshot(&mut self, now: Instant, is_user_initiated: bool) -> bool {
+        if is_user_initiated {
+            self.has_pending = false;
+            self.first_deferred_at = None;
+            return false;
+        }
+
+        if let Some(last_scroll) = self.last_scroll_at
+            && now.saturating_duration_since(last_scroll) < self.scroll_quiet_window
+        {
+            if let Some(first_deferred) = self.first_deferred_at
+                && now.saturating_duration_since(first_deferred) >= self.max_defer_window
+            {
+                self.has_pending = false;
+                self.first_deferred_at = None;
+                return false;
+            }
+            self.has_pending = true;
+            self.first_deferred_at.get_or_insert(now);
+            return true;
+        }
+
+        self.has_pending = false;
+        self.first_deferred_at = None;
+        false
+    }
+
+    /// Returns how long a flush timer should wait before applying the pending snapshot,
+    /// bounded by both the scroll quiet window and the maximum deferral cap.
+    ///
+    /// Returns `None` if no snapshot is currently pending.
+    pub(crate) fn remaining_quiet_delay(&self, now: Instant) -> Option<Duration> {
+        if !self.has_pending {
+            return None;
+        }
+        let quiet_rem = self
+            .last_scroll_at
+            .map(|last| {
+                self.scroll_quiet_window
+                    .saturating_sub(now.saturating_duration_since(last))
+            })
+            .unwrap_or(Duration::ZERO);
+        let cap_rem = self
+            .first_deferred_at
+            .map(|first| {
+                self.max_defer_window
+                    .saturating_sub(now.saturating_duration_since(first))
+            })
+            .unwrap_or(quiet_rem);
+        Some(quiet_rem.min(cap_rem))
+    }
+
+    /// Clears deferred state and returns whether a pending snapshot existed.
+    #[inline]
+    pub(crate) fn take_pending(&mut self) -> bool {
+        let had = self.has_pending;
+        self.has_pending = false;
+        self.first_deferred_at = None;
+        had
+    }
+}
+
+/// Fast, deterministic 64-bit FNV-1a hasher for computing table viewport fingerprints
+/// without `RandomState` initialization or heap allocations.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FnvHasher64(u64);
+
+impl Default for FnvHasher64 {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FnvHasher64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    /// Creates a new [`FnvHasher64`] initialized with the 64-bit FNV-1a offset basis.
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self(Self::OFFSET_BASIS)
+    }
+
+    /// Mixes a byte slice into the hash state.
+    #[inline]
+    pub(crate) fn write_bytes(&mut self, bytes: &[u8]) {
+        let mut hash = self.0;
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(Self::PRIME);
+        }
+        self.0 = hash;
+    }
+
+    /// Mixes a single `u8` into the hash state.
+    #[inline]
+    pub(crate) fn write_u8(&mut self, v: u8) {
+        self.0 ^= u64::from(v);
+        self.0 = self.0.wrapping_mul(Self::PRIME);
+    }
+
+    /// Mixes a `bool` into the hash state.
+    #[inline]
+    pub(crate) fn write_bool(&mut self, v: bool) {
+        self.write_u8(u8::from(v));
+    }
+
+    /// Mixes a `u16` into the hash state.
+    #[inline]
+    pub(crate) fn write_u16(&mut self, v: u16) {
+        self.write_bytes(&v.to_le_bytes());
+    }
+
+    /// Mixes a `u32` into the hash state.
+    #[inline]
+    pub(crate) fn write_u32(&mut self, v: u32) {
+        self.write_bytes(&v.to_le_bytes());
+    }
+
+    /// Mixes a `u64` into the hash state.
+    #[inline]
+    pub(crate) fn write_u64(&mut self, v: u64) {
+        self.write_bytes(&v.to_le_bytes());
+    }
+
+    /// Mixes a `usize` into the hash state.
+    #[inline]
+    pub(crate) fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64);
+    }
+
+    /// Mixes a length-delimited string slice into the hash state.
+    #[inline]
+    pub(crate) fn write_str(&mut self, s: &str) {
+        self.write_usize(s.len());
+        self.write_bytes(s.as_bytes());
+    }
+
+    /// Mixes a bounded head+tail sample of a potentially multi-kilobyte string (e.g. command line)
+    /// into the hash state in `O(1)` time.
+    #[inline]
+    pub(crate) fn write_preview_str(&mut self, s: &str) {
+        let bytes = s.as_bytes();
+        self.write_usize(bytes.len());
+        if bytes.len() <= 320 {
+            self.write_bytes(bytes);
+        } else {
+            self.write_bytes(&bytes[..256]);
+            self.write_bytes(&bytes[bytes.len() - 64..]);
+        }
+    }
+
+    /// Returns the final 64-bit fingerprint.
+    #[inline]
+    pub(crate) const fn finish(self) -> u64 {
+        self.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1838,5 +2181,128 @@ mod tests {
             rust_i18n::t!("proc_ux_copy_column", locale = "zh-CN", column = "发布者"),
             "复制“发布者”"
         );
+    }
+
+    #[test]
+    fn column_index_at_x_handles_pinned_scroll_bounds_and_layout_mutations() {
+        let mut layout = sample_layout();
+        // Visible initially: [Name (pinned, 200), Cpu (80), Memory (100), Publisher (140)].
+        // Total width = 520.
+
+        // Negative or non-finite coordinates never match.
+        assert_eq!(layout.column_index_at_x(-1.0, 0.0), None);
+        assert_eq!(layout.column_index_at_x(f32::NAN, 0.0), None);
+        assert_eq!(layout.column_index_at_x(f32::INFINITY, 0.0), None);
+
+        // Left-pinned Name column [0, 200) hits index 0 regardless of horizontal scroll.
+        assert_eq!(layout.column_index_at_x(0.0, 0.0), Some(0));
+        assert_eq!(layout.column_index_at_x(199.5, 0.0), Some(0));
+        assert_eq!(layout.column_index_at_x(50.0, 120.0), Some(0));
+        assert_eq!(layout.column_index_at_x(199.9, 250.0), Some(0));
+
+        // Scrollable columns at scroll_x = 0:
+        // Cpu: [200, 280), Memory: [280, 380), Publisher: [380, 520), past end: >= 520.
+        assert_eq!(layout.column_index_at_x(200.0, 0.0), Some(1));
+        assert_eq!(layout.column_index_at_x(279.9, 0.0), Some(1));
+        assert_eq!(layout.column_index_at_x(280.0, 0.0), Some(2));
+        assert_eq!(layout.column_index_at_x(379.9, 0.0), Some(2));
+        assert_eq!(layout.column_index_at_x(380.0, 0.0), Some(3));
+        assert_eq!(layout.column_index_at_x(519.9, 0.0), Some(3));
+        assert_eq!(layout.column_index_at_x(520.0, 0.0), None);
+        assert_eq!(layout.column_index_at_x(900.0, 0.0), None);
+
+        // After scrolling right by 80 px, Cpu is scrolled under Name, so local_x = 210 hits Memory (2).
+        assert_eq!(layout.column_index_at_x(210.0, 80.0), Some(2));
+        // Scrolling right by 180 px brings Publisher to local_x = 200.
+        assert_eq!(layout.column_index_at_x(200.0, 180.0), Some(3));
+        // Past Publisher when scrolled right by 180 px: content_x = (340 - 200) + 180 = 320 -> None.
+        assert_eq!(layout.column_index_at_x(340.0, 180.0), None);
+
+        // After hiding Cpu, reordering Publisher before Memory, and resizing Name to 150 px:
+        assert!(layout.hide_column(TestCol::Cpu));
+        // Visible: [Name (200), Memory (100), Publisher (140)]
+        assert!(layout.move_visible_column(2, 1));
+        // Visible: [Name (200), Publisher (140), Memory (100)]
+        assert!(layout.apply_visible_widths(&[px(150.0), px(140.0), px(100.0)]));
+        // Pinned Name is now [0, 150), Publisher [150, 290), Memory [290, 390).
+        assert_eq!(layout.column_index_at_x(149.0, 0.0), Some(0));
+        assert_eq!(layout.column_index_at_x(150.0, 0.0), Some(1));
+        assert_eq!(layout.column_index_at_x(290.0, 0.0), Some(2));
+        assert_eq!(layout.column_index_at_x(390.0, 0.0), None);
+        // With scroll_x = 140, local_x = 155 lands on Memory (index 2).
+        assert_eq!(layout.column_index_at_x(155.0, 140.0), Some(2));
+    }
+
+    #[test]
+    fn visible_cols_mask_always_includes_pinned_and_handles_empty_range() {
+        let layout = sample_layout();
+        // 4 visible columns: Name (pinned), Cpu, Memory, Publisher.
+        assert_eq!(layout.pinned_count(), 1);
+        // Empty range (initial paint) conservatively marks all 4 columns visible.
+        assert_eq!(layout.visible_cols_mask(&(0..0)), 0b1111);
+        // Scrollable range 0..1 marks Name (bit 0) and Cpu (bit 1).
+        assert_eq!(layout.visible_cols_mask(&(0..1)), 0b0011);
+        // Scrollable range 1..3 marks Name (bit 0), Memory (bit 2), Publisher (bit 3).
+        assert_eq!(layout.visible_cols_mask(&(1..3)), 0b1101);
+    }
+
+    #[test]
+    fn scroll_burst_coalescer_defers_during_scroll_flushes_on_quiet_cap_and_user_action() {
+        let quiet = Duration::from_millis(150);
+        let cap = Duration::from_millis(500);
+        let mut coalescer = ScrollBurstCoalescer::with_windows(quiet, cap);
+        let t0 = Instant::now();
+
+        // 1. No prior scroll -> apply immediately.
+        assert!(!coalescer.should_defer_snapshot(t0, false));
+        assert_eq!(coalescer.remaining_quiet_delay(t0), None);
+        assert!(!coalescer.take_pending());
+
+        // 2. During active scroll -> defer and report remaining quiet delay.
+        coalescer.on_scroll(t0);
+        let t_50 = t0 + Duration::from_millis(50);
+        assert!(coalescer.should_defer_snapshot(t_50, false));
+        assert_eq!(
+            coalescer.remaining_quiet_delay(t_50),
+            Some(Duration::from_millis(100))
+        );
+
+        // 3. Quiet window elapsed (>= 150ms since last scroll) -> flush immediately.
+        let t_150 = t0 + Duration::from_millis(150);
+        assert_eq!(coalescer.remaining_quiet_delay(t_150), Some(Duration::ZERO));
+        assert!(!coalescer.should_defer_snapshot(t_150, false));
+        assert!(!coalescer.take_pending());
+
+        // 4. Continuous scroll past max_defer_window (500ms) -> cap reached, force flush!
+        let base = t0 + Duration::from_secs(2);
+        coalescer.on_scroll(base);
+        assert!(coalescer.should_defer_snapshot(base + Duration::from_millis(10), false));
+        // Keep scrolling every 100ms (never quiet for 150ms) until 510ms elapsed since first defer.
+        for step in 1..=4 {
+            let now = base + Duration::from_millis(step * 100);
+            coalescer.on_scroll(now);
+            assert!(
+                coalescer.should_defer_snapshot(now + Duration::from_millis(10), false),
+                "step {step} should still defer before 500ms cap"
+            );
+        }
+        // At 490ms since first_deferred (base + 10ms), remaining_quiet_delay is clamped to 10ms.
+        let t_near_cap = base + Duration::from_millis(500);
+        coalescer.on_scroll(t_near_cap);
+        assert_eq!(
+            coalescer.remaining_quiet_delay(t_near_cap),
+            Some(Duration::from_millis(10))
+        );
+        // At base + 510ms (500ms after first defer at base + 10ms), cap triggers flush.
+        let t_cap = base + Duration::from_millis(510);
+        assert!(!coalescer.should_defer_snapshot(t_cap, false));
+        assert!(!coalescer.take_pending());
+
+        // 5. User-initiated snapshot always bypasses deferral immediately, even mid-scroll.
+        let t_user = base + Duration::from_secs(2);
+        coalescer.on_scroll(t_user);
+        assert!(coalescer.should_defer_snapshot(t_user + Duration::from_millis(20), false));
+        assert!(!coalescer.should_defer_snapshot(t_user + Duration::from_millis(30), true));
+        assert!(!coalescer.take_pending());
     }
 }
