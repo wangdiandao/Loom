@@ -453,12 +453,20 @@ struct SchwartzEntry {
     tie_str: (u32, u32),
 }
 
+/// Dense per-process previous-tick deadband state indexed directly by `computed` index
+/// so `slice::sort_by` performs `O(1)` array indexing with zero `HashMap` lookups.
+#[derive(Debug, Clone, Copy, Default)]
+struct DenseDeadbandEntry {
+    prev_rank: usize,
+    prev_sticky: u64,
+    has_prev: bool,
+}
+
 /// Borrowed sort hysteresis deadband state for a single projection pass.
 #[derive(Clone, Copy)]
 struct DeadbandContext<'a> {
     deadband: u64,
-    prev_ranks: &'a HashMap<ProcessKey, usize, FastBuildHasher>,
-    prev_sticky: &'a HashMap<ProcessKey, u64, FastBuildHasher>,
+    dense_prev: &'a [DenseDeadbandEntry],
 }
 
 /// Persistent scratch buffers owned by [`ProjectionEngine`] and cleared in place across ticks
@@ -466,6 +474,7 @@ struct DeadbandContext<'a> {
 #[derive(Debug, Default)]
 struct ProjectionScratch {
     frozen_ranks: HashMap<ProcessKey, usize, FastBuildHasher>,
+    dense_deadband: Vec<DenseDeadbandEntry>,
     bool_mask_a: Vec<bool>,
     bool_mask_b: Vec<bool>,
     bool_mask_c: Vec<bool>,
@@ -494,6 +503,7 @@ impl ProjectionScratch {
     fn with_capacity(cap: usize) -> Self {
         Self {
             frozen_ranks: HashMap::with_capacity_and_hasher(cap, FastBuildHasher),
+            dense_deadband: Vec::with_capacity(cap),
             bool_mask_a: Vec::with_capacity(cap),
             bool_mask_b: Vec::with_capacity(cap),
             bool_mask_c: Vec::with_capacity(cap),
@@ -520,6 +530,42 @@ impl ProjectionScratch {
             folded_arena: FoldedKeyArena::default(),
             schwartz_entries: Vec::with_capacity(cap),
             schwartz_children: Vec::with_capacity(64),
+        }
+    }
+
+    #[inline]
+    fn populate_dense_deadband(
+        &mut self,
+        computed: &[ComputedProcess],
+        prev_map: &HashMap<ProcessKey, (usize, u64), FastBuildHasher>,
+    ) {
+        self.dense_deadband.clear();
+        self.dense_deadband.reserve(computed.len());
+        if prev_map.is_empty() {
+            self.dense_deadband.resize(
+                computed.len(),
+                DenseDeadbandEntry {
+                    prev_rank: usize::MAX,
+                    prev_sticky: 0,
+                    has_prev: false,
+                },
+            );
+            return;
+        }
+        for proc in computed {
+            if let Some(&(prev_rank, prev_sticky)) = prev_map.get(&proc.key) {
+                self.dense_deadband.push(DenseDeadbandEntry {
+                    prev_rank,
+                    prev_sticky,
+                    has_prev: true,
+                });
+            } else {
+                self.dense_deadband.push(DenseDeadbandEntry {
+                    prev_rank: usize::MAX,
+                    prev_sticky: 0,
+                    has_prev: false,
+                });
+            }
         }
     }
 
@@ -569,12 +615,10 @@ pub struct ProjectionEngine {
     listening_ports: HashSet<(u32, u16)>,
     leak_detector: LeakDetector,
     prev_proc_sort_signature: Option<ProcSortSignature>,
-    prev_proc_ranks: HashMap<ProcessKey, usize, FastBuildHasher>,
-    prev_proc_sticky_metrics: HashMap<ProcessKey, u64, FastBuildHasher>,
+    prev_proc_deadband: HashMap<ProcessKey, (usize, u64), FastBuildHasher>,
     prev_details_sort_signature: Option<DetailsSortSignature>,
-    prev_details_ranks: HashMap<ProcessKey, usize, FastBuildHasher>,
-    prev_details_sticky_metrics: HashMap<ProcessKey, u64, FastBuildHasher>,
-    next_sticky_scratch: HashMap<ProcessKey, u64, FastBuildHasher>,
+    prev_details_deadband: HashMap<ProcessKey, (usize, u64), FastBuildHasher>,
+    next_deadband_scratch: HashMap<ProcessKey, (usize, u64), FastBuildHasher>,
     scratch: ProjectionScratch,
 }
 
@@ -631,12 +675,10 @@ impl ProjectionEngine {
             listening_ports: HashSet::new(),
             leak_detector: LeakDetector::with_config(leak_config),
             prev_proc_sort_signature: None,
-            prev_proc_ranks: HashMap::with_capacity_and_hasher(512, FastBuildHasher),
-            prev_proc_sticky_metrics: HashMap::with_capacity_and_hasher(512, FastBuildHasher),
+            prev_proc_deadband: HashMap::with_capacity_and_hasher(512, FastBuildHasher),
             prev_details_sort_signature: None,
-            prev_details_ranks: HashMap::with_capacity_and_hasher(512, FastBuildHasher),
-            prev_details_sticky_metrics: HashMap::with_capacity_and_hasher(512, FastBuildHasher),
-            next_sticky_scratch: HashMap::with_capacity_and_hasher(512, FastBuildHasher),
+            prev_details_deadband: HashMap::with_capacity_and_hasher(512, FastBuildHasher),
+            next_deadband_scratch: HashMap::with_capacity_and_hasher(512, FastBuildHasher),
             scratch: ProjectionScratch::with_capacity(512),
         }
     }
@@ -1175,8 +1217,7 @@ impl ProjectionEngine {
                     && sig.3 == config.search_query
             });
             if !sig_matches {
-                self.prev_proc_ranks.clear();
-                self.prev_proc_sticky_metrics.clear();
+                self.prev_proc_deadband.clear();
                 self.prev_proc_sort_signature = Some((
                     config.process_view_mode,
                     config.process_sort_column,
@@ -1184,10 +1225,11 @@ impl ProjectionEngine {
                     config.search_query.clone(),
                 ));
             }
+            self.scratch
+                .populate_dense_deadband(&self.computed, &self.prev_proc_deadband);
         } else if self.prev_proc_sort_signature.is_some() {
             self.prev_proc_sort_signature = None;
-            self.prev_proc_ranks.clear();
-            self.prev_proc_sticky_metrics.clear();
+            self.prev_proc_deadband.clear();
         }
 
         let rows = match config.process_view_mode {
@@ -1208,23 +1250,27 @@ impl ProjectionEngine {
         };
 
         if let Some(deadband) = proc_deadband {
-            self.prev_proc_ranks.clear();
-            self.next_sticky_scratch.clear();
+            self.next_deadband_scratch.clear();
+            self.next_deadband_scratch.reserve(rows.len());
             let mut rank = 0usize;
             for row in &rows {
                 if row.kind != ProcessRowKind::Process {
                     continue;
                 }
                 let live = process_row_deadband_metric(row, config.process_sort_column);
-                let sticky =
-                    resolve_sticky_metric(row.key, live, deadband, &self.prev_proc_sticky_metrics);
-                self.prev_proc_ranks.insert(row.key, rank);
-                self.next_sticky_scratch.insert(row.key, sticky);
+                let sticky = if let Some(&(_, prev_val)) = self.prev_proc_deadband.get(&row.key)
+                    && live.abs_diff(prev_val) < deadband
+                {
+                    prev_val
+                } else {
+                    live
+                };
+                self.next_deadband_scratch.insert(row.key, (rank, sticky));
                 rank += 1;
             }
             std::mem::swap(
-                &mut self.prev_proc_sticky_metrics,
-                &mut self.next_sticky_scratch,
+                &mut self.prev_proc_deadband,
+                &mut self.next_deadband_scratch,
             );
         }
 
@@ -1273,8 +1319,7 @@ impl ProjectionEngine {
                         && sig.3 == config.search_query
                 });
             if !sig_matches {
-                self.prev_details_ranks.clear();
-                self.prev_details_sticky_metrics.clear();
+                self.prev_details_deadband.clear();
                 self.prev_details_sort_signature = Some((
                     config.details_view_mode,
                     config.details_sort_column,
@@ -1282,10 +1327,11 @@ impl ProjectionEngine {
                     config.search_query.clone(),
                 ));
             }
+            self.scratch
+                .populate_dense_deadband(&self.computed, &self.prev_details_deadband);
         } else if self.prev_details_sort_signature.is_some() {
             self.prev_details_sort_signature = None;
-            self.prev_details_ranks.clear();
-            self.prev_details_sticky_metrics.clear();
+            self.prev_details_deadband.clear();
         }
 
         let rows = match config.details_view_mode {
@@ -1306,22 +1352,22 @@ impl ProjectionEngine {
         };
 
         if let Some(deadband) = details_deadband {
-            self.prev_details_ranks.clear();
-            self.next_sticky_scratch.clear();
+            self.next_deadband_scratch.clear();
+            self.next_deadband_scratch.reserve(rows.len());
             for (rank, row) in rows.iter().enumerate() {
                 let live = u64::from(row.cpu_permille);
-                let sticky = resolve_sticky_metric(
-                    row.key,
-                    live,
-                    deadband,
-                    &self.prev_details_sticky_metrics,
-                );
-                self.prev_details_ranks.insert(row.key, rank);
-                self.next_sticky_scratch.insert(row.key, sticky);
+                let sticky = if let Some(&(_, prev_val)) = self.prev_details_deadband.get(&row.key)
+                    && live.abs_diff(prev_val) < deadband
+                {
+                    prev_val
+                } else {
+                    live
+                };
+                self.next_deadband_scratch.insert(row.key, (rank, sticky));
             }
             std::mem::swap(
-                &mut self.prev_details_sticky_metrics,
-                &mut self.next_sticky_scratch,
+                &mut self.prev_details_deadband,
+                &mut self.next_deadband_scratch,
             );
         }
 
@@ -1929,8 +1975,6 @@ impl ProjectionEngine {
             leak_detector,
             total_disk_bytes_per_sec,
             total_net_bytes_per_sec,
-            prev_proc_ranks,
-            prev_proc_sticky_metrics,
             scratch,
             ..
         } = self;
@@ -1938,14 +1982,10 @@ impl ProjectionEngine {
         let n = computed.len();
         let total_disk_bps = *total_disk_bytes_per_sec;
         let total_net_bps = *total_net_bytes_per_sec;
-        let deadband_ctx = deadband.map(|db| DeadbandContext {
-            deadband: db,
-            prev_ranks: prev_proc_ranks,
-            prev_sticky: prev_proc_sticky_metrics,
-        });
 
         let ProjectionScratch {
             ref frozen_ranks,
+            ref dense_deadband,
             bool_mask_a: ref mut in_any_section,
             bool_mask_b: ref mut visited,
             ref mut stack,
@@ -1955,6 +1995,10 @@ impl ProjectionEngine {
             ..
         } = *scratch;
         let frozen_ranks = use_frozen.then_some(frozen_ranks);
+        let deadband_ctx = deadband.map(|db| DeadbandContext {
+            deadband: db,
+            dense_prev: dense_deadband.as_slice(),
+        });
 
         for vec in by_category.iter_mut() {
             vec.clear();
@@ -2107,8 +2151,6 @@ impl ProjectionEngine {
             latest_perf,
             total_disk_bytes_per_sec,
             total_net_bytes_per_sec,
-            prev_proc_ranks,
-            prev_proc_sticky_metrics,
             scratch,
             ..
         } = self;
@@ -2117,14 +2159,10 @@ impl ProjectionEngine {
         let mem_total_bytes = latest_perf.mem_total_bytes;
         let total_disk_bps = *total_disk_bytes_per_sec;
         let total_net_bps = *total_net_bytes_per_sec;
-        let deadband_ctx = deadband.map(|db| DeadbandContext {
-            deadband: db,
-            prev_ranks: prev_proc_ranks,
-            prev_sticky: prev_proc_sticky_metrics,
-        });
 
         let ProjectionScratch {
             ref frozen_ranks,
+            ref dense_deadband,
             bool_mask_a: ref mut in_remaining_section,
             bool_mask_b: ref mut visited,
             ref mut stack,
@@ -2146,6 +2184,10 @@ impl ProjectionEngine {
             ..
         } = *scratch;
         let frozen_ranks = use_frozen.then_some(frozen_ranks);
+        let deadband_ctx = deadband.map(|db| DeadbandContext {
+            deadband: db,
+            dense_prev: dense_deadband.as_slice(),
+        });
 
         app_group_leaders.clear();
         idx_to_app_group.clear();
@@ -2424,11 +2466,10 @@ impl ProjectionEngine {
             let sort_col = config.process_sort_column;
             let sort_dir = config.process_sort_direction;
             visible_apps.sort_by(|(ia, _, agg_a), (ib, _, agg_b)| {
-                let a = &computed[*ia];
-                let b = &computed[*ib];
                 compare_process_items(
-                    a,
-                    b,
+                    *ia,
+                    *ib,
+                    computed,
                     Some(agg_a),
                     Some(agg_b),
                     cold_cache,
@@ -2679,8 +2720,6 @@ impl ProjectionEngine {
             leak_detector,
             total_disk_bytes_per_sec,
             total_net_bytes_per_sec,
-            prev_proc_ranks,
-            prev_proc_sticky_metrics,
             scratch,
             ..
         } = self;
@@ -2688,14 +2727,10 @@ impl ProjectionEngine {
         let n = computed.len();
         let total_disk_bps = *total_disk_bytes_per_sec;
         let total_net_bps = *total_net_bytes_per_sec;
-        let deadband_ctx = deadband.map(|db| DeadbandContext {
-            deadband: db,
-            prev_ranks: prev_proc_ranks,
-            prev_sticky: prev_proc_sticky_metrics,
-        });
 
         let ProjectionScratch {
             ref frozen_ranks,
+            ref dense_deadband,
             bool_mask_a: ref mut visible_mask,
             bool_mask_b: ref mut visited,
             bool_mask_c: ref mut included_mask,
@@ -2705,6 +2740,10 @@ impl ProjectionEngine {
             ..
         } = *scratch;
         let frozen_ranks = use_frozen.then_some(frozen_ranks);
+        let deadband_ctx = deadband.map(|db| DeadbandContext {
+            deadband: db,
+            dense_prev: dense_deadband.as_slice(),
+        });
 
         visible_mask.clear();
         visible_mask.extend(
@@ -2825,24 +2864,21 @@ impl ProjectionEngine {
             latest_tree,
             listening_ports,
             leak_detector,
-            prev_details_ranks,
-            prev_details_sticky_metrics,
             scratch,
             ..
         } = self;
 
-        let deadband_ctx = deadband.map(|db| DeadbandContext {
-            deadband: db,
-            prev_ranks: prev_details_ranks,
-            prev_sticky: prev_details_sticky_metrics,
-        });
-
         let ProjectionScratch {
             ref frozen_ranks,
+            ref dense_deadband,
             section_roots: ref mut indices,
             ..
         } = *scratch;
         let frozen_ranks = use_frozen.then_some(frozen_ranks);
+        let deadband_ctx = deadband.map(|db| DeadbandContext {
+            deadband: db,
+            dense_prev: dense_deadband.as_slice(),
+        });
 
         indices.clear();
         for (idx, proc) in computed.iter().enumerate() {
@@ -2901,21 +2937,15 @@ impl ProjectionEngine {
             latest_tree,
             listening_ports,
             leak_detector,
-            prev_details_ranks,
-            prev_details_sticky_metrics,
             scratch,
             ..
         } = self;
 
         let n = computed.len();
-        let deadband_ctx = deadband.map(|db| DeadbandContext {
-            deadband: db,
-            prev_ranks: prev_details_ranks,
-            prev_sticky: prev_details_sticky_metrics,
-        });
 
         let ProjectionScratch {
             ref frozen_ranks,
+            ref dense_deadband,
             bool_mask_a: ref mut visible_mask,
             bool_mask_b: ref mut visited,
             bool_mask_c: ref mut included_mask,
@@ -2925,6 +2955,10 @@ impl ProjectionEngine {
             ..
         } = *scratch;
         let frozen_ranks = use_frozen.then_some(frozen_ranks);
+        let deadband_ctx = deadband.map(|db| DeadbandContext {
+            deadband: db,
+            dense_prev: dense_deadband.as_slice(),
+        });
 
         visible_mask.clear();
         visible_mask.extend(
@@ -3057,22 +3091,16 @@ const fn process_row_deadband_metric(row: &ProcessRowProjection, column: Process
     }
 }
 
-/// Computes the hysteresis-stabilized effective sort metric for `key`.
+/// Computes the hysteresis-stabilized effective sort metric from a pre-populated dense entry.
 ///
-/// Because this depends solely on `key` and `live_val` against the immutable previous-tick
-/// sticky map (never on pairs of compared elements), sorting by the returned value defines a
-/// strict total order and can never violate `slice::sort_by` transitivity.
-#[inline]
-fn resolve_sticky_metric(
-    key: ProcessKey,
-    live_val: u64,
-    deadband: u64,
-    prev_sticky: &HashMap<ProcessKey, u64, FastBuildHasher>,
-) -> u64 {
-    if let Some(&prev_val) = prev_sticky.get(&key)
-        && live_val.abs_diff(prev_val) < deadband
-    {
-        prev_val
+/// Because this depends solely on the element's own live value and immutable previous-tick
+/// sticky metric (never on pairs of compared elements), sorting by the returned value defines
+/// a strict total order and can never violate `slice::sort_by` transitivity, while avoiding
+/// any `HashMap` lookup inside the `O(N log N)` comparator.
+#[inline(always)]
+fn resolve_sticky_metric_dense(entry: DenseDeadbandEntry, live_val: u64, deadband: u64) -> u64 {
+    if entry.has_prev && live_val.abs_diff(entry.prev_sticky) < deadband {
+        entry.prev_sticky
     } else {
         live_val
     }
@@ -3492,8 +3520,9 @@ fn matches_query_with_ports(
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn compare_process_items(
-    a: &ComputedProcess,
-    b: &ComputedProcess,
+    ia: usize,
+    ib: usize,
+    computed: &[ComputedProcess],
     agg_a: Option<&GroupAggregate>,
     agg_b: Option<&GroupAggregate>,
     cold_cache: &ColdMetaCache,
@@ -3502,6 +3531,8 @@ fn compare_process_items(
     frozen_ranks: Option<&HashMap<ProcessKey, usize, FastBuildHasher>>,
     deadband_ctx: Option<DeadbandContext<'_>>,
 ) -> Ordering {
+    let a = &computed[ia];
+    let b = &computed[ib];
     if let Some(ranks) = frozen_ranks {
         let ra = ranks.get(&a.key).copied().unwrap_or(usize::MAX);
         let rb = ranks.get(&b.key).copied().unwrap_or(usize::MAX);
@@ -3510,7 +3541,7 @@ fn compare_process_items(
             return frozen_ord;
         }
     }
-    let ord = cmp_process_sort_column(a, b, agg_a, agg_b, cold_cache, column, deadband_ctx);
+    let ord = cmp_process_sort_column(ia, ib, a, b, agg_a, agg_b, cold_cache, column, deadband_ctx);
     let directed = match direction {
         SortDirection::Ascending => ord,
         SortDirection::Descending => ord.reverse(),
@@ -3518,9 +3549,9 @@ fn compare_process_items(
     directed
         .then_with(|| {
             if let Some(db) = deadband_ctx {
-                let ra = db.prev_ranks.get(&a.key).copied().unwrap_or(usize::MAX);
-                let rb = db.prev_ranks.get(&b.key).copied().unwrap_or(usize::MAX);
-                ra.cmp(&rb)
+                db.dense_prev[ia]
+                    .prev_rank
+                    .cmp(&db.dense_prev[ib].prev_rank)
             } else {
                 Ordering::Equal
             }
@@ -3542,8 +3573,9 @@ fn sort_process_indices_with_aggregates_slice(
 ) {
     indices.sort_by(|&ia, &ib| {
         compare_process_items(
-            &computed[ia],
-            &computed[ib],
+            ia,
+            ib,
+            computed,
             group_agg[ia].as_ref(),
             group_agg[ib].as_ref(),
             cold_cache,
@@ -3567,8 +3599,9 @@ fn sort_process_indices_slice(
 ) {
     indices.sort_by(|&ia, &ib| {
         compare_process_items(
-            &computed[ia],
-            &computed[ib],
+            ia,
+            ib,
+            computed,
             None,
             None,
             cold_cache,
@@ -3601,10 +3634,6 @@ fn sort_details_indices_slice(
                 return frozen_ord;
             }
         }
-        let ea = cold_cache.get_entry(a.key);
-        let eb = cold_cache.get_entry(b.key);
-        let ca = ea.map(|e| &e.meta);
-        let cb = eb.map(|e| &e.meta);
         let ord = match column {
             DetailsSortColumn::Name => cmp_str_ascii_ci(&a.name, &b.name),
             DetailsSortColumn::Pid => a.key.pid.cmp(&b.key.pid),
@@ -3612,24 +3641,28 @@ fn sort_details_indices_slice(
                 .contains(ProcessStatusFlags::SUSPENDED)
                 .cmp(&effective_status(b, cold_cache).contains(ProcessStatusFlags::SUSPENDED)),
             DetailsSortColumn::UserName => {
-                let ua = ea.and_then(|e| e.user_name_short.as_deref()).unwrap_or("");
-                let ub = eb.and_then(|e| e.user_name_short.as_deref()).unwrap_or("");
+                let ua = cold_cache
+                    .get_entry(a.key)
+                    .and_then(|e| e.user_name_short.as_deref())
+                    .unwrap_or("");
+                let ub = cold_cache
+                    .get_entry(b.key)
+                    .and_then(|e| e.user_name_short.as_deref())
+                    .unwrap_or("");
                 cmp_str_ascii_ci(ua, ub)
             }
             DetailsSortColumn::SessionId => a.session_id.cmp(&b.session_id),
             DetailsSortColumn::Cpu => {
                 if let Some(db) = deadband_ctx {
-                    let sa = resolve_sticky_metric(
-                        a.key,
+                    let sa = resolve_sticky_metric_dense(
+                        db.dense_prev[ia],
                         u64::from(a.cpu_permille),
                         db.deadband,
-                        db.prev_sticky,
                     );
-                    let sb = resolve_sticky_metric(
-                        b.key,
+                    let sb = resolve_sticky_metric_dense(
+                        db.dense_prev[ib],
                         u64::from(b.cpu_permille),
                         db.deadband,
-                        db.prev_sticky,
                     );
                     sa.cmp(&sb)
                 } else {
@@ -3646,13 +3679,29 @@ fn sort_details_indices_slice(
             DetailsSortColumn::Handles => a.handle_count.cmp(&b.handle_count),
             DetailsSortColumn::Threads => a.thread_count.cmp(&b.thread_count),
             DetailsSortColumn::Arch => {
-                let aa = arch_rank(ca.map_or(ProcessArch::Unknown, |m| m.arch));
-                let ab = arch_rank(cb.map_or(ProcessArch::Unknown, |m| m.arch));
+                let aa = arch_rank(
+                    cold_cache
+                        .get_process(a.key)
+                        .map_or(ProcessArch::Unknown, |m| m.arch),
+                );
+                let ab = arch_rank(
+                    cold_cache
+                        .get_process(b.key)
+                        .map_or(ProcessArch::Unknown, |m| m.arch),
+                );
                 aa.cmp(&ab)
             }
             DetailsSortColumn::UacVirtualization => {
-                let va = uac_rank(ca.map_or(UacVirtualization::Unknown, |m| m.uac_virtualization));
-                let vb = uac_rank(cb.map_or(UacVirtualization::Unknown, |m| m.uac_virtualization));
+                let va = uac_rank(
+                    cold_cache
+                        .get_process(a.key)
+                        .map_or(UacVirtualization::Unknown, |m| m.uac_virtualization),
+                );
+                let vb = uac_rank(
+                    cold_cache
+                        .get_process(b.key)
+                        .map_or(UacVirtualization::Unknown, |m| m.uac_virtualization),
+                );
                 va.cmp(&vb)
             }
             DetailsSortColumn::Elevated => effective_status(a, cold_cache)
@@ -3660,35 +3709,51 @@ fn sort_details_indices_slice(
                 .cmp(&effective_status(b, cold_cache).contains(ProcessStatusFlags::ELEVATED)),
             DetailsSortColumn::GpuMemory => a.gpu_dedicated_bytes.cmp(&b.gpu_dedicated_bytes),
             DetailsSortColumn::Publisher => {
-                let pa = ca
+                let pa = cold_cache
+                    .get_process(a.key)
                     .and_then(|m| m.asset.as_ref())
                     .and_then(|asset| asset.publisher.as_deref())
                     .unwrap_or("");
-                let pb = cb
+                let pb = cold_cache
+                    .get_process(b.key)
                     .and_then(|m| m.asset.as_ref())
                     .and_then(|asset| asset.publisher.as_deref())
                     .unwrap_or("");
                 cmp_str_ascii_ci(pa, pb)
             }
             DetailsSortColumn::Description => {
-                let da = ca
+                let da = cold_cache
+                    .get_process(a.key)
                     .and_then(|m| m.asset.as_ref())
                     .and_then(|asset| asset.file_description.as_deref())
                     .unwrap_or("");
-                let db = cb
+                let db = cold_cache
+                    .get_process(b.key)
                     .and_then(|m| m.asset.as_ref())
                     .and_then(|asset| asset.file_description.as_deref())
                     .unwrap_or("");
                 cmp_str_ascii_ci(da, db)
             }
             DetailsSortColumn::ExePath => {
-                let ea = ca.and_then(|m| m.exe_path.as_deref()).unwrap_or("");
-                let eb = cb.and_then(|m| m.exe_path.as_deref()).unwrap_or("");
+                let ea = cold_cache
+                    .get_process(a.key)
+                    .and_then(|m| m.exe_path.as_deref())
+                    .unwrap_or("");
+                let eb = cold_cache
+                    .get_process(b.key)
+                    .and_then(|m| m.exe_path.as_deref())
+                    .unwrap_or("");
                 cmp_str_ascii_ci(ea, eb)
             }
             DetailsSortColumn::CommandLine => {
-                let cmd_a = ca.and_then(|m| m.command_line.as_deref()).unwrap_or("");
-                let cmd_b = cb.and_then(|m| m.command_line.as_deref()).unwrap_or("");
+                let cmd_a = cold_cache
+                    .get_process(a.key)
+                    .and_then(|m| m.command_line.as_deref())
+                    .unwrap_or("");
+                let cmd_b = cold_cache
+                    .get_process(b.key)
+                    .and_then(|m| m.command_line.as_deref())
+                    .unwrap_or("");
                 cmp_str_ascii_ci(cmd_a, cmd_b)
             }
         };
@@ -3699,9 +3764,9 @@ fn sort_details_indices_slice(
         directed
             .then_with(|| {
                 if let Some(db) = deadband_ctx {
-                    let ra = db.prev_ranks.get(&a.key).copied().unwrap_or(usize::MAX);
-                    let rb = db.prev_ranks.get(&b.key).copied().unwrap_or(usize::MAX);
-                    ra.cmp(&rb)
+                    db.dense_prev[ia]
+                        .prev_rank
+                        .cmp(&db.dense_prev[ib].prev_rank)
                 } else {
                     Ordering::Equal
                 }
@@ -3712,7 +3777,10 @@ fn sort_details_indices_slice(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn cmp_process_sort_column(
+    ia: usize,
+    ib: usize,
     a: &ComputedProcess,
     b: &ComputedProcess,
     agg_a: Option<&GroupAggregate>,
@@ -3739,8 +3807,8 @@ fn cmp_process_sort_column(
             let va = u64::from(agg_a.map_or(a.cpu_permille, |g| g.cpu_permille));
             let vb = u64::from(agg_b.map_or(b.cpu_permille, |g| g.cpu_permille));
             if let Some(db) = deadband_ctx {
-                let sa = resolve_sticky_metric(a.key, va, db.deadband, db.prev_sticky);
-                let sb = resolve_sticky_metric(b.key, vb, db.deadband, db.prev_sticky);
+                let sa = resolve_sticky_metric_dense(db.dense_prev[ia], va, db.deadband);
+                let sb = resolve_sticky_metric_dense(db.dense_prev[ib], vb, db.deadband);
                 sa.cmp(&sb)
             } else {
                 va.cmp(&vb)
@@ -3753,8 +3821,8 @@ fn cmp_process_sort_column(
             let va = agg_a.map_or(a.disk_bytes_per_sec, |g| g.disk_bytes_per_sec);
             let vb = agg_b.map_or(b.disk_bytes_per_sec, |g| g.disk_bytes_per_sec);
             if let Some(db) = deadband_ctx {
-                let sa = resolve_sticky_metric(a.key, va, db.deadband, db.prev_sticky);
-                let sb = resolve_sticky_metric(b.key, vb, db.deadband, db.prev_sticky);
+                let sa = resolve_sticky_metric_dense(db.dense_prev[ia], va, db.deadband);
+                let sb = resolve_sticky_metric_dense(db.dense_prev[ib], vb, db.deadband);
                 sa.cmp(&sb)
             } else {
                 va.cmp(&vb)
@@ -3764,8 +3832,8 @@ fn cmp_process_sort_column(
             let va = agg_a.map_or(a.net_bytes_per_sec, |g| g.net_bytes_per_sec);
             let vb = agg_b.map_or(b.net_bytes_per_sec, |g| g.net_bytes_per_sec);
             if let Some(db) = deadband_ctx {
-                let sa = resolve_sticky_metric(a.key, va, db.deadband, db.prev_sticky);
-                let sb = resolve_sticky_metric(b.key, vb, db.deadband, db.prev_sticky);
+                let sa = resolve_sticky_metric_dense(db.dense_prev[ia], va, db.deadband);
+                let sb = resolve_sticky_metric_dense(db.dense_prev[ib], vb, db.deadband);
                 sa.cmp(&sb)
             } else {
                 va.cmp(&vb)
@@ -3779,8 +3847,8 @@ fn cmp_process_sort_column(
                 (g.gpu_util_permille, g.gpu_dedicated_bytes)
             });
             if let Some(db) = deadband_ctx {
-                let sa = resolve_sticky_metric(a.key, u64::from(ua), db.deadband, db.prev_sticky);
-                let sb = resolve_sticky_metric(b.key, u64::from(ub), db.deadband, db.prev_sticky);
+                let sa = resolve_sticky_metric_dense(db.dense_prev[ia], u64::from(ua), db.deadband);
+                let sb = resolve_sticky_metric_dense(db.dense_prev[ib], u64::from(ub), db.deadband);
                 (sa, vram_a).cmp(&(sb, vram_b))
             } else {
                 (ua, vram_a).cmp(&(ub, vram_b))
