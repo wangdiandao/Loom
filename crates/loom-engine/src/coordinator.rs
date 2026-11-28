@@ -5,18 +5,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender, TrySendError, select};
 use loom_config::AppSettings;
 use loom_pal_api::{
-    FastSystemSampler, PalError, PerfSampleScratch, PlatformBackend, ProcessSampleScratch,
-    SystemOperator,
+    AppHistoryReader, FastSystemSampler, PalError, PerfSampleScratch, PlatformBackend,
+    ProcessSampleScratch, SystemOperator,
 };
 use loom_types::{
     AppHistoryRecord, AppSnapshot, MonitorDomain, ProcessKey, RefreshSpeed, ServicesSlice,
-    StartupSlice, UserSessionRecord,
+    StartupSlice, Timestamp100Ns, UserSessionRecord,
 };
 use parking_lot::Mutex;
 
@@ -24,13 +24,16 @@ use crate::command::{
     CommandEnvelope, CommandEvent, CommandKind, CommandOutcome, CommandSuccess, EngineCommand,
     EngineCommandError, EventBus,
 };
+use crate::leaks::LeakDetectorConfig;
 use crate::lease::{MonitorLease, MonitorLeaseRegistry};
 use crate::projection::{ProjectionEngine, ViewProjectionConfig};
+use crate::query::ParsedQuery;
 use crate::slow_lane::{
     CircuitBreaker, ColdMetaCache, MgmtDomainRefresh, SlowLanePool, SlowMgmtOp, SlowPriorityJob,
     SlowProbeJob, SlowResult, SlowShellOp,
 };
 use crate::tree::collect_bottom_up_kill_order;
+use crate::wake::SnapshotWakeSignal;
 
 /// Retry cooldown before re-probing a process whose metadata probe failed (e.g., protected/denied).
 const FAILED_PROBE_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
@@ -74,6 +77,18 @@ pub struct EngineConfig {
     ///
     /// Defaults to `64`.
     pub event_channel_capacity: usize,
+    /// Periodic flush cadence for dirty cumulative `AppHistory` records while leased.
+    ///
+    /// Defaults to `60 s`.
+    pub app_history_flush_interval: Duration,
+    /// Minimum cache TTL between on-demand `:PORT` listening socket scans while active.
+    ///
+    /// Defaults to `2 s`.
+    pub port_scan_cache_ttl: Duration,
+    /// Timing thresholds for the pure in-memory [`crate::LeakDetector`].
+    ///
+    /// Defaults to `30 s` check cadence and `10 min` sustain window.
+    pub leak_detector: LeakDetectorConfig,
 }
 
 impl Default for EngineConfig {
@@ -87,21 +102,26 @@ impl Default for EngineConfig {
             slow_shutdown_timeout: Duration::from_millis(100),
             command_queue_capacity: 128,
             event_channel_capacity: 64,
+            app_history_flush_interval: Duration::from_secs(60),
+            port_scan_cache_ttl: Duration::from_secs(2),
+            leak_detector: LeakDetectorConfig::default(),
         }
     }
 }
 
 /// Headless engine coordinator parameterized statically over a [`PlatformBackend`].
 ///
-/// Owns at most **3** background threads:
-/// - `1` dedicated fast-lane sampling and snapshot projection thread (`loom-fast-sampler`).
-/// - `1..=2` slow-lane bulkhead worker threads (`loom-slow-*`) for disk/shell/PE probes.
+/// Owns at most **3** background threads (`1` fast-lane sampling & projection thread
+/// plus `1..=2` slow-lane bulkhead worker threads; elevated `ProcessNetwork` ETW adds at
+/// most `1` on-demand thread strictly while leased and stops immediately on release).
 ///
-/// Publishes domain-sliced [`AppSnapshot`] instances lock-free via [`ArcSwap`].
+/// Publishes domain-sliced [`AppSnapshot`] instances lock-free via [`ArcSwap`] and
+/// fires [`SnapshotWakeSignal`] on every snapshot publication or [`CommandEvent`].
 pub struct EngineCoordinator<B: PlatformBackend> {
     backend: Arc<B>,
     settings: AppSettings,
     snapshot: Arc<ArcSwap<AppSnapshot>>,
+    wake_signal: SnapshotWakeSignal,
     leases: Arc<MonitorLeaseRegistry>,
     cmd_tx: Sender<CommandEnvelope>,
     events: Arc<EventBus>,
@@ -138,8 +158,9 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
         let cmd_cap = config.command_queue_capacity.max(16);
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<CommandEnvelope>(cmd_cap);
         let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
+        let wake_signal = SnapshotWakeSignal::new();
         let leases = Arc::new(MonitorLeaseRegistry::with_wakeup(wake_tx));
-        let events = Arc::new(EventBus::new());
+        let events = Arc::new(EventBus::with_wake_signal(wake_signal.clone()));
 
         let slow_pool = SlowLanePool::spawn(
             Arc::clone(&backend),
@@ -152,26 +173,26 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
         )?;
 
         let logical_cpu_count = backend.operator().logical_cpu_count().max(1);
-        let view_config = ViewProjectionConfig {
-            process_view_mode: settings.process_view_mode,
-            ..ViewProjectionConfig::default()
-        };
+        let view_config = ViewProjectionConfig::from_settings(&settings);
         let refresh_speed = settings.refresh_speed;
         let event_channel_capacity = config.event_channel_capacity;
 
         let runner_backend = Arc::clone(&backend);
         let runner_snapshot = Arc::clone(&snapshot);
+        let runner_wake_signal = wake_signal.clone();
         let runner_leases = Arc::clone(&leases);
         let runner_events = Arc::clone(&events);
 
         let fast_handle = thread::Builder::new()
             .name("loom-fast-sampler".to_owned())
             .spawn(move || {
+                let leak_cfg = config.leak_detector;
                 let mut runner = FastLaneRunner {
                     backend: runner_backend,
                     fast_sampler,
                     slow_pool,
                     snapshot_store: runner_snapshot,
+                    wake_signal: runner_wake_signal,
                     current_snapshot: initial_snapshot,
                     leases: runner_leases,
                     events: runner_events,
@@ -183,7 +204,11 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
                     ),
                     config,
                     view_config,
-                    projection: ProjectionEngine::with_platform(B::PLATFORM),
+                    parsed_query: ParsedQuery::default(),
+                    projection: ProjectionEngine::with_platform_and_leak_config(
+                        B::PLATFORM,
+                        leak_cfg,
+                    ),
                     cold_cache: ColdMetaCache::new(),
                     pending_procs: HashSet::with_capacity(256),
                     pending_paths: HashSet::with_capacity(64),
@@ -195,6 +220,13 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
                     logical_cpu_count,
                     refresh_speed,
                     window_dormant: false,
+                    temp_frozen: false,
+                    process_net_enabled: false,
+                    pending_history_gap: false,
+                    last_sample_instant: None,
+                    last_sample_timestamp: None,
+                    pending_port_scan: false,
+                    last_port_scan_at: None,
                     tick_count: 0,
                     next_tick: None,
                     last_details_projected_tick: 0,
@@ -209,6 +241,9 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
                     persisted_app_history_since: None,
                     persisted_app_history: Vec::new(),
                     app_history_polled_once: false,
+                    app_history_dirty: false,
+                    pending_app_history_save: false,
+                    last_app_history_flush: Instant::now(),
                 };
                 runner.run();
             })
@@ -218,6 +253,7 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
             backend,
             settings,
             snapshot,
+            wake_signal,
             leases,
             cmd_tx,
             events,
@@ -237,6 +273,27 @@ impl<B: PlatformBackend> EngineCoordinator<B> {
     #[inline]
     pub fn snapshot_store(&self) -> Arc<ArcSwap<AppSnapshot>> {
         Arc::clone(&self.snapshot)
+    }
+
+    /// Returns a cloneable zero-polling [`SnapshotWakeSignal`] fired whenever a new
+    /// [`AppSnapshot`] is published or a [`CommandEvent`] is emitted.
+    #[inline]
+    pub fn snapshot_wake_signal(&self) -> SnapshotWakeSignal {
+        self.wake_signal.clone()
+    }
+
+    /// Subscribes a coalescing `bounded(1)` [`Receiver<()>`] that receives a wakeup token
+    /// whenever a new [`AppSnapshot`] is published or a [`CommandEvent`] is emitted.
+    #[inline]
+    pub fn subscribe_snapshot_wake(&self) -> Receiver<()> {
+        self.wake_signal.subscribe_channel()
+    }
+
+    /// Registers a non-blocking callback invoked whenever a new [`AppSnapshot`] is
+    /// published or a [`CommandEvent`] is emitted.
+    #[inline]
+    pub fn set_snapshot_waker(&self, waker: Arc<dyn Fn() + Send + Sync>) {
+        self.wake_signal.add_callback(waker);
     }
 
     /// Returns a reference to the initial [`AppSettings`].
@@ -330,6 +387,7 @@ struct FastLaneRunner<B: PlatformBackend> {
     fast_sampler: B::FastSampler,
     slow_pool: SlowLanePool,
     snapshot_store: Arc<ArcSwap<AppSnapshot>>,
+    wake_signal: SnapshotWakeSignal,
     current_snapshot: AppSnapshot,
     leases: Arc<MonitorLeaseRegistry>,
     events: Arc<EventBus>,
@@ -337,6 +395,7 @@ struct FastLaneRunner<B: PlatformBackend> {
     wake_rx: Receiver<()>,
     config: EngineConfig,
     view_config: ViewProjectionConfig,
+    parsed_query: ParsedQuery,
     projection: ProjectionEngine,
     cold_cache: ColdMetaCache,
     circuit_breaker: CircuitBreaker,
@@ -350,6 +409,13 @@ struct FastLaneRunner<B: PlatformBackend> {
     logical_cpu_count: u32,
     refresh_speed: RefreshSpeed,
     window_dormant: bool,
+    temp_frozen: bool,
+    process_net_enabled: bool,
+    pending_history_gap: bool,
+    last_sample_instant: Option<Instant>,
+    last_sample_timestamp: Option<Timestamp100Ns>,
+    pending_port_scan: bool,
+    last_port_scan_at: Option<Instant>,
     tick_count: u64,
     next_tick: Option<Instant>,
     last_details_projected_tick: u64,
@@ -364,10 +430,15 @@ struct FastLaneRunner<B: PlatformBackend> {
     persisted_app_history_since: Option<u64>,
     persisted_app_history: Vec<AppHistoryRecord>,
     app_history_polled_once: bool,
+    app_history_dirty: bool,
+    pending_app_history_save: bool,
+    last_app_history_flush: Instant,
 }
 
 impl<B: PlatformBackend> FastLaneRunner<B> {
     fn run(&mut self) {
+        self.sync_process_network_state();
+
         // Tick 0: publish first interactive frame immediately before entering the event loop.
         self.run_sample_tick();
         self.schedule_after_tick(true);
@@ -403,7 +474,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                     }
                 }
                 recv(tick_rx) -> _ => {
-                    if !self.window_dormant {
+                    if !self.window_dormant && !self.temp_frozen {
                         self.run_sample_tick();
                         self.schedule_after_tick(false);
                     } else {
@@ -413,11 +484,29 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             }
         }
 
+        // Stop elevated ETW per-process network session immediately on shutdown.
+        if self.process_net_enabled {
+            self.fast_sampler.set_per_process_network_enabled(false);
+            self.process_net_enabled = false;
+        }
+
+        // Flush dirty accumulated AppHistory cleanly once on shutdown.
+        self.flush_app_history_sync_on_shutdown();
+
         self.slow_pool.shutdown();
+        self.wake_signal.close();
+    }
+
+    fn sync_process_network_state(&mut self) {
+        let desired = !self.window_dormant && self.leases.is_active(MonitorDomain::ProcessNetwork);
+        if desired != self.process_net_enabled {
+            self.fast_sampler.set_per_process_network_enabled(desired);
+            self.process_net_enabled = desired;
+        }
     }
 
     fn schedule_after_tick(&mut self, use_calibration_delay: bool) {
-        if self.window_dormant {
+        if self.window_dormant || self.temp_frozen {
             self.next_tick = None;
             return;
         }
@@ -433,6 +522,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
     }
 
     fn run_sample_tick(&mut self) {
+        self.sync_process_network_state();
         self.process_scratch.clear();
         let timestamp = match self
             .fast_sampler
@@ -441,20 +531,51 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             Ok(ts) => ts,
             Err(err) => {
                 tracing::warn!(%err, "fast-lane process sampling failed");
+                self.pending_history_gap = true;
+                self.projection.push_performance_gap();
                 return;
             }
         };
+
+        let now = Instant::now();
+        let gap_threshold_ms = self
+            .refresh_speed
+            .interval_ms()
+            .map_or(5_000u64, |ms| ms.saturating_mul(3).max(5_000));
+        let wall_gap = self.last_sample_instant.is_some_and(|prev| {
+            now.saturating_duration_since(prev).as_millis() as u64 > gap_threshold_ms
+        });
+        let sample_ts_gap = self
+            .last_sample_timestamp
+            .is_some_and(|prev| timestamp.saturating_sub(prev).as_millis() > gap_threshold_ms);
+        if self.pending_history_gap || wall_gap || sample_ts_gap {
+            self.projection.push_performance_gap();
+            self.pending_history_gap = false;
+        }
+        self.last_sample_instant = Some(now);
+        self.last_sample_timestamp = Some(timestamp);
 
         self.projection.ingest_process_sample(
             timestamp,
             &self.process_scratch,
             self.logical_cpu_count,
         );
-        self.projection.accumulate_app_history(&self.cold_cache);
+        if self.projection.accumulate_app_history(&self.cold_cache) {
+            self.app_history_dirty = true;
+        }
         self.tick_count = self.tick_count.saturating_add(1);
 
         // Maintain live-set caches and enqueue cold metadata probes non-blockingly.
         self.reconcile_live_caches_and_enqueue_probes();
+
+        // Update zero-syscall in-memory leak heuristic analyzer on its coarse cadence.
+        self.projection.update_leak_detector(now, &self.cold_cache);
+
+        // Refresh on-demand `:PORT` listening socket table ONLY when a port query is active.
+        self.maybe_enqueue_listening_ports(now);
+
+        // Periodically persist dirty AppHistory on the slow lane while AppHistory is leased.
+        self.maybe_flush_app_history(now);
 
         // Sample full performance metrics only when Performance or PerCoreCpu lease is active.
         let perf_leased = self.leases.is_active(MonitorDomain::Performance);
@@ -472,6 +593,82 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
         // Project and publish snapshot, updating Details ONLY when leased.
         let details_leased = self.leases.is_active(MonitorDomain::Details);
         self.publish_slices(true, details_leased, true, per_core_leased);
+    }
+
+    fn maybe_enqueue_listening_ports(&mut self, now: Instant) {
+        if !self.parsed_query.has_port_predicate() || self.pending_port_scan {
+            return;
+        }
+        let cache_stale = self.last_port_scan_at.is_none_or(|last| {
+            now.saturating_duration_since(last) >= self.config.port_scan_cache_ttl
+        });
+        if cache_stale
+            && self
+                .slow_pool
+                .try_enqueue_priority(SlowPriorityJob::PollListeningPorts)
+                .is_ok()
+        {
+            self.pending_port_scan = true;
+        }
+    }
+
+    fn prepare_app_history_flush(&mut self) -> (u64, Vec<AppHistoryRecord>) {
+        let since = self
+            .persisted_app_history_since
+            .unwrap_or_else(current_unix_epoch_secs);
+        let merged = self
+            .projection
+            .project_app_history(Some(since), &self.persisted_app_history, 0)
+            .items;
+        self.persisted_app_history_since = Some(since);
+        self.persisted_app_history = merged.clone();
+        self.projection.clear_app_history();
+        self.app_history_dirty = false;
+        (since, merged)
+    }
+
+    fn maybe_flush_app_history(&mut self, now: Instant) {
+        if !self.app_history_dirty
+            || self.pending_app_history_save
+            || !self.leases.is_active(MonitorDomain::AppHistory)
+        {
+            return;
+        }
+        if now.saturating_duration_since(self.last_app_history_flush)
+            < self.config.app_history_flush_interval
+        {
+            return;
+        }
+        let (since_epoch_secs, records) = self.prepare_app_history_flush();
+        self.last_app_history_flush = now;
+        match self
+            .slow_pool
+            .try_enqueue_priority(SlowPriorityJob::SaveAppHistory {
+                since_epoch_secs,
+                records,
+            }) {
+            Ok(()) => {
+                self.pending_app_history_save = true;
+            }
+            Err(_) => {
+                // Retry on a subsequent tick if slow-lane queue was momentarily saturated.
+                self.app_history_dirty = true;
+            }
+        }
+    }
+
+    fn flush_app_history_sync_on_shutdown(&mut self) {
+        if !self.app_history_dirty {
+            return;
+        }
+        let (since_epoch_secs, records) = self.prepare_app_history_flush();
+        if let Err(err) = self
+            .backend
+            .history_reader()
+            .save_history(since_epoch_secs, &records)
+        {
+            tracing::warn!(%err, "failed to flush AppHistory on shutdown");
+        }
     }
 
     fn sample_full_performance(&mut self, include_per_core: bool) {
@@ -497,7 +694,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             }
             Err(err) => {
                 tracing::warn!(%err, "fast-lane performance sampling failed");
-                self.projection.record_performance(None, None);
+                self.projection.push_performance_gap();
             }
         }
     }
@@ -576,6 +773,9 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
 
         for domain in SLOW_DOMAINS {
             let idx = domain.index();
+            if domain == MonitorDomain::AppHistory && self.pending_app_history_save {
+                continue;
+            }
             if self.leases.is_active(domain)
                 && !self.pending_domains[idx]
                 && self.last_domain_poll_tick[idx] != self.tick_count
@@ -591,7 +791,10 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
     }
 
     fn handle_lease_wakeup(&mut self) {
-        if self.window_dormant || self.tick_count == 0 {
+        // Always reconcile ProcessNetwork ETW state immediately on lease edge (even if dormant).
+        self.sync_process_network_state();
+
+        if self.window_dormant || self.temp_frozen || self.tick_count == 0 {
             return;
         }
 
@@ -645,7 +848,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             }
         }
 
-        if !self.window_dormant {
+        if !self.window_dormant && !self.temp_frozen {
             if cold_updated || perf_updated {
                 let details_leased = cold_updated && self.leases.is_active(MonitorDomain::Details);
                 let per_core_leased =
@@ -654,6 +857,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             } else if snapshot_dirty {
                 self.snapshot_store
                     .store(Arc::new(self.current_snapshot.clone()));
+                self.wake_signal.notify();
             }
         }
 
@@ -769,6 +973,27 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                     }
                 }
             }
+            SlowResult::ListeningPortsPolled(result) => {
+                self.pending_port_scan = false;
+                self.last_port_scan_at = Some(now);
+                match result {
+                    Ok(sockets) => {
+                        if self.parsed_query.has_port_predicate() {
+                            self.projection.set_listening_ports(&sockets);
+                            *cold_updated = true;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "slow-lane listening port scan failed");
+                    }
+                }
+            }
+            SlowResult::AppHistorySaved(result) => {
+                self.pending_app_history_save = false;
+                if let Err(err) = result {
+                    tracing::warn!(%err, "slow-lane AppHistory periodic save failed");
+                }
+            }
             SlowResult::ServicesPolled(result) => {
                 self.pending_domains[MonitorDomain::Services.index()] = false;
                 if let Ok(items) = result
@@ -814,6 +1039,7 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 if cleared_app_history {
                     self.projection.clear_app_history();
                     self.persisted_app_history.clear();
+                    self.app_history_dirty = false;
                     if refresh.is_none() && self.leases.is_active(MonitorDomain::AppHistory) {
                         let since = self.persisted_app_history_since;
                         self.apply_app_history_snapshot(since, Vec::new());
@@ -952,7 +1178,10 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             if need_sample_tick {
                 self.run_sample_tick();
                 self.schedule_after_tick(self.tick_count <= 1);
-            } else if !self.window_dormant && (need_reproject_processes || need_reproject_details) {
+            } else if !self.window_dormant
+                && !self.temp_frozen
+                && (need_reproject_processes || need_reproject_details)
+            {
                 let details_dirty =
                     need_reproject_details && self.leases.is_active(MonitorDomain::Details);
                 if need_reproject_processes || details_dirty {
@@ -996,13 +1225,24 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 return true;
             }
             EngineCommand::SetRefreshSpeed(speed) => {
+                let was_paused = self.refresh_speed == RefreshSpeed::Paused;
                 self.refresh_speed = speed;
+                if was_paused && speed != RefreshSpeed::Paused {
+                    self.pending_history_gap = true;
+                }
                 self.schedule_after_tick(false);
                 push_ack(kind, reply, pending_acks);
             }
             EngineCommand::SetSearchQuery(query) => {
                 if self.view_config.search_query != query {
+                    self.parsed_query = ParsedQuery::parse(&query);
                     self.view_config.search_query = query;
+                    if self.parsed_query.has_port_predicate() {
+                        self.maybe_enqueue_listening_ports(Instant::now());
+                    } else {
+                        self.projection.clear_listening_ports();
+                        self.last_port_scan_at = None;
+                    }
                     *need_reproject_processes = true;
                     *need_reproject_details = true;
                 }
@@ -1059,11 +1299,60 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             EngineCommand::SetWindowDormant(dormant) => {
                 let was_dormant = self.window_dormant;
                 self.window_dormant = dormant;
+                self.sync_process_network_state();
                 if dormant {
                     self.next_tick = None;
                     *need_sample_tick = false;
                 } else if was_dormant {
                     *need_sample_tick = true;
+                }
+                push_ack(kind, reply, pending_acks);
+            }
+            EngineCommand::SetProcessOrderFreeze(frozen) => {
+                if frozen {
+                    self.view_config
+                        .freeze_process_order(&self.current_snapshot.processes.rows);
+                } else {
+                    self.view_config.process_order_frozen = false;
+                    self.view_config.frozen_process_order.clear();
+                }
+                *need_reproject_processes = true;
+                push_ack(kind, reply, pending_acks);
+            }
+            EngineCommand::SetDetailsOrderFreeze(frozen) => {
+                if frozen {
+                    if self.current_snapshot.details.rows.is_empty()
+                        && self.leases.is_active(MonitorDomain::Details)
+                    {
+                        let rev = self.current_snapshot.revisions.details.saturating_add(1);
+                        let slice = self.projection.project_details(
+                            &self.view_config,
+                            &self.cold_cache,
+                            rev,
+                        );
+                        self.view_config.freeze_details_order(&slice.rows);
+                    } else {
+                        self.view_config
+                            .freeze_details_order(&self.current_snapshot.details.rows);
+                    }
+                } else {
+                    self.view_config.details_order_frozen = false;
+                    self.view_config.frozen_details_order.clear();
+                }
+                *need_reproject_details = true;
+                push_ack(kind, reply, pending_acks);
+            }
+            EngineCommand::SetTempFreeze(frozen) => {
+                let was_frozen = self.temp_frozen;
+                self.temp_frozen = frozen;
+                if frozen {
+                    self.next_tick = None;
+                } else if was_frozen && !self.window_dormant {
+                    if self.refresh_speed != RefreshSpeed::Paused {
+                        *need_sample_tick = true;
+                    } else {
+                        self.next_tick = None;
+                    }
                 }
                 push_ack(kind, reply, pending_acks);
             }
@@ -1087,6 +1376,93 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
                 };
                 self.events
                     .emit(CommandEvent::new(kind, Some(root_key), outcome), reply);
+            }
+            EngineCommand::SuspendProcess(key) => {
+                match self.backend.operator().suspend_process(key) {
+                    Ok(()) => {
+                        *need_sample_tick = true;
+                        pending_events.push((
+                            CommandEvent::new(
+                                kind,
+                                Some(key),
+                                CommandOutcome::Ok(CommandSuccess::Ack),
+                            ),
+                            reply,
+                        ));
+                    }
+                    Err(err) => {
+                        self.events.emit(
+                            CommandEvent::new(kind, Some(key), CommandOutcome::err(err)),
+                            reply,
+                        );
+                    }
+                }
+            }
+            EngineCommand::ResumeProcess(key) => {
+                match self.backend.operator().resume_process(key) {
+                    Ok(()) => {
+                        *need_sample_tick = true;
+                        pending_events.push((
+                            CommandEvent::new(
+                                kind,
+                                Some(key),
+                                CommandOutcome::Ok(CommandSuccess::Ack),
+                            ),
+                            reply,
+                        ));
+                    }
+                    Err(err) => {
+                        self.events.emit(
+                            CommandEvent::new(kind, Some(key), CommandOutcome::err(err)),
+                            reply,
+                        );
+                    }
+                }
+            }
+            EngineCommand::RestartExplorer => {
+                self.dispatch_slow_shell_op(kind, None, SlowShellOp::RestartExplorer, reply);
+            }
+            EngineCommand::FindFileLocks { path } => {
+                self.dispatch_slow_shell_op(kind, None, SlowShellOp::FindFileLocks(path), reply);
+            }
+            EngineCommand::SetWebView2HostGrouping(enabled) => {
+                if self.view_config.webview2_host_grouping != enabled {
+                    self.view_config.webview2_host_grouping = enabled;
+                    *need_reproject_processes = true;
+                    *need_reproject_details = true;
+                }
+                push_ack(kind, reply, pending_acks);
+            }
+            EngineCommand::SetShowLeakWarnings(enabled) => {
+                if self.view_config.show_leak_warnings != enabled {
+                    self.view_config.show_leak_warnings = enabled;
+                    *need_reproject_processes = true;
+                    *need_reproject_details = true;
+                }
+                push_ack(kind, reply, pending_acks);
+            }
+            EngineCommand::IgnoreLeakPath(path) => {
+                let trimmed = path.trim();
+                if !trimmed.is_empty()
+                    && !self
+                        .view_config
+                        .leak_ignored_paths
+                        .iter()
+                        .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+                {
+                    self.view_config.leak_ignored_paths.push(trimmed.to_owned());
+                    *need_reproject_processes = true;
+                    *need_reproject_details = true;
+                }
+                push_ack(kind, reply, pending_acks);
+            }
+            EngineCommand::SetHideSystemProcesses(hidden) => {
+                if self.view_config.hide_windows_system_processes != hidden {
+                    self.view_config.hide_windows_system_processes = hidden;
+                    *need_reproject_processes = true;
+                    *need_reproject_details = true;
+                }
+                push_ack(kind, reply, pending_acks);
             }
             EngineCommand::SetEfficiencyMode { key, enabled } => {
                 match self.backend.operator().set_efficiency_mode(key, enabled) {
@@ -1356,7 +1732,16 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
 
         self.current_snapshot = next.clone();
         self.snapshot_store.store(Arc::new(next));
+        self.wake_signal.notify();
     }
+}
+
+#[inline]
+fn current_unix_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[inline]

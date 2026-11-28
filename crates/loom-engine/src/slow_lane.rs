@@ -21,8 +21,8 @@ use loom_pal_api::{
 };
 use loom_types::{
     AppHistoryRecord, DiskDeviceSample, ExeStaticAsset, HardwareStaticInfo, MonitorDomain,
-    ProcessColdMeta, ProcessKey, RunTaskRequest, ServiceRecord, StartupEntry, UacVirtualization,
-    UserSessionRecord,
+    ProcessColdMeta, ProcessKey, ProcessSocketRecord, RunTaskRequest, ServiceRecord, StartupEntry,
+    UacVirtualization, UserSessionRecord,
 };
 use parking_lot::{Condvar, Mutex};
 
@@ -365,6 +365,8 @@ pub(crate) enum SlowShellOp {
         cancel: Arc<AtomicBool>,
     },
     AttachDebugger(ProcessKey),
+    RestartExplorer,
+    FindFileLocks(PathBuf),
 }
 
 /// Blocking system management operations (Services, Startup, Users, App History)
@@ -404,6 +406,11 @@ pub(crate) enum SlowPriorityJob {
     PollOnDemandDomain(MonitorDomain),
     ProbeHardwareStaticInfo,
     PollDiskPerformance,
+    PollListeningPorts,
+    SaveAppHistory {
+        since_epoch_secs: u64,
+        records: Vec<AppHistoryRecord>,
+    },
 }
 
 /// Low-priority background metadata probe jobs.
@@ -432,6 +439,8 @@ pub(crate) enum SlowResult {
     },
     HardwareStaticInfo(Result<HardwareStaticInfo, PalError>),
     DiskPerformancePolled(Result<Vec<DiskDeviceSample>, PalError>),
+    ListeningPortsPolled(Result<Vec<ProcessSocketRecord>, PalError>),
+    AppHistorySaved(Result<(), PalError>),
     ServicesPolled(Result<Vec<ServiceRecord>, PalError>),
     StartupPolled(Result<(Option<u64>, Vec<StartupEntry>), PalError>),
     UsersPolled(Result<Vec<UserSessionRecord>, PalError>),
@@ -741,6 +750,30 @@ fn execute_priority_job<B: PlatformBackend>(
                         CommandOutcome::err(err),
                     ),
                 },
+                SlowShellOp::RestartExplorer => match operator.restart_explorer() {
+                    Ok(()) => CommandEvent::new(
+                        CommandKind::RestartExplorer,
+                        None,
+                        CommandOutcome::Ok(CommandSuccess::Ack),
+                    ),
+                    Err(err) => CommandEvent::new(
+                        CommandKind::RestartExplorer,
+                        None,
+                        CommandOutcome::err(err),
+                    ),
+                },
+                SlowShellOp::FindFileLocks(path) => match operator.find_file_locks(&path) {
+                    Ok(holders) => CommandEvent::new(
+                        CommandKind::FindFileLocks,
+                        None,
+                        CommandOutcome::Ok(CommandSuccess::FileLocks(holders)),
+                    ),
+                    Err(err) => CommandEvent::new(
+                        CommandKind::FindFileLocks,
+                        None,
+                        CommandOutcome::err(err),
+                    ),
+                },
             };
             events.emit(event, reply);
         }
@@ -865,6 +898,19 @@ fn execute_priority_job<B: PlatformBackend>(
         SlowPriorityJob::PollDiskPerformance => {
             let res = prober.probe_disk_performance();
             let _ = result_tx.try_send(SlowResult::DiskPerformancePolled(res));
+        }
+        SlowPriorityJob::PollListeningPorts => {
+            let res = prober.list_listening_ports();
+            let _ = result_tx.try_send(SlowResult::ListeningPortsPolled(res));
+        }
+        SlowPriorityJob::SaveAppHistory {
+            since_epoch_secs,
+            records,
+        } => {
+            let res = backend
+                .history_reader()
+                .save_history(since_epoch_secs, &records);
+            let _ = result_tx.try_send(SlowResult::AppHistorySaved(res));
         }
     }
 }

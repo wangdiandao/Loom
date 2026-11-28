@@ -7,12 +7,14 @@ use std::sync::atomic::AtomicBool;
 use crossbeam_channel::Sender;
 use loom_pal_api::PalError;
 use loom_types::{
-    CpuAffinityMask, DetailsSortColumn, DetailsViewMode, ProcessKey, ProcessPriority,
-    ProcessSortColumn, ProcessViewMode, RefreshSpeed, RunTaskRequest, SortDirection,
-    TreeKillReport, WaitChainNode,
+    CpuAffinityMask, DetailsSortColumn, DetailsViewMode, FileLockHolder, ProcessKey,
+    ProcessPriority, ProcessSortColumn, ProcessViewMode, RefreshSpeed, RunTaskRequest,
+    SortDirection, TreeKillReport, WaitChainNode,
 };
 use parking_lot::Mutex;
 use thiserror::Error;
+
+use crate::wake::SnapshotWakeSignal;
 
 /// Commands dispatched from UI slices or headless callers into [`crate::EngineCoordinator`].
 #[derive(Debug, Clone)]
@@ -45,6 +47,12 @@ pub enum EngineCommand {
     ToggleDetailsExpanded(ProcessKey),
     /// Enters or exits window dormancy (minimized / closed to tray) to suspend fast-lane ticks.
     SetWindowDormant(bool),
+    /// Freezes or unfreezes displayed [`ProcessKey`] row order in the Processes view while live metrics keep updating.
+    SetProcessOrderFreeze(bool),
+    /// Freezes or unfreezes displayed [`ProcessKey`] row order in the Details view while live metrics keep updating.
+    SetDetailsOrderFreeze(bool),
+    /// Temporarily pauses snapshot updates (e.g., while holding `Ctrl`) without altering `RefreshSpeed`.
+    SetTempFreeze(bool),
     /// Triggers an immediate sampling and projection pass even when paused.
     ForceRefresh,
     /// Launches a new process via [`loom_pal_api::SystemOperator::run_new_task`].
@@ -53,6 +61,25 @@ pub enum EngineCommand {
     TerminateProcess(ProcessKey),
     /// Computes bottom-up kill order from the latest verified tree and terminates the process tree.
     TerminateProcessTree(ProcessKey),
+    /// Suspends all threads of a non-critical process verified by [`ProcessKey`].
+    SuspendProcess(ProcessKey),
+    /// Resumes all threads of a previously suspended process verified by [`ProcessKey`].
+    ResumeProcess(ProcessKey),
+    /// Safely restarts the desktop shell / file explorer (e.g., `explorer.exe`) on the slow lane.
+    RestartExplorer,
+    /// Queries processes holding open file or directory locks on `path` on the slow lane.
+    FindFileLocks {
+        /// Target file or directory path to inspect.
+        path: PathBuf,
+    },
+    /// Enables or disables attributing `msedgewebview2.exe` processes under their host app group.
+    SetWebView2HostGrouping(bool),
+    /// Enables or disables advisory in-memory resource leak warnings on process rows.
+    SetShowLeakWarnings(bool),
+    /// Adds an executable path or image name to the leak-warning ignore list.
+    IgnoreLeakPath(String),
+    /// Hides or shows core Windows system processes (except interactive shell tools) in process lists.
+    SetHideSystemProcesses(bool),
     /// Enables or disables Efficiency Mode (`EcoQoS`) for a process.
     SetEfficiencyMode {
         /// Target process lifecycle key.
@@ -150,6 +177,12 @@ pub enum CommandKind {
     ToggleDetailsExpanded,
     /// [`EngineCommand::SetWindowDormant`]
     SetWindowDormant,
+    /// [`EngineCommand::SetProcessOrderFreeze`]
+    SetProcessOrderFreeze,
+    /// [`EngineCommand::SetDetailsOrderFreeze`]
+    SetDetailsOrderFreeze,
+    /// [`EngineCommand::SetTempFreeze`]
+    SetTempFreeze,
     /// [`EngineCommand::ForceRefresh`]
     ForceRefresh,
     /// [`EngineCommand::RunNewTask`]
@@ -158,6 +191,22 @@ pub enum CommandKind {
     TerminateProcess,
     /// [`EngineCommand::TerminateProcessTree`]
     TerminateProcessTree,
+    /// [`EngineCommand::SuspendProcess`]
+    SuspendProcess,
+    /// [`EngineCommand::ResumeProcess`]
+    ResumeProcess,
+    /// [`EngineCommand::RestartExplorer`]
+    RestartExplorer,
+    /// [`EngineCommand::FindFileLocks`]
+    FindFileLocks,
+    /// [`EngineCommand::SetWebView2HostGrouping`]
+    SetWebView2HostGrouping,
+    /// [`EngineCommand::SetShowLeakWarnings`]
+    SetShowLeakWarnings,
+    /// [`EngineCommand::IgnoreLeakPath`]
+    IgnoreLeakPath,
+    /// [`EngineCommand::SetHideSystemProcesses`]
+    SetHideSystemProcesses,
     /// [`EngineCommand::SetEfficiencyMode`]
     SetEfficiencyMode,
     /// [`EngineCommand::SetPriority`]
@@ -216,10 +265,21 @@ impl EngineCommand {
             Self::SetDetailsSort { .. } => CommandKind::SetDetailsSort,
             Self::ToggleDetailsExpanded(_) => CommandKind::ToggleDetailsExpanded,
             Self::SetWindowDormant(_) => CommandKind::SetWindowDormant,
+            Self::SetProcessOrderFreeze(_) => CommandKind::SetProcessOrderFreeze,
+            Self::SetDetailsOrderFreeze(_) => CommandKind::SetDetailsOrderFreeze,
+            Self::SetTempFreeze(_) => CommandKind::SetTempFreeze,
             Self::ForceRefresh => CommandKind::ForceRefresh,
             Self::RunNewTask(_) => CommandKind::RunNewTask,
             Self::TerminateProcess(_) => CommandKind::TerminateProcess,
             Self::TerminateProcessTree(_) => CommandKind::TerminateProcessTree,
+            Self::SuspendProcess(_) => CommandKind::SuspendProcess,
+            Self::ResumeProcess(_) => CommandKind::ResumeProcess,
+            Self::RestartExplorer => CommandKind::RestartExplorer,
+            Self::FindFileLocks { .. } => CommandKind::FindFileLocks,
+            Self::SetWebView2HostGrouping(_) => CommandKind::SetWebView2HostGrouping,
+            Self::SetShowLeakWarnings(_) => CommandKind::SetShowLeakWarnings,
+            Self::IgnoreLeakPath(_) => CommandKind::IgnoreLeakPath,
+            Self::SetHideSystemProcesses(_) => CommandKind::SetHideSystemProcesses,
             Self::SetEfficiencyMode { .. } => CommandKind::SetEfficiencyMode,
             Self::SetPriority { .. } => CommandKind::SetPriority,
             Self::GetAffinity(_) => CommandKind::GetAffinity,
@@ -265,6 +325,8 @@ pub enum CommandSuccess {
     MiniDumpWritten(PathBuf),
     /// [`EngineCommand::BrowseExecutable`] completed with an optional selected file path.
     FilePicked(Option<PathBuf>),
+    /// [`EngineCommand::FindFileLocks`] returned all processes/services locking the queried path.
+    FileLocks(Vec<FileLockHolder>),
 }
 
 /// Structured outcome of executing an [`EngineCommand`].
@@ -377,11 +439,15 @@ pub(crate) struct CommandEnvelope {
 #[derive(Debug, Default)]
 pub(crate) struct EventBus {
     subscribers: Mutex<Vec<Sender<CommandEvent>>>,
+    wake_signal: Option<SnapshotWakeSignal>,
 }
 
 impl EventBus {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn with_wake_signal(wake_signal: SnapshotWakeSignal) -> Self {
+        Self {
+            subscribers: Mutex::new(Vec::new()),
+            wake_signal: Some(wake_signal),
+        }
     }
 
     pub(crate) fn subscribe(&self, capacity: usize) -> crossbeam_channel::Receiver<CommandEvent> {
@@ -399,5 +465,9 @@ impl EventBus {
             Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => true,
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
         });
+        drop(subs);
+        if let Some(ref wake) = self.wake_signal {
+            wake.notify();
+        }
     }
 }

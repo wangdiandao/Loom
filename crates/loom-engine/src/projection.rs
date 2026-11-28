@@ -7,20 +7,26 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
+use loom_config::AppSettings;
 use loom_pal_api::ProcessSampleScratch;
 use loom_types::{
     AppHistoryRecord, AppHistorySlice, DetailsRowProjection, DetailsSortColumn, DetailsTableSlice,
     DetailsViewMode, DiskDeviceSample, DiskDeviceSlice, GpuAdapterSample, GpuAdapterSlice,
-    GpuEngineSlice, HardwareStaticInfo, HistoryRing, NetAdapterSample, NetAdapterSlice,
-    PerformanceSlice, PlatformKind, PlatformProfile, ProcessArch, ProcessCategory, ProcessKey,
-    ProcessPriority, ProcessRowKind, ProcessRowProjection, ProcessSortColumn, ProcessStatusFlags,
-    ProcessTableSlice, ProcessViewMode, SortDirection, SystemPerfSample, ThroughputRing,
-    Timestamp100Ns, UacVirtualization, UserSessionProcess, UserSessionRecord, UsersSlice,
+    GpuEngineSlice, HardwareStaticInfo, HistoryRing, LeakWarning, NetAdapterSample,
+    NetAdapterSlice, PerformanceSlice, PlatformKind, PlatformProfile, ProcessArch, ProcessCategory,
+    ProcessKey, ProcessPriority, ProcessRowKind, ProcessRowProjection, ProcessSocketRecord,
+    ProcessSortColumn, ProcessStatusFlags, ProcessTableSlice, ProcessViewMode, SortDirection,
+    SystemPerfSample, ThroughputRing, Timestamp100Ns, UacVirtualization, UserSessionProcess,
+    UserSessionRecord, UsersSlice,
 };
 
+use crate::leaks::{LeakDetector, LeakDetectorConfig, LeakSampleInput};
+use crate::query::{ParsedQuery, QueryMatchContext};
 use crate::slow_lane::ColdMetaCache;
 use crate::tree::{FastBuildHasher, ProcessTree};
+use crate::webview2::{classify_webview2, is_webview2_image};
 
 /// Maximum number of interned strings retained by the fast-lane interner.
 const MAX_INTERNED_STRINGS: usize = 4_096;
@@ -28,10 +34,10 @@ const MAX_INTERNED_STRINGS: usize = 4_096;
 /// Maximum number of distinct application keys retained in the live App History accumulator.
 const MAX_LIVE_APP_HISTORY_ENTRIES: usize = 2_048;
 
-/// View filtering, grouping, sorting, and tree expansion parameters.
-#[derive(Debug, Default, Clone)]
+/// View filtering, grouping, sorting, freeze, and tree expansion parameters.
+#[derive(Debug, Clone)]
 pub struct ViewProjectionConfig {
-    /// Active case-insensitive search query.
+    /// Active structured / case-insensitive search query.
     pub search_query: String,
     /// Processes view mode (`Grouped` or `Tree`).
     pub process_view_mode: ProcessViewMode,
@@ -41,6 +47,10 @@ pub struct ViewProjectionConfig {
     pub process_sort_direction: SortDirection,
     /// Expanded rows in the Processes view.
     pub process_expanded: HashSet<ProcessKey>,
+    /// Whether Processes table row order is currently frozen in place.
+    pub process_order_frozen: bool,
+    /// Captured [`ProcessKey`] order honored while `process_order_frozen` is `true`.
+    pub frozen_process_order: Vec<ProcessKey>,
     /// Details view mode (`Flat` or `Tree`).
     pub details_view_mode: DetailsViewMode,
     /// Details table sort column.
@@ -49,6 +59,76 @@ pub struct ViewProjectionConfig {
     pub details_sort_direction: SortDirection,
     /// Expanded rows in the Details tree view.
     pub details_expanded: HashSet<ProcessKey>,
+    /// Whether Details table row order is currently frozen in place.
+    pub details_order_frozen: bool,
+    /// Captured [`ProcessKey`] order honored while `details_order_frozen` is `true`.
+    pub frozen_details_order: Vec<ProcessKey>,
+    /// Whether `msedgewebview2.exe` subprocesses are grouped under their host app on Windows.
+    pub webview2_host_grouping: bool,
+    /// Whether advisory resource-leak warnings are attached to projected rows.
+    pub show_leak_warnings: bool,
+    /// Case-insensitive executable paths or image names excluded from leak warnings.
+    pub leak_ignored_paths: Vec<String>,
+    /// Whether core OS system processes (except interactive shells) are hidden in process tables.
+    pub hide_windows_system_processes: bool,
+}
+
+impl Default for ViewProjectionConfig {
+    fn default() -> Self {
+        Self {
+            search_query: String::new(),
+            process_view_mode: ProcessViewMode::default(),
+            process_sort_column: ProcessSortColumn::default(),
+            process_sort_direction: SortDirection::default(),
+            process_expanded: HashSet::new(),
+            process_order_frozen: false,
+            frozen_process_order: Vec::new(),
+            details_view_mode: DetailsViewMode::default(),
+            details_sort_column: DetailsSortColumn::default(),
+            details_sort_direction: SortDirection::default(),
+            details_expanded: HashSet::new(),
+            details_order_frozen: false,
+            frozen_details_order: Vec::new(),
+            webview2_host_grouping: true,
+            show_leak_warnings: true,
+            leak_ignored_paths: Vec::new(),
+            hide_windows_system_processes: false,
+        }
+    }
+}
+
+impl ViewProjectionConfig {
+    /// Initializes a [`ViewProjectionConfig`] from persisted [`AppSettings`].
+    pub fn from_settings(settings: &AppSettings) -> Self {
+        Self {
+            process_view_mode: settings.process_view_mode,
+            webview2_host_grouping: settings.webview2_host_grouping,
+            show_leak_warnings: settings.show_leak_warnings,
+            leak_ignored_paths: settings.leak_ignored_paths.clone(),
+            hide_windows_system_processes: settings.hide_windows_system_processes,
+            ..Self::default()
+        }
+    }
+
+    /// Captures the current displayed [`ProcessKey`] row order from a [`ProcessTableSlice`]
+    /// and enables [`Self::process_order_frozen`].
+    pub fn freeze_process_order(&mut self, rows: &[ProcessRowProjection]) {
+        self.frozen_process_order.clear();
+        self.frozen_process_order.extend(
+            rows.iter()
+                .filter(|r| r.kind == ProcessRowKind::Process)
+                .map(|r| r.key),
+        );
+        self.process_order_frozen = true;
+    }
+
+    /// Captures the current displayed [`ProcessKey`] row order from a [`DetailsTableSlice`]
+    /// and enables [`Self::details_order_frozen`].
+    pub fn freeze_details_order(&mut self, rows: &[DetailsRowProjection]) {
+        self.frozen_details_order.clear();
+        self.frozen_details_order.extend(rows.iter().map(|r| r.key));
+        self.details_order_frozen = true;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -220,6 +300,8 @@ pub struct ProjectionEngine {
     latest_disk_read_bps: u64,
     latest_disk_write_bps: u64,
     app_history_live: HashMap<Arc<str>, LiveAppHistoryEntry>,
+    listening_ports: HashSet<(u32, u16)>,
+    leak_detector: LeakDetector,
 }
 
 impl Default for ProjectionEngine {
@@ -237,6 +319,14 @@ impl ProjectionEngine {
 
     /// Creates a fresh [`ProjectionEngine`] configured for `platform`.
     pub fn with_platform(platform: PlatformProfile) -> Self {
+        Self::with_platform_and_leak_config(platform, LeakDetectorConfig::default())
+    }
+
+    /// Creates a fresh [`ProjectionEngine`] configured for `platform` and explicit [`LeakDetectorConfig`].
+    pub fn with_platform_and_leak_config(
+        platform: PlatformProfile,
+        leak_config: LeakDetectorConfig,
+    ) -> Self {
         Self {
             platform,
             delta_tracker: DeltaTracker::with_capacity(512),
@@ -264,6 +354,76 @@ impl ProjectionEngine {
             latest_disk_read_bps: 0,
             latest_disk_write_bps: 0,
             app_history_live: HashMap::new(),
+            listening_ports: HashSet::new(),
+            leak_detector: LeakDetector::with_config(leak_config),
+        }
+    }
+
+    /// Replaces the cached on-demand listening `(pid, local_port)` lookup set.
+    pub fn set_listening_ports(&mut self, sockets: &[ProcessSocketRecord]) {
+        self.listening_ports.clear();
+        self.listening_ports.reserve(sockets.len());
+        for sock in sockets {
+            self.listening_ports.insert((sock.pid, sock.local_port));
+        }
+    }
+
+    /// Clears the cached on-demand listening port set when no `:PORT` query is active.
+    pub fn clear_listening_ports(&mut self) {
+        self.listening_ports.clear();
+    }
+
+    /// Evaluates the pure in-memory [`LeakDetector`] at `now` when its cadence has elapsed.
+    ///
+    /// Returns `true` if a leak-detection evaluation pass ran.
+    pub fn update_leak_detector(&mut self, now: Instant, cold_cache: &ColdMetaCache) -> bool {
+        let mut inputs = Vec::with_capacity(self.computed.len());
+        for (idx, proc) in self.computed.iter().enumerate() {
+            let exe_path = cold_cache
+                .get_process(proc.key)
+                .and_then(|meta| meta.exe_path.as_deref());
+            inputs.push(LeakSampleInput {
+                key: proc.key,
+                name: &proc.name,
+                exe_path,
+                category: proc.category,
+                status: effective_status(proc, cold_cache),
+                has_window: proc.window_title.is_some() || proc.category == ProcessCategory::App,
+                has_live_parent: self.latest_tree.parent_index(idx).is_some(),
+                handle_count: proc.handle_count,
+                child_count: self.latest_tree.children_indices(idx).len() as u32,
+                cpu_time_100ns: proc.cpu_time_100ns,
+            });
+        }
+        self.leak_detector.update_at(now, &inputs)
+    }
+
+    /// Pushes a gap sentinel (`GAP_SENTINEL`) into every non-empty performance history ring
+    /// (CPU, Kernel, Memory, Per-Core, Disk, Network, and GPU/Engine rings) to record
+    /// a sampling discontinuity (pause/resume, sampling error, or system sleep/clock jump).
+    pub fn push_performance_gap(&mut self) {
+        push_history_gap_if_needed(&mut self.cpu_history);
+        push_history_gap_if_needed(&mut self.cpu_kernel_history);
+        push_history_gap_if_needed(&mut self.mem_history);
+        for ring in &mut self.per_core_history {
+            push_history_gap_if_needed(ring);
+        }
+        for disk in &mut self.disks {
+            push_history_gap_if_needed(&mut disk.active_history);
+            push_throughput_gap_if_needed(&mut disk.read_history);
+            push_throughput_gap_if_needed(&mut disk.write_history);
+        }
+        for net in &mut self.networks {
+            push_throughput_gap_if_needed(&mut net.recv_history);
+            push_throughput_gap_if_needed(&mut net.sent_history);
+        }
+        for gpu in &mut self.gpus {
+            push_history_gap_if_needed(&mut gpu.util_history);
+            push_history_gap_if_needed(&mut gpu.dedicated_mem_history);
+            push_history_gap_if_needed(&mut gpu.shared_mem_history);
+            for eng in &mut gpu.engines {
+                push_history_gap_if_needed(&mut eng.history);
+            }
         }
     }
 
@@ -706,16 +866,23 @@ impl ProjectionEngine {
         cold_cache: &ColdMetaCache,
         revision: u64,
     ) -> ProcessTableSlice {
-        let query_lower = config.search_query.trim().to_lowercase();
-        let has_query = !query_lower.is_empty();
+        let parsed_query = ParsedQuery::parse(&config.search_query);
+        let frozen_ranks =
+            build_frozen_ranks(config.process_order_frozen, &config.frozen_process_order);
 
         let rows = match config.process_view_mode {
-            ProcessViewMode::Grouped => {
-                self.project_processes_grouped(config, cold_cache, &query_lower, has_query)
-            }
-            ProcessViewMode::Tree => {
-                self.project_processes_tree(config, cold_cache, &query_lower, has_query)
-            }
+            ProcessViewMode::Grouped => self.project_processes_grouped(
+                config,
+                cold_cache,
+                &parsed_query,
+                frozen_ranks.as_ref(),
+            ),
+            ProcessViewMode::Tree => self.project_processes_tree(
+                config,
+                cold_cache,
+                &parsed_query,
+                frozen_ranks.as_ref(),
+            ),
         };
 
         ProcessTableSlice {
@@ -741,15 +908,16 @@ impl ProjectionEngine {
         cold_cache: &ColdMetaCache,
         revision: u64,
     ) -> DetailsTableSlice {
-        let query_lower = config.search_query.trim().to_lowercase();
-        let has_query = !query_lower.is_empty();
+        let parsed_query = ParsedQuery::parse(&config.search_query);
+        let frozen_ranks =
+            build_frozen_ranks(config.details_order_frozen, &config.frozen_details_order);
 
         let rows = match config.details_view_mode {
             DetailsViewMode::Flat => {
-                self.project_details_flat(config, cold_cache, &query_lower, has_query)
+                self.project_details_flat(config, cold_cache, &parsed_query, frozen_ranks.as_ref())
             }
             DetailsViewMode::Tree => {
-                self.project_details_tree(config, cold_cache, &query_lower, has_query)
+                self.project_details_tree(config, cold_cache, &parsed_query, frozen_ranks.as_ref())
             }
         };
 
@@ -791,7 +959,10 @@ impl ProjectionEngine {
 
     /// Accumulates per-tick CPU and network deltas from non-system processes into the
     /// in-memory App History map (keyed by app group ID or lowercase image name).
-    pub fn accumulate_app_history(&mut self, cold_cache: &ColdMetaCache) {
+    ///
+    /// Returns `true` if any non-zero usage delta was accumulated on this tick.
+    pub fn accumulate_app_history(&mut self, cold_cache: &ColdMetaCache) -> bool {
+        let mut accumulated_any = false;
         for proc in &self.computed {
             if proc.delta_cpu_100ns == 0 && proc.delta_net_bytes == 0 {
                 continue;
@@ -819,6 +990,7 @@ impl ProjectionEngine {
             if let Some(entry) = self.app_history_live.get_mut(&app_id) {
                 entry.cpu_time_100ns = entry.cpu_time_100ns.saturating_add(proc.delta_cpu_100ns);
                 entry.network_bytes = entry.network_bytes.saturating_add(proc.delta_net_bytes);
+                accumulated_any = true;
                 // Upgrade raw image name once PE description / window title resolves.
                 if entry.name.as_ref() == proc.name.as_ref()
                     && friendly_name.as_ref() != proc.name.as_ref()
@@ -835,8 +1007,10 @@ impl ProjectionEngine {
                         metered_network_bytes: 0,
                     },
                 );
+                accumulated_any = true;
             }
         }
+        accumulated_any
     }
 
     /// Clears all in-memory cumulative App History counters.
@@ -980,9 +1154,11 @@ impl ProjectionEngine {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn build_process_row(
         &self,
         proc: &ComputedProcess,
+        config: &ViewProjectionConfig,
         cold_cache: &ColdMetaCache,
         depth: u16,
         has_children: bool,
@@ -1002,6 +1178,16 @@ impl ProjectionEngine {
             compute_throughput_permille(proc.disk_bytes_per_sec, self.total_disk_bytes_per_sec);
         let net_permille =
             compute_throughput_permille(proc.net_bytes_per_sec, self.total_net_bytes_per_sec);
+        let parent_key = self.latest_tree.parent(proc.key);
+        let webview2_role =
+            classify_webview2(&proc.name, command_line.as_deref()).map(|parsed| parsed.role);
+        let leak_warning = self.leak_detector.warning_for(
+            proc.key,
+            &proc.name,
+            exe_path.as_deref(),
+            config.show_leak_warnings,
+            &config.leak_ignored_paths,
+        );
 
         ProcessRowProjection {
             kind: ProcessRowKind::Process,
@@ -1028,9 +1214,9 @@ impl ProjectionEngine {
             net_permille,
             gpu_util_permille: proc.gpu_util_permille,
             gpu_dedicated_bytes: proc.gpu_dedicated_bytes,
-            parent_key: None,
-            leak_warning: None,
-            webview2_role: None,
+            parent_key,
+            leak_warning,
+            webview2_role,
         }
     }
 
@@ -1038,6 +1224,7 @@ impl ProjectionEngine {
     fn build_details_row(
         &self,
         idx: usize,
+        config: &ViewProjectionConfig,
         cold_cache: &ColdMetaCache,
         depth: u16,
         has_children: bool,
@@ -1051,6 +1238,17 @@ impl ProjectionEngine {
             .parent_index(idx)
             .map(|p| self.latest_tree.key_at(p));
         let status = effective_status(proc, cold_cache);
+        let exe_path = cold.and_then(|m| m.exe_path.clone());
+        let command_line = cold.and_then(|m| m.command_line.clone());
+        let webview2_role =
+            classify_webview2(&proc.name, command_line.as_deref()).map(|parsed| parsed.role);
+        let leak_warning = self.leak_detector.warning_for(
+            proc.key,
+            &proc.name,
+            exe_path.as_deref(),
+            config.show_leak_warnings,
+            &config.leak_ignored_paths,
+        );
 
         DetailsRowProjection {
             key: proc.key,
@@ -1077,10 +1275,10 @@ impl ProjectionEngine {
             uac_virtualization: cold.map_or(UacVirtualization::Unknown, |m| m.uac_virtualization),
             gpu_dedicated_bytes: proc.gpu_dedicated_bytes,
             gpu_shared_bytes: proc.gpu_shared_bytes,
-            exe_path: cold.and_then(|m| m.exe_path.clone()),
-            command_line: cold.and_then(|m| m.command_line.clone()),
-            leak_warning: None,
-            webview2_role: None,
+            exe_path,
+            command_line,
+            leak_warning,
+            webview2_role,
         }
     }
 
@@ -1089,7 +1287,8 @@ impl ProjectionEngine {
     fn build_aggregated_process_row(
         &self,
         proc: &ComputedProcess,
-        agg: GroupAggregate,
+        agg: &GroupAggregate,
+        config: &ViewProjectionConfig,
         cold_cache: &ColdMetaCache,
         depth: u16,
         has_children: bool,
@@ -1098,6 +1297,7 @@ impl ProjectionEngine {
     ) -> ProcessRowProjection {
         let mut row = self.build_process_row(
             proc,
+            config,
             cold_cache,
             depth,
             has_children,
@@ -1116,6 +1316,9 @@ impl ProjectionEngine {
             compute_throughput_permille(agg.net_bytes_per_sec, self.total_net_bytes_per_sec);
         row.gpu_util_permille = agg.gpu_util_permille;
         row.gpu_dedicated_bytes = agg.gpu_dedicated_bytes;
+        if row.leak_warning.is_none() {
+            row.leak_warning = agg.leak_warning.clone();
+        }
         row
     }
 
@@ -1123,6 +1326,7 @@ impl ProjectionEngine {
         &self,
         root_idx: usize,
         children: &[usize],
+        config: &ViewProjectionConfig,
         cold_cache: &ColdMetaCache,
     ) -> GroupAggregate {
         let root = &self.computed[root_idx];
@@ -1136,6 +1340,15 @@ impl ProjectionEngine {
         let mut sum_gpu_vram: u64 = root.gpu_dedicated_bytes;
         let mut all_suspended = root_status.contains(ProcessStatusFlags::SUSPENDED);
         let mut rolled_status = root_status - ProcessStatusFlags::SUSPENDED;
+        let mut rolled_leak = self.leak_detector.warning_for(
+            root.key,
+            &root.name,
+            cold_cache
+                .get_process(root.key)
+                .and_then(|m| m.exe_path.as_deref()),
+            config.show_leak_warnings,
+            &config.leak_ignored_paths,
+        );
 
         for &c_idx in children {
             let child = &self.computed[c_idx];
@@ -1150,6 +1363,17 @@ impl ProjectionEngine {
             all_suspended &= child_status.contains(ProcessStatusFlags::SUSPENDED);
             rolled_status |= child_status
                 & (ProcessStatusFlags::EFFICIENCY_MODE | ProcessStatusFlags::NOT_RESPONDING);
+            if rolled_leak.is_none() {
+                rolled_leak = self.leak_detector.warning_for(
+                    child.key,
+                    &child.name,
+                    cold_cache
+                        .get_process(child.key)
+                        .and_then(|m| m.exe_path.as_deref()),
+                    config.show_leak_warnings,
+                    &config.leak_ignored_paths,
+                );
+            }
         }
 
         if all_suspended {
@@ -1172,6 +1396,7 @@ impl ProjectionEngine {
             gpu_util_permille: sum_gpu_util.min(1_000) as u16,
             gpu_dedicated_bytes: sum_gpu_vram,
             status: rolled_status,
+            leak_warning: rolled_leak,
         }
     }
 
@@ -1179,24 +1404,28 @@ impl ProjectionEngine {
         &self,
         config: &ViewProjectionConfig,
         cold_cache: &ColdMetaCache,
-        query_lower: &str,
-        has_query: bool,
+        parsed_query: &ParsedQuery,
+        frozen_ranks: Option<&HashMap<ProcessKey, usize, FastBuildHasher>>,
     ) -> Vec<ProcessRowProjection> {
         if self.platform.kind == PlatformKind::Windows {
             return self.project_processes_grouped_windows(
                 config,
                 cold_cache,
-                query_lower,
-                has_query,
+                parsed_query,
+                frozen_ranks,
             );
         }
 
+        let has_query = !parsed_query.is_empty();
         let n = self.computed.len();
         let mut by_category: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         let mut in_any_section = vec![false; n];
 
         for (idx, proc) in self.computed.iter().enumerate() {
-            if has_query && !matches_process_query(proc, cold_cache, query_lower) {
+            if is_hidden_system_process(proc, config.hide_windows_system_processes) {
+                continue;
+            }
+            if has_query && !self.matches_query(proc, cold_cache, parsed_query, false) {
                 continue;
             }
             in_any_section[idx] = true;
@@ -1239,6 +1468,7 @@ impl ProjectionEngine {
                 cold_cache,
                 config.process_sort_column,
                 config.process_sort_direction,
+                frozen_ranks,
             );
 
             stack.clear();
@@ -1267,6 +1497,7 @@ impl ProjectionEngine {
 
                 rows.push(self.build_process_row(
                     proc,
+                    config,
                     cold_cache,
                     depth,
                     has_children,
@@ -1280,6 +1511,7 @@ impl ProjectionEngine {
                         cold_cache,
                         config.process_sort_column,
                         config.process_sort_direction,
+                        frozen_ranks,
                     );
                     for &c_idx in visible_children.iter().rev() {
                         stack.push((c_idx, depth.saturating_add(1)));
@@ -1297,7 +1529,10 @@ impl ProjectionEngine {
     ///   when present, otherwise normalized `exe_path` case-insensitive, falling back to
     ///   executable `name` case-insensitive before slow-lane paths arrive), scoped by
     ///   `session_id`.
-    /// - Never pulls different-executable child processes (e.g. `crashpad_handler.exe`,
+    /// - When `config.webview2_host_grouping` is `true`, attributes `msedgewebview2.exe`
+    ///   processes to their matching host `App` group via `--webview-exe-name=` or their
+    ///   verified `ProcessKey` ancestor chain.
+    /// - Never pulls other different-executable child processes (e.g. `crashpad_handler.exe`,
     ///   `WeChatAppEx.exe`) into an `App` group; those remain in `Background`.
     /// - Every unique `App` identity appears once at depth 0 in `Apps` (never nested
     ///   under `explorer.exe` or another app) with a deterministic leader, total group
@@ -1310,11 +1545,13 @@ impl ProjectionEngine {
         &self,
         config: &ViewProjectionConfig,
         cold_cache: &ColdMetaCache,
-        query_lower: &str,
-        has_query: bool,
+        parsed_query: &ParsedQuery,
+        frozen_ranks: Option<&HashMap<ProcessKey, usize, FastBuildHasher>>,
     ) -> Vec<ProcessRowProjection> {
+        let has_query = !parsed_query.is_empty();
         let n = self.computed.len();
         let mut app_groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut idx_to_app_group: Vec<Option<usize>> = vec![None; n];
         let mut pkg_to_group: HashMap<(u32, AsciiCiStr<'_>), usize, FastBuildHasher> =
             HashMap::with_hasher(FastBuildHasher);
         let mut exe_to_group: HashMap<(u32, AsciiCiStr<'_>), usize, FastBuildHasher> =
@@ -1372,6 +1609,8 @@ impl ProjectionEngine {
                 g_idx
             };
 
+            idx_to_app_group[idx] = Some(g_idx);
+
             if let Some(p) = pkg {
                 pkg_to_group
                     .entry((proc.session_id, AsciiCiStr(p)))
@@ -1384,15 +1623,22 @@ impl ProjectionEngine {
             }
         }
 
-        // Step 2: Attach windowless Background processes strictly by matching App identity.
+        // Step 2: Attach windowless Background processes strictly by matching App identity
+        // (plus optional WebView2 host attribution when `webview2_host_grouping` is enabled).
         let mut bg_indices: Vec<usize> = Vec::new();
         let mut sys_indices: Vec<usize> = Vec::new();
         let mut in_remaining_section = vec![false; n];
+        let mut deferred_webview2: Vec<usize> = Vec::new();
 
         for (idx, proc) in self.computed.iter().enumerate() {
             match proc.category {
                 ProcessCategory::App => {}
                 ProcessCategory::Background => {
+                    if config.webview2_host_grouping && is_webview2_image(&proc.name) {
+                        deferred_webview2.push(idx);
+                        continue;
+                    }
+
                     let pkg = process_app_group_id(cold_cache, proc.key);
                     let exe = process_normalized_exe_slice(cold_cache, proc.key);
 
@@ -1422,17 +1668,42 @@ impl ProjectionEngine {
 
                     if let Some(g_idx) = matched_group {
                         app_groups[g_idx].1.push(idx);
-                    } else if !has_query || matches_process_query(proc, cold_cache, query_lower) {
+                        idx_to_app_group[idx] = Some(g_idx);
+                    } else if !has_query
+                        || self.matches_query(proc, cold_cache, parsed_query, false)
+                    {
                         in_remaining_section[idx] = true;
                         bg_indices.push(idx);
                     }
                 }
                 ProcessCategory::System => {
-                    if !has_query || matches_process_query(proc, cold_cache, query_lower) {
+                    if is_hidden_system_process(proc, config.hide_windows_system_processes) {
+                        continue;
+                    }
+                    if !has_query || self.matches_query(proc, cold_cache, parsed_query, false) {
                         in_remaining_section[idx] = true;
                         sys_indices.push(idx);
                     }
                 }
+            }
+        }
+
+        // Step 2b: Attribute `msedgewebview2.exe` processes to their host App group after
+        // all host app members are indexed in `idx_to_app_group`.
+        for idx in deferred_webview2 {
+            let proc = &self.computed[idx];
+            let host_group = self.resolve_webview2_host_group(
+                idx,
+                cold_cache,
+                &name_to_groups,
+                &idx_to_app_group,
+            );
+            if let Some(g_idx) = host_group {
+                app_groups[g_idx].1.push(idx);
+                idx_to_app_group[idx] = Some(g_idx);
+            } else if !has_query || self.matches_query(proc, cold_cache, parsed_query, false) {
+                in_remaining_section[idx] = true;
+                bg_indices.push(idx);
             }
         }
 
@@ -1443,14 +1714,14 @@ impl ProjectionEngine {
         let mut visible_apps: Vec<(usize, GroupAggregate, Vec<usize>)> =
             Vec::with_capacity(app_groups.len());
         for (leader_idx, mut children_all) in app_groups {
-            let agg = self.compute_group_aggregate(leader_idx, &children_all, cold_cache);
+            let agg = self.compute_group_aggregate(leader_idx, &children_all, config, cold_cache);
             if has_query {
                 let root_matches =
-                    matches_process_query(&self.computed[leader_idx], cold_cache, query_lower);
+                    self.matches_query(&self.computed[leader_idx], cold_cache, parsed_query, false);
                 let matching_children: Vec<usize> = children_all
                     .into_iter()
                     .filter(|&c_idx| {
-                        matches_process_query(&self.computed[c_idx], cold_cache, query_lower)
+                        self.matches_query(&self.computed[c_idx], cold_cache, parsed_query, false)
                     })
                     .collect();
                 if root_matches || !matching_children.is_empty() {
@@ -1469,8 +1740,16 @@ impl ProjectionEngine {
             visible_apps.sort_by(|(ia, agg_a, _), (ib, agg_b, _)| {
                 let a = &self.computed[*ia];
                 let b = &self.computed[*ib];
+                if let Some(ranks) = frozen_ranks {
+                    let ra = ranks.get(&a.key).copied().unwrap_or(usize::MAX);
+                    let rb = ranks.get(&b.key).copied().unwrap_or(usize::MAX);
+                    let frozen_ord = ra.cmp(&rb);
+                    if frozen_ord != Ordering::Equal {
+                        return frozen_ord;
+                    }
+                }
                 let ord =
-                    cmp_process_sort_column(a, b, Some(*agg_a), Some(*agg_b), cold_cache, sort_col);
+                    cmp_process_sort_column(a, b, Some(agg_a), Some(agg_b), cold_cache, sort_col);
                 let directed = match sort_dir {
                     SortDirection::Ascending => ord,
                     SortDirection::Descending => ord.reverse(),
@@ -1495,7 +1774,8 @@ impl ProjectionEngine {
 
                 rows.push(self.build_aggregated_process_row(
                     leader,
-                    agg,
+                    &agg,
+                    config,
                     cold_cache,
                     0,
                     has_children,
@@ -1509,10 +1789,12 @@ impl ProjectionEngine {
                         cold_cache,
                         config.process_sort_column,
                         config.process_sort_direction,
+                        frozen_ranks,
                     );
                     for c_idx in children {
                         rows.push(self.build_process_row(
                             &self.computed[c_idx],
+                            config,
                             cold_cache,
                             1,
                             false,
@@ -1592,8 +1874,12 @@ impl ProjectionEngine {
                         }
                     }
                     subtree_counts[idx] = (subtree_descendants.len() + 1) as u32;
-                    group_agg[idx] =
-                        Some(self.compute_group_aggregate(idx, &subtree_descendants, cold_cache));
+                    group_agg[idx] = Some(self.compute_group_aggregate(
+                        idx,
+                        &subtree_descendants,
+                        config,
+                        cold_cache,
+                    ));
                 }
             }
 
@@ -1605,6 +1891,7 @@ impl ProjectionEngine {
                 cold_cache,
                 config.process_sort_column,
                 config.process_sort_direction,
+                frozen_ranks,
             );
 
             stack.clear();
@@ -1638,10 +1925,11 @@ impl ProjectionEngine {
                     0
                 };
 
-                if let Some(agg) = group_agg[idx] {
+                if let Some(ref agg) = group_agg[idx] {
                     rows.push(self.build_aggregated_process_row(
                         proc,
                         agg,
+                        config,
                         cold_cache,
                         depth,
                         has_children,
@@ -1651,6 +1939,7 @@ impl ProjectionEngine {
                 } else {
                     rows.push(self.build_process_row(
                         proc,
+                        config,
                         cold_cache,
                         depth,
                         has_children,
@@ -1666,6 +1955,7 @@ impl ProjectionEngine {
                         cold_cache,
                         config.process_sort_column,
                         config.process_sort_direction,
+                        frozen_ranks,
                     );
                     for &c_idx in visible_children.iter().rev() {
                         stack.push((c_idx, depth.saturating_add(1)));
@@ -1677,28 +1967,98 @@ impl ProjectionEngine {
         rows
     }
 
+    fn resolve_webview2_host_group(
+        &self,
+        idx: usize,
+        cold_cache: &ColdMetaCache,
+        name_to_groups: &HashMap<(u32, AsciiCiStr<'_>), Vec<usize>, FastBuildHasher>,
+        idx_to_app_group: &[Option<usize>],
+    ) -> Option<usize> {
+        let proc = &self.computed[idx];
+        let session = proc.session_id;
+
+        // 1. Check `--webview-exe-name=` on this process or any `msedgewebview2.exe` ancestor.
+        let mut cur_opt = Some(idx);
+        let mut hops = 0usize;
+        while let Some(cur) = cur_opt {
+            if hops >= 16 {
+                break;
+            }
+            hops += 1;
+            let cur_proc = &self.computed[cur];
+            if cur_proc.session_id != session {
+                break;
+            }
+            if is_webview2_image(&cur_proc.name)
+                && let Some(cmd) = cold_cache
+                    .get_process(cur_proc.key)
+                    .and_then(|m| m.command_line.as_deref())
+                && let Some(parsed) = classify_webview2(&cur_proc.name, Some(cmd))
+                && let Some(host_exe) = parsed.host_exe_name
+                && let Some(groups) = name_to_groups.get(&(session, AsciiCiStr(host_exe)))
+                && let Some(&g_idx) = groups.first()
+            {
+                return Some(g_idx);
+            }
+            cur_opt = self.latest_tree.parent_index(cur);
+        }
+
+        // 2. Walk verified `ProcessKey` ancestor chain looking for any owning `App` group.
+        let mut cur_opt = self.latest_tree.parent_index(idx);
+        let mut hops = 0usize;
+        while let Some(anc) = cur_opt {
+            if hops >= 32 {
+                break;
+            }
+            hops += 1;
+            let anc_proc = &self.computed[anc];
+            if anc_proc.session_id != session || is_windows_shell_launcher(&anc_proc.name) {
+                break;
+            }
+            if let Some(g_idx) = idx_to_app_group[anc] {
+                return Some(g_idx);
+            }
+            cur_opt = self.latest_tree.parent_index(anc);
+        }
+
+        None
+    }
+
     fn project_processes_tree(
         &self,
         config: &ViewProjectionConfig,
         cold_cache: &ColdMetaCache,
-        query_lower: &str,
-        has_query: bool,
+        parsed_query: &ParsedQuery,
+        frozen_ranks: Option<&HashMap<ProcessKey, usize, FastBuildHasher>>,
     ) -> Vec<ProcessRowProjection> {
+        let has_query = !parsed_query.is_empty();
         let n = self.computed.len();
+        let visible_mask: Vec<bool> = self
+            .computed
+            .iter()
+            .map(|p| !is_hidden_system_process(p, config.hide_windows_system_processes))
+            .collect();
         let included = if has_query {
-            Some(self.collect_matching_with_ancestors(|proc| {
-                matches_process_query(proc, cold_cache, query_lower)
+            Some(self.collect_matching_with_ancestors(&visible_mask, |proc| {
+                self.matches_query(proc, cold_cache, parsed_query, false)
             }))
         } else {
             None
         };
 
-        let mut roots: Vec<usize> = self
-            .latest_tree
-            .root_indices()
-            .iter()
-            .copied()
-            .filter(|&idx| included.as_ref().is_none_or(|mask| mask[idx]))
+        let is_included = |idx: usize| -> bool {
+            visible_mask[idx] && included.as_ref().is_none_or(|mask| mask[idx])
+        };
+
+        // Any included node whose verified parent is absent or hidden/excluded becomes a tree root.
+        let mut roots: Vec<usize> = (0..n)
+            .filter(|&idx| {
+                is_included(idx)
+                    && self
+                        .latest_tree
+                        .parent_index(idx)
+                        .is_none_or(|p_idx| !is_included(p_idx))
+            })
             .collect();
 
         self.sort_process_indices(
@@ -1706,6 +2066,7 @@ impl ProjectionEngine {
             cold_cache,
             config.process_sort_column,
             config.process_sort_direction,
+            frozen_ranks,
         );
 
         let mut rows = Vec::with_capacity(n);
@@ -1727,7 +2088,7 @@ impl ProjectionEngine {
             let proc = &self.computed[idx];
             visible_children.clear();
             for &c_idx in self.latest_tree.children_indices(idx) {
-                if included.as_ref().is_none_or(|mask| mask[c_idx]) {
+                if is_included(c_idx) {
                     visible_children.push(c_idx);
                 }
             }
@@ -1739,6 +2100,7 @@ impl ProjectionEngine {
 
             rows.push(self.build_process_row(
                 proc,
+                config,
                 cold_cache,
                 depth,
                 has_children,
@@ -1752,6 +2114,7 @@ impl ProjectionEngine {
                     cold_cache,
                     config.process_sort_column,
                     config.process_sort_direction,
+                    frozen_ranks,
                 );
                 for &c_idx in visible_children.iter().rev() {
                     stack.push((c_idx, depth.saturating_add(1)));
@@ -1766,12 +2129,15 @@ impl ProjectionEngine {
         &self,
         config: &ViewProjectionConfig,
         cold_cache: &ColdMetaCache,
-        query_lower: &str,
-        has_query: bool,
+        parsed_query: &ParsedQuery,
+        frozen_ranks: Option<&HashMap<ProcessKey, usize, FastBuildHasher>>,
     ) -> Vec<DetailsRowProjection> {
+        let has_query = !parsed_query.is_empty();
         let mut indices: Vec<usize> = (0..self.computed.len())
             .filter(|&idx| {
-                !has_query || matches_details_query(&self.computed[idx], cold_cache, query_lower)
+                let proc = &self.computed[idx];
+                !is_hidden_system_process(proc, config.hide_windows_system_processes)
+                    && (!has_query || self.matches_query(proc, cold_cache, parsed_query, true))
             })
             .collect();
 
@@ -1780,11 +2146,12 @@ impl ProjectionEngine {
             cold_cache,
             config.details_sort_column,
             config.details_sort_direction,
+            frozen_ranks,
         );
 
         indices
             .into_iter()
-            .map(|idx| self.build_details_row(idx, cold_cache, 0, false, false))
+            .map(|idx| self.build_details_row(idx, config, cold_cache, 0, false, false))
             .collect()
     }
 
@@ -1792,24 +2159,36 @@ impl ProjectionEngine {
         &self,
         config: &ViewProjectionConfig,
         cold_cache: &ColdMetaCache,
-        query_lower: &str,
-        has_query: bool,
+        parsed_query: &ParsedQuery,
+        frozen_ranks: Option<&HashMap<ProcessKey, usize, FastBuildHasher>>,
     ) -> Vec<DetailsRowProjection> {
+        let has_query = !parsed_query.is_empty();
         let n = self.computed.len();
+        let visible_mask: Vec<bool> = self
+            .computed
+            .iter()
+            .map(|p| !is_hidden_system_process(p, config.hide_windows_system_processes))
+            .collect();
         let included = if has_query {
-            Some(self.collect_matching_with_ancestors(|proc| {
-                matches_details_query(proc, cold_cache, query_lower)
+            Some(self.collect_matching_with_ancestors(&visible_mask, |proc| {
+                self.matches_query(proc, cold_cache, parsed_query, true)
             }))
         } else {
             None
         };
 
-        let mut roots: Vec<usize> = self
-            .latest_tree
-            .root_indices()
-            .iter()
-            .copied()
-            .filter(|&idx| included.as_ref().is_none_or(|mask| mask[idx]))
+        let is_included = |idx: usize| -> bool {
+            visible_mask[idx] && included.as_ref().is_none_or(|mask| mask[idx])
+        };
+
+        let mut roots: Vec<usize> = (0..n)
+            .filter(|&idx| {
+                is_included(idx)
+                    && self
+                        .latest_tree
+                        .parent_index(idx)
+                        .is_none_or(|p_idx| !is_included(p_idx))
+            })
             .collect();
 
         self.sort_details_indices(
@@ -1817,6 +2196,7 @@ impl ProjectionEngine {
             cold_cache,
             config.details_sort_column,
             config.details_sort_direction,
+            frozen_ranks,
         );
 
         let mut rows = Vec::with_capacity(n);
@@ -1838,7 +2218,7 @@ impl ProjectionEngine {
             let key = self.computed[idx].key;
             visible_children.clear();
             for &c_idx in self.latest_tree.children_indices(idx) {
-                if included.as_ref().is_none_or(|mask| mask[c_idx]) {
+                if is_included(c_idx) {
                     visible_children.push(c_idx);
                 }
             }
@@ -1847,7 +2227,14 @@ impl ProjectionEngine {
             let is_expanded = has_children
                 && (has_query || (has_expanded && config.details_expanded.contains(&key)));
 
-            rows.push(self.build_details_row(idx, cold_cache, depth, has_children, is_expanded));
+            rows.push(self.build_details_row(
+                idx,
+                config,
+                cold_cache,
+                depth,
+                has_children,
+                is_expanded,
+            ));
 
             if is_expanded {
                 self.sort_details_indices(
@@ -1855,6 +2242,7 @@ impl ProjectionEngine {
                     cold_cache,
                     config.details_sort_column,
                     config.details_sort_direction,
+                    frozen_ranks,
                 );
                 for &c_idx in visible_children.iter().rev() {
                     stack.push((c_idx, depth.saturating_add(1)));
@@ -1865,16 +2253,21 @@ impl ProjectionEngine {
         rows
     }
 
-    fn collect_matching_with_ancestors<F>(&self, predicate: F) -> Vec<bool>
+    fn collect_matching_with_ancestors<F>(&self, visible_mask: &[bool], predicate: F) -> Vec<bool>
     where
         F: Fn(&ComputedProcess) -> bool,
     {
         let mut included = vec![false; self.computed.len()];
         for (idx, proc) in self.computed.iter().enumerate() {
+            if !visible_mask[idx] {
+                continue;
+            }
             if predicate(proc) {
                 let mut curr = idx;
                 while !included[curr] {
-                    included[curr] = true;
+                    if visible_mask[curr] {
+                        included[curr] = true;
+                    }
                     if let Some(p_idx) = self.latest_tree.parent_index(curr) {
                         curr = p_idx;
                     } else {
@@ -1886,6 +2279,38 @@ impl ProjectionEngine {
         included
     }
 
+    fn matches_query(
+        &self,
+        proc: &ComputedProcess,
+        cold_cache: &ColdMetaCache,
+        parsed_query: &ParsedQuery,
+        include_user_in_text: bool,
+    ) -> bool {
+        let cold = cold_cache.get_process(proc.key);
+        let asset = cold.and_then(|m| m.asset.as_ref());
+        let display_name = process_display_name_ref(proc, cold_cache);
+        let status = effective_status(proc, cold_cache);
+        let listening_ports = (!self.listening_ports.is_empty()).then_some(&self.listening_ports);
+
+        let ctx = QueryMatchContext {
+            pid: proc.key.pid,
+            name: &proc.name,
+            display_name,
+            window_title: proc.window_title.as_deref(),
+            publisher: asset.and_then(|a| a.publisher.as_deref()),
+            exe_path: cold.and_then(|m| m.exe_path.as_deref()),
+            command_line: cold.and_then(|m| m.command_line.as_deref()),
+            user_name: cold.and_then(|m| m.user_name.as_deref()),
+            include_user_in_text,
+            status,
+            cpu_permille: proc.cpu_permille,
+            memory_bytes: proc.private_working_set_bytes,
+            listening_ports,
+        };
+        parsed_query.matches(&ctx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn sort_process_indices_with_aggregates(
         &self,
         indices: &mut [usize],
@@ -1893,12 +2318,27 @@ impl ProjectionEngine {
         cold_cache: &ColdMetaCache,
         column: ProcessSortColumn,
         direction: SortDirection,
+        frozen_ranks: Option<&HashMap<ProcessKey, usize, FastBuildHasher>>,
     ) {
         indices.sort_by(|&ia, &ib| {
             let a = &self.computed[ia];
             let b = &self.computed[ib];
-            let ord =
-                cmp_process_sort_column(a, b, group_agg[ia], group_agg[ib], cold_cache, column);
+            if let Some(ranks) = frozen_ranks {
+                let ra = ranks.get(&a.key).copied().unwrap_or(usize::MAX);
+                let rb = ranks.get(&b.key).copied().unwrap_or(usize::MAX);
+                let frozen_ord = ra.cmp(&rb);
+                if frozen_ord != Ordering::Equal {
+                    return frozen_ord;
+                }
+            }
+            let ord = cmp_process_sort_column(
+                a,
+                b,
+                group_agg[ia].as_ref(),
+                group_agg[ib].as_ref(),
+                cold_cache,
+                column,
+            );
             let directed = match direction {
                 SortDirection::Ascending => ord,
                 SortDirection::Descending => ord.reverse(),
@@ -1915,10 +2355,19 @@ impl ProjectionEngine {
         cold_cache: &ColdMetaCache,
         column: ProcessSortColumn,
         direction: SortDirection,
+        frozen_ranks: Option<&HashMap<ProcessKey, usize, FastBuildHasher>>,
     ) {
         indices.sort_by(|&ia, &ib| {
             let a = &self.computed[ia];
             let b = &self.computed[ib];
+            if let Some(ranks) = frozen_ranks {
+                let ra = ranks.get(&a.key).copied().unwrap_or(usize::MAX);
+                let rb = ranks.get(&b.key).copied().unwrap_or(usize::MAX);
+                let frozen_ord = ra.cmp(&rb);
+                if frozen_ord != Ordering::Equal {
+                    return frozen_ord;
+                }
+            }
             let ord = cmp_process_sort_column(a, b, None, None, cold_cache, column);
             let directed = match direction {
                 SortDirection::Ascending => ord,
@@ -1936,10 +2385,19 @@ impl ProjectionEngine {
         cold_cache: &ColdMetaCache,
         column: DetailsSortColumn,
         direction: SortDirection,
+        frozen_ranks: Option<&HashMap<ProcessKey, usize, FastBuildHasher>>,
     ) {
         indices.sort_by(|&ia, &ib| {
             let a = &self.computed[ia];
             let b = &self.computed[ib];
+            if let Some(ranks) = frozen_ranks {
+                let ra = ranks.get(&a.key).copied().unwrap_or(usize::MAX);
+                let rb = ranks.get(&b.key).copied().unwrap_or(usize::MAX);
+                let frozen_ord = ra.cmp(&rb);
+                if frozen_ord != Ordering::Equal {
+                    return frozen_ord;
+                }
+            }
             let ca = cold_cache.get_process(a.key);
             let cb = cold_cache.get_process(b.key);
             let ord = match column {
@@ -2028,8 +2486,8 @@ impl ProjectionEngine {
 fn cmp_process_sort_column(
     a: &ComputedProcess,
     b: &ComputedProcess,
-    agg_a: Option<GroupAggregate>,
-    agg_b: Option<GroupAggregate>,
+    agg_a: Option<&GroupAggregate>,
+    agg_b: Option<&GroupAggregate>,
     cold_cache: &ColdMetaCache,
     column: ProcessSortColumn,
 ) -> Ordering {
@@ -2095,7 +2553,7 @@ fn cmp_process_sort_column(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct GroupAggregate {
     cpu_permille: u16,
     memory_bytes: u64,
@@ -2105,6 +2563,7 @@ struct GroupAggregate {
     gpu_util_permille: u16,
     gpu_dedicated_bytes: u64,
     status: ProcessStatusFlags,
+    leak_warning: Option<LeakWarning>,
 }
 
 #[derive(Clone, Copy)]
@@ -2368,107 +2827,55 @@ fn process_display_name_ref<'a>(
     &proc.name
 }
 
-fn matches_process_query(
-    proc: &ComputedProcess,
-    cold_cache: &ColdMetaCache,
-    query_lower: &str,
-) -> bool {
-    if pid_matches_query(proc.key.pid, query_lower) {
-        return true;
+#[inline]
+fn build_frozen_ranks(
+    frozen: bool,
+    order: &[ProcessKey],
+) -> Option<HashMap<ProcessKey, usize, FastBuildHasher>> {
+    if !frozen || order.is_empty() {
+        return None;
     }
-    if contains_case_insensitive(&proc.name, query_lower) {
-        return true;
+    let mut map = HashMap::with_capacity_and_hasher(order.len(), FastBuildHasher);
+    for (rank, &key) in order.iter().enumerate() {
+        map.entry(key).or_insert(rank);
     }
-    if let Some(ref title) = proc.window_title
-        && contains_case_insensitive(title, query_lower)
-    {
-        return true;
-    }
-    if let Some(asset) = cold_cache
-        .get_process(proc.key)
-        .and_then(|m| m.asset.as_ref())
-    {
-        if let Some(ref desc) = asset.file_description
-            && contains_case_insensitive(desc, query_lower)
-        {
-            return true;
-        }
-        if let Some(ref pub_name) = asset.publisher
-            && contains_case_insensitive(pub_name, query_lower)
-        {
-            return true;
-        }
-    }
-    false
+    Some(map)
 }
 
-fn matches_details_query(
-    proc: &ComputedProcess,
-    cold_cache: &ColdMetaCache,
-    query_lower: &str,
-) -> bool {
-    if matches_process_query(proc, cold_cache, query_lower) {
-        return true;
+#[inline]
+fn push_history_gap_if_needed<const N: usize>(ring: &mut HistoryRing<N>) {
+    if !ring.is_empty() && !ring.latest().is_some_and(HistoryRing::<N>::is_gap) {
+        ring.push_gap();
     }
-    if let Some(cold) = cold_cache.get_process(proc.key) {
-        if let Some(ref user) = cold.user_name
-            && contains_case_insensitive(user, query_lower)
-        {
-            return true;
-        }
-        if let Some(ref exe) = cold.exe_path
-            && contains_case_insensitive(exe, query_lower)
-        {
-            return true;
-        }
-        if let Some(ref cmd) = cold.command_line
-            && contains_case_insensitive(cmd, query_lower)
-        {
-            return true;
-        }
-    }
-    false
 }
 
-fn pid_matches_query(mut pid: u32, query_lower: &str) -> bool {
-    if query_lower.is_empty() || !query_lower.bytes().all(|b| b.is_ascii_digit()) {
+#[inline]
+fn push_throughput_gap_if_needed<const N: usize>(ring: &mut ThroughputRing<N>) {
+    if !ring.is_empty() && !ring.latest().is_some_and(ThroughputRing::<N>::is_gap) {
+        ring.push_gap();
+    }
+}
+
+/// Interactive Windows shell tools that remain visible even when
+/// `hide_windows_system_processes` is enabled.
+const INTERACTIVE_SHELL_EXEMPTIONS: &[&str] = &[
+    "explorer.exe",
+    "cmd.exe",
+    "conhost.exe",
+    "openconsole.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "wt.exe",
+];
+
+#[inline]
+fn is_hidden_system_process(proc: &ComputedProcess, hide_system: bool) -> bool {
+    if !hide_system || proc.category != ProcessCategory::System {
         return false;
     }
-    // Stack-allocated decimal formatting (u32::MAX has 10 digits).
-    let mut buf = [0u8; 10];
-    let mut idx = buf.len();
-    if pid == 0 {
-        idx -= 1;
-        buf[idx] = b'0';
-    } else {
-        while pid > 0 {
-            idx -= 1;
-            buf[idx] = b'0' + (pid % 10) as u8;
-            pid /= 10;
-        }
-    }
-    let pid_str = std::str::from_utf8(&buf[idx..]).unwrap_or("");
-    pid_str.contains(query_lower)
-}
-
-fn contains_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
-    if needle_lower.is_empty() {
-        return true;
-    }
-    if haystack.is_ascii() && needle_lower.is_ascii() {
-        let h = haystack.as_bytes();
-        let n = needle_lower.as_bytes();
-        if n.len() > h.len() {
-            return false;
-        }
-        return h.windows(n.len()).any(|window| {
-            window
-                .iter()
-                .zip(n.iter())
-                .all(|(&hb, &nb)| hb.to_ascii_lowercase() == nb)
-        });
-    }
-    haystack.to_lowercase().contains(needle_lower)
+    !INTERACTIVE_SHELL_EXEMPTIONS
+        .iter()
+        .any(|exempt| proc.name.eq_ignore_ascii_case(exempt))
 }
 
 #[inline]
@@ -3374,5 +3781,347 @@ mod tests {
             );
             assert_eq!(slice.rows[3].key.pid, 201);
         }
+    }
+
+    #[test]
+    fn windows_grouped_webview2_host_attribution_and_role_population() {
+        use loom_types::{ProcessColdMeta, WebView2Role};
+
+        let mut engine = ProjectionEngine::with_platform(PlatformProfile::WINDOWS);
+        let mut scratch = ProcessSampleScratch::<()>::new();
+        scratch.perf.logical_cpu_count = 4;
+
+        // Host App: Teams.exe (PID 100) + two msedgewebview2.exe subprocesses (200 by flag, 201 by ancestor chain).
+        make_detailed_sample(
+            &mut scratch,
+            100,
+            10,
+            1,
+            1,
+            "Teams.exe",
+            ProcessCategory::App,
+            ProcessStatusFlags::empty(),
+            0,
+            150 * 1024 * 1024,
+            0,
+        );
+        make_detailed_sample(
+            &mut scratch,
+            200,
+            20,
+            999, // detached parent PID, matched via `--webview-exe-name=Teams.exe`
+            1,
+            "msedgewebview2.exe",
+            ProcessCategory::Background,
+            ProcessStatusFlags::empty(),
+            0,
+            80 * 1024 * 1024,
+            0,
+        );
+        make_detailed_sample(
+            &mut scratch,
+            201,
+            30,
+            100, // child of Teams.exe, no `--webview-exe-name=` flag -> matched via ancestor chain
+            1,
+            "msedgewebview2.exe",
+            ProcessCategory::Background,
+            ProcessStatusFlags::empty(),
+            0,
+            60 * 1024 * 1024,
+            0,
+        );
+
+        engine.ingest_process_sample(Timestamp100Ns::new(10_000_000), &scratch, 4);
+
+        let mut cold = ColdMetaCache::new();
+        cold.insert_process(ProcessColdMeta {
+            key: ProcessKey::new(200, 20),
+            exe_path: Some(Arc::from(r"C:\Program Files\WebView2\msedgewebview2.exe")),
+            command_line: Some(Arc::from(
+                r#"msedgewebview2.exe --type=renderer --webview-exe-name=Teams.exe"#,
+            )),
+            user_name: None,
+            arch: ProcessArch::X64,
+            uac_virtualization: UacVirtualization::NotAllowed,
+            efficiency_mode: false,
+            is_elevated: false,
+            app_group_id: None,
+            asset: None,
+        });
+        cold.insert_process(ProcessColdMeta {
+            key: ProcessKey::new(201, 30),
+            exe_path: Some(Arc::from(r"C:\Program Files\WebView2\msedgewebview2.exe")),
+            command_line: Some(Arc::from(
+                r#"msedgewebview2.exe --type=utility --utility-sub-type=network.mojom.NetworkService"#,
+            )),
+            user_name: None,
+            arch: ProcessArch::X64,
+            uac_virtualization: UacVirtualization::NotAllowed,
+            efficiency_mode: false,
+            is_elevated: false,
+            app_group_id: None,
+            asset: None,
+        });
+
+        let mut cfg = ViewProjectionConfig {
+            process_view_mode: ProcessViewMode::Grouped,
+            webview2_host_grouping: true,
+            ..ViewProjectionConfig::default()
+        };
+        cfg.process_expanded.insert(ProcessKey::new(100, 10));
+
+        let grouped = engine.project_processes(&cfg, &cold, 1);
+        // Teams.exe absorbs both WebView2 processes -> total group count 3, zero Background section.
+        assert_eq!(
+            grouped.rows[0].kind,
+            ProcessRowKind::SectionHeader {
+                category: ProcessCategory::App,
+                count: 1
+            }
+        );
+        assert_eq!(grouped.rows[1].key, ProcessKey::new(100, 10));
+        assert_eq!(grouped.rows[1].child_count, 3);
+        assert_eq!(grouped.rows[1].memory_bytes, 290 * 1024 * 1024);
+        assert_eq!(grouped.rows.len(), 4);
+
+        let wv_renderer = grouped
+            .rows
+            .iter()
+            .find(|r| r.key == ProcessKey::new(200, 20))
+            .unwrap();
+        assert_eq!(wv_renderer.depth, 1);
+        assert_eq!(wv_renderer.webview2_role, Some(WebView2Role::Renderer));
+
+        let wv_net = grouped
+            .rows
+            .iter()
+            .find(|r| r.key == ProcessKey::new(201, 30))
+            .unwrap();
+        assert_eq!(wv_net.depth, 1);
+        assert_eq!(wv_net.webview2_role, Some(WebView2Role::Network));
+        assert_eq!(wv_net.parent_key, Some(ProcessKey::new(100, 10)));
+
+        // Disabling `webview2_host_grouping` moves WebView2 processes back to Background
+        // while still populating `webview2_role`.
+        cfg.webview2_host_grouping = false;
+        let ungrouped = engine.project_processes(&cfg, &cold, 2);
+        let teams = ungrouped
+            .rows
+            .iter()
+            .find(|r| r.key == ProcessKey::new(100, 10))
+            .unwrap();
+        assert_eq!(teams.child_count, 0);
+        assert!(ungrouped.rows.iter().any(|r| matches!(
+            r.kind,
+            ProcessRowKind::SectionHeader {
+                category: ProcessCategory::Background,
+                ..
+            }
+        )));
+        let details = engine.project_details(&cfg, &cold, 1);
+        assert_eq!(
+            details
+                .rows
+                .iter()
+                .find(|r| r.key == ProcessKey::new(200, 20))
+                .unwrap()
+                .webview2_role,
+            Some(WebView2Role::Renderer)
+        );
+    }
+
+    #[test]
+    fn hide_windows_system_processes_filters_core_os_but_keeps_interactive_shells() {
+        let mut engine = ProjectionEngine::with_platform(PlatformProfile::WINDOWS);
+        let mut scratch = ProcessSampleScratch::<()>::new();
+        scratch.perf.logical_cpu_count = 4;
+
+        for (pid, name, cat) in [
+            (4, "System", ProcessCategory::System),
+            (100, "svchost.exe", ProcessCategory::System),
+            (101, "csrss.exe", ProcessCategory::System),
+            (102, "explorer.exe", ProcessCategory::System),
+            (103, "cmd.exe", ProcessCategory::System),
+            (104, "pwsh.exe", ProcessCategory::System),
+            (105, "wt.exe", ProcessCategory::System),
+            (200, "myapp.exe", ProcessCategory::App),
+        ] {
+            make_sample(&mut scratch, pid, 10, 4, name, cat, 0, 0);
+        }
+        engine.ingest_process_sample(Timestamp100Ns::new(10_000_000), &scratch, 4);
+
+        let cold = ColdMetaCache::new();
+        let cfg = ViewProjectionConfig {
+            hide_windows_system_processes: true,
+            ..ViewProjectionConfig::default()
+        };
+        let slice = engine.project_processes(&cfg, &cold, 1);
+        let visible_names: Vec<&str> = slice
+            .rows
+            .iter()
+            .filter(|r| r.kind == ProcessRowKind::Process)
+            .map(|r| r.name.as_ref())
+            .collect();
+        assert!(visible_names.contains(&"myapp.exe"));
+        assert!(visible_names.contains(&"explorer.exe"));
+        assert!(visible_names.contains(&"cmd.exe"));
+        assert!(visible_names.contains(&"pwsh.exe"));
+        assert!(visible_names.contains(&"wt.exe"));
+        assert!(!visible_names.contains(&"System"));
+        assert!(!visible_names.contains(&"svchost.exe"));
+        assert!(!visible_names.contains(&"csrss.exe"));
+
+        // In Tree mode, visible children whose hidden parent (PID 4) is filtered out are promoted to roots.
+        let tree_cfg = ViewProjectionConfig {
+            process_view_mode: ProcessViewMode::Tree,
+            hide_windows_system_processes: true,
+            ..ViewProjectionConfig::default()
+        };
+        let tree_slice = engine.project_processes(&tree_cfg, &cold, 2);
+        assert!(
+            tree_slice
+                .rows
+                .iter()
+                .any(|r| r.name.as_ref() == "myapp.exe" && r.depth == 0)
+        );
+        assert!(
+            !tree_slice
+                .rows
+                .iter()
+                .any(|r| r.name.as_ref() == "svchost.exe")
+        );
+
+        let details = engine.project_details(&cfg, &cold, 1);
+        assert!(
+            !details
+                .rows
+                .iter()
+                .any(|r| r.name.as_ref() == "svchost.exe")
+        );
+        assert!(details.rows.iter().any(|r| r.name.as_ref() == "pwsh.exe"));
+    }
+
+    #[test]
+    fn order_freeze_locks_row_order_while_updating_metrics_and_pruning_exited_rows() {
+        let mut engine = ProjectionEngine::new();
+        let mut scratch = ProcessSampleScratch::<()>::new();
+        scratch.perf.logical_cpu_count = 4;
+
+        let k_a = ProcessKey::new(10, 100);
+        let k_b = ProcessKey::new(20, 100);
+        let k_c = ProcessKey::new(30, 100);
+        make_detailed_sample(
+            &mut scratch,
+            10,
+            100,
+            0,
+            1,
+            "alpha.exe",
+            ProcessCategory::Background,
+            ProcessStatusFlags::empty(),
+            0,
+            300 * 1024 * 1024,
+            0,
+        );
+        make_detailed_sample(
+            &mut scratch,
+            20,
+            100,
+            0,
+            1,
+            "beta.exe",
+            ProcessCategory::Background,
+            ProcessStatusFlags::empty(),
+            0,
+            200 * 1024 * 1024,
+            0,
+        );
+        make_detailed_sample(
+            &mut scratch,
+            30,
+            100,
+            0,
+            1,
+            "gamma.exe",
+            ProcessCategory::Background,
+            ProcessStatusFlags::empty(),
+            0,
+            100 * 1024 * 1024,
+            0,
+        );
+        engine.ingest_process_sample(Timestamp100Ns::new(10_000_000), &scratch, 4);
+
+        let cold = ColdMetaCache::new();
+        let mut cfg = ViewProjectionConfig {
+            process_sort_column: ProcessSortColumn::Memory,
+            process_sort_direction: SortDirection::Descending,
+            ..ViewProjectionConfig::default()
+        };
+
+        let s1 = engine.project_processes(&cfg, &cold, 1);
+        let order1: Vec<ProcessKey> = s1
+            .rows
+            .iter()
+            .filter(|r| r.kind == ProcessRowKind::Process)
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(order1, vec![k_a, k_b, k_c]);
+
+        // Freeze row order, then reverse memory usage (gamma > alpha) and remove exited beta.
+        cfg.freeze_process_order(&s1.rows);
+        scratch.clear();
+        make_detailed_sample(
+            &mut scratch,
+            10,
+            100,
+            0,
+            1,
+            "alpha.exe",
+            ProcessCategory::Background,
+            ProcessStatusFlags::empty(),
+            0,
+            50 * 1024 * 1024,
+            0,
+        );
+        make_detailed_sample(
+            &mut scratch,
+            30,
+            100,
+            0,
+            1,
+            "gamma.exe",
+            ProcessCategory::Background,
+            ProcessStatusFlags::empty(),
+            0,
+            900 * 1024 * 1024,
+            0,
+        );
+        engine.ingest_process_sample(Timestamp100Ns::new(20_000_000), &scratch, 4);
+
+        let s2 = engine.project_processes(&cfg, &cold, 2);
+        let rows2: Vec<(ProcessKey, u64)> = s2
+            .rows
+            .iter()
+            .filter(|r| r.kind == ProcessRowKind::Process)
+            .map(|r| (r.key, r.memory_bytes))
+            .collect();
+        // Order stays alpha -> gamma (beta removed cleanly) while live memory updates in place!
+        assert_eq!(
+            rows2,
+            vec![(k_a, 50 * 1024 * 1024), (k_c, 900 * 1024 * 1024)]
+        );
+
+        // Unfreezing immediately re-sorts gamma ahead of alpha.
+        cfg.process_order_frozen = false;
+        cfg.frozen_process_order.clear();
+        let s3 = engine.project_processes(&cfg, &cold, 3);
+        let order3: Vec<ProcessKey> = s3
+            .rows
+            .iter()
+            .filter(|r| r.kind == ProcessRowKind::Process)
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(order3, vec![k_c, k_a]);
     }
 }

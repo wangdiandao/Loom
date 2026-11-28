@@ -7,7 +7,7 @@ use std::mem::{offset_of, size_of, zeroed};
 use std::ptr;
 use std::sync::Arc;
 
-use loom_types::{CpuStaticInfo, HardwareStaticInfo, SystemPerfSample};
+use loom_types::{CpuCoreKind, CpuStaticInfo, HardwareStaticInfo, SystemPerfSample};
 use windows_sys::Wdk::System::SystemInformation::NtQuerySystemInformation;
 use windows_sys::Win32::Foundation::{
     ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GetLastError, STATUS_SUCCESS,
@@ -150,8 +150,9 @@ pub(crate) fn populate_memory_list_composition(
 pub fn probe_cpu_static_info() -> CpuStaticInfo {
     let logical_processors = query_logical_cpu_count();
     let (brand_name, reg_mhz) = read_cpu_registry_metadata();
-    let (sockets, physical_cores, l1_cache_bytes, l2_cache_bytes, l3_cache_bytes, hetero) =
+    let (sockets, physical_cores, l1_cache_bytes, l2_cache_bytes, l3_cache_bytes, _) =
         query_cpu_topology_and_caches();
+    let hetero = probe_heterogeneous_topology();
     tracing::debug!(
         p_cores = hetero.performance_cores,
         e_cores = hetero.efficiency_cores,
@@ -159,6 +160,11 @@ pub fn probe_cpu_static_info() -> CpuStaticInfo {
         logical_tiers = hetero.logical_tiers.len(),
         "probed heterogeneous CPU topology"
     );
+    let core_kinds = hetero
+        .logical_tiers
+        .into_iter()
+        .map(CoreTier::into_cpu_core_kind)
+        .collect();
 
     let mut power_buf = Vec::new();
     let (_, power_base_mhz) = sample_cpu_frequencies(&mut power_buf, logical_processors);
@@ -185,7 +191,7 @@ pub fn probe_cpu_static_info() -> CpuStaticInfo {
         l1_cache_bytes,
         l2_cache_bytes,
         l3_cache_bytes,
-        core_kinds: Vec::new(),
+        core_kinds,
     }
 }
 
@@ -215,6 +221,18 @@ pub(crate) enum CoreTier {
     Efficiency,
     /// Low-power efficiency core (lowest efficiency tier or isolated without L3 cache).
     LowPowerEfficiency,
+}
+
+impl CoreTier {
+    /// Converts internal [`CoreTier`] classification into public [`CpuCoreKind`].
+    #[inline]
+    pub(crate) const fn into_cpu_core_kind(self) -> CpuCoreKind {
+        match self {
+            Self::Performance => CpuCoreKind::Performance,
+            Self::Efficiency => CpuCoreKind::Efficiency,
+            Self::LowPowerEfficiency => CpuCoreKind::LowPowerEfficiency,
+        }
+    }
 }
 
 /// Raw physical core descriptor extracted from `GetLogicalProcessorInformationEx`.
@@ -353,7 +371,6 @@ pub(crate) fn classify_heterogeneous_topology(
 
 /// Probes live heterogeneous core topology (`P` / `E` / `LP-E`) via
 /// `GetLogicalProcessorInformationEx(RelationAll, ...)`.
-#[allow(dead_code)]
 pub(crate) fn probe_heterogeneous_topology() -> HeterogeneousTopology {
     let (_, _, _, _, _, topo) = query_cpu_topology_and_caches();
     topo

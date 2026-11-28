@@ -988,7 +988,9 @@ impl GpuPerfSampler {
                 .power_gates
                 .entry(adapter.luid)
                 .or_insert_with(|| GpuPowerGate::new(adapter.is_hybrid_discrete));
-            let temperature_celsius = match gate.evaluate(power_state, any_node_activity, now) {
+            let gate_decision = gate.evaluate(power_state, any_node_activity, now);
+            let d3_asleep = matches!(gate_decision, PerfDataGateDecision::SkipSleeping);
+            let temperature_celsius = match gate_decision {
                 PerfDataGateDecision::Allow => {
                     let temp = query_adapter_temperature(api, adapter.luid_raw);
                     gate.record_temperature(temp);
@@ -1011,7 +1013,7 @@ impl GpuPerfSampler {
                 dedicated_total_bytes: dedicated_total,
                 shared_used_bytes: shared_used_clamped,
                 shared_total_bytes: shared_total,
-                d3_asleep: false,
+                d3_asleep,
                 engines,
             });
         }
