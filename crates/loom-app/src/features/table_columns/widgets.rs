@@ -368,7 +368,6 @@ pub(crate) fn expand_chevron_button(
         .items_center()
         .justify_center()
         .rounded_sm()
-        .cursor_pointer()
         .hover(move |s| s.bg(hover_bg))
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
@@ -567,7 +566,6 @@ pub(crate) fn render_table_th_cell<D: TableDelegate>(
         .text_xs()
         .text_color(if is_active_sort { fg } else { muted_fg })
         .when(is_active_sort, |d| d.font_semibold())
-        .cursor_pointer()
         .on_click(cx.listener(move |table, _, _, cx| {
             on_click_sort(table, cx);
         }))

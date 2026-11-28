@@ -135,6 +135,7 @@ struct SetAffinityDialogView {
     store: Entity<UiStore>,
     key: ProcessKey,
     state: AffinityLoadState,
+    applied: bool,
     _load_task: Option<Task<()>>,
 }
 
@@ -187,11 +188,15 @@ impl SetAffinityDialogView {
             store,
             key,
             state,
+            applied: false,
             _load_task: load_task,
         }
     }
 
     fn try_apply(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.applied {
+            return true;
+        }
         let AffinityLoadState::Ready(selection) = &self.state else {
             return false;
         };
@@ -199,6 +204,7 @@ impl SetAffinityDialogView {
             cx.notify();
             return false;
         }
+        self.applied = true;
         let mask = selection.mask().clone();
         UiCommands::set_affinity(&self.store, self.key, mask, cx);
         true

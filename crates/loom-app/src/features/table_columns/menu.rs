@@ -117,6 +117,7 @@ type ConfirmColumnsCallback = Rc<dyn Fn(Vec<&'static str>, &mut App)>;
 struct SelectColumnsDialogView {
     draft: SelectColumnsDraft,
     on_confirm: ConfirmColumnsCallback,
+    applied: bool,
 }
 
 impl SelectColumnsDialogView {
@@ -124,7 +125,18 @@ impl SelectColumnsDialogView {
         Self {
             draft: SelectColumnsDraft::new(items),
             on_confirm,
+            applied: false,
         }
+    }
+
+    fn try_apply(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.applied {
+            return true;
+        }
+        self.applied = true;
+        let selected = self.draft.selected_slugs();
+        (self.on_confirm)(selected, cx);
+        true
     }
 }
 
@@ -187,9 +199,9 @@ impl Render for SelectColumnsDialogView {
                             .primary()
                             .label(i18n::tr("common.ok"))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                let selected = this.draft.selected_slugs();
-                                (this.on_confirm)(selected, cx);
-                                window.close_dialog(cx);
+                                if this.try_apply(cx) {
+                                    window.close_dialog(cx);
+                                }
                             })),
                     ),
             )
@@ -204,11 +216,14 @@ pub(crate) fn open_select_columns_dialog(
     cx: &mut App,
 ) {
     let dialog_view = cx.new(|_| SelectColumnsDialogView::new(items, on_confirm));
+    let dialog_for_ok = dialog_view.clone();
     window.open_dialog(cx, move |dialog, _window, _cx| {
+        let ok_view = dialog_for_ok.clone();
         dialog
             .w(px(360.))
             .centered()
             .title(i18n::tr("table.select_columns_title"))
+            .on_ok(move |_, _, cx| ok_view.update(cx, |view, cx| view.try_apply(cx)))
             .child(dialog_view.clone())
     });
 }
