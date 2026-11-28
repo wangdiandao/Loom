@@ -8,10 +8,13 @@
 mod affinity_dialog;
 mod wait_chain_dialog;
 
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -20,15 +23,15 @@ use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableEvent, TableState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _,
-    WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _, Size,
+    StyledExt as _, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
     App, AppContext as _, Bounds, ClipboardItem, Context, Empty, Entity, EntityInputHandler,
     FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement as _, Pixels, Point, Render, ScrollStrategy, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, UTF16Selection, WeakEntity, Window,
-    div, img, prelude::FluentBuilder as _, px,
+    MouseDownEvent, ParentElement as _, Pixels, Point, Render, ScrollStrategy, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, UTF16Selection, WeakEntity,
+    Window, div, img, prelude::FluentBuilder as _, px,
 };
 use loom_engine::{EngineCommand, EngineCoordinator};
 use loom_pal::NativeBackend;
@@ -38,19 +41,20 @@ use loom_types::{
     ProcessStatusFlags, SortDirection, UacVirtualization, WebView2Role,
 };
 use loom_ui_kit::{
-    HeatmapLevel, LoomSemanticColors, format_bytes, format_bytes_shared, format_cpu_time,
-    format_cpu_time_shared, format_permille, format_permille_shared, heatmap_cell,
+    CachedSemanticColors, DEFAULT_CELL_PREVIEW_CHARS, HeatmapLevel, MetricDisplay, RowTextCache,
+    format_bytes, format_cpu_time, format_permille, format_permille_metric, heatmap_cell_metric,
+    quantize_bytes_display, quantize_cpu_time_secs,
 };
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
 use crate::features::table_columns::{
-    ColumnKey, ColumnSpec, ColumnToggleItem, CopyRowFields, DataTablePane, HeaderMenuAction,
-    IconRenderCache, OrderFreezeState, TableColumnLayout, TableInputBridge, TypeToSearchState,
-    build_column_header_menu, build_copy_submenu, can_suspend_or_resume_process,
-    dispatch_ignore_leak_path, dispatch_restart_explorer, dispatch_suspend_or_resume,
-    format_process_name_and_pid, is_explorer_image, leak_ignore_target, leak_warning_badge,
-    open_select_columns_dialog, sort_paused_indicator, spawn_csv_export, webview2_role_badge,
-    webview2_role_label,
+    ColumnKey, ColumnSpec, ColumnToggleItem, CopyRowFields, DataTablePane, FnvHasher64,
+    HeaderMenuAction, IconRenderCache, OrderFreezeState, ScrollBurstCoalescer, TableColumnLayout,
+    TableInputBridge, TypeToSearchState, build_column_header_menu, build_copy_submenu,
+    can_suspend_or_resume_process, dispatch_ignore_leak_path, dispatch_restart_explorer,
+    dispatch_suspend_or_resume, expand_chevron_button, format_process_name_and_pid,
+    is_explorer_image, leak_ignore_target, leak_warning_badge, open_select_columns_dialog,
+    sort_paused_indicator, spawn_csv_export, webview2_role_badge, webview2_role_label,
 };
 use crate::i18n;
 use crate::shell::{ShellHandle, dialogs};
@@ -388,6 +392,22 @@ pub(super) fn find_row_index_by_key(
     rows.iter().position(|row| row.key == target)
 }
 
+/// Fast-path variant of [`find_row_index_by_key`] checking `hint_idx` in `O(1)` before scanning.
+#[inline]
+fn find_row_index_by_key_fast(
+    rows: &[DetailsRowProjection],
+    target: ProcessKey,
+    hint_idx: Option<usize>,
+) -> Option<usize> {
+    if let Some(idx) = hint_idx
+        && let Some(row) = rows.get(idx)
+        && row.key == target
+    {
+        return Some(idx);
+    }
+    find_row_index_by_key(rows, target)
+}
+
 /// Returns `true` when `status` represents a critical, kernel, idle, or OS-protected process
 /// that should show an explicit confirmation warning before termination.
 #[inline]
@@ -506,8 +526,64 @@ fn memory_heatmap_level(private_working_set_bytes: u64, total_ram_bytes: u64) ->
     HeatmapLevel::from_permille(permille)
 }
 
+/// Maximum cached domain-stripped user names retained per Details table instance.
+const MAX_CACHED_USER_NAMES: usize = 128;
+
+/// Returns a display [`SharedString`] for a process user name without allocating in steady state.
+///
+/// Clean single-segment names reuse `Arc::clone` directly; domain-prefixed Windows names
+/// (e.g. `HOST\User`) are memoized in `cache` (typically < 10 distinct accounts per machine).
+fn cached_user_name(
+    cache: &mut HashMap<String, SharedString>,
+    raw: Option<&Arc<str>>,
+) -> SharedString {
+    let Some(arc) = raw else {
+        return SharedString::new_static("—");
+    };
+    let trimmed = arc.trim();
+    if trimmed.is_empty() {
+        return SharedString::new_static("—");
+    }
+    if trimmed.len() == arc.len() && !trimmed.contains('\\') {
+        return SharedString::from(Arc::clone(arc));
+    }
+    if let Some(cached) = cache.get(arc.as_ref()) {
+        return cached.clone();
+    }
+    let formatted: SharedString = display_user_name(Some(arc.as_ref())).to_owned().into();
+    if cache.len() >= MAX_CACHED_USER_NAMES {
+        cache.clear();
+    }
+    cache.insert(arc.to_string(), formatted.clone());
+    formatted
+}
+
+/// Renders a right-aligned monospace numeric cell from a split [`MetricDisplay`] so
+/// `metric.value` hits `gpui-fast::NumberShaping` and `metric.unit` hits `LineLayoutCache`.
+#[inline]
+fn render_metric_cell(
+    metric: MetricDisplay,
+    mono_font: SharedString,
+    text_color: gpui_kit::Hsla,
+) -> gpui_kit::AnyElement {
+    let mut cell = h_flex()
+        .size_full()
+        .items_center()
+        .justify_end()
+        .text_xs()
+        .font_family(mono_font)
+        .text_color(text_color)
+        .child(metric.value);
+    if !metric.unit.is_empty() {
+        cell = cell.child(SharedString::new_static(metric.unit));
+    }
+    cell.into_any_element()
+}
+
 /// Cached localized strings for [`DetailsTableDelegate`] to avoid per-frame `i18n::tr` allocations.
 struct DetailsLocaleCache {
+    col_labels: [SharedString; 21],
+    sort_paused_tooltip: SharedString,
     running: SharedString,
     suspended: SharedString,
     elevated_yes: SharedString,
@@ -539,8 +615,32 @@ struct DetailsLocaleCache {
 }
 
 impl DetailsLocaleCache {
-    fn build() -> Self {
+    fn build(platform: PlatformProfile) -> Self {
         Self {
+            col_labels: [
+                DetailsColumn::Name.label(platform).into(),
+                DetailsColumn::Pid.label(platform).into(),
+                DetailsColumn::Status.label(platform).into(),
+                DetailsColumn::UserName.label(platform).into(),
+                DetailsColumn::SessionId.label(platform).into(),
+                DetailsColumn::Cpu.label(platform).into(),
+                DetailsColumn::CpuTime.label(platform).into(),
+                DetailsColumn::Memory.label(platform).into(),
+                DetailsColumn::WorkingSet.label(platform).into(),
+                DetailsColumn::CommitSize.label(platform).into(),
+                DetailsColumn::Priority.label(platform).into(),
+                DetailsColumn::Handles.label(platform).into(),
+                DetailsColumn::Threads.label(platform).into(),
+                DetailsColumn::Platform.label(platform).into(),
+                DetailsColumn::UacVirtualization.label(platform).into(),
+                DetailsColumn::Elevated.label(platform).into(),
+                DetailsColumn::GpuMemory.label(platform).into(),
+                DetailsColumn::Publisher.label(platform).into(),
+                DetailsColumn::Description.label(platform).into(),
+                DetailsColumn::ExePath.label(platform).into(),
+                DetailsColumn::CommandLine.label(platform).into(),
+            ],
+            sort_paused_tooltip: i18n::tr("proc_ux_sort_paused_tooltip").into(),
             running: i18n::tr("details.status_running").into(),
             suspended: i18n::tr("details.status_suspended").into(),
             elevated_yes: i18n::tr("details.elevated_yes").into(),
@@ -572,6 +672,11 @@ impl DetailsLocaleCache {
             wv2_utility: webview2_role_label(WebView2Role::Utility).into(),
             wv2_crashpad: webview2_role_label(WebView2Role::Crashpad).into(),
         }
+    }
+
+    #[inline]
+    fn column_label(&self, col: DetailsColumn) -> SharedString {
+        self.col_labels[col as usize].clone()
     }
 
     #[inline]
@@ -790,6 +895,169 @@ fn open_end_process_tree_dialog(
     });
 }
 
+/// Computes a fast 64-bit viewport fingerprint over the currently visible rows and columns
+/// of a [`DetailsTableSlice`] so unchanged live ticks can skip `cx.notify()`.
+#[allow(clippy::too_many_arguments)]
+fn compute_details_viewport_fingerprint(
+    details: &DetailsTableSlice,
+    column_layout: &TableColumnLayout<DetailsColumn>,
+    visible_rows: &Range<usize>,
+    visible_cols: &Range<usize>,
+    selected_idx: Option<usize>,
+    highlighted_key: Option<ProcessKey>,
+    total_ram_bytes: u64,
+    order_frozen: bool,
+) -> u64 {
+    let mut h = FnvHasher64::new();
+    let rows_len = details.rows.len();
+    let start = visible_rows.start.min(rows_len);
+    let end = visible_rows.end.min(rows_len).max(start);
+    let cols_mask = column_layout.visible_cols_mask(visible_cols);
+
+    h.write_bool(details.revision == 0);
+    h.write_usize(rows_len);
+    h.write_u8(details.view_mode as u8);
+    h.write_u8(details.sort_column as u8);
+    h.write_u8(details.sort_direction as u8);
+    h.write_usize(selected_idx.unwrap_or(usize::MAX));
+    if let Some(hk) = highlighted_key {
+        h.write_u8(1);
+        h.write_u32(hk.pid);
+        h.write_u64(hk.create_time_100ns);
+    } else {
+        h.write_u8(0);
+    }
+    h.write_u64(total_ram_bytes);
+    h.write_bool(order_frozen);
+    h.write_usize(start);
+    h.write_usize(end);
+    h.write_u64(cols_mask);
+
+    let visible_specs = column_layout.visible_columns();
+    for row in &details.rows[start..end] {
+        h.write_u32(row.key.pid);
+        h.write_u64(row.key.create_time_100ns);
+        h.write_u16(row.depth);
+        h.write_bool(row.has_children);
+        h.write_bool(row.is_expanded);
+
+        for (col_ix, spec) in visible_specs.iter().enumerate() {
+            if col_ix < 64 && (cols_mask & (1u64 << col_ix)) == 0 {
+                continue;
+            }
+            match spec.id {
+                DetailsColumn::Name => {
+                    h.write_str(&row.name);
+                    h.write_u8(row.webview2_role.map_or(u8::MAX, |r| r as u8));
+                    if let Some(icon) = row.icon.as_ref() {
+                        h.write_usize(icon.rgba.as_ptr() as usize);
+                        h.write_usize(icon.rgba.len());
+                    } else {
+                        h.write_u8(0);
+                    }
+                }
+                DetailsColumn::Pid => {}
+                DetailsColumn::Status => {
+                    h.write_bool(row.status.contains(ProcessStatusFlags::SUSPENDED));
+                    if let Some(w) = row.leak_warning.as_ref() {
+                        h.write_u8(1);
+                        h.write_u8(w.kind as u8);
+                        h.write_u64(w.current_value);
+                        h.write_u64(w.baseline_value);
+                        h.write_str(&w.summary);
+                    } else {
+                        h.write_u8(0);
+                    }
+                }
+                DetailsColumn::UserName => {
+                    if let Some(u) = row.user_name.as_deref() {
+                        h.write_u8(1);
+                        h.write_str(u);
+                    } else {
+                        h.write_u8(0);
+                    }
+                }
+                DetailsColumn::SessionId => {
+                    h.write_u32(row.session_id);
+                }
+                DetailsColumn::Cpu => {
+                    h.write_u16(row.cpu_permille);
+                }
+                DetailsColumn::CpuTime => {
+                    h.write_u64(quantize_cpu_time_secs(row.cpu_time_100ns));
+                }
+                DetailsColumn::Memory => {
+                    h.write_u64(quantize_bytes_display(row.private_working_set_bytes));
+                    h.write_u8(
+                        memory_heatmap_level(row.private_working_set_bytes, total_ram_bytes) as u8,
+                    );
+                }
+                DetailsColumn::WorkingSet => {
+                    h.write_u64(quantize_bytes_display(row.working_set_bytes));
+                }
+                DetailsColumn::CommitSize => {
+                    h.write_u64(quantize_bytes_display(row.commit_bytes));
+                }
+                DetailsColumn::Priority => {
+                    h.write_u8(row.priority as u8);
+                }
+                DetailsColumn::Handles => {
+                    h.write_u32(row.handle_count);
+                }
+                DetailsColumn::Threads => {
+                    h.write_u32(row.thread_count);
+                }
+                DetailsColumn::Platform => {
+                    h.write_u8(row.arch as u8);
+                }
+                DetailsColumn::UacVirtualization => {
+                    h.write_u8(row.uac_virtualization as u8);
+                }
+                DetailsColumn::Elevated => {
+                    h.write_bool(row.status.contains(ProcessStatusFlags::ELEVATED));
+                }
+                DetailsColumn::GpuMemory => {
+                    h.write_u64(quantize_bytes_display(row.gpu_dedicated_bytes));
+                }
+                DetailsColumn::Publisher => {
+                    if let Some(p) = row.publisher.as_deref() {
+                        h.write_u8(1);
+                        h.write_str(p);
+                    } else {
+                        h.write_u8(0);
+                    }
+                }
+                DetailsColumn::Description => {
+                    if let Some(d) = row.description.as_deref() {
+                        h.write_u8(1);
+                        h.write_str(d);
+                    } else {
+                        h.write_u8(0);
+                    }
+                }
+                DetailsColumn::ExePath => {
+                    if let Some(p) = row.exe_path.as_deref() {
+                        h.write_u8(1);
+                        h.write_preview_str(p);
+                    } else {
+                        h.write_u8(0);
+                    }
+                }
+                DetailsColumn::CommandLine => {
+                    if let Some(c) = row.command_line.as_deref() {
+                        h.write_u8(1);
+                        h.write_preview_str(c);
+                    } else {
+                        h.write_u8(0);
+                    }
+                }
+            }
+        }
+    }
+
+    h.finish()
+}
+
 /// 2D-virtualized `gpui-kit` [`TableDelegate`] backing the live Details table.
 struct DetailsTableDelegate {
     store: Entity<UiStore>,
@@ -807,7 +1075,16 @@ struct DetailsTableDelegate {
     menu_focus_subs: Vec<Subscription>,
     column_layout: TableColumnLayout<DetailsColumn>,
     icon_cache: IconRenderCache,
+    semantic_colors: CachedSemanticColors,
+    row_cache: RowTextCache,
+    user_name_cache: HashMap<String, SharedString>,
     locale: DetailsLocaleCache,
+    visible_rows: Range<usize>,
+    visible_cols: Range<usize>,
+    last_rows_len: usize,
+    last_viewport_fingerprint: Option<u64>,
+    scroll_coalescer: ScrollBurstCoalescer,
+    user_initiated_pending: bool,
 }
 
 impl DetailsTableDelegate {
@@ -828,6 +1105,7 @@ impl DetailsTableDelegate {
         if !saved_cols.is_empty() {
             column_layout.apply_saved(saved_cols);
         }
+        let initial_rows_len = snap.details.rows.len();
 
         Self {
             store: store.clone(),
@@ -845,8 +1123,46 @@ impl DetailsTableDelegate {
             menu_focus_subs: Vec::new(),
             column_layout,
             icon_cache: IconRenderCache::new(),
-            locale: DetailsLocaleCache::build(),
+            semantic_colors: CachedSemanticColors::new(),
+            row_cache: RowTextCache::new(),
+            user_name_cache: HashMap::new(),
+            locale: DetailsLocaleCache::build(platform),
+            visible_rows: 0..0,
+            visible_cols: 0..0,
+            last_rows_len: initial_rows_len,
+            last_viewport_fingerprint: None,
+            scroll_coalescer: ScrollBurstCoalescer::new(),
+            user_initiated_pending: false,
         }
+    }
+
+    #[inline]
+    fn mark_user_initiated(&mut self) {
+        self.user_initiated_pending = true;
+    }
+
+    #[inline]
+    fn take_user_initiated(&mut self) -> bool {
+        std::mem::take(&mut self.user_initiated_pending)
+    }
+
+    #[inline]
+    fn invalidate_viewport_fingerprint(&mut self) {
+        self.last_viewport_fingerprint = None;
+    }
+
+    #[inline]
+    fn compute_viewport_fingerprint(&self, selected_idx: Option<usize>) -> u64 {
+        compute_details_viewport_fingerprint(
+            &self.details,
+            &self.column_layout,
+            &self.visible_rows,
+            &self.visible_cols,
+            selected_idx,
+            self.highlighted_key,
+            self.total_ram_bytes,
+            self.order_freeze.is_frozen(),
+        )
     }
 
     fn apply_order_freeze_transition(
@@ -855,6 +1171,7 @@ impl DetailsTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) {
         if let Some(frozen) = transition {
+            self.invalidate_viewport_fingerprint();
             let _ = self
                 .store
                 .read(cx)
@@ -992,13 +1309,14 @@ impl DetailsTableDelegate {
         UiCommands::set_details_columns(&self.store, snapshot, cx);
     }
 
-    fn trigger_sort_col(&self, col_ix: usize, cx: &mut App) {
+    fn trigger_sort_col(&mut self, col_ix: usize, cx: &mut App) {
         let Some(spec) = self.column_layout.visible_column(col_ix) else {
             return;
         };
         let Some(target) = spec.id.sort_column() else {
             return;
         };
+        self.mark_user_initiated();
         let next_dir = next_sort_direction(
             self.details.sort_column,
             self.details.sort_direction,
@@ -1009,6 +1327,7 @@ impl DetailsTableDelegate {
 
     fn hide_column(&mut self, col: DetailsColumn, cx: &mut App) -> bool {
         if self.column_layout.hide_column(col) {
+            self.invalidate_viewport_fingerprint();
             self.persist_column_layout(cx);
             true
         } else {
@@ -1019,6 +1338,7 @@ impl DetailsTableDelegate {
     fn reset_columns(&mut self, cx: &mut App) {
         self.column_layout
             .reset(DetailsColumn::default_specs(self.capabilities));
+        self.invalidate_viewport_fingerprint();
         UiCommands::set_details_columns(&self.store, Vec::new(), cx);
     }
 
@@ -1045,6 +1365,7 @@ impl DetailsTableDelegate {
                         .column_layout
                         .apply_visible_slugs(&selected_slugs);
                     if changed {
+                        table.delegate_mut().invalidate_viewport_fingerprint();
                         table.delegate().persist_column_layout(cx);
                         table.refresh(cx);
                     }
@@ -1137,7 +1458,7 @@ impl TableDelegate for DetailsTableDelegate {
             return Column::default();
         };
         let col = spec.id;
-        let mut column = Column::new(col.slug(), col.label(self.platform))
+        let mut column = Column::new(col.slug(), self.locale.column_label(col))
             .width(px(spec.width))
             .min_width(px(spec.min_width))
             .max_width(px(spec.max_width))
@@ -1180,8 +1501,40 @@ impl TableDelegate for DetailsTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) {
         if self.column_layout.move_visible_column(col_ix, to_ix) {
+            self.invalidate_viewport_fingerprint();
             self.persist_column_layout(cx);
         }
+    }
+
+    fn visible_rows_changed(
+        &mut self,
+        visible_range: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) {
+        let rows_len = self.details.rows.len();
+        if !self.visible_rows.is_empty()
+            && self.visible_rows != visible_range
+            && rows_len == self.last_rows_len
+        {
+            self.scroll_coalescer.on_scroll(Instant::now());
+        }
+        self.visible_rows = visible_range;
+        self.last_rows_len = rows_len;
+        self.last_viewport_fingerprint = None;
+    }
+
+    fn visible_columns_changed(
+        &mut self,
+        visible_range: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) {
+        if !self.visible_cols.is_empty() && self.visible_cols != visible_range {
+            self.scroll_coalescer.on_scroll(Instant::now());
+        }
+        self.visible_cols = visible_range;
+        self.last_viewport_fingerprint = None;
     }
 
     fn render_header(
@@ -1226,7 +1579,9 @@ impl TableDelegate for DetailsTableDelegate {
         let theme = cx.theme();
         let fg = theme.foreground;
         let muted_fg = theme.muted_foreground;
-        let sort_paused_color = LoomSemanticColors::from_theme(theme).sort_paused;
+        let sort_paused_color = self.semantic_colors.get_copy(theme).sort_paused;
+        let col_label = self.locale.column_label(col);
+        let sort_paused_tip = self.locale.sort_paused_tooltip.clone();
         let table_weak = cx.entity().downgrade();
 
         h_flex()
@@ -1243,19 +1598,21 @@ impl TableDelegate for DetailsTableDelegate {
             .when(is_active_sort, |d| d.font_semibold())
             .cursor_pointer()
             .on_click(cx.listener(move |table, _, _, cx| {
-                table.delegate().trigger_sort_col(col_ix, cx);
+                table.delegate_mut().trigger_sort_col(col_ix, cx);
             }))
             .when(is_sort_paused && col.right_aligned(), |d| {
                 d.child(sort_paused_indicator(
                     ("details-sort-paused", col_ix),
                     sort_paused_color,
+                    sort_paused_tip.clone(),
                 ))
             })
-            .child(div().min_w_0().truncate().child(col.label(self.platform)))
+            .child(div().min_w_0().truncate().child(col_label))
             .when(is_sort_paused && !col.right_aligned(), |d| {
                 d.child(sort_paused_indicator(
                     ("details-sort-paused", col_ix),
                     sort_paused_color,
+                    sort_paused_tip,
                 ))
             })
             .context_menu(move |menu, window, cx| {
@@ -1303,12 +1660,13 @@ impl TableDelegate for DetailsTableDelegate {
         let theme = cx.theme();
         let muted_fg = theme.muted_foreground;
         let muted_bg = theme.muted;
+        let hover_bg = theme.list_hover;
         let radius = theme.radius;
-        let semantic = LoomSemanticColors::from_theme(theme);
+        let semantic = self.semantic_colors.get_copy(theme);
         let key = row.key;
         let row_id = process_key_element_id(key);
 
-        let cell_content = match spec.id {
+        match spec.id {
             DetailsColumn::Name => {
                 let is_tree_mode = self.details.view_mode == DetailsViewMode::Tree;
                 let indent = if is_tree_mode {
@@ -1336,31 +1694,19 @@ impl TableDelegate for DetailsTableDelegate {
                     .overflow_hidden()
                     .when(is_tree_mode, |el| {
                         el.child(if has_children {
-                            div()
-                                .flex_shrink_0()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation();
-                                })
-                                .child(
-                                    Button::new(("details-expand", row_id))
-                                        .xsmall()
-                                        .ghost()
-                                        .icon(if is_expanded {
-                                            IconName::ChevronDown
-                                        } else {
-                                            IconName::ChevronRight
-                                        })
-                                        .on_click(move |_, _, cx| {
-                                            UiCommands::toggle_details_expanded(
-                                                &toggle_store,
-                                                key,
-                                                cx,
-                                            );
-                                        }),
-                                )
-                                .into_any_element()
+                            expand_chevron_button(
+                                ("details-expand", row_id),
+                                is_expanded,
+                                hover_bg,
+                                muted_fg,
+                                cx.listener(move |table, _, _, cx| {
+                                    table.delegate_mut().mark_user_initiated();
+                                    UiCommands::toggle_details_expanded(&toggle_store, key, cx);
+                                }),
+                            )
+                            .into_any_element()
                         } else {
-                            div().w(px(18.)).flex_shrink_0().into_any_element()
+                            div().w(px(20.)).flex_shrink_0().into_any_element()
                         })
                     })
                     .child(if let Some(image) = icon_image {
@@ -1397,7 +1743,7 @@ impl TableDelegate for DetailsTableDelegate {
                 .text_xs()
                 .font_family(theme.mono_font_family.clone())
                 .text_color(muted_fg)
-                .child(key.pid.to_string())
+                .child(self.row_cache.pid_text(key))
                 .into_any_element(),
             DetailsColumn::Status => {
                 let status_text = if row.status.contains(ProcessStatusFlags::SUSPENDED) {
@@ -1428,7 +1774,7 @@ impl TableDelegate for DetailsTableDelegate {
                     .into_any_element()
             }
             DetailsColumn::UserName => {
-                let user_text = display_user_name(row.user_name.as_deref()).to_owned();
+                let user_text = cached_user_name(&mut self.user_name_cache, row.user_name.as_ref());
                 h_flex()
                     .size_full()
                     .items_center()
@@ -1450,12 +1796,13 @@ impl TableDelegate for DetailsTableDelegate {
                 .text_xs()
                 .font_family(theme.mono_font_family.clone())
                 .text_color(muted_fg)
-                .child(row.session_id.to_string())
+                .child(self.row_cache.u32_slot(key, 0, row.session_id))
                 .into_any_element(),
-            DetailsColumn::Cpu => heatmap_cell(
-                format_permille_shared(row.cpu_permille),
+            DetailsColumn::Cpu => heatmap_cell_metric(
+                format_permille_metric(row.cpu_permille),
                 HeatmapLevel::from_permille(row.cpu_permille),
                 &semantic,
+                theme.mono_font_family.clone(),
             )
             .into_any_element(),
             DetailsColumn::CpuTime => h_flex()
@@ -1465,32 +1812,27 @@ impl TableDelegate for DetailsTableDelegate {
                 .text_xs()
                 .font_family(theme.mono_font_family.clone())
                 .text_color(muted_fg)
-                .child(format_cpu_time_shared(row.cpu_time_100ns))
+                .child(self.row_cache.cpu_time_text(key, row.cpu_time_100ns))
                 .into_any_element(),
-            DetailsColumn::Memory => heatmap_cell(
-                format_bytes_shared(row.private_working_set_bytes),
+            DetailsColumn::Memory => heatmap_cell_metric(
+                self.row_cache
+                    .bytes_metric_slot(key, 0, row.private_working_set_bytes),
                 memory_heatmap_level(row.private_working_set_bytes, self.total_ram_bytes),
                 &semantic,
+                theme.mono_font_family.clone(),
             )
             .into_any_element(),
-            DetailsColumn::WorkingSet => h_flex()
-                .size_full()
-                .items_center()
-                .justify_end()
-                .text_xs()
-                .font_family(theme.mono_font_family.clone())
-                .text_color(muted_fg)
-                .child(format_bytes_shared(row.working_set_bytes))
-                .into_any_element(),
-            DetailsColumn::CommitSize => h_flex()
-                .size_full()
-                .items_center()
-                .justify_end()
-                .text_xs()
-                .font_family(theme.mono_font_family.clone())
-                .text_color(muted_fg)
-                .child(format_bytes_shared(row.commit_bytes))
-                .into_any_element(),
+            DetailsColumn::WorkingSet => render_metric_cell(
+                self.row_cache
+                    .bytes_metric_slot(key, 1, row.working_set_bytes),
+                theme.mono_font_family.clone(),
+                muted_fg,
+            ),
+            DetailsColumn::CommitSize => render_metric_cell(
+                self.row_cache.bytes_metric_slot(key, 2, row.commit_bytes),
+                theme.mono_font_family.clone(),
+                muted_fg,
+            ),
             DetailsColumn::Priority => h_flex()
                 .size_full()
                 .items_center()
@@ -1511,7 +1853,7 @@ impl TableDelegate for DetailsTableDelegate {
                 .text_xs()
                 .font_family(theme.mono_font_family.clone())
                 .text_color(muted_fg)
-                .child(row.handle_count.to_string())
+                .child(self.row_cache.u32_slot(key, 1, row.handle_count))
                 .into_any_element(),
             DetailsColumn::Threads => h_flex()
                 .size_full()
@@ -1520,7 +1862,7 @@ impl TableDelegate for DetailsTableDelegate {
                 .text_xs()
                 .font_family(theme.mono_font_family.clone())
                 .text_color(muted_fg)
-                .child(row.thread_count.to_string())
+                .child(self.row_cache.u32_slot(key, 2, row.thread_count))
                 .into_any_element(),
             DetailsColumn::Platform => h_flex()
                 .size_full()
@@ -1568,15 +1910,12 @@ impl TableDelegate for DetailsTableDelegate {
                     )
                     .into_any_element()
             }
-            DetailsColumn::GpuMemory => h_flex()
-                .size_full()
-                .items_center()
-                .justify_end()
-                .text_xs()
-                .font_family(theme.mono_font_family.clone())
-                .text_color(muted_fg)
-                .child(format_bytes_shared(row.gpu_dedicated_bytes))
-                .into_any_element(),
+            DetailsColumn::GpuMemory => render_metric_cell(
+                self.row_cache
+                    .bytes_metric_slot(key, 3, row.gpu_dedicated_bytes),
+                theme.mono_font_family.clone(),
+                muted_fg,
+            ),
             DetailsColumn::Publisher => {
                 let text = row
                     .publisher
@@ -1619,69 +1958,66 @@ impl TableDelegate for DetailsTableDelegate {
                     .into_any_element()
             }
             DetailsColumn::ExePath => {
-                let path_arc = row
-                    .exe_path
-                    .as_ref()
-                    .filter(|s| !s.is_empty())
-                    .map(Arc::clone);
-                let text = path_arc
-                    .as_ref()
-                    .map(|s| SharedString::from(Arc::clone(s)))
-                    .unwrap_or_else(|| SharedString::new_static("—"));
-
-                h_flex()
-                    .id(("details-exe", row_id))
-                    .size_full()
-                    .items_center()
-                    .overflow_hidden()
-                    .text_xs()
-                    .font_family(theme.mono_font_family.clone())
-                    .text_color(muted_fg)
-                    .when_some(path_arc, |el, full_path| {
-                        let tip = SharedString::from(full_path);
-                        el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                    })
-                    .child(div().min_w_0().truncate().child(text))
-                    .into_any_element()
+                let mono_font = theme.mono_font_family.clone();
+                if let Some(path_arc) = row.exe_path.as_ref().filter(|s| !s.is_empty()) {
+                    let preview =
+                        self.row_cache
+                            .preview_slot(key, 0, path_arc, DEFAULT_CELL_PREVIEW_CHARS);
+                    let tip = SharedString::from(Arc::clone(path_arc));
+                    h_flex()
+                        .id(("details-exe", row_id))
+                        .size_full()
+                        .items_center()
+                        .overflow_hidden()
+                        .text_xs()
+                        .font_family(mono_font)
+                        .text_color(muted_fg)
+                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .child(div().min_w_0().truncate().child(preview))
+                        .into_any_element()
+                } else {
+                    h_flex()
+                        .size_full()
+                        .items_center()
+                        .overflow_hidden()
+                        .text_xs()
+                        .font_family(mono_font)
+                        .text_color(muted_fg)
+                        .child(SharedString::new_static("—"))
+                        .into_any_element()
+                }
             }
             DetailsColumn::CommandLine => {
-                let cmd_arc = row
-                    .command_line
-                    .as_ref()
-                    .filter(|s| !s.is_empty())
-                    .map(Arc::clone);
-                let text = cmd_arc
-                    .as_ref()
-                    .map(|s| SharedString::from(Arc::clone(s)))
-                    .unwrap_or_else(|| SharedString::new_static("—"));
-
-                h_flex()
-                    .id(("details-cmd", row_id))
-                    .size_full()
-                    .items_center()
-                    .overflow_hidden()
-                    .text_xs()
-                    .font_family(theme.mono_font_family.clone())
-                    .text_color(muted_fg)
-                    .when_some(cmd_arc, |el, full_cmd| {
-                        let tip = SharedString::from(full_cmd);
-                        el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                    })
-                    .child(div().min_w_0().truncate().child(text))
-                    .into_any_element()
+                let mono_font = theme.mono_font_family.clone();
+                if let Some(cmd_arc) = row.command_line.as_ref().filter(|s| !s.is_empty()) {
+                    let preview =
+                        self.row_cache
+                            .preview_slot(key, 1, cmd_arc, DEFAULT_CELL_PREVIEW_CHARS);
+                    let tip = SharedString::from(Arc::clone(cmd_arc));
+                    h_flex()
+                        .id(("details-cmd", row_id))
+                        .size_full()
+                        .items_center()
+                        .overflow_hidden()
+                        .text_xs()
+                        .font_family(mono_font)
+                        .text_color(muted_fg)
+                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .child(div().min_w_0().truncate().child(preview))
+                        .into_any_element()
+                } else {
+                    h_flex()
+                        .size_full()
+                        .items_center()
+                        .overflow_hidden()
+                        .text_xs()
+                        .font_family(mono_font)
+                        .text_color(muted_fg)
+                        .child(SharedString::new_static("—"))
+                        .into_any_element()
+                }
             }
-        };
-
-        div()
-            .size_full()
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |table, _, _, _| {
-                    table.delegate_mut().last_right_clicked_col = Some(col_ix);
-                }),
-            )
-            .child(cell_content)
-            .into_any_element()
+        }
     }
 
     fn context_menu(
@@ -1800,6 +2136,14 @@ impl TableDelegate for DetailsTableDelegate {
     }
 }
 
+struct PendingDetailsSnapshot {
+    rev: u64,
+    details: Arc<DetailsTableSlice>,
+    capabilities: CapabilityFlags,
+    platform: PlatformProfile,
+    total_ram_bytes: u64,
+}
+
 /// Live full-field Details table view holding an RAII `MonitorDomain::Details` lease.
 ///
 /// Splits the static toolbar/banner from the 2D-virtualized `DataTable` entity so
@@ -1810,11 +2154,14 @@ pub(crate) struct DetailsView {
     _details_lease: ScopedMonitorLease,
     table: Entity<TableState<DetailsTableDelegate>>,
     table_pane: Entity<DataTablePane<DetailsTableDelegate>>,
+    table_left_x: Rc<Cell<Pixels>>,
     view_mode: DetailsViewMode,
     highlighted_key: Option<ProcessKey>,
     has_selection: bool,
     last_locale: LanguagePreference,
     type_to_search: TypeToSearchState,
+    pending_snapshot: Option<PendingDetailsSnapshot>,
+    scroll_flush_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1990,8 +2337,11 @@ impl DetailsView {
         subscriptions.push(
             cx.subscribe(&store, move |this, store, event, cx| match event {
                 UiStoreEvent::SnapshotUpdated(revs) => {
-                    let current_rev = table_for_store.read(cx).delegate().last_rev;
-                    if revs.details == current_rev {
+                    let latest_rev = this
+                        .pending_snapshot
+                        .as_ref()
+                        .map_or_else(|| table_for_store.read(cx).delegate().last_rev, |p| p.rev);
+                    if revs.details == latest_rev {
                         return;
                     }
                     let (next_details, next_caps, next_platform, next_ram) = {
@@ -2003,41 +2353,41 @@ impl DetailsView {
                             snap.performance.latest.mem_total_bytes,
                         )
                     };
-                    let (next_view_mode, next_has_sel) = table_for_store.update(cx, |table, cx| {
+
+                    let should_defer = table_for_store.update(cx, |table, _| {
                         let d = table.delegate_mut();
-                        let sort_changed = d.details.sort_column != next_details.sort_column
-                            || d.details.sort_direction != next_details.sort_direction;
-                        d.details = next_details;
-                        d.capabilities = next_caps;
-                        d.platform = next_platform;
-                        d.total_ram_bytes = next_ram;
-                        d.last_rev = revs.details;
-
-                        let view_mode = d.details.view_mode;
-                        let selected_idx = d
-                            .selected_key
-                            .and_then(|sel| find_row_index_by_key(&d.details.rows, sel));
-
-                        if let Some(idx) = selected_idx {
-                            if table.selected_row() != Some(idx) {
-                                table.set_selected_row(idx, cx);
-                            }
-                        } else if table.selected_row().is_some() {
-                            table.clear_selection(cx);
-                        }
-
-                        Self::try_scroll_to_pending_in_table(table, cx);
-                        if sort_changed {
-                            table.refresh(cx);
-                        }
-                        cx.notify();
-                        (view_mode, selected_idx.is_some())
+                        let is_user_initiated = d.last_rev == 0
+                            || d.details.revision == 0
+                            || d.pending_scroll_key.is_some()
+                            || d.take_user_initiated()
+                            || d.details.sort_column != next_details.sort_column
+                            || d.details.sort_direction != next_details.sort_direction
+                            || d.details.view_mode != next_details.view_mode
+                            || d.details.rows.is_empty() != next_details.rows.is_empty();
+                        d.scroll_coalescer
+                            .should_defer_snapshot(Instant::now(), is_user_initiated)
                     });
 
-                    if this.view_mode != next_view_mode || this.has_selection != next_has_sel {
-                        this.view_mode = next_view_mode;
-                        this.has_selection = next_has_sel;
-                        cx.notify();
+                    if should_defer {
+                        this.pending_snapshot = Some(PendingDetailsSnapshot {
+                            rev: revs.details,
+                            details: next_details,
+                            capabilities: next_caps,
+                            platform: next_platform,
+                            total_ram_bytes: next_ram,
+                        });
+                        this.ensure_scroll_flush_scheduled(cx);
+                    } else {
+                        this.pending_snapshot = None;
+                        this.scroll_flush_task = None;
+                        this.commit_snapshot(
+                            revs.details,
+                            next_details,
+                            next_caps,
+                            next_platform,
+                            next_ram,
+                            cx,
+                        );
                     }
                 }
                 UiStoreEvent::SettingsChanged => {
@@ -2045,7 +2395,10 @@ impl DetailsView {
                     if this.last_locale != next_locale {
                         this.last_locale = next_locale;
                         table_for_store.update(cx, |table, cx| {
-                            table.delegate_mut().locale = DetailsLocaleCache::build();
+                            let platform = table.delegate().platform;
+                            let d = table.delegate_mut();
+                            d.locale = DetailsLocaleCache::build(platform);
+                            d.invalidate_viewport_fingerprint();
                             table.refresh(cx);
                             cx.notify();
                         });
@@ -2058,6 +2411,9 @@ impl DetailsView {
                 UiStoreEvent::SearchQueryChanged => {
                     let query = store.read(cx).search_query().to_owned();
                     this.type_to_search.sync_committed(&query);
+                    table_for_store.update(cx, |table, _| {
+                        table.delegate_mut().mark_user_initiated();
+                    });
                 }
                 UiStoreEvent::ElevationRequired { .. } | UiStoreEvent::CommandFailed { .. } => {}
             }),
@@ -2071,6 +2427,7 @@ impl DetailsView {
                     let next_has_sel = table.update(cx, |table, _| {
                         let d = table.delegate_mut();
                         d.selected_key = d.details.rows.get(*row_ix).map(|r| r.key);
+                        d.invalidate_viewport_fingerprint();
                         d.selected_key.is_some()
                     });
                     if this.has_selection != next_has_sel {
@@ -2081,7 +2438,11 @@ impl DetailsView {
                 TableEvent::RightClickedRow(Some(row_ix)) => {
                     let next_has_sel = table.update(cx, |table, cx| {
                         let key_opt = table.delegate().details.rows.get(*row_ix).map(|r| r.key);
-                        table.delegate_mut().selected_key = key_opt;
+                        {
+                            let d = table.delegate_mut();
+                            d.selected_key = key_opt;
+                            d.invalidate_viewport_fingerprint();
+                        }
                         if key_opt.is_some() && table.selected_row() != Some(*row_ix) {
                             table.set_selected_row(*row_ix, cx);
                         }
@@ -2094,7 +2455,9 @@ impl DetailsView {
                 }
                 TableEvent::ClearSelection => {
                     table.update(cx, |table, _| {
-                        table.delegate_mut().selected_key = None;
+                        let d = table.delegate_mut();
+                        d.selected_key = None;
+                        d.invalidate_viewport_fingerprint();
                     });
                     if this.has_selection {
                         this.has_selection = false;
@@ -2108,6 +2471,7 @@ impl DetailsView {
                             .column_layout
                             .apply_visible_widths(widths)
                         {
+                            table.delegate_mut().invalidate_viewport_fingerprint();
                             table.delegate().persist_column_layout(cx);
                         }
                     });
@@ -2125,13 +2489,156 @@ impl DetailsView {
             _details_lease: lease,
             table,
             table_pane,
+            table_left_x: Rc::new(Cell::new(px(0.0))),
             view_mode,
             highlighted_key,
             has_selection,
             last_locale,
             type_to_search,
+            pending_snapshot: None,
+            scroll_flush_task: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Commits a live [`DetailsTableSlice`] to `self.table`, re-anchoring selection in `O(1)`
+    /// steady state and notifying `TableState` only when the visible viewport fingerprint changed.
+    ///
+    /// Returns `true` if `TableState` was notified to repaint.
+    fn commit_snapshot(
+        &mut self,
+        rev: u64,
+        next_details: Arc<DetailsTableSlice>,
+        next_caps: CapabilityFlags,
+        next_platform: PlatformProfile,
+        next_ram: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (next_view_mode, next_has_sel, table_notified) = self.table.update(cx, |table, cx| {
+            let prev_selected_row = table.selected_row();
+            let (sort_changed, prev_fp, had_visible_rows, had_pending_scroll) = {
+                let d = table.delegate_mut();
+                let sort_changed = d.details.sort_column != next_details.sort_column
+                    || d.details.sort_direction != next_details.sort_direction;
+                let had_visible = !d.visible_rows.is_empty();
+                let had_pending_scroll = d.pending_scroll_key.is_some();
+                let prev_fp = d
+                    .last_viewport_fingerprint
+                    .unwrap_or_else(|| d.compute_viewport_fingerprint(prev_selected_row));
+
+                d.row_cache.begin_epoch();
+                d.row_cache.prune_if_needed();
+                let platform_changed = d.platform != next_platform;
+                d.details = next_details;
+                d.capabilities = next_caps;
+                d.platform = next_platform;
+                d.total_ram_bytes = next_ram;
+                d.last_rev = rev;
+                if platform_changed {
+                    d.locale = DetailsLocaleCache::build(next_platform);
+                }
+                (sort_changed, prev_fp, had_visible, had_pending_scroll)
+            };
+
+            let (view_mode, selected_idx) = {
+                let d = table.delegate();
+                let selected_idx = d.selected_key.and_then(|sel| {
+                    find_row_index_by_key_fast(&d.details.rows, sel, prev_selected_row)
+                });
+                (d.details.view_mode, selected_idx)
+            };
+
+            let mut selection_changed = false;
+            if let Some(idx) = selected_idx {
+                if prev_selected_row != Some(idx) {
+                    table.set_selected_row(idx, cx);
+                    selection_changed = true;
+                }
+            } else if prev_selected_row.is_some() {
+                table.clear_selection(cx);
+                selection_changed = true;
+            }
+
+            Self::try_scroll_to_pending_in_table(table, cx);
+            let scrolled_to_pending =
+                had_pending_scroll && table.delegate().pending_scroll_key.is_none();
+
+            let effective_selected_idx = table.selected_row();
+            let next_fp = {
+                let d = table.delegate_mut();
+                let fp = d.compute_viewport_fingerprint(effective_selected_idx);
+                d.last_viewport_fingerprint = Some(fp);
+                fp
+            };
+
+            if sort_changed {
+                table.refresh(cx);
+            }
+
+            let should_notify = !had_visible_rows
+                || sort_changed
+                || selection_changed
+                || scrolled_to_pending
+                || prev_fp != next_fp;
+            if should_notify {
+                cx.notify();
+            }
+            (
+                view_mode,
+                selected_idx.is_some() || scrolled_to_pending,
+                should_notify,
+            )
+        });
+
+        if self.view_mode != next_view_mode || self.has_selection != next_has_sel {
+            self.view_mode = next_view_mode;
+            self.has_selection = next_has_sel;
+            cx.notify();
+        }
+
+        table_notified
+    }
+
+    fn ensure_scroll_flush_scheduled(&mut self, cx: &mut Context<Self>) {
+        if self.scroll_flush_task.is_some() {
+            return;
+        }
+        let table = self.table.clone();
+        self.scroll_flush_task = Some(cx.spawn(async move |weak, cx| {
+            loop {
+                let delay = match cx.update(|cx| {
+                    table
+                        .read(cx)
+                        .delegate()
+                        .scroll_coalescer
+                        .remaining_quiet_delay(Instant::now())
+                }) {
+                    Some(d) if !d.is_zero() => d,
+                    Some(_) => break,
+                    None => return,
+                };
+                cx.background_executor()
+                    .timer(delay.max(Duration::from_millis(1)))
+                    .await;
+            }
+
+            let _ = weak.update(cx, |this, cx| {
+                this.scroll_flush_task = None;
+                let had_pending = this.table.update(cx, |table, _| {
+                    table.delegate_mut().scroll_coalescer.take_pending()
+                });
+                if had_pending && let Some(pending) = this.pending_snapshot.take() {
+                    this.commit_snapshot(
+                        pending.rev,
+                        pending.details,
+                        pending.capabilities,
+                        pending.platform,
+                        pending.total_ram_bytes,
+                        cx,
+                    );
+                }
+            });
+        }));
     }
 
     fn try_scroll_to_pending_in_table(
@@ -2157,9 +2664,11 @@ impl DetailsView {
         let next_has_sel = self.table.update(cx, |table, cx| {
             let d = table.delegate_mut();
             d.highlighted_key = key;
+            d.invalidate_viewport_fingerprint();
             if let Some(target) = key {
                 d.selected_key = Some(target);
                 d.pending_scroll_key = Some(target);
+                d.mark_user_initiated();
                 Self::try_scroll_to_pending_in_table(table, cx);
             } else {
                 d.pending_scroll_key = None;
@@ -2412,6 +2921,8 @@ impl Render for DetailsView {
 
         let table_focus = self.table.focus_handle(cx);
         let view_entity = cx.entity();
+        let table_left_x_click = Rc::clone(&self.table_left_x);
+        let table_left_x_prepaint = Rc::clone(&self.table_left_x);
 
         v_flex()
             .id("details-view-root")
@@ -2475,8 +2986,29 @@ impl Render for DetailsView {
                             table.delegate_mut().set_table_hovered(*hovered, cx);
                         });
                     }))
+                    .capture_any_mouse_down(cx.listener(
+                        move |this, event: &MouseDownEvent, _, cx| {
+                            if event.button != MouseButton::Right {
+                                return;
+                            }
+                            let local_x = f32::from(event.position.x - table_left_x_click.get());
+                            this.table.update(cx, |table, _| {
+                                let scroll_x = f32::from(
+                                    (-table.horizontal_scroll_handle.offset().x).max(px(0.0)),
+                                );
+                                let col_ix = table
+                                    .delegate()
+                                    .column_layout
+                                    .column_index_at_x(local_x, scroll_x);
+                                table.delegate_mut().last_right_clicked_col = col_ix;
+                            });
+                        },
+                    ))
                     .child(TableInputBridge::new(table_focus, view_entity))
-                    .child(self.table_pane.clone()),
+                    .child(self.table_pane.clone())
+                    .on_prepaint(move |bounds, _, _| {
+                        table_left_x_prepaint.set(bounds.left());
+                    }),
             )
     }
 }
@@ -3239,6 +3771,310 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].len(), headers.len());
         assert_eq!(rows[0][0], "msedgewebview2.exe");
+
+        coordinator_for_shutdown.shutdown();
+    }
+
+    #[test]
+    fn details_viewport_fingerprint_detects_visible_changes_and_ignores_offscreen_and_jitter() {
+        let layout = TableColumnLayout::new(DetailsColumn::default_specs(CapabilityFlags::empty()));
+        let visible_rows = 0..10;
+        let visible_cols = 0..8;
+        let ram = 16 * 1024 * 1024 * 1024u64;
+
+        let mut slice = DetailsTableSlice {
+            revision: 1,
+            rows: (0..60u32)
+                .map(|i| {
+                    let mut r = sample_row(1000 + i, 50_000 + u64::from(i), &format!("p-{i}.exe"));
+                    r.cpu_permille = 30;
+                    r.cpu_time_100ns = 10_000_000; // 1.0s
+                    r.private_working_set_bytes = 128 * 1024 * 1024;
+                    r
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let fp_base = compute_details_viewport_fingerprint(
+            &slice,
+            &layout,
+            &visible_rows,
+            &visible_cols,
+            None,
+            None,
+            ram,
+            false,
+        );
+
+        // Mutating an off-screen row (index 50) keeps the same fingerprint.
+        slice.rows[50].cpu_permille = 880;
+        slice.rows[50].private_working_set_bytes = 2 * 1024 * 1024 * 1024;
+        assert_eq!(
+            fp_base,
+            compute_details_viewport_fingerprint(
+                &slice,
+                &layout,
+                &visible_rows,
+                &visible_cols,
+                None,
+                None,
+                ram,
+                false,
+            )
+        );
+
+        // Sub-display-tenth private WS jitter (+512 B on 128.0 MB) and sub-second CPU time jitter
+        // (+500ms within 1s) render identically -> fingerprint stays identical.
+        slice.rows[1].private_working_set_bytes += 512;
+        slice.rows[1].cpu_time_100ns = 15_000_000;
+        assert_eq!(
+            fp_base,
+            compute_details_viewport_fingerprint(
+                &slice,
+                &layout,
+                &visible_rows,
+                &visible_cols,
+                None,
+                None,
+                ram,
+                false,
+            )
+        );
+
+        // Visible CPU change invalidates the fingerprint.
+        slice.rows[1].cpu_permille = 150;
+        let fp_cpu = compute_details_viewport_fingerprint(
+            &slice,
+            &layout,
+            &visible_rows,
+            &visible_cols,
+            None,
+            None,
+            ram,
+            false,
+        );
+        assert_ne!(fp_base, fp_cpu);
+
+        // Loading transition (revision == 0 vs > 0) always changes the fingerprint.
+        let mut loading_slice = slice.clone();
+        loading_slice.revision = 0;
+        assert_ne!(
+            fp_cpu,
+            compute_details_viewport_fingerprint(
+                &loading_slice,
+                &layout,
+                &visible_rows,
+                &visible_cols,
+                None,
+                None,
+                ram,
+                false,
+            )
+        );
+    }
+
+    #[gpui_kit::test]
+    fn details_view_right_click_column_coord_long_paths_and_viewport_dirty_skip(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::{
+            AppContext as _, Modifiers, MouseButton, VisualTestContext, point, px, size,
+        };
+        use loom_config::{AppSettings, ConfigStore};
+        use loom_engine::EngineCoordinator;
+        use loom_pal::{NativeBackend, PlatformBackend as _};
+        use loom_ui_kit::DEFAULT_CELL_PREVIEW_CHARS;
+
+        use crate::bridge::UiStore;
+        use crate::shell::ShellHandle;
+
+        cx.update(gpui_kit::init);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_store = ConfigStore::new(dir.path().join("settings.toml"));
+        let backend = NativeBackend::initialize().expect("native backend");
+        let coordinator =
+            Arc::new(EngineCoordinator::new(backend, AppSettings::default()).expect("coordinator"));
+        let coordinator_for_shutdown = Arc::clone(&coordinator);
+
+        let store =
+            cx.new(|cx| UiStore::new(coordinator, config_store, AppSettings::default(), cx));
+        let shell = ShellHandle::new(|_, _, _| {});
+
+        let store_for_window = store.clone();
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), move |window, cx| {
+                let view = cx.new(|cx| DetailsView::new(store_for_window, None, shell, window, cx));
+                cx.new(|cx| gpui_kit::base::Root::new(view, window, cx))
+            })
+            .expect("open window")
+        });
+        cx.simulate_window_resize(window.into(), size(px(1200.), px(720.)));
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let view = window
+            .read_with(&vcx, |root, _| {
+                root.view()
+                    .clone()
+                    .downcast::<DetailsView>()
+                    .expect("root wraps DetailsView")
+            })
+            .expect("read root");
+        let table = view.read_with(&vcx, |v, _| v.table.clone());
+
+        // Stop the live OS sampler so background ticks never overwrite synthetic test slices.
+        coordinator_for_shutdown.shutdown();
+        vcx.run_until_parked();
+
+        let long_path: Arc<str> = Arc::from(format!(
+            "C:\\Program Files\\{}\\{}\\app.exe",
+            "deepdir\\".repeat(500),
+            "segment".repeat(500)
+        ));
+        let long_cmd: Arc<str> = Arc::from(format!("\"{}\" --arg={}", long_path, "z".repeat(4096)));
+
+        let make_rows = |visible_cpu: u16, offscreen_cpu: u16| -> Vec<DetailsRowProjection> {
+            (0..60u32)
+                .map(|i| {
+                    let mut r = sample_row(3000 + i, 80_000 + u64::from(i), &format!("d-{i}.exe"));
+                    r.user_name = Some(Arc::from(r"WORKSTATION\Alice"));
+                    r.private_working_set_bytes = 128 * 1024 * 1024;
+                    r.working_set_bytes = 256 * 1024 * 1024;
+                    r.commit_bytes = 512 * 1024 * 1024;
+                    r.cpu_permille = if i == 0 {
+                        visible_cpu
+                    } else if i == 55 {
+                        offscreen_cpu
+                    } else {
+                        5
+                    };
+                    if i == 0 {
+                        r.exe_path = Some(Arc::clone(&long_path));
+                        r.command_line = Some(Arc::clone(&long_cmd));
+                    }
+                    r
+                })
+                .collect()
+        };
+
+        let platform = store.read_with(&vcx, |s, _| s.snapshot().platform);
+        let slice_v1 = Arc::new(DetailsTableSlice {
+            revision: 10,
+            rows: make_rows(15, 15),
+            ..Default::default()
+        });
+        let ram = 16 * 1024 * 1024 * 1024;
+        let notified_v1 = view.update(&mut vcx, |this, cx| {
+            this.commit_snapshot(
+                10,
+                Arc::clone(&slice_v1),
+                CapabilityFlags::empty(),
+                platform,
+                ram,
+                cx,
+            )
+        });
+        assert!(notified_v1, "initial commit must notify TableState");
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // 1. Table-level right-click column hit-testing:
+        // Default visible columns: Name [0..240), Pid [240..316), Status [316..412), User [412..552).
+        for (x_pos, expected_col) in [(120.0, Some(0)), (260.0, Some(1)), (350.0, Some(2))] {
+            vcx.simulate_mouse_down(
+                point(px(x_pos), px(100.)),
+                MouseButton::Right,
+                Modifiers::default(),
+            );
+            vcx.simulate_mouse_up(
+                point(px(x_pos), px(100.)),
+                MouseButton::Right,
+                Modifiers::default(),
+            );
+            let detected = table.read_with(&vcx, |t, _| t.delegate().last_right_clicked_col);
+            assert_eq!(
+                detected, expected_col,
+                "right-click at x={x_pos} should map to column {expected_col:?}"
+            );
+            // Dismiss the opened context menu overlay so the next right-click hits the table.
+            vcx.simulate_keystrokes("escape");
+            vcx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+
+        // 2. Long ExePath & CommandLine are capped in RowTextCache previews while Copy & CSV retain full text.
+        let key0 = slice_v1.rows[0].key;
+        let (path_preview, cmd_preview) = table.update(&mut vcx, |t, cx| {
+            let previews = {
+                let d = t.delegate_mut();
+                d.selected_key = Some(key0);
+                d.column_layout
+                    .apply_visible_slugs(&["pid", "cpu", "exe_path", "command_line"]);
+                d.invalidate_viewport_fingerprint();
+                let p = d
+                    .row_cache
+                    .preview_slot(key0, 0, &long_path, DEFAULT_CELL_PREVIEW_CHARS);
+                let c = d
+                    .row_cache
+                    .preview_slot(key0, 1, &long_cmd, DEFAULT_CELL_PREVIEW_CHARS);
+                (p, c)
+            };
+            t.refresh(cx);
+            previews
+        });
+        assert!(path_preview.chars().count() <= DEFAULT_CELL_PREVIEW_CHARS + 1);
+        assert!(path_preview.ends_with('…'));
+        assert!(cmd_preview.chars().count() <= DEFAULT_CELL_PREVIEW_CHARS + 1);
+        assert!(cmd_preview.ends_with('…'));
+
+        let (summary_text, csv_rows) = table.read_with(&vcx, |t, _| {
+            (
+                t.delegate().selected_copy_summary().expect("row 0 summary"),
+                t.delegate().export_visible_csv_payload().1,
+            )
+        });
+        assert!(summary_text.contains(long_path.as_ref()));
+        assert!(summary_text.contains(long_cmd.as_ref()));
+        assert!(
+            csv_rows[0]
+                .iter()
+                .any(|cell| cell.as_str() == long_path.as_ref())
+        );
+        assert!(
+            csv_rows[0]
+                .iter()
+                .any(|cell| cell.as_str() == long_cmd.as_ref())
+        );
+
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // 3. Off-screen change skips TableState notification.
+        let slice_v2 = Arc::new(DetailsTableSlice {
+            revision: 11,
+            rows: make_rows(15, 777),
+            ..Default::default()
+        });
+        let notified_v2 = view.update(&mut vcx, |this, cx| {
+            this.commit_snapshot(11, slice_v2, CapabilityFlags::empty(), platform, ram, cx)
+        });
+        assert!(
+            !notified_v2,
+            "off-screen Details row change must skip TableState cx.notify()"
+        );
+
+        // 4. Visible row change triggers TableState notification.
+        let slice_v3 = Arc::new(DetailsTableSlice {
+            revision: 12,
+            rows: make_rows(320, 777),
+            ..Default::default()
+        });
+        let notified_v3 = view.update(&mut vcx, |this, cx| {
+            this.commit_snapshot(12, slice_v3, CapabilityFlags::empty(), platform, ram, cx)
+        });
+        assert!(
+            notified_v3,
+            "visible Details row CPU change must notify TableState"
+        );
 
         coordinator_for_shutdown.shutdown();
     }

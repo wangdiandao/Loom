@@ -7,10 +7,12 @@
 
 mod state;
 
+use std::cell::Cell;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -18,15 +20,15 @@ use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableEvent, TableState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _, h_flex,
-    v_flex,
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _, Size,
+    StyledExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
     App, AppContext as _, Bounds, ClipboardItem, Context, Empty, Entity, EntityInputHandler,
     FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement as _, Pixels, Point, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, UTF16Selection, WeakEntity, Window, div, img,
-    prelude::FluentBuilder as _, px,
+    MouseDownEvent, ParentElement as _, Pixels, Point, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, UTF16Selection, WeakEntity,
+    Window, div, img, prelude::FluentBuilder as _, px,
 };
 use loom_engine::{EngineCommand, EngineCoordinator};
 use loom_pal::NativeBackend;
@@ -36,20 +38,22 @@ use loom_types::{
     ProcessTableSlice, ProcessViewMode, ResourceDisplayMode, SortDirection, WebView2Role,
 };
 use loom_ui_kit::{
-    HeatmapLevel, LoomSemanticColors, StatusLabels, format_disk_cell, format_disk_cell_shared,
-    format_memory_cell, format_memory_cell_shared, format_network_cell, format_network_cell_shared,
-    format_permille, format_permille_shared, heatmap_cell, status_badges,
+    CachedSemanticColors, DEFAULT_CELL_PREVIEW_CHARS, HeatmapLevel, RowTextCache, StatusLabels,
+    format_child_count_shared, format_disk_cell, format_memory_cell, format_network_cell,
+    format_permille, format_permille_metric, has_visible_status_badges, heatmap_cell_metric,
+    quantize_bytes_display, quantize_net_bps_display, quantize_rate_bps_display,
+    status_badges_with_a11y,
 };
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
 use crate::features::table_columns::{
-    ColumnKey, ColumnSpec, ColumnToggleItem, CopyRowFields, DataTablePane, HeaderMenuAction,
-    IconRenderCache, OrderFreezeState, TableColumnLayout, TableInputBridge, TypeToSearchState,
-    build_column_header_menu, build_copy_submenu, can_suspend_or_resume_process,
-    dispatch_hide_system_processes, dispatch_ignore_leak_path, dispatch_restart_explorer,
-    dispatch_suspend_or_resume, is_explorer_image, leak_ignore_target, leak_warning_badge,
-    open_select_columns_dialog, sort_paused_indicator, spawn_csv_export, webview2_role_badge,
-    webview2_role_label,
+    ColumnKey, ColumnSpec, ColumnToggleItem, CopyRowFields, DataTablePane, FnvHasher64,
+    HeaderMenuAction, IconRenderCache, OrderFreezeState, ScrollBurstCoalescer, TableColumnLayout,
+    TableInputBridge, TypeToSearchState, build_column_header_menu, build_copy_submenu,
+    can_suspend_or_resume_process, dispatch_hide_system_processes, dispatch_ignore_leak_path,
+    dispatch_restart_explorer, dispatch_suspend_or_resume, expand_chevron_button,
+    is_explorer_image, leak_ignore_target, leak_warning_badge, open_select_columns_dialog,
+    sort_paused_indicator, spawn_csv_export, webview2_role_badge, webview2_role_label,
 };
 use crate::i18n;
 use crate::shell::{ShellHandle, dialogs};
@@ -190,8 +194,19 @@ const fn to_column_sort(dir: SortDirection) -> ColumnSort {
 }
 
 #[inline]
-fn find_row_index(rows: &[ProcessRowProjection], key: Option<ProcessKey>) -> Option<usize> {
+fn find_row_index_fast(
+    rows: &[ProcessRowProjection],
+    key: Option<ProcessKey>,
+    hint_idx: Option<usize>,
+) -> Option<usize> {
     let target = key?;
+    if let Some(idx) = hint_idx
+        && let Some(row) = rows.get(idx)
+        && row.kind == ProcessRowKind::Process
+        && row.key == target
+    {
+        return Some(idx);
+    }
     rows.iter()
         .position(|row| row.kind == ProcessRowKind::Process && row.key == target)
 }
@@ -219,6 +234,8 @@ fn build_process_row_div(
 
 /// Cached localized strings for [`ProcessesTableDelegate`] to avoid per-frame `i18n::tr` lookups.
 struct ProcessesLocaleCache {
+    col_labels: [SharedString; 12],
+    sort_paused_tooltip: SharedString,
     status_labels: StatusLabels,
     status_elevated: SharedString,
     status_running: SharedString,
@@ -239,6 +256,21 @@ struct ProcessesLocaleCache {
 impl ProcessesLocaleCache {
     fn build(platform: PlatformProfile) -> Self {
         Self {
+            col_labels: [
+                ProcessColumn::Name.label().into(),
+                ProcessColumn::Category.label().into(),
+                ProcessColumn::Pid.label().into(),
+                ProcessColumn::ProcessName.label().into(),
+                ProcessColumn::Status.label().into(),
+                ProcessColumn::Cpu.label().into(),
+                ProcessColumn::Memory.label().into(),
+                ProcessColumn::Disk.label().into(),
+                ProcessColumn::Network.label().into(),
+                ProcessColumn::Gpu.label().into(),
+                ProcessColumn::Publisher.label().into(),
+                ProcessColumn::CommandLine.label().into(),
+            ],
+            sort_paused_tooltip: i18n::tr("proc_ux_sort_paused_tooltip").into(),
             status_labels: StatusLabels::new(
                 i18n::tr("processes.status_efficiency"),
                 i18n::tr("processes.status_suspended"),
@@ -260,6 +292,11 @@ impl ProcessesLocaleCache {
             wv2_utility: webview2_role_label(WebView2Role::Utility).into(),
             wv2_crashpad: webview2_role_label(WebView2Role::Crashpad).into(),
         }
+    }
+
+    #[inline]
+    fn column_label(&self, col: ProcessColumn) -> SharedString {
+        self.col_labels[col as usize].clone()
     }
 
     #[inline]
@@ -286,6 +323,156 @@ impl ProcessesLocaleCache {
     }
 }
 
+/// Computes a fast 64-bit viewport fingerprint over the currently visible rows and columns
+/// of a [`ProcessTableSlice`] so unchanged live ticks can skip `cx.notify()`.
+#[allow(clippy::too_many_arguments)]
+fn compute_processes_viewport_fingerprint(
+    slice: &ProcessTableSlice,
+    column_layout: &TableColumnLayout<ProcessColumn>,
+    visible_rows: &Range<usize>,
+    visible_cols: &Range<usize>,
+    selected_idx: Option<usize>,
+    mem_mode: ResourceDisplayMode,
+    disk_mode: ResourceDisplayMode,
+    net_mode: ResourceDisplayMode,
+    order_frozen: bool,
+) -> u64 {
+    let mut h = FnvHasher64::new();
+    let rows_len = slice.rows.len();
+    let start = visible_rows.start.min(rows_len);
+    let end = visible_rows.end.min(rows_len).max(start);
+    let cols_mask = column_layout.visible_cols_mask(visible_cols);
+
+    h.write_usize(rows_len);
+    h.write_u8(slice.view_mode as u8);
+    h.write_u8(slice.sort_column as u8);
+    h.write_u8(slice.sort_direction as u8);
+    h.write_usize(selected_idx.unwrap_or(usize::MAX));
+    h.write_u8(mem_mode as u8);
+    h.write_u8(disk_mode as u8);
+    h.write_u8(net_mode as u8);
+    h.write_bool(order_frozen);
+    h.write_usize(start);
+    h.write_usize(end);
+    h.write_u64(cols_mask);
+
+    let visible_specs = column_layout.visible_columns();
+    for row in &slice.rows[start..end] {
+        match row.kind {
+            ProcessRowKind::SectionHeader { category, count } => {
+                h.write_u8(0);
+                h.write_u8(category as u8);
+                h.write_usize(count);
+            }
+            ProcessRowKind::Process => {
+                h.write_u8(1);
+                h.write_u32(row.key.pid);
+                h.write_u64(row.key.create_time_100ns);
+                h.write_u16(row.depth);
+                h.write_bool(row.has_children);
+                h.write_bool(row.is_expanded);
+
+                for (col_ix, spec) in visible_specs.iter().enumerate() {
+                    if col_ix < 64 && (cols_mask & (1u64 << col_ix)) == 0 {
+                        continue;
+                    }
+                    match spec.id {
+                        ProcessColumn::Name => {
+                            h.write_str(&row.display_name);
+                            h.write_u32(row.child_count);
+                            h.write_u8(row.webview2_role.map_or(u8::MAX, |r| r as u8));
+                            if let Some(icon) = row.icon.as_ref() {
+                                h.write_usize(icon.rgba.as_ptr() as usize);
+                                h.write_usize(icon.rgba.len());
+                            } else {
+                                h.write_u8(0);
+                            }
+                        }
+                        ProcessColumn::Category => {
+                            h.write_u8(row.category as u8);
+                        }
+                        ProcessColumn::Pid => {}
+                        ProcessColumn::ProcessName => {
+                            h.write_str(&row.name);
+                        }
+                        ProcessColumn::Status => {
+                            h.write_u16(row.status.bits());
+                            if let Some(w) = row.leak_warning.as_ref() {
+                                h.write_u8(1);
+                                h.write_u8(w.kind as u8);
+                                h.write_u64(w.current_value);
+                                h.write_u64(w.baseline_value);
+                                h.write_str(&w.summary);
+                            } else {
+                                h.write_u8(0);
+                            }
+                        }
+                        ProcessColumn::Cpu => {
+                            h.write_u16(row.cpu_permille);
+                        }
+                        ProcessColumn::Memory => match mem_mode {
+                            ResourceDisplayMode::Percent => {
+                                h.write_u16(row.memory_permille);
+                            }
+                            ResourceDisplayMode::Values => {
+                                h.write_u64(quantize_bytes_display(row.memory_bytes));
+                                h.write_u8(HeatmapLevel::from_permille(row.memory_permille) as u8);
+                            }
+                        },
+                        ProcessColumn::Disk => {
+                            match disk_mode {
+                                ResourceDisplayMode::Percent => {
+                                    h.write_u16(row.disk_permille);
+                                }
+                                ResourceDisplayMode::Values => {
+                                    h.write_u64(quantize_rate_bps_display(row.disk_bytes_per_sec));
+                                }
+                            }
+                            h.write_u8(
+                                HeatmapLevel::from_bytes_per_sec(row.disk_bytes_per_sec) as u8
+                            );
+                        }
+                        ProcessColumn::Network => {
+                            match net_mode {
+                                ResourceDisplayMode::Percent => {
+                                    h.write_u16(row.net_permille);
+                                }
+                                ResourceDisplayMode::Values => {
+                                    h.write_u64(quantize_net_bps_display(row.net_bytes_per_sec));
+                                }
+                            }
+                            h.write_u8(
+                                HeatmapLevel::from_bytes_per_sec(row.net_bytes_per_sec) as u8
+                            );
+                        }
+                        ProcessColumn::Gpu => {
+                            h.write_u16(row.gpu_util_permille);
+                        }
+                        ProcessColumn::Publisher => {
+                            if let Some(p) = row.publisher.as_deref() {
+                                h.write_u8(1);
+                                h.write_str(p);
+                            } else {
+                                h.write_u8(0);
+                            }
+                        }
+                        ProcessColumn::CommandLine => {
+                            if let Some(c) = row.command_line.as_deref() {
+                                h.write_u8(1);
+                                h.write_preview_str(c);
+                            } else {
+                                h.write_u8(0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    h.finish()
+}
+
 /// 2D-virtualized `gpui-kit` [`TableDelegate`] backing the live Processes table.
 struct ProcessesTableDelegate {
     store: Entity<UiStore>,
@@ -302,7 +489,15 @@ struct ProcessesTableDelegate {
     order_freeze: OrderFreezeState,
     menu_focus_subs: Vec<Subscription>,
     icon_cache: IconRenderCache,
+    semantic_colors: CachedSemanticColors,
+    row_cache: RowTextCache,
     locale: ProcessesLocaleCache,
+    visible_rows: Range<usize>,
+    visible_cols: Range<usize>,
+    last_rows_len: usize,
+    last_viewport_fingerprint: Option<u64>,
+    scroll_coalescer: ScrollBurstCoalescer,
+    user_initiated_pending: bool,
 }
 
 impl ProcessesTableDelegate {
@@ -317,6 +512,7 @@ impl ProcessesTableDelegate {
         if !saved_cols.is_empty() {
             column_layout.apply_saved(saved_cols);
         }
+        let initial_rows_len = snapshot.processes.rows.len();
 
         Self {
             store: store.clone(),
@@ -333,8 +529,46 @@ impl ProcessesTableDelegate {
             order_freeze: OrderFreezeState::default(),
             menu_focus_subs: Vec::new(),
             icon_cache: IconRenderCache::new(),
+            semantic_colors: CachedSemanticColors::new(),
+            row_cache: RowTextCache::new(),
             locale: ProcessesLocaleCache::build(platform),
+            visible_rows: 0..0,
+            visible_cols: 0..0,
+            last_rows_len: initial_rows_len,
+            last_viewport_fingerprint: None,
+            scroll_coalescer: ScrollBurstCoalescer::new(),
+            user_initiated_pending: false,
         }
+    }
+
+    #[inline]
+    fn mark_user_initiated(&mut self) {
+        self.user_initiated_pending = true;
+    }
+
+    #[inline]
+    fn take_user_initiated(&mut self) -> bool {
+        std::mem::take(&mut self.user_initiated_pending)
+    }
+
+    #[inline]
+    fn invalidate_viewport_fingerprint(&mut self) {
+        self.last_viewport_fingerprint = None;
+    }
+
+    #[inline]
+    fn compute_viewport_fingerprint(&self, selected_idx: Option<usize>) -> u64 {
+        compute_processes_viewport_fingerprint(
+            &self.slice,
+            &self.column_layout,
+            &self.visible_rows,
+            &self.visible_cols,
+            selected_idx,
+            self.mem_mode,
+            self.disk_mode,
+            self.net_mode,
+            self.order_freeze.is_frozen(),
+        )
     }
 
     fn apply_order_freeze_transition(
@@ -343,6 +577,7 @@ impl ProcessesTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) {
         if let Some(frozen) = transition {
+            self.invalidate_viewport_fingerprint();
             let _ = self
                 .store
                 .read(cx)
@@ -450,13 +685,14 @@ impl ProcessesTableDelegate {
         UiCommands::set_processes_columns(&self.store, snapshot, cx);
     }
 
-    fn trigger_sort_col(&self, col_ix: usize, cx: &mut App) {
+    fn trigger_sort_col(&mut self, col_ix: usize, cx: &mut App) {
         let Some(spec) = self.column_layout.visible_column(col_ix) else {
             return;
         };
         let Some(target) = spec.id.sort_column() else {
             return;
         };
+        self.mark_user_initiated();
         let next_dir =
             next_sort_direction(self.slice.sort_column, self.slice.sort_direction, target);
         UiCommands::set_process_sort(&self.store, target, next_dir, cx);
@@ -464,6 +700,7 @@ impl ProcessesTableDelegate {
 
     fn hide_column(&mut self, col: ProcessColumn, cx: &mut Context<TableState<Self>>) -> bool {
         if self.column_layout.hide_column(col) {
+            self.invalidate_viewport_fingerprint();
             self.persist_column_layout(cx);
             true
         } else {
@@ -473,6 +710,7 @@ impl ProcessesTableDelegate {
 
     fn reset_columns(&mut self, cx: &mut Context<TableState<Self>>) {
         self.column_layout.reset(ProcessColumn::default_specs());
+        self.invalidate_viewport_fingerprint();
         UiCommands::set_processes_columns(&self.store, Vec::new(), cx);
     }
 
@@ -499,6 +737,7 @@ impl ProcessesTableDelegate {
                         .column_layout
                         .apply_visible_slugs(&selected_slugs);
                     if changed {
+                        table.delegate_mut().invalidate_viewport_fingerprint();
                         table.delegate().persist_column_layout(cx);
                         table.refresh(cx);
                     }
@@ -568,10 +807,6 @@ impl ProcessesTableDelegate {
             cx,
         )
     }
-
-    fn selected_end_task_enabled(&self) -> bool {
-        find_selected_row(&self.slice.rows, self.selected_key).is_some_and(can_terminate_process)
-    }
 }
 
 impl TableDelegate for ProcessesTableDelegate {
@@ -588,7 +823,7 @@ impl TableDelegate for ProcessesTableDelegate {
             return Column::default();
         };
         let col = spec.id;
-        let mut column = Column::new(col.slug(), col.label())
+        let mut column = Column::new(col.slug(), self.locale.column_label(col))
             .width(px(spec.width))
             .min_width(px(spec.min_width))
             .max_width(px(spec.max_width))
@@ -631,8 +866,40 @@ impl TableDelegate for ProcessesTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) {
         if self.column_layout.move_visible_column(col_ix, to_ix) {
+            self.invalidate_viewport_fingerprint();
             self.persist_column_layout(cx);
         }
+    }
+
+    fn visible_rows_changed(
+        &mut self,
+        visible_range: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) {
+        let rows_len = self.slice.rows.len();
+        if !self.visible_rows.is_empty()
+            && self.visible_rows != visible_range
+            && rows_len == self.last_rows_len
+        {
+            self.scroll_coalescer.on_scroll(Instant::now());
+        }
+        self.visible_rows = visible_range;
+        self.last_rows_len = rows_len;
+        self.last_viewport_fingerprint = None;
+    }
+
+    fn visible_columns_changed(
+        &mut self,
+        visible_range: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) {
+        if !self.visible_cols.is_empty() && self.visible_cols != visible_range {
+            self.scroll_coalescer.on_scroll(Instant::now());
+        }
+        self.visible_cols = visible_range;
+        self.last_viewport_fingerprint = None;
     }
 
     fn render_header(
@@ -685,7 +952,9 @@ impl TableDelegate for ProcessesTableDelegate {
         let theme = cx.theme();
         let fg = theme.foreground;
         let muted_fg = theme.muted_foreground;
-        let sort_paused_color = LoomSemanticColors::from_theme(theme).sort_paused;
+        let sort_paused_color = self.semantic_colors.get_copy(theme).sort_paused;
+        let col_label = self.locale.column_label(col);
+        let sort_paused_tip = self.locale.sort_paused_tooltip.clone();
         let store = self.store.clone();
         let table_weak = cx.entity().downgrade();
 
@@ -703,19 +972,21 @@ impl TableDelegate for ProcessesTableDelegate {
             .when(is_active_sort, |d| d.font_semibold())
             .cursor_pointer()
             .on_click(cx.listener(move |table, _, _, cx| {
-                table.delegate().trigger_sort_col(col_ix, cx);
+                table.delegate_mut().trigger_sort_col(col_ix, cx);
             }))
             .when(is_sort_paused && col.right_aligned(), |d| {
                 d.child(sort_paused_indicator(
                     ("proc-sort-paused", col_ix),
                     sort_paused_color,
+                    sort_paused_tip.clone(),
                 ))
             })
-            .child(div().min_w_0().truncate().child(col.label()))
+            .child(div().min_w_0().truncate().child(col_label))
             .when(is_sort_paused && !col.right_aligned(), |d| {
                 d.child(sort_paused_indicator(
                     ("proc-sort-paused", col_ix),
                     sort_paused_color,
+                    sort_paused_tip,
                 ))
             })
             .context_menu(move |menu, window, cx| {
@@ -746,7 +1017,7 @@ impl TableDelegate for ProcessesTableDelegate {
         &mut self,
         row_ix: usize,
         col_ix: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let Some(row) = self.slice.rows.get(row_ix) else {
@@ -777,12 +1048,13 @@ impl TableDelegate for ProcessesTableDelegate {
                 let theme = cx.theme();
                 let muted_fg = theme.muted_foreground;
                 let muted_bg = theme.muted;
+                let hover_bg = theme.list_hover;
                 let radius = theme.radius;
-                let semantic = LoomSemanticColors::from_theme(theme);
+                let semantic = self.semantic_colors.get_copy(theme);
                 let key = row.key;
                 let row_id = stable_row_id(key);
 
-                let cell_content = match spec.id {
+                match spec.id {
                     ProcessColumn::Name => {
                         let indent = f32::from(row.depth.min(8)) * 16.0;
                         let has_children = row.has_children;
@@ -793,8 +1065,8 @@ impl TableDelegate for ProcessesTableDelegate {
                             .as_ref()
                             .and_then(|icon| self.icon_cache.get_or_insert(icon));
                         let display_name = SharedString::from(Arc::clone(&row.display_name));
-                        let child_badge: Option<SharedString> =
-                            (row.child_count > 0).then(|| format!("({})", row.child_count).into());
+                        let child_badge: Option<SharedString> = (row.child_count > 0)
+                            .then(|| format_child_count_shared(row.child_count));
                         let wv2_label = row
                             .webview2_role
                             .map(|role| self.locale.webview2_label(role));
@@ -819,29 +1091,17 @@ impl TableDelegate for ProcessesTableDelegate {
                             .pl(px(indent))
                             .overflow_hidden()
                             .child(if has_children {
-                                div()
-                                    .flex_shrink_0()
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation();
-                                    })
-                                    .child(
-                                        Button::new(("proc-expand", row_id))
-                                            .xsmall()
-                                            .ghost()
-                                            .icon(if is_expanded {
-                                                IconName::ChevronDown
-                                            } else {
-                                                IconName::ChevronRight
-                                            })
-                                            .on_click(move |_, _, cx| {
-                                                UiCommands::toggle_process_expanded(
-                                                    &toggle_store,
-                                                    key,
-                                                    cx,
-                                                );
-                                            }),
-                                    )
-                                    .into_any_element()
+                                expand_chevron_button(
+                                    ("proc-expand", row_id),
+                                    is_expanded,
+                                    hover_bg,
+                                    muted_fg,
+                                    cx.listener(move |table, _, _, cx| {
+                                        table.delegate_mut().mark_user_initiated();
+                                        UiCommands::toggle_process_expanded(&toggle_store, key, cx);
+                                    }),
+                                )
+                                .into_any_element()
                             } else {
                                 div().w(px(20.)).flex_shrink_0().into_any_element()
                             })
@@ -898,7 +1158,7 @@ impl TableDelegate for ProcessesTableDelegate {
                         .text_xs()
                         .font_family(theme.mono_font_family.clone())
                         .text_color(muted_fg)
-                        .child(key.pid.to_string())
+                        .child(self.row_cache.pid_text(key))
                         .into_any_element(),
                     ProcessColumn::ProcessName => h_flex()
                         .size_full()
@@ -914,65 +1174,83 @@ impl TableDelegate for ProcessesTableDelegate {
                                 .child(SharedString::from(Arc::clone(&row.name))),
                         )
                         .into_any_element(),
-                    ProcessColumn::Status => h_flex()
-                        .size_full()
-                        .items_center()
-                        .gap_1()
-                        .overflow_hidden()
-                        .child(status_badges(
-                            row_id,
-                            row.status,
-                            &self.locale.status_labels,
-                            &semantic,
-                        ))
-                        .when_some(row.leak_warning.as_ref(), |el, warning| {
-                            el.child(leak_warning_badge(
-                                ("proc-leak", row_id),
-                                warning,
-                                semantic.leak_warning,
-                            ))
-                        })
-                        .into_any_element(),
-                    ProcessColumn::Cpu => heatmap_cell(
-                        format_permille_shared(row.cpu_permille),
+                    ProcessColumn::Status => {
+                        let has_badges = has_visible_status_badges(row.status);
+                        if !has_badges && row.leak_warning.is_none() {
+                            return Empty.into_any_element();
+                        }
+                        let a11y_active = window.is_a11y_active();
+                        h_flex()
+                            .size_full()
+                            .items_center()
+                            .gap_1()
+                            .overflow_hidden()
+                            .when(has_badges, |el| {
+                                el.child(status_badges_with_a11y(
+                                    row_id,
+                                    row.status,
+                                    &self.locale.status_labels,
+                                    &semantic,
+                                    a11y_active,
+                                ))
+                            })
+                            .when_some(row.leak_warning.as_ref(), |el, warning| {
+                                el.child(leak_warning_badge(
+                                    ("proc-leak", row_id),
+                                    warning,
+                                    semantic.leak_warning,
+                                ))
+                            })
+                            .into_any_element()
+                    }
+                    ProcessColumn::Cpu => heatmap_cell_metric(
+                        format_permille_metric(row.cpu_permille),
                         HeatmapLevel::from_permille(row.cpu_permille),
                         &semantic,
+                        theme.mono_font_family.clone(),
                     )
                     .into_any_element(),
-                    ProcessColumn::Memory => heatmap_cell(
-                        format_memory_cell_shared(
+                    ProcessColumn::Memory => heatmap_cell_metric(
+                        self.row_cache.memory_metric(
+                            key,
                             row.memory_bytes,
                             row.memory_permille,
                             self.mem_mode,
                         ),
                         HeatmapLevel::from_permille(row.memory_permille),
                         &semantic,
+                        theme.mono_font_family.clone(),
                     )
                     .into_any_element(),
-                    ProcessColumn::Disk => heatmap_cell(
-                        format_disk_cell_shared(
+                    ProcessColumn::Disk => heatmap_cell_metric(
+                        self.row_cache.disk_metric(
+                            key,
                             row.disk_bytes_per_sec,
                             row.disk_permille,
                             self.disk_mode,
                         ),
                         HeatmapLevel::from_bytes_per_sec(row.disk_bytes_per_sec),
                         &semantic,
+                        theme.mono_font_family.clone(),
                     )
                     .into_any_element(),
-                    ProcessColumn::Network => heatmap_cell(
-                        format_network_cell_shared(
+                    ProcessColumn::Network => heatmap_cell_metric(
+                        self.row_cache.network_metric(
+                            key,
                             row.net_bytes_per_sec,
                             row.net_permille,
                             self.net_mode,
                         ),
                         HeatmapLevel::from_bytes_per_sec(row.net_bytes_per_sec),
                         &semantic,
+                        theme.mono_font_family.clone(),
                     )
                     .into_any_element(),
-                    ProcessColumn::Gpu => heatmap_cell(
-                        format_permille_shared(row.gpu_util_permille),
+                    ProcessColumn::Gpu => heatmap_cell_metric(
+                        format_permille_metric(row.gpu_util_permille),
                         HeatmapLevel::from_permille(row.gpu_util_permille),
                         &semantic,
+                        theme.mono_font_family.clone(),
                     )
                     .into_any_element(),
                     ProcessColumn::Publisher => {
@@ -996,45 +1274,41 @@ impl TableDelegate for ProcessesTableDelegate {
                             .into_any_element()
                     }
                     ProcessColumn::CommandLine => {
-                        let cmd_arc = row
-                            .command_line
-                            .as_ref()
-                            .filter(|s| !s.is_empty())
-                            .map(Arc::clone);
-                        let cmd_text = cmd_arc
-                            .as_ref()
-                            .map(|s| SharedString::from(Arc::clone(s)))
-                            .unwrap_or_else(|| SharedString::new_static("—"));
-
-                        h_flex()
-                            .id(("proc-cmd", row_id))
-                            .size_full()
-                            .items_center()
-                            .overflow_hidden()
-                            .text_xs()
-                            .font_family(theme.mono_font_family.clone())
-                            .text_color(muted_fg)
-                            .when_some(cmd_arc, |el, full_cmd| {
-                                let tooltip_text = SharedString::from(full_cmd);
-                                el.tooltip(move |window, cx| {
+                        let mono_font = theme.mono_font_family.clone();
+                        if let Some(cmd_arc) = row.command_line.as_ref().filter(|s| !s.is_empty()) {
+                            let preview = self.row_cache.preview_slot(
+                                key,
+                                0,
+                                cmd_arc,
+                                DEFAULT_CELL_PREVIEW_CHARS,
+                            );
+                            let tooltip_text = SharedString::from(Arc::clone(cmd_arc));
+                            h_flex()
+                                .id(("proc-cmd", row_id))
+                                .size_full()
+                                .items_center()
+                                .overflow_hidden()
+                                .text_xs()
+                                .font_family(mono_font)
+                                .text_color(muted_fg)
+                                .tooltip(move |window, cx| {
                                     Tooltip::new(tooltip_text.clone()).build(window, cx)
                                 })
-                            })
-                            .child(div().min_w_0().truncate().child(cmd_text))
-                            .into_any_element()
+                                .child(div().min_w_0().truncate().child(preview))
+                                .into_any_element()
+                        } else {
+                            h_flex()
+                                .size_full()
+                                .items_center()
+                                .overflow_hidden()
+                                .text_xs()
+                                .font_family(mono_font)
+                                .text_color(muted_fg)
+                                .child(SharedString::new_static("—"))
+                                .into_any_element()
+                        }
                     }
-                };
-
-                div()
-                    .size_full()
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |table, _, _, _| {
-                            table.delegate_mut().last_right_clicked_col = Some(col_ix);
-                        }),
-                    )
-                    .child(cell_content)
-                    .into_any_element()
+                }
             }
         }
     }
@@ -1137,6 +1411,12 @@ impl TableDelegate for ProcessesTableDelegate {
     }
 }
 
+struct PendingProcessesSnapshot {
+    rev: u64,
+    slice: Arc<ProcessTableSlice>,
+    platform: PlatformProfile,
+}
+
 /// Live Processes overview view pairing a static toolbar with a 2D-virtualized `DataTable`.
 ///
 /// Live metric snapshots update `self.table` directly without marking `ProcessesView`
@@ -1147,12 +1427,15 @@ pub(crate) struct ProcessesView {
     coordinator: Arc<EngineCoordinator<NativeBackend>>,
     table: Entity<TableState<ProcessesTableDelegate>>,
     table_pane: Entity<DataTablePane<ProcessesTableDelegate>>,
+    table_left_x: Rc<Cell<Pixels>>,
     process_net_lease: Option<ScopedMonitorLease>,
     view_mode: ProcessViewMode,
     hide_system_processes: bool,
     end_task_enabled: bool,
     last_locale: LanguagePreference,
     type_to_search: TypeToSearchState,
+    pending_snapshot: Option<PendingProcessesSnapshot>,
+    scroll_flush_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1326,48 +1609,41 @@ impl ProcessesView {
                 UiStoreEvent::SnapshotUpdated(revs) => {
                     this.sync_process_network_lease(cx);
 
-                    let current_rev = table_for_store.read(cx).delegate().last_rev;
-                    if revs.processes == current_rev {
+                    let latest_rev = this
+                        .pending_snapshot
+                        .as_ref()
+                        .map_or_else(|| table_for_store.read(cx).delegate().last_rev, |p| p.rev);
+                    if revs.processes == latest_rev {
                         return;
                     }
                     let (next_slice, next_platform) = {
                         let snap = store.read(cx).snapshot();
                         (Arc::clone(&snap.processes), snap.platform)
                     };
-                    let (next_view_mode, next_end_enabled) =
-                        table_for_store.update(cx, |table, cx| {
-                            let d = table.delegate_mut();
-                            let sort_changed = d.slice.sort_column != next_slice.sort_column
-                                || d.slice.sort_direction != next_slice.sort_direction;
-                            d.slice = next_slice;
-                            d.platform = next_platform;
-                            d.last_rev = revs.processes;
 
-                            let view_mode = d.slice.view_mode;
-                            let selected_idx = find_row_index(&d.slice.rows, d.selected_key);
-                            let end_enabled = d.selected_end_task_enabled();
+                    let should_defer = table_for_store.update(cx, |table, _| {
+                        let d = table.delegate_mut();
+                        let is_user_initiated = d.last_rev == 0
+                            || d.take_user_initiated()
+                            || d.slice.sort_column != next_slice.sort_column
+                            || d.slice.sort_direction != next_slice.sort_direction
+                            || d.slice.view_mode != next_slice.view_mode
+                            || d.slice.rows.is_empty() != next_slice.rows.is_empty();
+                        d.scroll_coalescer
+                            .should_defer_snapshot(Instant::now(), is_user_initiated)
+                    });
 
-                            // Re-anchor selection index to ProcessKey without scrolling.
-                            if let Some(idx) = selected_idx {
-                                if table.selected_row() != Some(idx) {
-                                    table.set_selected_row(idx, cx);
-                                }
-                            } else if table.selected_row().is_some() {
-                                table.clear_selection(cx);
-                            }
-
-                            if sort_changed {
-                                table.refresh(cx);
-                            }
-                            cx.notify();
-                            (view_mode, end_enabled)
+                    if should_defer {
+                        this.pending_snapshot = Some(PendingProcessesSnapshot {
+                            rev: revs.processes,
+                            slice: next_slice,
+                            platform: next_platform,
                         });
-
-                    if this.view_mode != next_view_mode || this.end_task_enabled != next_end_enabled
-                    {
-                        this.view_mode = next_view_mode;
-                        this.end_task_enabled = next_end_enabled;
-                        cx.notify();
+                        this.ensure_scroll_flush_scheduled(cx);
+                    } else {
+                        this.pending_snapshot = None;
+                        this.scroll_flush_task = None;
+                        this.commit_snapshot(revs.processes, next_slice, next_platform, cx);
                     }
                 }
                 UiStoreEvent::SettingsChanged => {
@@ -1396,10 +1672,16 @@ impl ProcessesView {
                         d.mem_mode = mem_mode;
                         d.disk_mode = disk_mode;
                         d.net_mode = net_mode;
+                        if hide_sys_changed {
+                            d.mark_user_initiated();
+                        }
                         if locale_changed {
                             let platform = d.platform;
                             d.locale = ProcessesLocaleCache::build(platform);
+                            d.invalidate_viewport_fingerprint();
                             table.refresh(cx);
+                        } else if mode_changed {
+                            d.invalidate_viewport_fingerprint();
                         }
                         if locale_changed || mode_changed {
                             cx.notify();
@@ -1418,6 +1700,9 @@ impl ProcessesView {
                 UiStoreEvent::SearchQueryChanged => {
                     let query = store.read(cx).search_query().to_owned();
                     this.type_to_search.sync_committed(&query);
+                    table_for_store.update(cx, |table, _| {
+                        table.delegate_mut().mark_user_initiated();
+                    });
                 }
                 UiStoreEvent::ElevationRequired { .. } | UiStoreEvent::CommandFailed { .. } => {}
             }),
@@ -1430,15 +1715,17 @@ impl ProcessesView {
                 TableEvent::SelectRow(row_ix) => {
                     let next_end_enabled = table.update(cx, |table, _| {
                         let d = table.delegate_mut();
+                        d.invalidate_viewport_fingerprint();
                         match d.slice.rows.get(*row_ix) {
                             Some(row) if row.kind == ProcessRowKind::Process => {
                                 d.selected_key = Some(row.key);
+                                can_terminate_process(row)
                             }
                             _ => {
                                 d.selected_key = None;
+                                false
                             }
                         }
-                        d.selected_end_task_enabled()
                     });
                     if this.end_task_enabled != next_end_enabled {
                         this.end_task_enabled = next_end_enabled;
@@ -1447,18 +1734,22 @@ impl ProcessesView {
                 }
                 TableEvent::RightClickedRow(Some(row_ix)) => {
                     let next_end_enabled = table.update(cx, |table, cx| {
-                        let key_opt = table
-                            .delegate()
-                            .slice
-                            .rows
-                            .get(*row_ix)
-                            .filter(|r| r.kind == ProcessRowKind::Process)
-                            .map(|r| r.key);
-                        table.delegate_mut().selected_key = key_opt;
+                        let (key_opt, end_enabled) = match table.delegate().slice.rows.get(*row_ix)
+                        {
+                            Some(row) if row.kind == ProcessRowKind::Process => {
+                                (Some(row.key), can_terminate_process(row))
+                            }
+                            _ => (None, false),
+                        };
+                        {
+                            let d = table.delegate_mut();
+                            d.selected_key = key_opt;
+                            d.invalidate_viewport_fingerprint();
+                        }
                         if key_opt.is_some() && table.selected_row() != Some(*row_ix) {
                             table.set_selected_row(*row_ix, cx);
                         }
-                        table.delegate().selected_end_task_enabled()
+                        end_enabled
                     });
                     if this.end_task_enabled != next_end_enabled {
                         this.end_task_enabled = next_end_enabled;
@@ -1467,7 +1758,9 @@ impl ProcessesView {
                 }
                 TableEvent::ClearSelection => {
                     table.update(cx, |table, _| {
-                        table.delegate_mut().selected_key = None;
+                        let d = table.delegate_mut();
+                        d.selected_key = None;
+                        d.invalidate_viewport_fingerprint();
                     });
                     if this.end_task_enabled {
                         this.end_task_enabled = false;
@@ -1481,6 +1774,7 @@ impl ProcessesView {
                             .column_layout
                             .apply_visible_widths(widths)
                         {
+                            table.delegate_mut().invalidate_viewport_fingerprint();
                             table.delegate().persist_column_layout(cx);
                         }
                     });
@@ -1497,16 +1791,135 @@ impl ProcessesView {
             coordinator,
             table,
             table_pane,
+            table_left_x: Rc::new(Cell::new(px(0.0))),
             process_net_lease: None,
             view_mode,
             hide_system_processes,
             end_task_enabled: false,
             last_locale,
             type_to_search,
+            pending_snapshot: None,
+            scroll_flush_task: None,
             _subscriptions: subscriptions,
         };
         view.sync_process_network_lease(cx);
         view
+    }
+
+    /// Commits a live [`ProcessTableSlice`] to `self.table`, re-anchoring selection in `O(1)`
+    /// steady state and notifying `TableState` only when the visible viewport fingerprint changed.
+    ///
+    /// Returns `true` if `TableState` was notified to repaint.
+    fn commit_snapshot(
+        &mut self,
+        rev: u64,
+        next_slice: Arc<ProcessTableSlice>,
+        next_platform: PlatformProfile,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (next_view_mode, next_end_enabled, table_notified) =
+            self.table.update(cx, |table, cx| {
+                let prev_selected_row = table.selected_row();
+                let (sort_changed, prev_fp, had_visible_rows) = {
+                    let d = table.delegate_mut();
+                    let sort_changed = d.slice.sort_column != next_slice.sort_column
+                        || d.slice.sort_direction != next_slice.sort_direction;
+                    let had_visible = !d.visible_rows.is_empty();
+                    let prev_fp = d
+                        .last_viewport_fingerprint
+                        .unwrap_or_else(|| d.compute_viewport_fingerprint(prev_selected_row));
+
+                    d.row_cache.begin_epoch();
+                    d.row_cache.prune_if_needed();
+                    d.slice = next_slice;
+                    d.platform = next_platform;
+                    d.last_rev = rev;
+                    (sort_changed, prev_fp, had_visible)
+                };
+
+                let (view_mode, selected_idx, end_enabled) = {
+                    let d = table.delegate();
+                    let selected_idx =
+                        find_row_index_fast(&d.slice.rows, d.selected_key, prev_selected_row);
+                    let end_enabled = selected_idx
+                        .and_then(|idx| d.slice.rows.get(idx))
+                        .is_some_and(can_terminate_process);
+                    (d.slice.view_mode, selected_idx, end_enabled)
+                };
+
+                // Re-anchor selection index to ProcessKey without scrolling.
+                let mut selection_changed = false;
+                if let Some(idx) = selected_idx {
+                    if prev_selected_row != Some(idx) {
+                        table.set_selected_row(idx, cx);
+                        selection_changed = true;
+                    }
+                } else if prev_selected_row.is_some() {
+                    table.clear_selection(cx);
+                    selection_changed = true;
+                }
+
+                let next_fp = {
+                    let d = table.delegate_mut();
+                    let fp = d.compute_viewport_fingerprint(selected_idx);
+                    d.last_viewport_fingerprint = Some(fp);
+                    fp
+                };
+
+                if sort_changed {
+                    table.refresh(cx);
+                }
+
+                let should_notify =
+                    !had_visible_rows || sort_changed || selection_changed || prev_fp != next_fp;
+                if should_notify {
+                    cx.notify();
+                }
+                (view_mode, end_enabled, should_notify)
+            });
+
+        if self.view_mode != next_view_mode || self.end_task_enabled != next_end_enabled {
+            self.view_mode = next_view_mode;
+            self.end_task_enabled = next_end_enabled;
+            cx.notify();
+        }
+
+        table_notified
+    }
+
+    fn ensure_scroll_flush_scheduled(&mut self, cx: &mut Context<Self>) {
+        if self.scroll_flush_task.is_some() {
+            return;
+        }
+        let table = self.table.clone();
+        self.scroll_flush_task = Some(cx.spawn(async move |weak, cx| {
+            loop {
+                let delay = match cx.update(|cx| {
+                    table
+                        .read(cx)
+                        .delegate()
+                        .scroll_coalescer
+                        .remaining_quiet_delay(Instant::now())
+                }) {
+                    Some(d) if !d.is_zero() => d,
+                    Some(_) => break,
+                    None => return,
+                };
+                cx.background_executor()
+                    .timer(delay.max(Duration::from_millis(1)))
+                    .await;
+            }
+
+            let _ = weak.update(cx, |this, cx| {
+                this.scroll_flush_task = None;
+                let had_pending = this.table.update(cx, |table, _| {
+                    table.delegate_mut().scroll_coalescer.take_pending()
+                });
+                if had_pending && let Some(pending) = this.pending_snapshot.take() {
+                    this.commit_snapshot(pending.rev, pending.slice, pending.platform, cx);
+                }
+            });
+        }));
     }
 
     /// Acquires or releases `MonitorDomain::ProcessNetwork` strictly when the Network column is
@@ -2115,6 +2528,8 @@ impl Render for ProcessesView {
 
         let table_focus = self.table.focus_handle(cx);
         let view_entity = cx.entity();
+        let table_left_x_click = Rc::clone(&self.table_left_x);
+        let table_left_x_prepaint = Rc::clone(&self.table_left_x);
 
         v_flex()
             .id("processes-view-root")
@@ -2177,8 +2592,29 @@ impl Render for ProcessesView {
                             table.delegate_mut().set_table_hovered(*hovered, cx);
                         });
                     }))
+                    .capture_any_mouse_down(cx.listener(
+                        move |this, event: &MouseDownEvent, _, cx| {
+                            if event.button != MouseButton::Right {
+                                return;
+                            }
+                            let local_x = f32::from(event.position.x - table_left_x_click.get());
+                            this.table.update(cx, |table, _| {
+                                let scroll_x = f32::from(
+                                    (-table.horizontal_scroll_handle.offset().x).max(px(0.0)),
+                                );
+                                let col_ix = table
+                                    .delegate()
+                                    .column_layout
+                                    .column_index_at_x(local_x, scroll_x);
+                                table.delegate_mut().last_right_clicked_col = col_ix;
+                            });
+                        },
+                    ))
                     .child(TableInputBridge::new(table_focus, view_entity))
-                    .child(self.table_pane.clone()),
+                    .child(self.table_pane.clone())
+                    .on_prepaint(move |bounds, _, _| {
+                        table_left_x_prepaint.set(bounds.left());
+                    }),
             )
     }
 }
@@ -2680,6 +3116,357 @@ mod tests {
             store.read_with(&vcx, |s, _| s.settings().leak_ignored_paths.clone()),
             vec![r"C:\WebView2\msedgewebview2.exe".to_owned()]
         );
+
+        coordinator_for_shutdown.shutdown();
+    }
+
+    #[test]
+    fn processes_viewport_fingerprint_detects_visible_changes_and_ignores_offscreen_and_jitter() {
+        use std::sync::Arc;
+
+        use loom_types::{
+            ProcessCategory, ProcessKey, ProcessRowKind, ProcessRowProjection, ProcessStatusFlags,
+            ProcessTableSlice, ResourceDisplayMode,
+        };
+
+        let make_row = |i: u32| ProcessRowProjection {
+            kind: ProcessRowKind::Process,
+            key: ProcessKey::new(1000 + i, 50_000 + u64::from(i)),
+            depth: 0,
+            has_children: false,
+            is_expanded: false,
+            child_count: 0,
+            name: Arc::from(format!("worker-{i}.exe")),
+            display_name: Arc::from(format!("Worker {i}")),
+            window_title: None,
+            publisher: Some(Arc::from("Example Corp")),
+            exe_path: None,
+            command_line: None,
+            icon: None,
+            category: ProcessCategory::App,
+            status: ProcessStatusFlags::empty(),
+            cpu_permille: 25,
+            memory_bytes: 128 * 1024 * 1024,
+            memory_permille: 8,
+            disk_bytes_per_sec: 0,
+            disk_permille: 0,
+            net_bytes_per_sec: 0,
+            net_permille: 0,
+            gpu_util_permille: 0,
+            gpu_dedicated_bytes: 0,
+            parent_key: None,
+            leak_warning: None,
+            webview2_role: None,
+        };
+
+        let layout = TableColumnLayout::new(ProcessColumn::default_specs());
+        let visible_rows = 0..10;
+        let visible_cols = 0..6;
+
+        let mut slice = ProcessTableSlice {
+            revision: 1,
+            rows: (0..60).map(make_row).collect(),
+            ..Default::default()
+        };
+
+        let fp_base = super::compute_processes_viewport_fingerprint(
+            &slice,
+            &layout,
+            &visible_rows,
+            &visible_cols,
+            None,
+            ResourceDisplayMode::Values,
+            ResourceDisplayMode::Values,
+            ResourceDisplayMode::Values,
+            false,
+        );
+
+        // Identical slice computes identical fingerprint.
+        assert_eq!(
+            fp_base,
+            super::compute_processes_viewport_fingerprint(
+                &slice,
+                &layout,
+                &visible_rows,
+                &visible_cols,
+                None,
+                ResourceDisplayMode::Values,
+                ResourceDisplayMode::Values,
+                ResourceDisplayMode::Values,
+                false,
+            )
+        );
+
+        // Mutating an off-screen row (index 50) must NOT invalidate the viewport fingerprint.
+        slice.rows[50].cpu_permille = 950;
+        slice.rows[50].memory_bytes = 2 * 1024 * 1024 * 1024;
+        assert_eq!(
+            fp_base,
+            super::compute_processes_viewport_fingerprint(
+                &slice,
+                &layout,
+                &visible_rows,
+                &visible_cols,
+                None,
+                ResourceDisplayMode::Values,
+                ResourceDisplayMode::Values,
+                ResourceDisplayMode::Values,
+                false,
+            )
+        );
+
+        // Sub-display-tenth memory jitter (+512 bytes on 128.0 MB) renders identically -> same fp.
+        slice.rows[2].memory_bytes += 512;
+        assert_eq!(
+            fp_base,
+            super::compute_processes_viewport_fingerprint(
+                &slice,
+                &layout,
+                &visible_rows,
+                &visible_cols,
+                None,
+                ResourceDisplayMode::Values,
+                ResourceDisplayMode::Values,
+                ResourceDisplayMode::Values,
+                false,
+            )
+        );
+
+        // Visible CPU change invalidates the fingerprint.
+        slice.rows[2].cpu_permille = 120;
+        let fp_cpu = super::compute_processes_viewport_fingerprint(
+            &slice,
+            &layout,
+            &visible_rows,
+            &visible_cols,
+            None,
+            ResourceDisplayMode::Values,
+            ResourceDisplayMode::Values,
+            ResourceDisplayMode::Values,
+            false,
+        );
+        assert_ne!(fp_base, fp_cpu);
+
+        // Selection or freeze-state changes invalidate the fingerprint.
+        let fp_sel = super::compute_processes_viewport_fingerprint(
+            &slice,
+            &layout,
+            &visible_rows,
+            &visible_cols,
+            Some(2),
+            ResourceDisplayMode::Values,
+            ResourceDisplayMode::Values,
+            ResourceDisplayMode::Values,
+            false,
+        );
+        assert_ne!(fp_cpu, fp_sel);
+    }
+
+    #[gpui_kit::test]
+    fn processes_view_right_click_column_coord_long_cmdline_cap_and_viewport_dirty_skip(
+        cx: &mut TestAppContext,
+    ) {
+        use std::sync::Arc;
+
+        use loom_config::{AppSettings, ConfigStore};
+        use loom_engine::EngineCoordinator;
+        use loom_pal::{NativeBackend, PlatformBackend as _};
+        use loom_types::{ProcessRowProjection, ProcessStatusFlags, ProcessTableSlice};
+        use loom_ui_kit::DEFAULT_CELL_PREVIEW_CHARS;
+
+        use crate::bridge::UiStore;
+        use crate::shell::ShellHandle;
+
+        cx.update(gpui_kit::init);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_store = ConfigStore::new(dir.path().join("settings.toml"));
+        let backend = NativeBackend::initialize().expect("native backend");
+        let coordinator =
+            Arc::new(EngineCoordinator::new(backend, AppSettings::default()).expect("coordinator"));
+        let coordinator_for_shutdown = Arc::clone(&coordinator);
+
+        let store =
+            cx.new(|cx| UiStore::new(coordinator, config_store, AppSettings::default(), cx));
+        let shell = ShellHandle::new(|_, _, _| {});
+
+        let store_for_window = store.clone();
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), move |window, cx| {
+                let view = cx.new(|cx| ProcessesView::new(store_for_window, shell, window, cx));
+                cx.new(|cx| gpui_kit::base::Root::new(view, window, cx))
+            })
+            .expect("open window")
+        });
+        cx.simulate_window_resize(window.into(), size(px(1200.), px(720.)));
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let view = window
+            .read_with(&vcx, |root, _| {
+                root.view()
+                    .clone()
+                    .downcast::<ProcessesView>()
+                    .expect("root wraps ProcessesView")
+            })
+            .expect("read root");
+        let table = view.read_with(&vcx, |v, _| v.table.clone());
+
+        // Stop the live OS sampler so background ticks never overwrite synthetic test slices.
+        coordinator_for_shutdown.shutdown();
+        vcx.run_until_parked();
+
+        let long_cmdline: Arc<str> = Arc::from(format!(
+            "\"C:\\Program Files\\LongApp\\app.exe\" --token={}",
+            "x".repeat(8192)
+        ));
+        let make_rows = |visible_cpu: u16, offscreen_cpu: u16| -> Vec<ProcessRowProjection> {
+            (0..60u32)
+                .map(|i| ProcessRowProjection {
+                    kind: ProcessRowKind::Process,
+                    key: ProcessKey::new(2000 + i, 10_000 + u64::from(i)),
+                    depth: 0,
+                    has_children: false,
+                    is_expanded: false,
+                    child_count: 0,
+                    name: Arc::from(format!("proc-{i}.exe")),
+                    display_name: Arc::from(format!("Process {i}")),
+                    window_title: None,
+                    publisher: Some(Arc::from("Test Publisher")),
+                    exe_path: Some(Arc::from(r"C:\Program Files\LongApp\app.exe")),
+                    command_line: if i == 0 {
+                        Some(Arc::clone(&long_cmdline))
+                    } else {
+                        None
+                    },
+                    icon: None,
+                    category: ProcessCategory::App,
+                    status: ProcessStatusFlags::empty(),
+                    cpu_permille: if i == 0 {
+                        visible_cpu
+                    } else if i == 55 {
+                        offscreen_cpu
+                    } else {
+                        5
+                    },
+                    memory_bytes: 64 * 1024 * 1024,
+                    memory_permille: 4,
+                    disk_bytes_per_sec: 0,
+                    disk_permille: 0,
+                    net_bytes_per_sec: 0,
+                    net_permille: 0,
+                    gpu_util_permille: 0,
+                    gpu_dedicated_bytes: 0,
+                    parent_key: None,
+                    leak_warning: None,
+                    webview2_role: None,
+                })
+                .collect()
+        };
+
+        // First commit populates rows and notifies so uniform_list computes visible_rows.
+        let platform = store.read_with(&vcx, |s, _| s.snapshot().platform);
+        let slice_v1 = Arc::new(ProcessTableSlice {
+            revision: 100,
+            rows: make_rows(10, 10),
+            ..Default::default()
+        });
+        let notified_v1 = view.update(&mut vcx, |this, cx| {
+            this.commit_snapshot(100, Arc::clone(&slice_v1), platform, cx)
+        });
+        assert!(notified_v1, "initial commit must notify TableState");
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // 1. Table-level right-click column coordinate detection (zero per-cell listeners):
+        // Default visible columns: Name [0..260), Status [260..340), Cpu [340..422), Memory [422..518).
+        for (x_pos, expected_col) in [(100.0, Some(0)), (300.0, Some(1)), (380.0, Some(2))] {
+            vcx.simulate_mouse_down(
+                point(px(x_pos), px(100.)),
+                MouseButton::Right,
+                Modifiers::default(),
+            );
+            vcx.simulate_mouse_up(
+                point(px(x_pos), px(100.)),
+                MouseButton::Right,
+                Modifiers::default(),
+            );
+            let detected = table.read_with(&vcx, |t, _| t.delegate().last_right_clicked_col);
+            assert_eq!(
+                detected, expected_col,
+                "right-click at x={x_pos} should map to column {expected_col:?}"
+            );
+            // Dismiss the opened context menu overlay so the next right-click hits the table.
+            vcx.simulate_keystrokes("escape");
+            vcx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+
+        // 2. 8 KB command line is capped in RowTextCache preview while Copy & CSV keep full text.
+        let key0 = slice_v1.rows[0].key;
+        let preview = table.update(&mut vcx, |t, cx| {
+            let preview = {
+                let d = t.delegate_mut();
+                d.selected_key = Some(key0);
+                d.column_layout
+                    .apply_visible_slugs(&["status", "cpu", "memory", "command_line"]);
+                d.invalidate_viewport_fingerprint();
+                d.row_cache
+                    .preview_slot(key0, 0, &long_cmdline, DEFAULT_CELL_PREVIEW_CHARS)
+            };
+            t.refresh(cx);
+            preview
+        });
+        assert!(
+            preview.chars().count() <= DEFAULT_CELL_PREVIEW_CHARS + 1,
+            "preview must be capped to <= {} chars (+ ellipsis), got {}",
+            DEFAULT_CELL_PREVIEW_CHARS,
+            preview.chars().count()
+        );
+        assert!(preview.ends_with('…'));
+
+        let (summary_text, csv_rows) = table.read_with(&vcx, |t, _| {
+            (
+                t.delegate().selected_copy_summary().expect("row 0 summary"),
+                t.delegate().export_visible_csv_payload().1,
+            )
+        });
+        assert!(
+            summary_text.contains(long_cmdline.as_ref()),
+            "copy summary must preserve full 8 KB command line"
+        );
+        assert!(
+            csv_rows[0]
+                .iter()
+                .any(|cell| cell.as_str() == long_cmdline.as_ref()),
+            "CSV export must preserve full 8 KB command line"
+        );
+
+        // Draw once after column visibility change so fingerprint & visible_rows are settled.
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // 3. Viewport dirty-check skips cx.notify() when only an off-screen row (index 55) changes.
+        let slice_v2 = Arc::new(ProcessTableSlice {
+            revision: 101,
+            rows: make_rows(10, 999),
+            ..Default::default()
+        });
+        let notified_v2 = view.update(&mut vcx, |this, cx| {
+            this.commit_snapshot(101, slice_v2, platform, cx)
+        });
+        assert!(
+            !notified_v2,
+            "off-screen metric change must skip TableState cx.notify()"
+        );
+
+        // 4. Visible row change (index 0 CPU 10 -> 250) triggers cx.notify().
+        let slice_v3 = Arc::new(ProcessTableSlice {
+            revision: 102,
+            rows: make_rows(250, 999),
+            ..Default::default()
+        });
+        let notified_v3 = view.update(&mut vcx, |this, cx| {
+            this.commit_snapshot(102, slice_v3, platform, cx)
+        });
+        assert!(notified_v3, "visible row CPU change must notify TableState");
 
         coordinator_for_shutdown.shutdown();
     }
