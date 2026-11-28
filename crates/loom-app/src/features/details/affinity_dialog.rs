@@ -191,17 +191,23 @@ impl SetAffinityDialogView {
         }
     }
 
-    fn apply_and_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn try_apply(&mut self, cx: &mut Context<Self>) -> bool {
         let AffinityLoadState::Ready(selection) = &self.state else {
-            return;
+            return false;
         };
         if selection.is_empty() {
             cx.notify();
-            return;
+            return false;
         }
         let mask = selection.mask().clone();
         UiCommands::set_affinity(&self.store, self.key, mask, cx);
-        window.close_dialog(cx);
+        true
+    }
+
+    fn apply_and_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.try_apply(cx) {
+            window.close_dialog(cx);
+        }
     }
 }
 
@@ -295,6 +301,7 @@ impl Render for SetAffinityDialogView {
                     )
                     .child(
                         DialogFooter::new()
+                            .gap_2()
                             .child(
                                 Button::new("affinity-elevation-close")
                                     .outline()
@@ -483,6 +490,7 @@ impl Render for SetAffinityDialogView {
                     .child(
                         DialogFooter::new()
                             .pt_1()
+                            .gap_2()
                             .child(
                                 Button::new("affinity-cancel")
                                     .outline()
@@ -524,10 +532,14 @@ pub(super) fn open_set_affinity_dialog(
         key.pid
     );
     let dialog_view = cx.new(|cx| SetAffinityDialogView::new(store, key, window, cx));
+    let dialog_for_ok = dialog_view.clone();
     window.open_dialog(cx, move |dialog, _window, _cx| {
+        let ok_view = dialog_for_ok.clone();
         dialog
             .w(px(540.))
+            .centered()
             .title(dialog_title.clone())
+            .on_ok(move |_, _, cx| ok_view.update(cx, |view, cx| view.try_apply(cx)))
             .child(dialog_view.clone())
     });
 }

@@ -26,6 +26,8 @@ use loom_types::{CapabilityFlags, ProcessKey, WaitChainNode};
 use crate::bridge::{UiCommands, UiStore};
 use crate::i18n;
 
+use super::state::process_key_element_id;
+
 /// Flattened display metadata keyed by [`TreeItem::id`] for rendering each wait-chain row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct WaitChainNodeMeta {
@@ -589,7 +591,7 @@ impl Render for WaitChainDialogView {
                                                             .child(
                                                                 Button::new((
                                                                     "wait-chain-end-blocker",
-                                                                    ix,
+                                                                    process_key_element_id(bkey),
                                                                 ))
                                                                 .xsmall()
                                                                 .danger()
