@@ -3798,3 +3798,124 @@ fn offloaded_domain_sort_filter_expand_and_search_commands_are_lease_gated() {
 
     coord.shutdown();
 }
+
+#[test]
+fn details_working_set_delta_tracks_signed_growth_shrink_and_sorting() {
+    const MIB: u64 = 1024 * 1024;
+    let mut grow = MockProcSpec::new(201, 10, 0, "grow.exe");
+    grow.private_mem_bytes = 100 * MIB;
+    let mut shrink = MockProcSpec::new(202, 10, 0, "shrink.exe");
+    shrink.private_mem_bytes = 200 * MIB;
+    let mut steady = MockProcSpec::new(203, 10, 0, "steady.exe");
+    steady.private_mem_bytes = 150 * MIB;
+
+    let k_grow = grow.key;
+    let k_shrink = shrink.key;
+    let k_steady = steady.key;
+
+    let state = MockState::new(vec![grow, shrink, steady]);
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let coord = EngineCoordinator::with_config(backend, settings, EngineConfig::default()).unwrap();
+    let _details_lease = coord.acquire_lease(MonitorDomain::Details);
+
+    // Ensure the initial tick and Details projection have completed before mutating overrides.
+    coord
+        .send_command_with_reply(EngineCommand::SetDetailsSort {
+            column: DetailsSortColumn::WorkingSetDelta,
+            direction: SortDirection::Descending,
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    // Tick 1: baseline observation for all processes -> delta must be 0.
+    let snap1 = coord.snapshot();
+    assert_eq!(snap1.details.rows.len(), 3);
+    for row in &snap1.details.rows {
+        assert_eq!(
+            row.working_set_delta_bytes, 0,
+            "initial sample must report 0 working set delta for {}",
+            row.name
+        );
+    }
+
+    // Tick 2: grow (+100 MiB), shrink (-64 MiB), steady (0).
+    {
+        let mut ov = state.dynamic_mem_override.lock();
+        ov.insert(k_grow, 200 * MIB);
+        ov.insert(k_shrink, 136 * MIB);
+        ov.insert(k_steady, 150 * MIB);
+    }
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    // Sort descending: largest positive growth first, largest shrink last.
+    coord
+        .send_command_with_reply(EngineCommand::SetDetailsSort {
+            column: DetailsSortColumn::WorkingSetDelta,
+            direction: SortDirection::Descending,
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let snap_desc = coord.snapshot();
+    let desc_pairs: Vec<(ProcessKey, i64)> = snap_desc
+        .details
+        .rows
+        .iter()
+        .map(|r| (r.key, r.working_set_delta_bytes))
+        .collect();
+    assert_eq!(
+        desc_pairs,
+        vec![
+            (k_grow, (100 * MIB) as i64),
+            (k_steady, 0),
+            (k_shrink, -((64 * MIB) as i64)),
+        ]
+    );
+
+    // Sort ascending: largest negative shrink first, largest positive growth last.
+    coord
+        .send_command_with_reply(EngineCommand::SetDetailsSort {
+            column: DetailsSortColumn::WorkingSetDelta,
+            direction: SortDirection::Ascending,
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let snap_asc = coord.snapshot();
+    let asc_pairs: Vec<(ProcessKey, i64)> = snap_asc
+        .details
+        .rows
+        .iter()
+        .map(|r| (r.key, r.working_set_delta_bytes))
+        .collect();
+    assert_eq!(
+        asc_pairs,
+        vec![
+            (k_shrink, -((64 * MIB) as i64)),
+            (k_steady, 0),
+            (k_grow, (100 * MIB) as i64),
+        ]
+    );
+
+    // Tick 3: working sets unchanged -> deltas return to 0.
+    coord
+        .send_command_with_reply(EngineCommand::ForceRefresh)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let snap3 = coord.snapshot();
+    for row in &snap3.details.rows {
+        assert_eq!(row.working_set_delta_bytes, 0);
+    }
+
+    coord.shutdown();
+}

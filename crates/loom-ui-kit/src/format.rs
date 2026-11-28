@@ -204,6 +204,16 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Formats a signed byte delta using binary (`1024`-based) units (`"0 B"`,
+/// `"+512 B"`, `"-4 KB"`, `"+1.5 MB"`, `"-2.0 GB"`, etc.).
+pub fn format_signed_bytes(delta_bytes: i64) -> String {
+    if delta_bytes == 0 {
+        return String::from("0 B");
+    }
+    let sign = if delta_bytes > 0 { '+' } else { '-' };
+    format!("{sign}{}", format_bytes(delta_bytes.unsigned_abs()))
+}
+
 /// Formats a storage/transfer throughput in bytes per second (e.g., `"0 MB/s"`,
 /// `"512.0 KB/s"`, `"1.4 MB/s"`, `"2.1 GB/s"`).
 pub fn format_rate_bytes_per_sec(bytes_per_sec: u64) -> String {
@@ -401,6 +411,21 @@ pub const fn quantize_bytes_display(bytes: u64) -> u64 {
     ((tier as u64) << 60) | val
 }
 
+/// Encodes the sign, display unit tier, and rounded magnitude for
+/// [`format_signed_bytes_metric`].
+///
+/// Two signed byte deltas produce the same key if and only if they render
+/// identically via [`format_signed_bytes_metric`].
+#[inline]
+pub const fn quantize_signed_bytes_display(delta_bytes: i64) -> u64 {
+    if delta_bytes == 0 {
+        return 0;
+    }
+    let sign_tag: u64 = if delta_bytes > 0 { 1 } else { 2 };
+    let (tier, val) = quantize_bytes_parts(delta_bytes.unsigned_abs());
+    (sign_tag << 62) | ((tier as u64) << 58) | val
+}
+
 /// Encodes the display unit tier and rounded numeric value for [`format_rate_bytes_per_sec_metric`].
 ///
 /// Two byte rates produce the same key if and only if they render identically
@@ -445,6 +470,25 @@ pub fn format_bytes_metric(bytes: u64) -> MetricDisplay {
         3 => MetricDisplay::new(format_tenths_shared(val), " MB"),
         4 => MetricDisplay::new(format_tenths_shared(val), " GB"),
         _ => MetricDisplay::new(format_tenths_shared(val), " TB"),
+    }
+}
+
+/// Formats a signed byte delta into a split [`MetricDisplay`] (`value` strictly
+/// numeric with an explicit `'+'` / `'-'` sign for non-zero deltas, `unit` in
+/// `{" B", " KB", " MB", " GB", " TB"}`).
+pub fn format_signed_bytes_metric(delta_bytes: i64) -> MetricDisplay {
+    if delta_bytes == 0 {
+        return MetricDisplay::from_static("0", " B");
+    }
+    let sign = if delta_bytes > 0 { '+' } else { '-' };
+    let (tier, val) = quantize_bytes_parts(delta_bytes.unsigned_abs());
+    match tier {
+        0 => MetricDisplay::from_static("0", " B"),
+        1 => MetricDisplay::new(format!("{sign}{val}"), " B"),
+        2 => MetricDisplay::new(format!("{sign}{val}"), " KB"),
+        3 => MetricDisplay::new(format!("{sign}{}.{}", val / 10, val % 10), " MB"),
+        4 => MetricDisplay::new(format!("{sign}{}.{}", val / 10, val % 10), " GB"),
+        _ => MetricDisplay::new(format!("{sign}{}.{}", val / 10, val % 10), " TB"),
     }
 }
 

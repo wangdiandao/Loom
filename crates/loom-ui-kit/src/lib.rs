@@ -29,9 +29,10 @@ pub use format::{
     format_network_cell_shared, format_network_rate_mbps, format_network_rate_mbps_metric,
     format_network_rate_mbps_shared, format_opt_percent_permille, format_opt_temp_celsius,
     format_permille, format_permille_metric, format_permille_shared, format_rate_bytes_per_sec,
-    format_rate_bytes_per_sec_metric, format_rate_bytes_per_sec_shared, format_u32_shared,
-    format_uptime, quantize_bytes_display, quantize_cpu_time_secs, quantize_net_bps_display,
-    quantize_rate_bps_display,
+    format_rate_bytes_per_sec_metric, format_rate_bytes_per_sec_shared, format_signed_bytes,
+    format_signed_bytes_metric, format_u32_shared, format_uptime, quantize_bytes_display,
+    quantize_cpu_time_secs, quantize_net_bps_display, quantize_rate_bps_display,
+    quantize_signed_bytes_display,
 };
 pub use heatmap::{heatmap_cell, heatmap_cell_metric, heatmap_cell_mono};
 pub use icon::rgba_icon_to_render_image;
@@ -1072,6 +1073,64 @@ mod tests {
             MetricDisplay::new("2.5", " TB")
         );
 
+        // Signed byte delta formatting (0, positive, negative, i64 extremes) & NumberShaping.
+        let signed_samples = [
+            i64::MIN,
+            -((2 * TIB + 512 * GIB) as i64),
+            -((16 * GIB + 512 * MIB) as i64),
+            -((1536 * KIB) as i64),
+            -(4 * KIB as i64),
+            -512,
+            -1,
+            0,
+            1,
+            512,
+            4 * KIB as i64,
+            (1536 * KIB) as i64,
+            (16 * GIB + 512 * MIB) as i64,
+            (2 * TIB + 512 * GIB) as i64,
+            i64::MAX,
+        ];
+        for s in signed_samples {
+            let sm = format_signed_bytes_metric(s);
+            assert_number_shaping(&sm, "signed_bytes");
+        }
+        assert_eq!(format_signed_bytes(0), "0 B");
+        assert_eq!(format_signed_bytes(512), "+512 B");
+        assert_eq!(format_signed_bytes(-512), "-512 B");
+        assert_eq!(format_signed_bytes(4 * KIB as i64), "+4 KB");
+        assert_eq!(format_signed_bytes(-(4 * KIB as i64)), "-4 KB");
+        assert_eq!(format_signed_bytes((1536 * KIB) as i64), "+1.5 MB");
+        assert_eq!(format_signed_bytes(-((1536 * KIB) as i64)), "-1.5 MB");
+        assert_eq!(
+            format_signed_bytes_metric(0),
+            MetricDisplay::from_static("0", " B")
+        );
+        assert_eq!(
+            format_signed_bytes_metric(512),
+            MetricDisplay::new("+512", " B")
+        );
+        assert_eq!(
+            format_signed_bytes_metric(-512),
+            MetricDisplay::new("-512", " B")
+        );
+        assert_eq!(
+            format_signed_bytes_metric(4 * KIB as i64),
+            MetricDisplay::new("+4", " KB")
+        );
+        assert_eq!(
+            format_signed_bytes_metric(-(4 * KIB as i64)),
+            MetricDisplay::new("-4", " KB")
+        );
+        assert_eq!(
+            format_signed_bytes_metric((1536 * KIB) as i64),
+            MetricDisplay::new("+1.5", " MB")
+        );
+        assert_eq!(
+            format_signed_bytes_metric(-((1536 * KIB) as i64)),
+            MetricDisplay::new("-1.5", " MB")
+        );
+
         assert_eq!(
             format_rate_bytes_per_sec_metric(0),
             MetricDisplay::from_static("0", " MB/s")
@@ -1141,6 +1200,33 @@ mod tests {
         assert_ne!(quantize_bytes_display(0), quantize_bytes_display(1));
         assert_ne!(quantize_bytes_display(KIB - 1), quantize_bytes_display(KIB));
         assert_ne!(quantize_bytes_display(MIB - 1), quantize_bytes_display(MIB));
+
+        // Signed byte delta quantization distinguishes sign and buckets cleanly.
+        assert_eq!(quantize_signed_bytes_display(0), 0);
+        assert_ne!(
+            quantize_signed_bytes_display(0),
+            quantize_signed_bytes_display(1)
+        );
+        assert_ne!(
+            quantize_signed_bytes_display(0),
+            quantize_signed_bytes_display(-1)
+        );
+        assert_ne!(
+            quantize_signed_bytes_display(4 * KIB as i64),
+            quantize_signed_bytes_display(-(4 * KIB as i64))
+        );
+        assert_eq!(
+            quantize_signed_bytes_display(MIB as i64),
+            quantize_signed_bytes_display(MIB as i64 + 50)
+        );
+        assert_eq!(
+            quantize_signed_bytes_display(-(MIB as i64)),
+            quantize_signed_bytes_display(-(MIB as i64 + 50))
+        );
+        assert_ne!(
+            quantize_signed_bytes_display(-(MIB as i64)),
+            quantize_signed_bytes_display(-(MIB as i64 + 120 * KIB as i64))
+        );
 
         // Throughput quantization buckets.
         assert_eq!(
@@ -1260,6 +1346,16 @@ mod tests {
         assert_eq!(ws1, MetricDisplay::new("64.0", " MB"));
         assert_eq!(commit1, MetricDisplay::new("256.0", " MB"));
         assert_eq!(ws1, ws2);
+
+        // Signed byte-delta slot handles zero fast-path, positive/negative caching, and sign flips.
+        let d0 = cache.signed_bytes_metric_slot(p1, 0, 0);
+        let d_pos1 = cache.signed_bytes_metric_slot(p1, 0, (4 * MIB) as i64);
+        let d_pos2 = cache.signed_bytes_metric_slot(p1, 0, (4 * MIB) as i64 + 16);
+        let d_neg = cache.signed_bytes_metric_slot(p1, 0, -((4 * MIB) as i64));
+        assert_eq!(d0, MetricDisplay::from_static("0", " B"));
+        assert_eq!(d_pos1, MetricDisplay::new("+4.0", " MB"));
+        assert_eq!(d_pos1, d_pos2);
+        assert_eq!(d_neg, MetricDisplay::new("-4.0", " MB"));
 
         // CPU time reformats only when whole seconds advance.
         let t1 = cache.cpu_time_text(p1, 10_000_000);

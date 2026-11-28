@@ -186,6 +186,8 @@ pub struct DetailsRowProjection {
     pub private_working_set_bytes: u64,
     /// Total resident working set memory in bytes.
     pub working_set_bytes: u64,
+    /// Signed change in total resident working set memory in bytes since the previous tick.
+    pub working_set_delta_bytes: i64,
     /// Private committed virtual memory in bytes.
     pub commit_bytes: u64,
     /// Active thread count.

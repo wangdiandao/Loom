@@ -74,6 +74,8 @@ pub enum DetailsSortColumn {
     Memory,
     /// Total resident working set memory.
     WorkingSet,
+    /// Signed change in total resident working set memory since the previous tick.
+    WorkingSetDelta,
     /// Private committed virtual memory.
     CommitSize,
     /// Scheduling priority class.

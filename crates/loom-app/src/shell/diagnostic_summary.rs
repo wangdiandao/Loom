@@ -175,6 +175,7 @@ mod tests {
                     cpu_time_100ns: 0,
                     private_working_set_bytes: 0,
                     working_set_bytes: 0,
+                    working_set_delta_bytes: 0,
                     commit_bytes: 0,
                     thread_count: 1,
                     handle_count: 1,

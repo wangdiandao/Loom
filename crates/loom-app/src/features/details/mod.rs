@@ -42,8 +42,9 @@ use loom_types::{
 };
 use loom_ui_kit::{
     CachedSemanticColors, DEFAULT_CELL_PREVIEW_CHARS, HeatmapLevel, MetricDisplay, RowTextCache,
-    format_bytes, format_cpu_time, format_permille, format_permille_metric, heatmap_cell_metric,
-    quantize_bytes_display, quantize_cpu_time_secs,
+    format_bytes, format_cpu_time, format_permille, format_permille_metric, format_signed_bytes,
+    heatmap_cell_metric, quantize_bytes_display, quantize_cpu_time_secs,
+    quantize_signed_bytes_display,
 };
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
@@ -69,8 +70,9 @@ const COL_USER_W: f32 = 140.0;
 const COL_SESSION_W: f32 = 84.0;
 const COL_CPU_W: f32 = 82.0;
 const COL_CPU_TIME_W: f32 = 96.0;
-const COL_MEM_W: f32 = 168.0;
+const COL_MEM_W: f32 = 184.0;
 const COL_WORKING_SET_W: f32 = 128.0;
+const COL_WORKING_SET_DELTA_W: f32 = 168.0;
 const COL_COMMIT_W: f32 = 112.0;
 const COL_PRIORITY_W: f32 = 112.0;
 const COL_HANDLES_W: f32 = 84.0;
@@ -99,6 +101,7 @@ enum DetailsColumn {
     CpuTime,
     Memory,
     WorkingSet,
+    WorkingSetDelta,
     CommitSize,
     Priority,
     Handles,
@@ -125,6 +128,7 @@ impl ColumnKey for DetailsColumn {
             Self::CpuTime => "cpu_time",
             Self::Memory => "memory",
             Self::WorkingSet => "working_set",
+            Self::WorkingSetDelta => "working_set_delta",
             Self::CommitSize => "commit_size",
             Self::Priority => "priority",
             Self::Handles => "handles",
@@ -153,6 +157,7 @@ impl DetailsColumn {
             ColumnSpec::hidden(Self::CpuTime, COL_CPU_TIME_W, 76.0, 200.0),
             ColumnSpec::new(Self::Memory, COL_MEM_W, 96.0, 320.0),
             ColumnSpec::hidden(Self::WorkingSet, COL_WORKING_SET_W, 88.0, 280.0),
+            ColumnSpec::hidden(Self::WorkingSetDelta, COL_WORKING_SET_DELTA_W, 96.0, 320.0),
             ColumnSpec::hidden(Self::CommitSize, COL_COMMIT_W, 84.0, 260.0),
             ColumnSpec::new(Self::Priority, COL_PRIORITY_W, 72.0, 240.0),
             ColumnSpec::hidden(Self::Handles, COL_HANDLES_W, 64.0, 180.0),
@@ -188,6 +193,7 @@ impl DetailsColumn {
             Self::CpuTime,
             Self::Memory,
             Self::WorkingSet,
+            Self::WorkingSetDelta,
             Self::CommitSize,
             Self::Priority,
             Self::Handles,
@@ -219,6 +225,7 @@ impl DetailsColumn {
             Self::CpuTime => i18n::tr("details.col_cpu_time"),
             Self::Memory => i18n::tr("details.col_memory"),
             Self::WorkingSet => i18n::tr("details.col_working_set"),
+            Self::WorkingSetDelta => i18n::tr("details.col_working_set_delta"),
             Self::CommitSize => i18n::tr("details.col_commit"),
             Self::Priority => i18n::tr("details.col_priority"),
             Self::Handles => i18n::tr("details.col_handles"),
@@ -245,6 +252,7 @@ impl DetailsColumn {
             Self::CpuTime => Some(DetailsSortColumn::CpuTime),
             Self::Memory => Some(DetailsSortColumn::Memory),
             Self::WorkingSet => Some(DetailsSortColumn::WorkingSet),
+            Self::WorkingSetDelta => Some(DetailsSortColumn::WorkingSetDelta),
             Self::CommitSize => Some(DetailsSortColumn::CommitSize),
             Self::Priority => Some(DetailsSortColumn::Priority),
             Self::Handles => Some(DetailsSortColumn::Handles),
@@ -269,6 +277,7 @@ impl DetailsColumn {
                 | Self::CpuTime
                 | Self::Memory
                 | Self::WorkingSet
+                | Self::WorkingSetDelta
                 | Self::CommitSize
                 | Self::Handles
                 | Self::Threads
@@ -460,6 +469,7 @@ pub(super) const fn default_sort_direction(column: DetailsSortColumn) -> SortDir
         | DetailsSortColumn::CpuTime
         | DetailsSortColumn::Memory
         | DetailsSortColumn::WorkingSet
+        | DetailsSortColumn::WorkingSetDelta
         | DetailsSortColumn::CommitSize
         | DetailsSortColumn::Priority
         | DetailsSortColumn::Handles
@@ -582,7 +592,7 @@ fn render_metric_cell(
 
 /// Cached localized strings for [`DetailsTableDelegate`] to avoid per-frame `i18n::tr` allocations.
 struct DetailsLocaleCache {
-    col_labels: [SharedString; 21],
+    col_labels: [SharedString; 22],
     sort_paused_tooltip: SharedString,
     running: SharedString,
     suspended: SharedString,
@@ -627,6 +637,7 @@ impl DetailsLocaleCache {
                 DetailsColumn::CpuTime.label(platform).into(),
                 DetailsColumn::Memory.label(platform).into(),
                 DetailsColumn::WorkingSet.label(platform).into(),
+                DetailsColumn::WorkingSetDelta.label(platform).into(),
                 DetailsColumn::CommitSize.label(platform).into(),
                 DetailsColumn::Priority.label(platform).into(),
                 DetailsColumn::Handles.label(platform).into(),
@@ -995,6 +1006,9 @@ fn compute_details_viewport_fingerprint(
                 DetailsColumn::WorkingSet => {
                     h.write_u64(quantize_bytes_display(row.working_set_bytes));
                 }
+                DetailsColumn::WorkingSetDelta => {
+                    h.write_u64(quantize_signed_bytes_display(row.working_set_delta_bytes));
+                }
                 DetailsColumn::CommitSize => {
                     h.write_u64(quantize_bytes_display(row.commit_bytes));
                 }
@@ -1212,6 +1226,7 @@ impl DetailsTableDelegate {
             DetailsColumn::CpuTime => format_cpu_time(row.cpu_time_100ns),
             DetailsColumn::Memory => format_bytes(row.private_working_set_bytes),
             DetailsColumn::WorkingSet => format_bytes(row.working_set_bytes),
+            DetailsColumn::WorkingSetDelta => format_signed_bytes(row.working_set_delta_bytes),
             DetailsColumn::CommitSize => format_bytes(row.commit_bytes),
             DetailsColumn::Priority => self.locale.priority_label(row.priority).to_string(),
             DetailsColumn::Handles => row.handle_count.to_string(),
@@ -1825,6 +1840,12 @@ impl TableDelegate for DetailsTableDelegate {
             DetailsColumn::WorkingSet => render_metric_cell(
                 self.row_cache
                     .bytes_metric_slot(key, 1, row.working_set_bytes),
+                theme.mono_font_family.clone(),
+                muted_fg,
+            ),
+            DetailsColumn::WorkingSetDelta => render_metric_cell(
+                self.row_cache
+                    .signed_bytes_metric_slot(key, 0, row.working_set_delta_bytes),
                 theme.mono_font_family.clone(),
                 muted_fg,
             ),
@@ -3332,6 +3353,7 @@ mod tests {
             cpu_time_100ns: 0,
             private_working_set_bytes: 0,
             working_set_bytes: 0,
+            working_set_delta_bytes: 0,
             commit_bytes: 0,
             thread_count: 1,
             handle_count: 10,
@@ -4077,5 +4099,149 @@ mod tests {
         );
 
         coordinator_for_shutdown.shutdown();
+    }
+
+    #[test]
+    fn details_locale_cache_and_working_set_delta_column_alignment() {
+        let all_cols = [
+            (DetailsColumn::Name, "details.col_name"),
+            (DetailsColumn::Pid, "details.col_pid"),
+            (DetailsColumn::Status, "details.col_status"),
+            (DetailsColumn::UserName, "details.col_user"),
+            (DetailsColumn::SessionId, "details.col_session_id"),
+            (DetailsColumn::Cpu, "details.col_cpu"),
+            (DetailsColumn::CpuTime, "details.col_cpu_time"),
+            (DetailsColumn::Memory, "details.col_memory"),
+            (DetailsColumn::WorkingSet, "details.col_working_set"),
+            (
+                DetailsColumn::WorkingSetDelta,
+                "details.col_working_set_delta",
+            ),
+            (DetailsColumn::CommitSize, "details.col_commit"),
+            (DetailsColumn::Priority, "details.col_priority"),
+            (DetailsColumn::Handles, "details.col_handles"),
+            (DetailsColumn::Threads, "details.col_threads"),
+            (DetailsColumn::Platform, "details.col_platform"),
+            (DetailsColumn::UacVirtualization, "details.col_uac"),
+            (DetailsColumn::Elevated, "details.col_elevated"),
+            (DetailsColumn::GpuMemory, "details.col_gpu_memory"),
+            (DetailsColumn::Publisher, "details.col_publisher"),
+            (DetailsColumn::Description, "details.col_description"),
+            (DetailsColumn::ExePath, "details.col_exe_path"),
+            (DetailsColumn::CommandLine, "details.col_command_line"),
+        ];
+        let cache = DetailsLocaleCache::build(PlatformProfile::WINDOWS);
+        assert_eq!(cache.col_labels.len(), all_cols.len());
+        for (idx, (col, key)) in all_cols.into_iter().enumerate() {
+            assert_eq!(
+                col as usize, idx,
+                "DetailsColumn::{col:?} discriminant must match slot {idx}"
+            );
+            let cached = cache.column_label(col);
+            let en = rust_i18n::t!(key, locale = "en-US");
+            let zh = rust_i18n::t!(key, locale = "zh-CN");
+            assert!(
+                cached.as_ref() == en.as_ref() || cached.as_ref() == zh.as_ref(),
+                "DetailsLocaleCache slot for {col:?} returned {cached:?}, expected {en:?} or {zh:?}"
+            );
+        }
+
+        assert_eq!(
+            rust_i18n::t!("details.col_memory", locale = "en-US").as_ref(),
+            "Memory (private working set)"
+        );
+        assert_eq!(
+            rust_i18n::t!("details.col_working_set_delta", locale = "en-US").as_ref(),
+            "Working set delta (memory)"
+        );
+        assert_eq!(
+            rust_i18n::t!("details.col_memory", locale = "zh-CN").as_ref(),
+            "内存（专用工作集）"
+        );
+        assert_eq!(
+            rust_i18n::t!("details.col_working_set_delta", locale = "zh-CN").as_ref(),
+            "工作集增量（内存）"
+        );
+
+        let mut layout =
+            TableColumnLayout::new(DetailsColumn::default_specs(CapabilityFlags::empty()));
+        assert!(layout.is_visible(DetailsColumn::Memory));
+        assert!(!layout.is_visible(DetailsColumn::WorkingSetDelta));
+        assert!(
+            DetailsColumn::selectable_order(CapabilityFlags::empty())
+                .contains(&DetailsColumn::WorkingSetDelta)
+        );
+        assert!(DetailsColumn::WorkingSetDelta.right_aligned());
+        assert_eq!(
+            DetailsColumn::WorkingSetDelta.sort_column(),
+            Some(DetailsSortColumn::WorkingSetDelta)
+        );
+        assert_eq!(
+            default_sort_direction(DetailsSortColumn::WorkingSetDelta),
+            SortDirection::Descending
+        );
+
+        // Make WorkingSetDelta visible and verify fingerprint detects sign & bucket changes.
+        assert!(layout.apply_visible_slugs(&[DetailsColumn::WorkingSetDelta.slug()]));
+        assert!(layout.is_visible(DetailsColumn::WorkingSetDelta));
+        let ram = 16 * 1024 * 1024 * 1024u64;
+        let mut slice = DetailsTableSlice {
+            revision: 1,
+            rows: vec![sample_row(1000, 1, "worker.exe")],
+            ..Default::default()
+        };
+        let visible_rows = 0..1;
+        let visible_cols = 0..layout.visible_count();
+
+        let fp_zero = compute_details_viewport_fingerprint(
+            &slice,
+            &layout,
+            &visible_rows,
+            &visible_cols,
+            None,
+            None,
+            ram,
+            false,
+        );
+        slice.rows[0].working_set_delta_bytes = 2 * 1024 * 1024;
+        let fp_pos = compute_details_viewport_fingerprint(
+            &slice,
+            &layout,
+            &visible_rows,
+            &visible_cols,
+            None,
+            None,
+            ram,
+            false,
+        );
+        assert_ne!(fp_zero, fp_pos);
+
+        // Sub-tenth jitter (+64 B on +2.0 MB) keeps identical fingerprint.
+        slice.rows[0].working_set_delta_bytes += 64;
+        let fp_pos_jitter = compute_details_viewport_fingerprint(
+            &slice,
+            &layout,
+            &visible_rows,
+            &visible_cols,
+            None,
+            None,
+            ram,
+            false,
+        );
+        assert_eq!(fp_pos, fp_pos_jitter);
+
+        // Flipping to negative -2.0 MB must change the fingerprint.
+        slice.rows[0].working_set_delta_bytes = -(2 * 1024 * 1024);
+        let fp_neg = compute_details_viewport_fingerprint(
+            &slice,
+            &layout,
+            &visible_rows,
+            &visible_cols,
+            None,
+            None,
+            ram,
+            false,
+        );
+        assert_ne!(fp_pos, fp_neg);
     }
 }

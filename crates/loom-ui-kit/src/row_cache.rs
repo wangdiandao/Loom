@@ -17,8 +17,9 @@ use loom_types::{ProcessKey, ResourceDisplayMode};
 use crate::format::{
     MetricDisplay, SMALL_U32_TABLE_MAX, display_preview_shared, format_bytes_metric,
     format_cpu_time_shared, format_disk_cell_metric, format_memory_cell_metric,
-    format_network_cell_metric, format_u32_shared, quantize_bytes_display, quantize_cpu_time_secs,
-    quantize_net_bps_display, quantize_rate_bps_display,
+    format_network_cell_metric, format_signed_bytes_metric, format_u32_shared,
+    quantize_bytes_display, quantize_cpu_time_secs, quantize_net_bps_display,
+    quantize_rate_bps_display, quantize_signed_bytes_display,
 };
 
 /// Default maximum number of [`ProcessKey`] entries retained in [`RowTextCache`].
@@ -47,6 +48,7 @@ struct RowEntry {
     network: Option<(MetricCacheKey, MetricDisplay)>,
     cpu_time: Option<(u64, SharedString)>,
     bytes_slots: Vec<(u8, u64, MetricDisplay)>,
+    signed_bytes_slots: Vec<(u8, u64, MetricDisplay)>,
     u32_slots: Vec<(u8, u32, SharedString)>,
     preview_slots: Vec<PreviewSlotEntry>,
 }
@@ -275,6 +277,45 @@ impl RowTextCache {
         }
         let formatted = format_bytes_metric(bytes);
         entry.bytes_slots.push((slot, quantized, formatted.clone()));
+        formatted
+    }
+
+    /// Returns the cached signed byte-delta [`MetricDisplay`] for a numbered
+    /// column `slot` (e.g., Working Set Delta), returning a zero-allocation
+    /// static `"0 B"` on zero deltas and reformatting non-zero deltas only when
+    /// the display-quantized sign/bucket changes.
+    pub fn signed_bytes_metric_slot(
+        &mut self,
+        key: ProcessKey,
+        slot: u8,
+        delta_bytes: i64,
+    ) -> MetricDisplay {
+        if delta_bytes == 0 {
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.last_epoch = self.epoch;
+            }
+            return MetricDisplay::from_static("0", " B");
+        }
+
+        let quantized = quantize_signed_bytes_display(delta_bytes);
+        let entry = self.entry_mut(key);
+        if let Some((_, prev_q, cached)) = entry
+            .signed_bytes_slots
+            .iter_mut()
+            .find(|(existing_slot, _, _)| *existing_slot == slot)
+        {
+            if *prev_q == quantized {
+                return cached.clone();
+            }
+            let formatted = format_signed_bytes_metric(delta_bytes);
+            *prev_q = quantized;
+            *cached = formatted.clone();
+            return formatted;
+        }
+        let formatted = format_signed_bytes_metric(delta_bytes);
+        entry
+            .signed_bytes_slots
+            .push((slot, quantized, formatted.clone()));
         formatted
     }
 
