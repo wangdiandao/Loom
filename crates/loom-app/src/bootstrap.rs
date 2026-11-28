@@ -11,25 +11,38 @@ use gpui_kit::assets::{Assets, icon_assets};
 use gpui_kit::component::TitleBar;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, AssetSource, BorrowAppContext as _, Bounds, Entity,
-    Global, QuitMode, SharedString, Subscription, Window, WindowBounds, WindowOptions, point, px,
-    size,
+    Global, QuitMode, SharedString, Subscription, Window, WindowBounds, WindowDecorations,
+    WindowKind, WindowOptions, point, px, size,
 };
 use loom_config::{AppSettings, ConfigStore, WindowGeometry};
 use loom_engine::{EngineCommand, EngineCoordinator};
 use loom_pal::{
     GlobalHotkeyController, NativeBackend, PalError, PlatformBackend, SingleInstanceGuard,
 };
-use loom_types::CapabilityFlags;
+use loom_types::{CapabilityFlags, ProcessKey};
 use parking_lot::Mutex;
 
 use crate::bridge::{UiStore, apply_theme};
 use crate::i18n;
-use crate::shell::{AppShell, Route, TrayAction, TrayController, TrayEventSignal};
+use crate::shell::{
+    AppShell, NavigationIntent, Route, TRAY_OVERVIEW_HEIGHT, TRAY_OVERVIEW_WIDTH, TrayAction,
+    TrayController, TrayEventSignal, TrayOverviewView,
+};
 
-icon_assets!(LoomExtraIcons, [LayoutList, List, ListTree]);
+icon_assets!(
+    LoomExtraIcons,
+    [
+        Activity,
+        CircleQuestionMark,
+        FileLock,
+        LayoutList,
+        List,
+        ListTree,
+    ]
+);
 
 /// Application asset source combining `gpui-kit`'s default component bundle with
-/// Loom's view-mode switcher icons (`LayoutList`, `List`, `ListTree`).
+/// Loom's additional shell & view-mode icons.
 struct LoomAssets;
 
 impl AssetSource for LoomAssets {
@@ -174,11 +187,15 @@ impl Future for NextHotkeyWake {
     }
 }
 
-/// Application-wide GPUI global managing the active window handle, tray icon, global hotkey, and exit policy.
+/// Application-wide GPUI global managing the active windows, tray icon, global hotkey, and exit policy.
 struct AppRuntime {
     store: Entity<UiStore>,
     active_window: Option<AnyWindowHandle>,
+    active_shell: Option<Entity<AppShell>>,
+    main_window_visible: bool,
+    tray_overview_window: Option<AnyWindowHandle>,
     active_route: Route,
+    pending_details_highlight: Option<ProcessKey>,
     hiding_to_tray: bool,
     explicit_exit: bool,
     tray: Option<TrayController>,
@@ -254,7 +271,11 @@ pub(crate) fn run(args: LaunchArgs) {
             cx.set_global(AppRuntime {
                 store,
                 active_window: None,
+                active_shell: None,
+                main_window_visible: false,
+                tray_overview_window: None,
                 active_route: initial_route,
+                pending_details_highlight: None,
                 hiding_to_tray: false,
                 explicit_exit: false,
                 tray: None,
@@ -322,6 +343,10 @@ fn spawn_tray_event_loop(signal: TrayEventSignal, cx: &mut App) {
     cx.spawn(async move |cx| {
         while let Some(action) = signal.next().await {
             let should_continue = cx.update(|cx| match action {
+                TrayAction::QuickOverview => {
+                    toggle_tray_overview_window(cx);
+                    true
+                }
                 TrayAction::Show => {
                     show_or_reopen_main_window(cx);
                     true
@@ -381,23 +406,122 @@ fn build_window_options(settings: &AppSettings) -> WindowOptions {
     }
 }
 
-fn open_main_window(cx: &mut App) -> gpui_kit::Result<()> {
-    let (store, route, settings) = {
+fn build_tray_overview_window_options(cx: &App) -> WindowOptions {
+    let margin_x = px(12.0);
+    let margin_bottom = px(12.0);
+    let win_size = size(px(TRAY_OVERVIEW_WIDTH), px(TRAY_OVERVIEW_HEIGHT));
+
+    let origin = if let Some(display) = cx.primary_display() {
+        let visible = display.visible_bounds();
+        let x = (visible.right() - win_size.width - margin_x).max(visible.left());
+        let y = (visible.bottom() - win_size.height - margin_bottom).max(visible.top());
+        point(x, y)
+    } else {
+        point(px(640.0), px(220.0))
+    };
+
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(origin, win_size))),
+        titlebar: None,
+        focus: true,
+        show: true,
+        kind: WindowKind::PopUp,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        window_decorations: Some(WindowDecorations::Client),
+        ..Default::default()
+    }
+}
+
+fn sync_dormancy(cx: &mut App) {
+    if !cx.has_global::<AppRuntime>() {
+        return;
+    }
+    let (store, should_be_dormant) = {
+        let runtime = cx.global::<AppRuntime>();
+        let any_active_surface = (runtime.active_window.is_some() && runtime.main_window_visible)
+            || runtime.tray_overview_window.is_some();
+        (runtime.store.clone(), !any_active_surface)
+    };
+    store.update(cx, |store, cx| {
+        store.set_window_dormant(should_be_dormant, cx);
+    });
+}
+
+fn close_tray_overview_window(cx: &mut App) {
+    if !cx.has_global::<AppRuntime>() {
+        return;
+    }
+    let existing =
+        cx.update_global::<AppRuntime, _>(|runtime, _| runtime.tray_overview_window.take());
+    if let Some(handle) = existing {
+        let _ = handle.update(cx, |_, window, _| {
+            window.remove_window();
+        });
+    }
+}
+
+fn toggle_tray_overview_window(cx: &mut App) {
+    if !cx.has_global::<AppRuntime>() {
+        return;
+    }
+    if cx.global::<AppRuntime>().tray_overview_window.is_some() {
+        close_tray_overview_window(cx);
+        sync_dormancy(cx);
+        return;
+    }
+
+    let (store, theme) = {
         let runtime = cx.global::<AppRuntime>();
         let store = runtime.store.clone();
+        let theme = store.read(cx).settings().theme;
+        (store, theme)
+    };
+
+    // Wake sampling before opening the popover so vitals & top processes update immediately.
+    store.update(cx, |store, cx| {
+        store.set_window_dormant(false, cx);
+        let _ = store.dispatch_command(EngineCommand::ForceRefresh);
+    });
+
+    let options = build_tray_overview_window_options(cx);
+    match gpui_kit::open_window(options, cx, move |window, cx| {
+        apply_theme(theme, Some(window), cx);
+        cx.new(|cx| TrayOverviewView::new(store, window, cx))
+    }) {
+        Ok((handle, _view)) => {
+            cx.update_global::<AppRuntime, _>(|runtime, _| {
+                runtime.tray_overview_window = Some(handle);
+            });
+        }
+        Err(err) => {
+            tracing::error!(%err, "failed to open tray quick overview popover");
+            sync_dormancy(cx);
+        }
+    }
+}
+
+fn open_main_window(cx: &mut App) -> gpui_kit::Result<()> {
+    let (store, route, pending_highlight, settings) = {
+        let runtime = cx.global_mut::<AppRuntime>();
+        let store = runtime.store.clone();
         let route = runtime.active_route;
+        let pending_highlight = runtime.pending_details_highlight.take();
         let settings = store.read(cx).settings().clone();
-        (store, route, settings)
+        (store, route, pending_highlight, settings)
     };
 
     let options = build_window_options(&settings);
-    let (window_handle, _shell) = gpui_kit::open_window(options, cx, move |window, cx| {
+    let (window_handle, shell) = gpui_kit::open_window(options, cx, move |window, cx| {
         apply_theme(settings.theme, Some(window), cx);
-        cx.new(|cx| AppShell::new(store, route, window, cx))
+        cx.new(|cx| AppShell::new_with_highlight(store, route, pending_highlight, window, cx))
     })?;
 
     cx.update_global::<AppRuntime, _>(|runtime, _| {
         runtime.active_window = Some(window_handle);
+        runtime.active_shell = Some(shell);
+        runtime.main_window_visible = true;
         runtime.hiding_to_tray = false;
     });
 
@@ -405,6 +529,8 @@ fn open_main_window(cx: &mut App) -> gpui_kit::Result<()> {
 }
 
 fn show_or_reopen_main_window(cx: &mut App) {
+    close_tray_overview_window(cx);
+
     let existing = cx.global::<AppRuntime>().active_window;
     if let Some(handle) = existing {
         loom_pal::window::restore_and_focus_main_window();
@@ -412,6 +538,10 @@ fn show_or_reopen_main_window(cx: &mut App) {
             window.activate_window();
         });
         if updated.is_ok() {
+            cx.update_global::<AppRuntime, _>(|runtime, _| {
+                runtime.main_window_visible = true;
+            });
+            sync_dormancy(cx);
             return;
         }
     }
@@ -427,12 +557,68 @@ fn show_or_reopen_main_window(cx: &mut App) {
     }
 }
 
+/// Restores or reopens the main Loom window from the tray Quick Overview popover,
+/// optionally navigating directly to `Details` highlighted at `jump_key`.
+pub(crate) fn open_main_window_from_tray_overview(jump_key: Option<ProcessKey>, cx: &mut App) {
+    if !cx.has_global::<AppRuntime>() {
+        return;
+    }
+
+    close_tray_overview_window(cx);
+
+    if let Some(key) = jump_key {
+        let existing = {
+            let runtime = cx.global::<AppRuntime>();
+            runtime.active_window.zip(runtime.active_shell.clone())
+        };
+        if let Some((handle, shell)) = existing {
+            loom_pal::window::restore_and_focus_main_window();
+            let updated = handle.update(cx, |_, window, cx| {
+                window.activate_window();
+                shell.update(cx, |shell, cx| {
+                    shell.handle_external_intent(NavigationIntent::JumpToDetails(key), window, cx);
+                });
+            });
+            if updated.is_ok() {
+                cx.update_global::<AppRuntime, _>(|runtime, _| {
+                    runtime.main_window_visible = true;
+                });
+                sync_dormancy(cx);
+                return;
+            }
+        }
+
+        cx.update_global::<AppRuntime, _>(|runtime, _| {
+            runtime.active_route = Route::Details;
+            runtime.pending_details_highlight = Some(key);
+        });
+    }
+
+    show_or_reopen_main_window(cx);
+}
+
 fn handle_window_closed(cx: &mut App, closed_id: gpui_kit::WindowId) {
     if !cx.has_global::<AppRuntime>() {
         return;
     }
 
-    let (matched, store, stay_in_tray) = {
+    // First check if the closed window was the lightweight tray Quick Overview popover.
+    let closed_tray_overview = cx.update_global::<AppRuntime, _>(|runtime, _| {
+        let matched = runtime
+            .tray_overview_window
+            .is_some_and(|handle| handle.window_id() == closed_id);
+        if matched {
+            runtime.tray_overview_window = None;
+        }
+        matched
+    });
+    if closed_tray_overview {
+        tracing::debug!("tray quick overview popover destroyed (0% GPU)");
+        sync_dormancy(cx);
+        return;
+    }
+
+    let (matched, stay_in_tray) = {
         let runtime = cx.global_mut::<AppRuntime>();
         let matched = runtime
             .active_window
@@ -441,13 +627,15 @@ fn handle_window_closed(cx: &mut App, closed_id: gpui_kit::WindowId) {
             return;
         }
         runtime.active_window = None;
+        runtime.active_shell = None;
+        runtime.main_window_visible = false;
         let hiding = std::mem::take(&mut runtime.hiding_to_tray);
         let explicit_exit = runtime.explicit_exit;
         let has_tray = runtime.tray.is_some();
         let store = runtime.store.clone();
         let close_to_tray = store.read(cx).settings().close_to_tray;
         let stay_in_tray = !explicit_exit && has_tray && (close_to_tray || hiding);
-        (matched, store, stay_in_tray)
+        (matched, stay_in_tray)
     };
 
     if !matched {
@@ -456,9 +644,7 @@ fn handle_window_closed(cx: &mut App, closed_id: gpui_kit::WindowId) {
 
     if stay_in_tray {
         tracing::info!("Loom window closed to system tray (0% GPU dormant mode)");
-        store.update(cx, |store, cx| {
-            store.set_window_dormant(true, cx);
-        });
+        sync_dormancy(cx);
     } else {
         quit_application(cx);
     }
@@ -470,7 +656,7 @@ fn quit_application(cx: &mut App) {
         return;
     }
 
-    let (store, active_window) = {
+    let (store, active_window, tray_overview_window) = {
         let runtime = cx.global_mut::<AppRuntime>();
         runtime.explicit_exit = true;
         if let Some(signal) = runtime.hotkey_signal.take() {
@@ -479,8 +665,20 @@ fn quit_application(cx: &mut App) {
         runtime.hotkey = None;
         runtime.tray = None;
         runtime._single_instance = None;
-        (runtime.store.clone(), runtime.active_window.take())
+        runtime.active_shell = None;
+        runtime.main_window_visible = false;
+        (
+            runtime.store.clone(),
+            runtime.active_window.take(),
+            runtime.tray_overview_window.take(),
+        )
     };
+
+    if let Some(handle) = tray_overview_window {
+        let _ = handle.update(cx, |_, window, _| {
+            window.remove_window();
+        });
+    }
 
     if let Some(handle) = active_window {
         let _ = handle.update(cx, |_, window, _| {
@@ -498,6 +696,21 @@ pub(crate) fn record_active_route(route: Route, cx: &mut App) {
         cx.update_global::<AppRuntime, _>(|runtime, _| {
             runtime.active_route = route;
         });
+    }
+}
+
+/// Updates the main window visibility state and reconciles engine dormancy across all shell windows.
+///
+/// Returns `true` when [`AppRuntime`] handled dormancy orchestration, or `false` in standalone tests.
+pub(crate) fn set_main_window_visible(visible: bool, cx: &mut App) -> bool {
+    if cx.has_global::<AppRuntime>() {
+        cx.update_global::<AppRuntime, _>(|runtime, _| {
+            runtime.main_window_visible = visible;
+        });
+        sync_dormancy(cx);
+        true
+    } else {
+        false
     }
 }
 

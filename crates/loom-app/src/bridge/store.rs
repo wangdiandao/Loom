@@ -2,7 +2,6 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use gpui_kit::{Context, EventEmitter, Task};
@@ -11,13 +10,9 @@ use loom_engine::{
     CommandEvent, CommandKind, EngineCommand, EngineCommandError, EngineCoordinator,
 };
 use loom_pal::NativeBackend;
-use loom_types::{AppSnapshot, DomainRevisions, MonitorDomain};
+use loom_types::{AppSnapshot, DomainRevisions, MonitorDomain, RefreshSpeed};
 
 use crate::bridge::ScopedMonitorLease;
-
-/// Lightweight polling cadence used while a window is open and visible to notice
-/// new lock-free [`AppSnapshot`] revisions published by `loom-fast-sampler`.
-const SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Structured events emitted by [`UiStore`] for shell and feature subscribers.
 #[derive(Debug, Clone)]
@@ -47,18 +42,23 @@ pub(crate) struct UiStore {
     coordinator: Arc<EngineCoordinator<NativeBackend>>,
     config_store: ConfigStore,
     settings: AppSettings,
+    last_active_refresh_speed: RefreshSpeed,
+    temp_frozen: bool,
     snapshot: Arc<AppSnapshot>,
     last_revisions: DomainRevisions,
     search_query: String,
     event_rx: Receiver<CommandEvent>,
     dormant: bool,
-    poll_task: Option<Task<()>>,
+    wake_task: Option<Task<()>>,
 }
 
 impl EventEmitter<UiStoreEvent> for UiStore {}
 
 impl UiStore {
     /// Creates a new [`UiStore`] bound to a live [`EngineCoordinator`] and [`ConfigStore`].
+    ///
+    /// Snapshot and command-event synchronization is strictly event-driven via
+    /// [`EngineCoordinator::snapshot_wake_signal`] with zero timer polling.
     pub(crate) fn new(
         coordinator: Arc<EngineCoordinator<NativeBackend>>,
         config_store: ConfigStore,
@@ -68,19 +68,25 @@ impl UiStore {
         let snapshot = coordinator.snapshot();
         let last_revisions = snapshot.revisions;
         let event_rx = coordinator.subscribe_events();
+        let last_active_refresh_speed = match settings.refresh_speed {
+            RefreshSpeed::Paused => RefreshSpeed::Normal1S,
+            active => active,
+        };
 
         let mut store = Self {
             coordinator,
             config_store,
             settings,
+            last_active_refresh_speed,
+            temp_frozen: false,
             snapshot,
             last_revisions,
             search_query: String::new(),
             event_rx,
             dormant: false,
-            poll_task: None,
+            wake_task: None,
         };
-        store.start_polling(cx);
+        store.start_wake_loop(cx);
         store
     }
 
@@ -99,6 +105,22 @@ impl UiStore {
             || previous.app_history != next.app_history
     }
 
+    /// Computes `(next_speed, next_last_active)` when toggling pause/resume refresh cadence.
+    #[inline]
+    pub(crate) const fn compute_pause_toggle(
+        current: RefreshSpeed,
+        last_active: RefreshSpeed,
+    ) -> (RefreshSpeed, RefreshSpeed) {
+        let fallback_active = match last_active {
+            RefreshSpeed::Paused => RefreshSpeed::Normal1S,
+            active => active,
+        };
+        match current {
+            RefreshSpeed::Paused => (fallback_active, fallback_active),
+            active => (RefreshSpeed::Paused, active),
+        }
+    }
+
     /// Returns the shared [`EngineCoordinator`].
     #[inline]
     pub(crate) fn coordinator(&self) -> &Arc<EngineCoordinator<NativeBackend>> {
@@ -109,6 +131,39 @@ impl UiStore {
     #[inline]
     pub(crate) fn settings(&self) -> &AppSettings {
         &self.settings
+    }
+
+    /// Returns `true` while temporary freeze (e.g., Hold `Ctrl`) is active.
+    #[inline]
+    pub(crate) const fn is_temp_frozen(&self) -> bool {
+        self.temp_frozen
+    }
+
+    /// Enables or disables temporary engine freeze without mutating persisted `RefreshSpeed`.
+    pub(crate) fn set_temp_frozen(&mut self, frozen: bool, cx: &mut Context<Self>) {
+        if self.temp_frozen == frozen {
+            return;
+        }
+        self.temp_frozen = frozen;
+        let _ = self.dispatch_command(EngineCommand::SetTempFreeze(frozen));
+        cx.notify();
+    }
+
+    /// Records the last non-paused [`RefreshSpeed`] so pause/resume restores it cleanly.
+    #[inline]
+    pub(crate) fn record_active_refresh_speed(&mut self, speed: RefreshSpeed) {
+        if speed != RefreshSpeed::Paused {
+            self.last_active_refresh_speed = speed;
+        }
+    }
+
+    /// Computes the next [`RefreshSpeed`] when toggling pause/resume.
+    #[inline]
+    pub(crate) fn next_pause_toggle_speed(&mut self) -> RefreshSpeed {
+        let (next, remembered) =
+            Self::compute_pause_toggle(self.settings.refresh_speed, self.last_active_refresh_speed);
+        self.last_active_refresh_speed = remembered;
+        next
     }
 
     /// Returns the latest immutable [`AppSnapshot`].
@@ -200,23 +255,39 @@ impl UiStore {
         save_res
     }
 
-    /// Enters or exits dormancy when the desktop window is minimized/closed to tray.
+    /// Enters or exits dormancy when desktop windows are minimized/closed to tray.
     ///
-    /// While dormant, the GPUI snapshot polling loop is dropped completely so zero
-    /// idle polling occurs in the UI thread.
+    /// While dormant, the event-driven GPUI wake task is cancelled and dropped completely
+    /// so zero UI wakeups or background polling occur while idle in the tray.
     pub(crate) fn set_window_dormant(&mut self, dormant: bool, cx: &mut Context<Self>) {
         if self.dormant == dormant {
             return;
         }
         self.dormant = dormant;
+        if dormant && self.temp_frozen {
+            self.temp_frozen = false;
+            let _ = self.dispatch_command(EngineCommand::SetTempFreeze(false));
+        }
         let _ = self.dispatch_command(EngineCommand::SetWindowDormant(dormant));
 
         if dormant {
-            self.poll_task = None;
+            self.wake_task = None;
         } else {
             self.sync_from_coordinator(cx);
-            self.start_polling(cx);
+            self.start_wake_loop(cx);
         }
+    }
+
+    /// Returns `true` when the store is currently in dormant tray mode.
+    #[cfg(test)]
+    pub(crate) const fn is_dormant(&self) -> bool {
+        self.dormant
+    }
+
+    /// Returns `true` when the event-driven wake task is actively running.
+    #[cfg(test)]
+    pub(crate) const fn has_active_wake_task(&self) -> bool {
+        self.wake_task.is_some()
     }
 
     /// Synchronizes the latest snapshot and drains pending command events.
@@ -259,13 +330,19 @@ impl UiStore {
         changed
     }
 
-    fn start_polling(&mut self, cx: &mut Context<Self>) {
-        if self.dormant || self.poll_task.is_some() {
+    fn start_wake_loop(&mut self, cx: &mut Context<Self>) {
+        if self.dormant || self.wake_task.is_some() {
             return;
         }
-        self.poll_task = Some(cx.spawn(async move |weak, cx| {
-            loop {
-                cx.background_executor().timer(SNAPSHOT_POLL_INTERVAL).await;
+        // `EngineCoordinator` publishes snapshots from its real OS `loom-fast-sampler` thread,
+        // waking the `SnapshotWakeSignal` future directly. Inform GPUI's deterministic test
+        // scheduler that cross-thread wakeups are expected under `#[gpui_kit::test]`.
+        #[cfg(test)]
+        cx.background_executor().allow_parking();
+
+        let signal = self.coordinator.snapshot_wake_signal();
+        self.wake_task = Some(cx.spawn(async move |weak, cx| {
+            while signal.wait().await {
                 let keep_running = weak
                     .update(cx, |store, cx| {
                         if store.dormant {
@@ -285,9 +362,18 @@ impl UiStore {
 
 #[cfg(test)]
 mod tests {
-    use loom_types::DomainRevisions;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
-    use super::UiStore;
+    use gpui_kit::{AppContext as _, TestAppContext};
+    use loom_config::{AppSettings, ConfigStore};
+    use loom_engine::{EngineCommand, EngineCoordinator};
+    use loom_pal::{NativeBackend, PlatformBackend as _};
+    use loom_types::{DomainRevisions, RefreshSpeed};
+
+    use super::{UiStore, UiStoreEvent};
 
     #[test]
     fn revisions_changed_detects_every_domain_delta() {
@@ -323,5 +409,108 @@ mod tests {
             );
             assert!(!UiStore::revisions_changed(next, next));
         }
+    }
+
+    #[test]
+    fn pause_toggle_remembers_and_restores_previous_active_speed() {
+        // High500Ms -> Paused (remember High500Ms) -> High500Ms.
+        let (paused, remembered) =
+            UiStore::compute_pause_toggle(RefreshSpeed::High500Ms, RefreshSpeed::Normal1S);
+        assert_eq!(paused, RefreshSpeed::Paused);
+        assert_eq!(remembered, RefreshSpeed::High500Ms);
+
+        let (resumed, remembered2) = UiStore::compute_pause_toggle(paused, remembered);
+        assert_eq!(resumed, RefreshSpeed::High500Ms);
+        assert_eq!(remembered2, RefreshSpeed::High500Ms);
+
+        // Low2S -> Paused (remember Low2S) -> Low2S.
+        let (paused_low, rem_low) =
+            UiStore::compute_pause_toggle(RefreshSpeed::Low2S, RefreshSpeed::Normal1S);
+        assert_eq!(paused_low, RefreshSpeed::Paused);
+        assert_eq!(rem_low, RefreshSpeed::Low2S);
+        assert_eq!(
+            UiStore::compute_pause_toggle(paused_low, rem_low),
+            (RefreshSpeed::Low2S, RefreshSpeed::Low2S)
+        );
+
+        // Starting from Paused with Paused fallback restores Normal1S.
+        assert_eq!(
+            UiStore::compute_pause_toggle(RefreshSpeed::Paused, RefreshSpeed::Paused),
+            (RefreshSpeed::Normal1S, RefreshSpeed::Normal1S)
+        );
+    }
+
+    #[gpui_kit::test]
+    fn ui_store_receives_event_driven_snapshot_and_command_wakeups_without_polling(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let config_store = ConfigStore::new(dir.path().join("settings.toml"));
+        // Start paused so only explicit ForceRefresh / command events drive wakeups.
+        let settings = AppSettings {
+            refresh_speed: RefreshSpeed::Paused,
+            ..AppSettings::default()
+        };
+        let backend = NativeBackend::initialize().expect("init native backend");
+        let coordinator =
+            Arc::new(EngineCoordinator::new(backend, settings.clone()).expect("start coordinator"));
+
+        let store = cx.new(|cx| UiStore::new(Arc::clone(&coordinator), config_store, settings, cx));
+        assert!(store.read_with(cx, |s, _| s.has_active_wake_task()));
+
+        let snapshot_events = Arc::new(AtomicUsize::new(0));
+        let cmd_failed_events = Arc::new(AtomicUsize::new(0));
+        let snap_counter = Arc::clone(&snapshot_events);
+        let cmd_counter = Arc::clone(&cmd_failed_events);
+
+        let _sub = cx.update(|cx| {
+            cx.subscribe(
+                &store,
+                move |_store, event: &UiStoreEvent, _cx| match event {
+                    UiStoreEvent::SnapshotUpdated(_) => {
+                        snap_counter.fetch_add(1, Ordering::AcqRel);
+                    }
+                    UiStoreEvent::CommandFailed { .. } => {
+                        cmd_counter.fetch_add(1, Ordering::AcqRel);
+                    }
+                    _ => {}
+                },
+            )
+        });
+
+        // Trigger a snapshot push via ForceRefresh and a command event via invalid file-lock path.
+        let _ = coordinator.send_command(EngineCommand::ForceRefresh);
+        let _ = coordinator.send_command(EngineCommand::FindFileLocks {
+            path: PathBuf::new(),
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            cx.run_until_parked();
+            if snapshot_events.load(Ordering::Acquire) > 0
+                && cmd_failed_events.load(Ordering::Acquire) > 0
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            snapshot_events.load(Ordering::Acquire) > 0,
+            "UiStore must wake up from SnapshotWakeSignal when a new snapshot is published"
+        );
+        assert!(
+            cmd_failed_events.load(Ordering::Acquire) > 0,
+            "UiStore must wake up from SnapshotWakeSignal when a CommandEvent is emitted"
+        );
+
+        // Entering dormancy cancels the wake task cleanly; waking restarts it.
+        store.update(cx, |s, cx| s.set_window_dormant(true, cx));
+        assert!(store.read_with(cx, |s, _| s.is_dormant() && !s.has_active_wake_task()));
+
+        store.update(cx, |s, cx| s.set_window_dormant(false, cx));
+        assert!(store.read_with(cx, |s, _| !s.is_dormant() && s.has_active_wake_task()));
+
+        coordinator.shutdown();
     }
 }

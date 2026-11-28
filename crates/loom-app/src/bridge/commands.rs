@@ -36,9 +36,48 @@ impl UiCommands {
     /// Updates the fast-lane refresh speed in the engine and persists it to `settings.toml`.
     pub(crate) fn set_refresh_speed(store: &Entity<UiStore>, speed: RefreshSpeed, cx: &mut App) {
         store.update(cx, |store, cx| {
+            store.record_active_refresh_speed(speed);
             let _ = store.dispatch_command(EngineCommand::SetRefreshSpeed(speed));
             let _ = store.update_settings(|s| s.refresh_speed = speed, cx);
         });
+    }
+
+    /// Toggles between [`RefreshSpeed::Paused`] and the user's previously active refresh speed.
+    ///
+    /// Returns the newly active [`RefreshSpeed`].
+    pub(crate) fn toggle_pause_refresh(store: &Entity<UiStore>, cx: &mut App) -> RefreshSpeed {
+        let next = store.update(cx, |store, _| store.next_pause_toggle_speed());
+        Self::set_refresh_speed(store, next, cx);
+        next
+    }
+
+    /// Triggers an immediate sampling and projection pass even while paused.
+    pub(crate) fn force_refresh(store: &Entity<UiStore>, cx: &mut App) {
+        let _ = store.read(cx).dispatch_command(EngineCommand::ForceRefresh);
+    }
+
+    /// Temporarily freezes or unfreezes live snapshot updates (e.g., Hold `Ctrl`)
+    /// without altering the user's persisted [`RefreshSpeed`].
+    pub(crate) fn set_temp_freeze(store: &Entity<UiStore>, frozen: bool, cx: &mut App) {
+        store.update(cx, |store, cx| {
+            store.set_temp_frozen(frozen, cx);
+        });
+    }
+
+    /// Freezes or unfreezes displayed row order in the Processes view while live metrics keep updating.
+    #[allow(dead_code)]
+    pub(crate) fn set_process_order_freeze(store: &Entity<UiStore>, frozen: bool, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SetProcessOrderFreeze(frozen));
+    }
+
+    /// Freezes or unfreezes displayed row order in the Details view while live metrics keep updating.
+    #[allow(dead_code)]
+    pub(crate) fn set_details_order_freeze(store: &Entity<UiStore>, frozen: bool, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SetDetailsOrderFreeze(frozen));
     }
 
     /// Updates and immediately applies the application theme preference (`System` / `Light` / `Dark`).
@@ -123,6 +162,54 @@ impl UiCommands {
         });
     }
 
+    /// Enables or disables attributing `msedgewebview2.exe` processes under their hosting app group.
+    #[allow(dead_code)]
+    pub(crate) fn set_webview2_host_grouping(store: &Entity<UiStore>, enabled: bool, cx: &mut App) {
+        store.update(cx, |store, cx| {
+            let _ = store.dispatch_command(EngineCommand::SetWebView2HostGrouping(enabled));
+            let _ = store.update_settings(|s| s.webview2_host_grouping = enabled, cx);
+        });
+    }
+
+    /// Enables or disables advisory in-memory resource leak warnings on process rows.
+    #[allow(dead_code)]
+    pub(crate) fn set_show_leak_warnings(store: &Entity<UiStore>, enabled: bool, cx: &mut App) {
+        store.update(cx, |store, cx| {
+            let _ = store.dispatch_command(EngineCommand::SetShowLeakWarnings(enabled));
+            let _ = store.update_settings(|s| s.show_leak_warnings = enabled, cx);
+        });
+    }
+
+    /// Adds an executable path or image name to the resource-leak ignore list and persists it.
+    #[allow(dead_code)]
+    pub(crate) fn ignore_leak_path(store: &Entity<UiStore>, path: String, cx: &mut App) {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let normalized = trimmed.to_owned();
+        store.update(cx, |store, cx| {
+            let _ = store.dispatch_command(EngineCommand::IgnoreLeakPath(normalized.clone()));
+            let _ = store.update_settings(
+                |s| {
+                    if !s.leak_ignored_paths.iter().any(|p| p == &normalized) {
+                        s.leak_ignored_paths.push(normalized);
+                    }
+                },
+                cx,
+            );
+        });
+    }
+
+    /// Hides or shows core Windows system processes in process lists and persists the preference.
+    #[allow(dead_code)]
+    pub(crate) fn set_hide_system_processes(store: &Entity<UiStore>, hide: bool, cx: &mut App) {
+        store.update(cx, |store, cx| {
+            let _ = store.dispatch_command(EngineCommand::SetHideSystemProcesses(hide));
+            let _ = store.update_settings(|s| s.hide_windows_system_processes = hide, cx);
+        });
+    }
+
     /// Toggles expansion of a parent process row in the Processes view.
     pub(crate) fn toggle_process_expanded(store: &Entity<UiStore>, key: ProcessKey, cx: &mut App) {
         let _ = store
@@ -156,6 +243,41 @@ impl UiCommands {
         let _ = store
             .read(cx)
             .dispatch_command(EngineCommand::TerminateProcessTree(key));
+    }
+
+    /// Suspends all threads of a non-critical process verified by [`ProcessKey`].
+    #[allow(dead_code)]
+    pub(crate) fn suspend_process(store: &Entity<UiStore>, key: ProcessKey, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::SuspendProcess(key));
+    }
+
+    /// Resumes all threads of a previously suspended process verified by [`ProcessKey`].
+    #[allow(dead_code)]
+    pub(crate) fn resume_process(store: &Entity<UiStore>, key: ProcessKey, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::ResumeProcess(key));
+    }
+
+    /// Safely restarts the desktop shell / Windows Explorer on the slow lane.
+    pub(crate) fn restart_explorer(store: &Entity<UiStore>, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::RestartExplorer);
+    }
+
+    /// Queries processes holding open file or directory locks on `path` via the slow lane,
+    /// returning a oneshot reply receiver with [`loom_engine::CommandSuccess::FileLocks`].
+    pub(crate) fn find_file_locks(
+        store: &Entity<UiStore>,
+        path: PathBuf,
+        cx: &App,
+    ) -> Result<Receiver<CommandEvent>, EngineCommandError> {
+        store
+            .read(cx)
+            .dispatch_command_with_reply(EngineCommand::FindFileLocks { path })
     }
 
     /// Enables or disables Efficiency Mode (`EcoQoS`) for `key`.
