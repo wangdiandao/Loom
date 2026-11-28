@@ -70,14 +70,28 @@ pub(crate) enum CpuGraphMode {
     LogicalProcessors,
 }
 
-/// GPU engine chart layout mode in the Performance detail pane.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum GpuViewMode {
-    /// Four-pane `2×2` multi-engine grid with per-pane engine selectors.
-    #[default]
-    Grid2x2,
-    /// Single large engine chart with one engine selector.
-    SingleEngine,
+/// Maximum number of GPU engine charts selectable in the GPU detail pane.
+pub(crate) const MAX_GPU_ENGINE_PANES: usize = 8;
+
+/// Default number of GPU engine charts shown when an adapter exposes at least 4 engines.
+pub(crate) const DEFAULT_GPU_ENGINE_COUNT: usize = 4;
+
+/// Returns the maximum selectable GPU engine pane count (`0` when no engines exist,
+/// otherwise clamped to `1..=MAX_GPU_ENGINE_PANES`).
+#[inline]
+pub(crate) fn max_gpu_engine_panes(engine_count: usize) -> usize {
+    engine_count.min(MAX_GPU_ENGINE_PANES)
+}
+
+/// Clamps a desired GPU engine pane count against an adapter's available engine count.
+#[inline]
+pub(crate) fn effective_gpu_engine_count(desired: usize, engine_count: usize) -> usize {
+    let max_panes = max_gpu_engine_panes(engine_count);
+    if max_panes == 0 {
+        0
+    } else {
+        desired.clamp(1, max_panes)
+    }
 }
 
 /// Computes the peak non-gap permille utilization for a GPU engine across its
@@ -97,16 +111,27 @@ pub(crate) fn gpu_engine_peak_permille(engine: &GpuEngineSlice) -> u16 {
     history_peak.max(current)
 }
 
-/// Selects up to four preferred default engine indices by well-known engine name
-/// (`3D`, `Copy`, `Video Decode`, `Video Encode`), filling remaining panes with
-/// distinct engines before cycling when fewer than 4 engines exist.
-pub(crate) fn default_gpu_engine_indices(engines: &[GpuEngineSlice]) -> [usize; 4] {
+/// Selects up to [`MAX_GPU_ENGINE_PANES`] preferred default engine indices by well-known
+/// engine name (`3D`, `Copy`, `Video Decode`, `Video Encode`, `Compute`, etc.), filling
+/// remaining slots with distinct engines before cycling when fewer engines exist.
+pub(crate) fn default_gpu_engine_indices(
+    engines: &[GpuEngineSlice],
+) -> [usize; MAX_GPU_ENGINE_PANES] {
     if engines.is_empty() {
-        return [0; 4];
+        return [0; MAX_GPU_ENGINE_PANES];
     }
 
-    const PREFERRED: [&str; 4] = ["3d", "copy", "video decode", "video encode"];
-    let mut chosen: Vec<usize> = Vec::with_capacity(4);
+    const PREFERRED: [&str; MAX_GPU_ENGINE_PANES] = [
+        "3d",
+        "copy",
+        "video decode",
+        "video encode",
+        "compute",
+        "video processing",
+        "high priority 3d",
+        "vr",
+    ];
+    let mut chosen: Vec<usize> = Vec::with_capacity(MAX_GPU_ENGINE_PANES);
 
     for target in PREFERRED {
         let exact = engines
@@ -133,7 +158,7 @@ pub(crate) fn default_gpu_engine_indices(engines: &[GpuEngineSlice]) -> [usize; 
     }
 
     for idx in 0..engines.len() {
-        if chosen.len() >= 4 {
+        if chosen.len() >= MAX_GPU_ENGINE_PANES {
             break;
         }
         if !chosen.contains(&idx) {
@@ -141,7 +166,7 @@ pub(crate) fn default_gpu_engine_indices(engines: &[GpuEngineSlice]) -> [usize; 
         }
     }
 
-    let mut result = [0usize; 4];
+    let mut result = [0usize; MAX_GPU_ENGINE_PANES];
     for (slot, out) in result.iter_mut().enumerate() {
         *out = chosen
             .get(slot)
@@ -151,13 +176,14 @@ pub(crate) fn default_gpu_engine_indices(engines: &[GpuEngineSlice]) -> [usize; 
     result
 }
 
-/// Computes smart `2×2` GPU engine indices prioritizing active engines that
-/// reached `>= 1%` peak in the active window via [`select_active_gpu_engines`]
-/// (always keeping at least 1 engine), then filling any remaining panes with
-/// distinct preferred defaults.
-pub(crate) fn active_gpu_grid_engine_indices(engines: &[GpuEngineSlice]) -> [usize; 4] {
+/// Computes smart GPU engine indices prioritizing active engines that reached `>= 1%`
+/// peak in the active window via [`select_active_gpu_engines`] (always keeping at
+/// least 1 engine), then filling any remaining slots with distinct preferred defaults.
+pub(crate) fn active_gpu_engine_indices(
+    engines: &[GpuEngineSlice],
+) -> [usize; MAX_GPU_ENGINE_PANES] {
     if engines.is_empty() {
-        return [0; 4];
+        return [0; MAX_GPU_ENGINE_PANES];
     }
 
     let peaks: Vec<(usize, u16)> = engines
@@ -165,10 +191,10 @@ pub(crate) fn active_gpu_grid_engine_indices(engines: &[GpuEngineSlice]) -> [usi
         .enumerate()
         .map(|(idx, eng)| (idx, gpu_engine_peak_permille(eng)))
         .collect();
-    let active = select_active_gpu_engines(&peaks, 4);
+    let active = select_active_gpu_engines(&peaks, MAX_GPU_ENGINE_PANES);
     let preferred = default_gpu_engine_indices(engines);
 
-    let mut chosen: Vec<usize> = Vec::with_capacity(4);
+    let mut chosen: Vec<usize> = Vec::with_capacity(MAX_GPU_ENGINE_PANES);
     let has_active_above_threshold = peaks
         .iter()
         .any(|&(_, peak)| peak >= loom_ui_kit::GPU_ENGINE_ACTIVE_THRESHOLD_PERMILLE);
@@ -186,7 +212,7 @@ pub(crate) fn active_gpu_grid_engine_indices(engines: &[GpuEngineSlice]) -> [usi
     }
 
     for idx in preferred {
-        if chosen.len() >= 4 {
+        if chosen.len() >= MAX_GPU_ENGINE_PANES {
             break;
         }
         if !chosen.contains(&idx) {
@@ -201,7 +227,7 @@ pub(crate) fn active_gpu_grid_engine_indices(engines: &[GpuEngineSlice]) -> [usi
         chosen.push(fallback_idx);
     }
 
-    let mut result = [0usize; 4];
+    let mut result = [0usize; MAX_GPU_ENGINE_PANES];
     for (slot, out) in result.iter_mut().enumerate() {
         *out = chosen
             .get(slot)
@@ -211,37 +237,36 @@ pub(crate) fn active_gpu_grid_engine_indices(engines: &[GpuEngineSlice]) -> [usi
     result
 }
 
-/// Selects the default engine index for a GPU's single-engine view (preferring `3D`).
-pub(crate) fn default_single_gpu_engine_index(engines: &[GpuEngineSlice]) -> usize {
-    if engines.is_empty() {
-        return 0;
-    }
-    engines
-        .iter()
-        .position(|eng| eng.name.trim().eq_ignore_ascii_case("3d"))
-        .or_else(|| {
-            engines
-                .iter()
-                .position(|eng| eng.name.to_ascii_lowercase().contains("3d"))
-        })
-        .unwrap_or(0)
-}
-
 /// Feature-local UI state owned by [`super::PerformanceView`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct PerformanceViewState {
     pub(crate) selected_device: SelectedDevice,
     pub(crate) cpu_graph_mode: CpuGraphMode,
     pub(crate) show_kernel_times: bool,
-    pub(crate) gpu_view_mode: GpuViewMode,
+    pub(crate) gpu_engine_count: usize,
     /// Last computed logical-core grid column count persisted across frames so
     /// [`compute_core_grid_layout`] applies its `8%` resize hysteresis dead-band.
     pub(crate) prev_core_grid_columns: Option<usize>,
     disk_pinned_order: Vec<u32>,
     network_pinned_order: Vec<u64>,
-    gpu_grid_engines: HashMap<u64, [usize; 4]>,
-    gpu_grid_user_overrides: HashMap<u64, [Option<usize>; 4]>,
-    gpu_single_engine: HashMap<u64, usize>,
+    gpu_engine_indices: HashMap<u64, [usize; MAX_GPU_ENGINE_PANES]>,
+    gpu_engine_user_overrides: HashMap<u64, [Option<usize>; MAX_GPU_ENGINE_PANES]>,
+}
+
+impl Default for PerformanceViewState {
+    fn default() -> Self {
+        Self {
+            selected_device: SelectedDevice::default(),
+            cpu_graph_mode: CpuGraphMode::default(),
+            show_kernel_times: false,
+            gpu_engine_count: DEFAULT_GPU_ENGINE_COUNT,
+            prev_core_grid_columns: None,
+            disk_pinned_order: Vec::new(),
+            network_pinned_order: Vec::new(),
+            gpu_engine_indices: HashMap::new(),
+            gpu_engine_user_overrides: HashMap::new(),
+        }
+    }
 }
 
 impl PerformanceViewState {
@@ -290,90 +315,71 @@ impl PerformanceViewState {
         merge_stable_order(&mut self.network_pinned_order, &keys)
     }
 
+    /// Updates the desired number of visible GPU engine charts (`1..=MAX_GPU_ENGINE_PANES`).
+    ///
+    /// Returns `true` if the desired count changed.
+    pub(crate) fn set_gpu_engine_count(&mut self, count: usize) -> bool {
+        let clamped = count.clamp(1, MAX_GPU_ENGINE_PANES);
+        if self.gpu_engine_count == clamped {
+            return false;
+        }
+        self.gpu_engine_count = clamped;
+        true
+    }
+
     /// Returns (and updates using active engine selection while preserving any
-    /// explicit user `Select` overrides) the 4 engine indices for GPU `luid`.
-    pub(crate) fn ensure_gpu_grid_engines(
+    /// explicit user `Select` overrides) the engine indices for GPU `luid`.
+    pub(crate) fn ensure_gpu_engine_indices(
         &mut self,
         luid: u64,
         engines: &[GpuEngineSlice],
-    ) -> [usize; 4] {
+    ) -> [usize; MAX_GPU_ENGINE_PANES] {
         let len = engines.len();
         if len == 0 {
-            self.gpu_grid_engines.insert(luid, [0; 4]);
-            return [0; 4];
+            self.gpu_engine_indices
+                .insert(luid, [0; MAX_GPU_ENGINE_PANES]);
+            return [0; MAX_GPU_ENGINE_PANES];
         }
 
-        let auto = active_gpu_grid_engine_indices(engines);
+        let auto = active_gpu_engine_indices(engines);
         let overrides = self
-            .gpu_grid_user_overrides
+            .gpu_engine_user_overrides
             .get(&luid)
             .copied()
-            .unwrap_or([None; 4]);
+            .unwrap_or([None; MAX_GPU_ENGINE_PANES]);
 
-        let mut resolved = [0usize; 4];
-        for slot in 0..4 {
+        let mut resolved = [0usize; MAX_GPU_ENGINE_PANES];
+        for slot in 0..MAX_GPU_ENGINE_PANES {
             resolved[slot] = match overrides[slot] {
                 Some(idx) if idx < len => idx,
                 _ => auto[slot],
             };
         }
 
-        self.gpu_grid_engines.insert(luid, resolved);
+        self.gpu_engine_indices.insert(luid, resolved);
         resolved
     }
 
-    /// Records an explicit user override for a single pane's selected engine
-    /// index in `2×2` GPU mode.
-    pub(crate) fn set_gpu_grid_engine(
+    /// Records an explicit user override for a single pane's selected GPU engine index.
+    pub(crate) fn set_gpu_engine_slot(
         &mut self,
         luid: u64,
         pane_slot: usize,
         engine_index: usize,
         engines: &[GpuEngineSlice],
     ) {
-        if pane_slot >= 4 || engine_index >= engines.len() {
+        if pane_slot >= MAX_GPU_ENGINE_PANES || engine_index >= engines.len() {
             return;
         }
         let overrides = self
-            .gpu_grid_user_overrides
+            .gpu_engine_user_overrides
             .entry(luid)
-            .or_insert([None; 4]);
+            .or_insert([None; MAX_GPU_ENGINE_PANES]);
         overrides[pane_slot] = Some(engine_index);
 
-        let mut current = self.ensure_gpu_grid_engines(luid, engines);
+        let mut current = self.ensure_gpu_engine_indices(luid, engines);
         current[pane_slot] = engine_index;
-        self.gpu_grid_engines.insert(luid, current);
-    }
-
-    /// Returns (and initializes/clamps if needed) the single-engine index for GPU `luid`.
-    pub(crate) fn ensure_gpu_single_engine(
-        &mut self,
-        luid: u64,
-        engines: &[GpuEngineSlice],
-    ) -> usize {
-        let len = engines.len();
-        let entry = self
-            .gpu_single_engine
-            .entry(luid)
-            .or_insert_with(|| default_single_gpu_engine_index(engines));
-        if len == 0 {
-            *entry = 0;
-        } else if *entry >= len {
-            *entry = default_single_gpu_engine_index(engines);
-        }
-        *entry
-    }
-
-    /// Updates the selected engine index in single-engine GPU mode.
-    pub(crate) fn set_gpu_single_engine(
-        &mut self,
-        luid: u64,
-        engine_index: usize,
-        engines: &[GpuEngineSlice],
-    ) {
-        if engine_index < engines.len() {
-            self.gpu_single_engine.insert(luid, engine_index);
-        }
+        self.gpu_engine_indices.insert(luid, current);
     }
 }
 
@@ -431,18 +437,43 @@ mod tests {
             engine("Video Decode"),
             engine("Copy 1"),
         ];
-        // Preferred order: 3D (2), Copy (3), Video Decode (4), Video Encode (1)
-        assert_eq!(default_gpu_engine_indices(&engines), [2, 3, 4, 1]);
-        assert_eq!(default_single_gpu_engine_index(&engines), 2);
+        // Preferred order: 3D (2), Copy (3), Video Decode (4), Video Encode (1), Compute_0 (0), Copy 1 (5), then wraps.
+        assert_eq!(
+            default_gpu_engine_indices(&engines),
+            [2, 3, 4, 1, 0, 5, 0, 1]
+        );
 
-        // Partial engine list fills distinct remaining engines and wraps cleanly when < 4.
+        // Partial engine list fills distinct remaining engines and wraps cleanly when < MAX_GPU_ENGINE_PANES.
         let two_engines = vec![engine("Copy"), engine("3D")];
-        assert_eq!(default_gpu_engine_indices(&two_engines), [1, 0, 0, 1]);
-        assert_eq!(default_single_gpu_engine_index(&two_engines), 1);
+        assert_eq!(
+            default_gpu_engine_indices(&two_engines),
+            [1, 0, 0, 1, 0, 1, 0, 1]
+        );
 
         // Empty engine list safely yields zeros.
-        assert_eq!(default_gpu_engine_indices(&[]), [0, 0, 0, 0]);
-        assert_eq!(default_single_gpu_engine_index(&[]), 0);
+        assert_eq!(default_gpu_engine_indices(&[]), [0; MAX_GPU_ENGINE_PANES]);
+    }
+
+    #[test]
+    fn gpu_engine_count_clamping_and_defaults() {
+        assert_eq!(max_gpu_engine_panes(0), 0);
+        assert_eq!(max_gpu_engine_panes(1), 1);
+        assert_eq!(max_gpu_engine_panes(6), 6);
+        assert_eq!(max_gpu_engine_panes(12), MAX_GPU_ENGINE_PANES);
+
+        assert_eq!(effective_gpu_engine_count(4, 0), 0);
+        assert_eq!(effective_gpu_engine_count(4, 2), 2);
+        assert_eq!(effective_gpu_engine_count(4, 10), 4);
+        assert_eq!(effective_gpu_engine_count(8, 10), 8);
+        assert_eq!(effective_gpu_engine_count(0, 5), 1);
+
+        let mut state = PerformanceViewState::default();
+        assert_eq!(state.gpu_engine_count, DEFAULT_GPU_ENGINE_COUNT);
+        assert!(!state.set_gpu_engine_count(4));
+        assert!(state.set_gpu_engine_count(1));
+        assert_eq!(state.gpu_engine_count, 1);
+        assert!(state.set_gpu_engine_count(99));
+        assert_eq!(state.gpu_engine_count, MAX_GPU_ENGINE_PANES);
     }
 
     #[test]
@@ -463,13 +494,21 @@ mod tests {
             engine_with_peak("Compute_1", 95),     // 9.5% active
         ];
 
-        // Active >= 1% engines sorted by peak desc: Video Decode (4), 3D (2), Compute_1 (5), then preferred Copy (3).
+        // Active >= 1% engines sorted by peak desc: Video Decode (4), 3D (2), Compute_1 (5),
+        // then preferred distinct defaults: Copy (3), Video Encode (1), Compute_0 (0), then wrap.
         let mut state = PerformanceViewState::default();
-        assert_eq!(state.ensure_gpu_grid_engines(77, &engines), [4, 2, 5, 3]);
+        assert_eq!(
+            &state.ensure_gpu_engine_indices(77, &engines)[..6],
+            &[4, 2, 5, 3, 1, 0]
+        );
 
-        // User explicitly overrides slot 0 to Copy (3) -> preserved on subsequent ticks!
-        state.set_gpu_grid_engine(77, 0, 3, &engines);
-        assert_eq!(state.ensure_gpu_grid_engines(77, &engines), [3, 2, 5, 3]);
+        // User explicitly overrides slot 0 to Copy (3) and slot 5 to 3D (2) -> preserved on subsequent ticks!
+        state.set_gpu_engine_slot(77, 0, 3, &engines);
+        state.set_gpu_engine_slot(77, 5, 2, &engines);
+        assert_eq!(
+            &state.ensure_gpu_engine_indices(77, &engines)[..6],
+            &[3, 2, 5, 3, 1, 2]
+        );
     }
 
     #[test]

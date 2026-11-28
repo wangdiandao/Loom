@@ -150,6 +150,16 @@ pub(crate) fn perf_gpu_title(index: u32) -> String {
     rust_i18n::t!("perf.gpu_numbered", index = index).into_owned()
 }
 
+/// Formats a localized GPU engine-pane count option (`"1 engine"` / `"4 engines"`).
+#[inline]
+pub(crate) fn perf_gpu_engine_count_label(count: usize) -> String {
+    if count == 1 {
+        tr("perf.gpu_engine_count_one")
+    } else {
+        rust_i18n::t!("perf.gpu_engine_count_many", count = count).into_owned()
+    }
+}
+
 /// Formats a localized logical CPU cell label (`"CPU 0"`).
 #[inline]
 pub(crate) fn perf_cpu_core_label(index: usize) -> String {
@@ -445,8 +455,9 @@ mod tests {
         "perf.net_ipv4",
         "perf.net_ipv6",
         "perf.net_dns_suffix",
-        "perf.gpu_view_grid",
-        "perf.gpu_view_single",
+        "perf.gpu_engine_count",
+        "perf.gpu_engine_count_one",
+        "perf.gpu_engine_count_many",
         "perf.gpu_utilization",
         "perf.gpu_dedicated_memory",
         "perf.gpu_shared_memory",
@@ -572,6 +583,8 @@ mod tests {
         assert_eq!(tr("uac.action"), "Restart as Administrator");
         assert_eq!(tr("tray.show"), "Show Loom");
         assert_eq!(startup_last_bios_time("4.2"), "Last BIOS time: 4.2 s");
+        assert_eq!(perf_gpu_engine_count_label(1), "1 engine");
+        assert_eq!(perf_gpu_engine_count_label(4), "4 engines");
         assert_eq!(
             app_history_since("2026-11-27 10:30"),
             "Resource usage since 2026-11-27 10:30"
@@ -583,6 +596,8 @@ mod tests {
         assert_eq!(tr("uac.action"), "以管理员身份重启");
         assert_eq!(tr("tray.show"), "显示 Loom");
         assert_eq!(startup_last_bios_time("4.2"), "上次 BIOS 时间: 4.2 秒");
+        assert_eq!(perf_gpu_engine_count_label(1), "1 个引擎");
+        assert_eq!(perf_gpu_engine_count_label(4), "4 个引擎");
         assert_eq!(
             app_history_since("2026-11-27 10:30"),
             "自 2026-11-27 10:30 起的资源使用情况"

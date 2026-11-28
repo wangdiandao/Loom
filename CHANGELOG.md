@@ -33,6 +33,7 @@ See [versioning and releases](docs/release.md) for the version progression polic
 
 ### UI & UX
 
+- Streamlined **Performance** view header controls in `loom-app`: removed the redundant CPU view/kernel-time toggle bar under the `CPU` header (keeping all controls in the right-click context menu) and replaced the GPU `2×2` / single-engine toggle buttons with an engine-graph count `Select` dropdown supporting `1`–`8` engine panes (capped dynamically by available adapter engines, with matching context-menu submenu).
 - Fixed the **Details** table's default private working set column label (`Memory (private working set)` / `内存（专用工作集）`, previously mislabeled as working set delta) and added a real signed **Working set delta (memory)** / **工作集增量（内存）** column (`DetailsRowProjection::working_set_delta_bytes`, `DetailsSortColumn::WorkingSetDelta`, `format_signed_bytes` / `format_signed_bytes_metric` / `RowTextCache::signed_bytes_metric_slot`) reporting positive, zero, and negative per-tick working set changes.
 - Removed redundant explanatory toast/dialog/popover captions across `loom-app` (diagnostic summary toast body, dialog descriptions/subtitles, search syntax subtitle, file-locks idle hint, and tray overview click hint) and rendered `16x16` cached application icons in the **Startup apps** table.
 

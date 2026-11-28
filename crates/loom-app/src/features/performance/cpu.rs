@@ -1,12 +1,10 @@
 //! CPU detail pane for the Performance view (overall vs adaptive logical-core grid + P/E/LP-E colors + kernel time overlay).
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
-use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex, v_flex};
+use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::{
     Context, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    Styled as _, div, prelude::FluentBuilder as _, px,
+    Styled as _, div, px,
 };
 use loom_types::{CpuCoreKind, HistoryRing, PerformanceSlice};
 use loom_ui_kit::{
@@ -87,57 +85,6 @@ pub(crate) fn render_cpu_detail(
     } else {
         SharedString::from(info.brand_name.as_ref().to_owned())
     };
-
-    let overall_btn = Button::new("perf-cpu-mode-overall")
-        .small()
-        .label(i18n::tr("perf.cpu_overall"))
-        .map(|btn| {
-            if mode == CpuGraphMode::Overall {
-                btn.primary()
-            } else {
-                btn.outline()
-            }
-        })
-        .on_click(cx.listener(|view, _, _window, cx| {
-            view.set_cpu_graph_mode(CpuGraphMode::Overall, cx);
-        }));
-
-    let logical_btn = Button::new("perf-cpu-mode-logical")
-        .small()
-        .label(i18n::tr("perf.cpu_logical"))
-        .map(|btn| {
-            if mode == CpuGraphMode::LogicalProcessors {
-                btn.primary()
-            } else {
-                btn.outline()
-            }
-        })
-        .on_click(cx.listener(|view, _, _window, cx| {
-            view.set_cpu_graph_mode(CpuGraphMode::LogicalProcessors, cx);
-        }));
-
-    let kernel_checkbox = Checkbox::new("perf-cpu-show-kernel-times")
-        .small()
-        .checked(show_kernel_times)
-        .label(i18n::tr("perf.cpu_show_kernel"))
-        .on_change(cx.listener(|view, checked, _window, cx| {
-            view.set_show_kernel_times(*checked, cx);
-        }));
-
-    let controls_bar = h_flex()
-        .w_full()
-        .flex_wrap()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .child(
-            h_flex()
-                .items_center()
-                .gap_1p5()
-                .child(overall_btn)
-                .child(logical_btn),
-        )
-        .child(kernel_checkbox);
 
     let chart_area = div()
         .id("perf-cpu-chart-surface")
@@ -260,7 +207,6 @@ pub(crate) fn render_cpu_detail(
         .w_full()
         .gap_4()
         .child(device_header(i18n::tr("perf.cpu"), brand, None, colors))
-        .child(controls_bar)
         .child(chart_area)
         .child(metrics_two_column_panel(left_stats, right_specs, colors))
         .context_menu(move |menu, _window, _cx| {

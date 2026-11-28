@@ -40,8 +40,11 @@ use crate::i18n;
 use charts::{
     HISTORY_WINDOW, history_ring_to_sparkline_points, throughput_pair_to_sparkline_points,
 };
-use gpu::GpuEngineOption;
-use state::{CpuGraphMode, GpuViewMode, PerformanceViewState, SelectedDevice};
+use gpu::{GpuEngineOption, GpuPaneCountOption};
+use state::{
+    CpuGraphMode, MAX_GPU_ENGINE_PANES, PerformanceViewState, SelectedDevice,
+    effective_gpu_engine_count, max_gpu_engine_panes,
+};
 use summary::format_performance_summary;
 
 /// Hardware Performance view (`CPU`, `Memory`, `Disk 0..N`, `Network 0..N`, `GPU 0..N`).
@@ -52,11 +55,14 @@ pub(crate) struct PerformanceView {
     state: PerformanceViewState,
     last_perf_revision: u64,
     last_locale: LanguagePreference,
-    gpu_grid_selects: [Entity<SelectState<Vec<GpuEngineOption>>>; 4],
-    gpu_single_select: Entity<SelectState<Vec<GpuEngineOption>>>,
+    gpu_pane_count_select: Entity<SelectState<Vec<GpuPaneCountOption>>>,
+    gpu_engine_selects: [Entity<SelectState<Vec<GpuEngineOption>>>; MAX_GPU_ENGINE_PANES],
     synced_gpu_luid: Option<u64>,
     synced_gpu_engines: Vec<Arc<str>>,
-    synced_gpu_grid_indices: [usize; 4],
+    synced_gpu_engine_indices: [usize; MAX_GPU_ENGINE_PANES],
+    synced_gpu_max_panes: usize,
+    synced_gpu_effective_count: usize,
+    synced_gpu_count_locale: Option<LanguagePreference>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -72,13 +78,13 @@ impl PerformanceView {
             )
         };
 
-        let gpu_grid_selects = std::array::from_fn(|_| {
+        let gpu_pane_count_select =
+            cx.new(|cx| SelectState::new(Vec::<GpuPaneCountOption>::new(), None, window, cx));
+        let gpu_engine_selects = std::array::from_fn(|_| {
             cx.new(|cx| SelectState::new(Vec::<GpuEngineOption>::new(), None, window, cx))
         });
-        let gpu_single_select =
-            cx.new(|cx| SelectState::new(Vec::<GpuEngineOption>::new(), None, window, cx));
 
-        let mut subscriptions = Vec::with_capacity(6);
+        let mut subscriptions = Vec::with_capacity(MAX_GPU_ENGINE_PANES + 2);
 
         // Subscribe to UiStore domain updates — re-render ONLY when `revs.performance` or settings change.
         subscriptions.push(cx.subscribe_in(
@@ -99,6 +105,8 @@ impl PerformanceView {
                     let next_locale = store.read(cx).settings().language;
                     if this.last_locale != next_locale {
                         this.last_locale = next_locale;
+                        let perf = store.read(cx).snapshot().performance.clone();
+                        this.sync_gpu_selects(&perf, window, cx);
                     }
                     cx.notify();
                 }
@@ -108,7 +116,21 @@ impl PerformanceView {
             },
         ));
 
-        for (slot, select) in gpu_grid_selects.iter().enumerate() {
+        subscriptions.push(cx.subscribe_in(
+            &gpu_pane_count_select,
+            window,
+            |this, _state, event: &SelectEvent<Vec<GpuPaneCountOption>>, _window, cx| {
+                let SelectEvent::Confirm(Some(count)) = event else {
+                    return;
+                };
+                if this.state.set_gpu_engine_count(*count) {
+                    this.synced_gpu_effective_count = *count;
+                    cx.notify();
+                }
+            },
+        ));
+
+        for (slot, select) in gpu_engine_selects.iter().enumerate() {
             subscriptions.push(cx.subscribe_in(
                 select,
                 window,
@@ -120,32 +142,14 @@ impl PerformanceView {
                         let perf = this.store.read(cx).snapshot().performance.clone();
                         if let Some(gpu) = perf.gpus.iter().find(|g| g.luid == luid) {
                             this.state
-                                .set_gpu_grid_engine(luid, slot, *engine_index, &gpu.engines);
-                            this.synced_gpu_grid_indices[slot] = *engine_index;
+                                .set_gpu_engine_slot(luid, slot, *engine_index, &gpu.engines);
+                            this.synced_gpu_engine_indices[slot] = *engine_index;
                             cx.notify();
                         }
                     }
                 },
             ));
         }
-
-        subscriptions.push(cx.subscribe_in(
-            &gpu_single_select,
-            window,
-            |this, _state, event: &SelectEvent<Vec<GpuEngineOption>>, _window, cx| {
-                let SelectEvent::Confirm(Some(engine_index)) = event else {
-                    return;
-                };
-                if let SelectedDevice::Gpu(luid) = this.state.selected_device {
-                    let perf = this.store.read(cx).snapshot().performance.clone();
-                    if let Some(gpu) = perf.gpus.iter().find(|g| g.luid == luid) {
-                        this.state
-                            .set_gpu_single_engine(luid, *engine_index, &gpu.engines);
-                        cx.notify();
-                    }
-                }
-            },
-        ));
 
         let mut view = Self {
             store,
@@ -154,11 +158,14 @@ impl PerformanceView {
             state: PerformanceViewState::default(),
             last_perf_revision: initial_perf_rev,
             last_locale: initial_locale,
-            gpu_grid_selects,
-            gpu_single_select,
+            gpu_pane_count_select,
+            gpu_engine_selects,
             synced_gpu_luid: None,
             synced_gpu_engines: Vec::new(),
-            synced_gpu_grid_indices: [0; 4],
+            synced_gpu_engine_indices: [0; MAX_GPU_ENGINE_PANES],
+            synced_gpu_max_panes: 0,
+            synced_gpu_effective_count: 0,
+            synced_gpu_count_locale: None,
             _subscriptions: subscriptions,
         };
 
@@ -216,12 +223,19 @@ impl PerformanceView {
         cx.notify();
     }
 
-    /// Toggles GPU view between `2×2` multi-engine grid and Single-engine mode.
-    pub(crate) fn set_gpu_view_mode(&mut self, mode: GpuViewMode, cx: &mut Context<Self>) {
-        if self.state.gpu_view_mode == mode {
+    /// Sets the number of visible GPU engine charts (`1..=MAX_GPU_ENGINE_PANES`)
+    /// and synchronizes the count dropdown selection.
+    pub(crate) fn set_gpu_engine_count(
+        &mut self,
+        count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.state.set_gpu_engine_count(count) {
             return;
         }
-        self.state.gpu_view_mode = mode;
+        let perf = self.store.read(cx).snapshot().performance.clone();
+        self.sync_gpu_selects(&perf, window, cx);
         cx.notify();
     }
 
@@ -238,8 +252,9 @@ impl PerformanceView {
         );
     }
 
-    /// Synchronizes the GPU engine dropdown `SelectState`s whenever the active GPU,
-    /// its engine inventory, or auto-selected active engines change.
+    /// Synchronizes the GPU engine-count and per-pane engine dropdown `SelectState`s
+    /// whenever the active GPU, its engine inventory, locale, or auto-selected active
+    /// engines change.
     fn sync_gpu_selects(
         &mut self,
         perf: &PerformanceSlice,
@@ -253,9 +268,39 @@ impl PerformanceView {
             return;
         };
 
+        let max_panes = max_gpu_engine_panes(gpu.engines.len());
+        let effective_count =
+            effective_gpu_engine_count(self.state.gpu_engine_count, gpu.engines.len());
+        let count_options_changed = self.synced_gpu_max_panes != max_panes
+            || self.synced_gpu_count_locale != Some(self.last_locale);
+
+        if count_options_changed {
+            let count_items: Vec<GpuPaneCountOption> = (1..=max_panes)
+                .map(|count| GpuPaneCountOption {
+                    count,
+                    label: SharedString::from(i18n::perf_gpu_engine_count_label(count)),
+                })
+                .collect();
+            let chosen =
+                (effective_count > 0).then(|| IndexPath::default().row(effective_count - 1));
+            self.gpu_pane_count_select.update(cx, |state, cx| {
+                state.set_items(count_items, window, cx);
+                state.set_selected_index(chosen, window, cx);
+            });
+            self.synced_gpu_max_panes = max_panes;
+            self.synced_gpu_effective_count = effective_count;
+            self.synced_gpu_count_locale = Some(self.last_locale);
+        } else if self.synced_gpu_effective_count != effective_count {
+            let chosen =
+                (effective_count > 0).then(|| IndexPath::default().row(effective_count - 1));
+            self.gpu_pane_count_select.update(cx, |state, cx| {
+                state.set_selected_index(chosen, window, cx);
+            });
+            self.synced_gpu_effective_count = effective_count;
+        }
+
         let engine_names: Vec<Arc<str>> = gpu.engines.iter().map(|e| e.name.clone()).collect();
-        let grid_indices = self.state.ensure_gpu_grid_engines(luid, &gpu.engines);
-        let single_index = self.state.ensure_gpu_single_engine(luid, &gpu.engines);
+        let engine_indices = self.state.ensure_gpu_engine_indices(luid, &gpu.engines);
 
         let inventory_changed =
             self.synced_gpu_luid != Some(luid) || self.synced_gpu_engines != engine_names;
@@ -271,36 +316,29 @@ impl PerformanceView {
                 })
                 .collect();
 
-            for (slot, select) in self.gpu_grid_selects.iter().enumerate() {
+            for (slot, select) in self.gpu_engine_selects.iter().enumerate() {
                 let items = options.clone();
                 let chosen =
-                    (!items.is_empty()).then(|| IndexPath::default().row(grid_indices[slot]));
+                    (!items.is_empty()).then(|| IndexPath::default().row(engine_indices[slot]));
                 select.update(cx, |state, cx| {
                     state.set_items(items, window, cx);
                     state.set_selected_index(chosen, window, cx);
                 });
             }
 
-            let single_chosen =
-                (!options.is_empty()).then(|| IndexPath::default().row(single_index));
-            self.gpu_single_select.update(cx, |state, cx| {
-                state.set_items(options, window, cx);
-                state.set_selected_index(single_chosen, window, cx);
-            });
-
             self.synced_gpu_luid = Some(luid);
             self.synced_gpu_engines = engine_names;
-            self.synced_gpu_grid_indices = grid_indices;
-        } else if self.synced_gpu_grid_indices != grid_indices && !gpu.engines.is_empty() {
-            for (slot, select) in self.gpu_grid_selects.iter().enumerate() {
-                if self.synced_gpu_grid_indices[slot] != grid_indices[slot] {
-                    let chosen = Some(IndexPath::default().row(grid_indices[slot]));
+            self.synced_gpu_engine_indices = engine_indices;
+        } else if self.synced_gpu_engine_indices != engine_indices && !gpu.engines.is_empty() {
+            for (slot, select) in self.gpu_engine_selects.iter().enumerate() {
+                if self.synced_gpu_engine_indices[slot] != engine_indices[slot] {
+                    let chosen = Some(IndexPath::default().row(engine_indices[slot]));
                     select.update(cx, |state, cx| {
                         state.set_selected_index(chosen, window, cx);
                     });
                 }
             }
-            self.synced_gpu_grid_indices = grid_indices;
+            self.synced_gpu_engine_indices = engine_indices;
         }
     }
 
@@ -545,17 +583,21 @@ impl Render for PerformanceView {
             }
             SelectedDevice::Gpu(luid) => {
                 if let Some(gpu_slice) = perf.gpus.iter().find(|g| g.luid == luid) {
-                    let grid_indices = self.state.ensure_gpu_grid_engines(luid, &gpu_slice.engines);
-                    let single_index = self
+                    let engine_indices = self
                         .state
-                        .ensure_gpu_single_engine(luid, &gpu_slice.engines);
+                        .ensure_gpu_engine_indices(luid, &gpu_slice.engines);
+                    let max_panes = max_gpu_engine_panes(gpu_slice.engines.len());
+                    let effective_count = effective_gpu_engine_count(
+                        self.state.gpu_engine_count,
+                        gpu_slice.engines.len(),
+                    );
                     gpu::render_gpu_detail(
                         gpu_slice,
-                        self.state.gpu_view_mode,
-                        grid_indices,
-                        single_index,
-                        &self.gpu_grid_selects,
-                        &self.gpu_single_select,
+                        effective_count,
+                        max_panes,
+                        engine_indices,
+                        &self.gpu_pane_count_select,
+                        &self.gpu_engine_selects,
                         &colors,
                         cx,
                     )
@@ -648,7 +690,7 @@ pub(crate) fn format_gpu_sidebar_metric(gpu: &GpuAdapterSlice) -> SharedString {
 mod tests {
     use std::sync::Arc;
 
-    use gpui_kit::component::ActiveTheme as _;
+    use gpui_kit::component::{ActiveTheme as _, IndexPath};
     use gpui_kit::{AppContext as _, TestAppContext, VisualTestContext};
     use loom_config::{AppSettings, ConfigStore};
     use loom_engine::EngineCoordinator;
@@ -662,7 +704,7 @@ mod tests {
     use crate::bridge::UiStore;
     use crate::i18n;
 
-    use super::state::{CpuGraphMode, GpuViewMode, SelectedDevice};
+    use super::state::{CpuGraphMode, MAX_GPU_ENGINE_PANES, SelectedDevice};
     use super::{PerformanceView, cpu, format_gpu_sidebar_metric, gpu};
 
     #[gpui_kit::test]
@@ -856,15 +898,161 @@ mod tests {
             hybrid_perf.gpus.push(sleeping_gpu);
 
             perf_view.update(cx, |view, cx| {
-                let _gpu_el = gpu::render_gpu_detail(
-                    &hybrid_perf.gpus[0],
-                    GpuViewMode::Grid2x2,
-                    [0, 0, 0, 0],
-                    0,
-                    &view.gpu_grid_selects,
-                    &view.gpu_single_select,
+                for count in [1usize, 3, 4, 8] {
+                    let _gpu_el = gpu::render_gpu_detail(
+                        &hybrid_perf.gpus[0],
+                        count.min(hybrid_perf.gpus[0].engines.len()),
+                        hybrid_perf.gpus[0].engines.len().min(MAX_GPU_ENGINE_PANES),
+                        [0; MAX_GPU_ENGINE_PANES],
+                        &view.gpu_pane_count_select,
+                        &view.gpu_engine_selects,
+                        &colors,
+                        cx,
+                    );
+                }
+            });
+        });
+
+        drop(perf_view);
+        vcx.update(|window, _| window.remove_window());
+        vcx.run_until_parked();
+        coordinator.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn gpu_engine_count_dropdown_syncs_caps_and_relocalizes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let dir = tempfile::tempdir().expect("create temp config dir");
+        let config_store = ConfigStore::new(dir.path().join("settings.toml"));
+        let settings = AppSettings {
+            language: LanguagePreference::EnUs,
+            ..Default::default()
+        };
+        let backend = NativeBackend::initialize().expect("initialize native backend");
+        let coordinator =
+            Arc::new(EngineCoordinator::new(backend, settings.clone()).expect("start coordinator"));
+
+        let store = cx.new(|cx| UiStore::new(coordinator.clone(), config_store, settings, cx));
+
+        let mut perf_view_handle = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| PerformanceView::new(store.clone(), window, cx));
+                perf_view_handle = Some(view.clone());
+                cx.new(|cx| gpui_kit::base::Root::new(view, window, cx))
+            })
+            .expect("open performance test window")
+        });
+        let perf_view = perf_view_handle.expect("PerformanceView constructed");
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let make_engine = |name: &str| GpuEngineSlice {
+            name: Arc::from(name),
+            util_permille: 250,
+            history: HistoryRing::<60>::new(),
+        };
+        let ten_engine_gpu = GpuAdapterSlice {
+            index: 0,
+            luid: 4242,
+            name: Arc::from("Test 10-Engine GPU"),
+            engines: vec![
+                make_engine("3D"),
+                make_engine("Copy"),
+                make_engine("Copy 1"),
+                make_engine("Video Decode"),
+                make_engine("Video Encode"),
+                make_engine("Video Processing"),
+                make_engine("Compute_0"),
+                make_engine("Compute_1"),
+                make_engine("High Priority 3D"),
+                make_engine("VR"),
+            ],
+            ..Default::default()
+        };
+        let two_engine_gpu = GpuAdapterSlice {
+            index: 1,
+            luid: 5252,
+            name: Arc::from("Test 2-Engine GPU"),
+            engines: vec![make_engine("3D"), make_engine("Copy")],
+            ..Default::default()
+        };
+        let perf = PerformanceSlice {
+            gpus: vec![ten_engine_gpu, two_engine_gpu],
+            ..Default::default()
+        };
+
+        vcx.update(|window, cx| {
+            let colors = LoomSemanticColors::from_theme(cx.theme());
+
+            // Selecting a 10-engine GPU caps dropdown options to 1..=MAX_GPU_ENGINE_PANES (8), defaulting to 4.
+            perf_view.update(cx, |view, cx| {
+                view.state.selected_device = SelectedDevice::Gpu(4242);
+                view.sync_gpu_selects(&perf, window, cx);
+                assert_eq!(view.synced_gpu_max_panes, MAX_GPU_ENGINE_PANES);
+                assert_eq!(view.synced_gpu_effective_count, 4);
+                let count_select = view.gpu_pane_count_select.read(cx);
+                assert_eq!(count_select.selected_value(), Some(&4));
+                assert_eq!(
+                    count_select.selected_index(cx),
+                    Some(IndexPath::default().row(3))
+                );
+                assert_eq!(view.synced_gpu_count_locale, Some(LanguagePreference::EnUs));
+
+                // Changing count to 1 and 8 updates state & renders both layouts cleanly.
+                view.set_gpu_engine_count(1, window, cx);
+                view.sync_gpu_selects(&perf, window, cx);
+                assert_eq!(
+                    view.gpu_pane_count_select.read(cx).selected_value(),
+                    Some(&1)
+                );
+                drop(gpu::render_gpu_detail(
+                    &perf.gpus[0],
+                    1,
+                    MAX_GPU_ENGINE_PANES,
+                    view.synced_gpu_engine_indices,
+                    &view.gpu_pane_count_select,
+                    &view.gpu_engine_selects,
                     &colors,
                     cx,
+                ));
+
+                view.set_gpu_engine_count(8, window, cx);
+                view.sync_gpu_selects(&perf, window, cx);
+                assert_eq!(
+                    view.gpu_pane_count_select.read(cx).selected_value(),
+                    Some(&8)
+                );
+                drop(gpu::render_gpu_detail(
+                    &perf.gpus[0],
+                    8,
+                    MAX_GPU_ENGINE_PANES,
+                    view.synced_gpu_engine_indices,
+                    &view.gpu_pane_count_select,
+                    &view.gpu_engine_selects,
+                    &colors,
+                    cx,
+                ));
+
+                // Switching to a 2-engine GPU clamps effective count to 2 without losing user's desired 8.
+                view.state.selected_device = SelectedDevice::Gpu(5252);
+                view.sync_gpu_selects(&perf, window, cx);
+                assert_eq!(view.synced_gpu_max_panes, 2);
+                assert_eq!(view.synced_gpu_effective_count, 2);
+                assert_eq!(view.state.gpu_engine_count, 8);
+                assert_eq!(
+                    view.gpu_pane_count_select.read(cx).selected_value(),
+                    Some(&2)
+                );
+
+                // Re-localizing updates dropdown state cleanly and preserves selection.
+                view.last_locale = LanguagePreference::ZhCn;
+                view.sync_gpu_selects(&perf, window, cx);
+                assert_eq!(view.synced_gpu_count_locale, Some(LanguagePreference::ZhCn));
+                assert_eq!(
+                    view.gpu_pane_count_select.read(cx).selected_value(),
+                    Some(&2)
                 );
             });
         });
