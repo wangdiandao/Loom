@@ -77,6 +77,11 @@ pub(crate) fn build_diagnostic_summary(snapshot: &AppSnapshot, settings: &AppSet
         ThemePreference::Light => "Light",
         ThemePreference::Dark => "Dark",
     };
+    let accent_label = if settings.accent_color.is_system() {
+        "System"
+    } else {
+        "Custom"
+    };
 
     let language_label = match settings.language {
         LanguagePreference::EnUs => "en-US",
@@ -101,7 +106,7 @@ pub(crate) fn build_diagnostic_summary(snapshot: &AppSnapshot, settings: &AppSet
     let _ = writeln!(out, "Total RAM: {total_ram}");
     let _ = writeln!(out, "GPU Adapters: {gpus_line}");
     let _ = writeln!(out, "Refresh Speed: {refresh_label}");
-    let _ = writeln!(out, "Theme: {theme_label}");
+    let _ = writeln!(out, "Theme: {theme_label} (Accent: {accent_label})");
     let _ = write!(out, "Language: {language_label}");
     out
 }

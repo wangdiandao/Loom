@@ -106,6 +106,10 @@ impl PlatformBackend for WindowsBackend {
         window::restore_and_focus_main_window();
     }
 
+    fn system_accent_color() -> Option<(u8, u8, u8)> {
+        window::system_accent_color()
+    }
+
     fn initialize() -> Result<Self, PalError> {
         Ok(Self::default())
     }

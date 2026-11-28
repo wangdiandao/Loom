@@ -28,7 +28,7 @@ use loom_types::{
 use loom_ui_kit::LoomSemanticColors;
 
 use crate::bootstrap;
-use crate::bridge::{UiCommands, UiStore, UiStoreEvent, apply_theme};
+use crate::bridge::{UiCommands, UiStore, UiStoreEvent, apply_theme, system_accent_rgb};
 use crate::features::{
     AppHistoryView, DetailsView, PerformanceView, ProcessesView, ServicesView, SettingsView,
     StartupView, UsersView,
@@ -114,6 +114,7 @@ pub(crate) struct AppShell {
     syntax_help_open: bool,
     last_locale: LanguagePreference,
     last_elevated: bool,
+    last_system_accent: Option<(u8, u8, u8)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -211,18 +212,36 @@ impl AppShell {
             },
         ));
 
-        // Follow OS light/dark changes automatically when ThemePreference::System is active.
+        // Follow OS light/dark and accent changes automatically when System preference is active.
         let store_for_appearance = store.clone();
         subscriptions.push(window.observe_window_appearance(move |window, cx| {
-            if store_for_appearance.read(cx).settings().theme == ThemePreference::System {
-                apply_theme(ThemePreference::System, Some(window), cx);
+            let (theme_pref, accent_pref) = {
+                let s = store_for_appearance.read(cx).settings();
+                (s.theme, s.accent_color)
+            };
+            if theme_pref == ThemePreference::System || accent_pref.is_system() {
+                apply_theme(theme_pref, accent_pref, Some(window), cx);
             }
         }));
 
-        // Always release Hold-Ctrl temporary freeze when the window loses focus (e.g., Alt+Tab).
+        // Release Hold-Ctrl temporary freeze on focus loss and sync OS accent color on re-focus.
         subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
-            if !window.is_window_active() && this.store.read(cx).is_temp_frozen() {
-                UiCommands::set_temp_freeze(&this.store, false, cx);
+            if !window.is_window_active() {
+                if this.store.read(cx).is_temp_frozen() {
+                    UiCommands::set_temp_freeze(&this.store, false, cx);
+                }
+            } else {
+                let (theme_pref, accent_pref) = {
+                    let s = this.store.read(cx).settings();
+                    (s.theme, s.accent_color)
+                };
+                if accent_pref.is_system() {
+                    let current_sys = system_accent_rgb();
+                    if this.last_system_accent != Some(current_sys) {
+                        this.last_system_accent = Some(current_sys);
+                        apply_theme(theme_pref, accent_pref, Some(window), cx);
+                    }
+                }
             }
         }));
 
@@ -296,6 +315,7 @@ impl AppShell {
             syntax_help_open: false,
             last_locale: initial_settings.language,
             last_elevated: initial_elevated,
+            last_system_accent: Some(system_accent_rgb()),
             _subscriptions: subscriptions,
         }
     }

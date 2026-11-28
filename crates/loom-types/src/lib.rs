@@ -27,9 +27,10 @@ pub use performance::{
 };
 pub use platform::{PlatformKind, PlatformProfile};
 pub use prefs::{
-    AppHistorySortColumn, DetailsSortColumn, DetailsViewMode, LanguagePreference,
-    ProcessSortColumn, ProcessViewMode, RefreshSpeed, ResourceDisplayMode, ServicesSortColumn,
-    SortDirection, StartupPage, StartupSortColumn, ThemePreference, UsersSortColumn,
+    AccentColorPreference, AppHistorySortColumn, DetailsSortColumn, DetailsViewMode,
+    LanguagePreference, ProcessSortColumn, ProcessViewMode, RefreshSpeed, ResourceDisplayMode,
+    ServicesSortColumn, SortDirection, StartupPage, StartupSortColumn, ThemePreference,
+    UsersSortColumn,
 };
 pub use process::{
     CpuAffinityMask, ExeIconRgba, ExeStaticAsset, LeakKind, LeakWarning, ProcessArch,
@@ -280,5 +281,59 @@ mod tests {
         t.push(u64::MAX);
         assert!(!ThroughputRing::<4>::is_gap(t.latest().unwrap()));
         assert_eq!(t.latest(), Some(u64::MAX - 1));
+    }
+
+    #[test]
+    fn accent_color_preference_hex_parsing_and_serde_roundtrip() {
+        use serde::Deserialize as _;
+        use serde::de::value::{Error as ValueError, StrDeserializer};
+
+        assert_eq!(
+            AccentColorPreference::default(),
+            AccentColorPreference::System
+        );
+        assert!(AccentColorPreference::System.is_system());
+        assert_eq!(AccentColorPreference::System.rgb(), None);
+        assert_eq!(AccentColorPreference::System.to_hex(), None);
+
+        let custom = AccentColorPreference::custom(0x1D, 0xC5, 0xF4);
+        assert!(!custom.is_system());
+        assert_eq!(custom.rgb(), Some((0x1D, 0xC5, 0xF4)));
+        assert_eq!(custom.to_hex().as_deref(), Some("#1DC5F4"));
+        assert_eq!(
+            AccentColorPreference::format_hex(0x00, 0x78, 0xD4),
+            "#0078D4"
+        );
+
+        assert_eq!(
+            AccentColorPreference::parse_hex("#0078d4"),
+            Some((0x00, 0x78, 0xD4))
+        );
+        assert_eq!(
+            AccentColorPreference::parse_hex("  1dc5f4 "),
+            Some((0x1D, 0xC5, 0xF4))
+        );
+        assert_eq!(
+            AccentColorPreference::parse_hex("#3af"),
+            Some((0x33, 0xAA, 0xFF))
+        );
+        assert_eq!(AccentColorPreference::parse_hex("#12345"), None);
+        assert_eq!(AccentColorPreference::parse_hex("#GGGGGG"), None);
+        assert_eq!(AccentColorPreference::parse_hex("非hex"), None);
+
+        let sys_de: StrDeserializer<'_, ValueError> = StrDeserializer::new("system");
+        assert_eq!(
+            AccentColorPreference::deserialize(sys_de).expect("deserialize system"),
+            AccentColorPreference::System
+        );
+
+        let hex_de: StrDeserializer<'_, ValueError> = StrDeserializer::new("#8764b8");
+        assert_eq!(
+            AccentColorPreference::deserialize(hex_de).expect("deserialize hex"),
+            AccentColorPreference::custom(0x87, 0x64, 0xB8)
+        );
+
+        let bad_de: StrDeserializer<'_, ValueError> = StrDeserializer::new("not-a-color");
+        assert!(AccentColorPreference::deserialize(bad_de).is_err());
     }
 }
