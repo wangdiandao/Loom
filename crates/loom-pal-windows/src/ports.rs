@@ -15,8 +15,7 @@ use loom_types::{ProcessSocketRecord, SocketProtocol};
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
 use windows_sys::core::BOOL;
 
-use crate::diagnostics::OwnedModule;
-use crate::handle::map_win32_error;
+use crate::handle::{OwnedModule, map_win32_error};
 
 /// IPv4 address family (`AF_INET`).
 const AF_INET: u32 = 2;
@@ -125,10 +124,15 @@ pub fn list_listening_ports() -> Result<Vec<ProcessSocketRecord>, PalError> {
     let state_udp: Arc<str> = Arc::from("UDP");
 
     // 1. IPv4 TCP listening endpoints.
-    if let Some(buf) = query_tcp_table(get_tcp_table, AF_INET)? {
-        for row in parse_table_rows::<MibTcpRowOwnerPid>(&buf) {
+    if let Some(buf) = query_iphlpapi_table(
+        get_tcp_table,
+        AF_INET,
+        TCP_TABLE_OWNER_PID_ALL,
+        "GetExtendedTcpTable",
+    )? {
+        for_each_table_row::<MibTcpRowOwnerPid>(&buf, |row| {
             if row.dw_state != MIB_TCP_STATE_LISTEN {
-                continue;
+                return;
             }
             records.push(ProcessSocketRecord {
                 protocol: SocketProtocol::Tcp,
@@ -139,14 +143,19 @@ pub fn list_listening_ports() -> Result<Vec<ProcessSocketRecord>, PalError> {
                 state: Arc::clone(&state_listen),
                 pid: row.dw_owning_pid,
             });
-        }
+        });
     }
 
     // 2. IPv6 TCP listening endpoints.
-    if let Some(buf) = query_tcp_table(get_tcp_table, AF_INET6)? {
-        for row in parse_table_rows::<MibTcp6RowOwnerPid>(&buf) {
+    if let Some(buf) = query_iphlpapi_table(
+        get_tcp_table,
+        AF_INET6,
+        TCP_TABLE_OWNER_PID_ALL,
+        "GetExtendedTcpTable",
+    )? {
+        for_each_table_row::<MibTcp6RowOwnerPid>(&buf, |row| {
             if row.dw_state != MIB_TCP_STATE_LISTEN {
-                continue;
+                return;
             }
             records.push(ProcessSocketRecord {
                 protocol: SocketProtocol::Tcp6,
@@ -157,12 +166,17 @@ pub fn list_listening_ports() -> Result<Vec<ProcessSocketRecord>, PalError> {
                 state: Arc::clone(&state_listen),
                 pid: row.dw_owning_pid,
             });
-        }
+        });
     }
 
     // 3. IPv4 UDP bound endpoints.
-    if let Some(buf) = query_udp_table(get_udp_table, AF_INET)? {
-        for row in parse_table_rows::<MibUdpRowOwnerPid>(&buf) {
+    if let Some(buf) = query_iphlpapi_table(
+        get_udp_table,
+        AF_INET,
+        UDP_TABLE_OWNER_PID,
+        "GetExtendedUdpTable",
+    )? {
+        for_each_table_row::<MibUdpRowOwnerPid>(&buf, |row| {
             records.push(ProcessSocketRecord {
                 protocol: SocketProtocol::Udp,
                 local_addr: Arc::from(decode_ipv4(row.dw_local_addr)),
@@ -172,12 +186,17 @@ pub fn list_listening_ports() -> Result<Vec<ProcessSocketRecord>, PalError> {
                 state: Arc::clone(&state_udp),
                 pid: row.dw_owning_pid,
             });
-        }
+        });
     }
 
     // 4. IPv6 UDP bound endpoints.
-    if let Some(buf) = query_udp_table(get_udp_table, AF_INET6)? {
-        for row in parse_table_rows::<MibUdp6RowOwnerPid>(&buf) {
+    if let Some(buf) = query_iphlpapi_table(
+        get_udp_table,
+        AF_INET6,
+        UDP_TABLE_OWNER_PID,
+        "GetExtendedUdpTable",
+    )? {
+        for_each_table_row::<MibUdp6RowOwnerPid>(&buf, |row| {
             records.push(ProcessSocketRecord {
                 protocol: SocketProtocol::Udp6,
                 local_addr: Arc::from(decode_ipv6(row.uc_local_addr)),
@@ -187,7 +206,7 @@ pub fn list_listening_ports() -> Result<Vec<ProcessSocketRecord>, PalError> {
                 state: Arc::clone(&state_udp),
                 pid: row.dw_owning_pid,
             });
-        }
+        });
     }
 
     records.sort_by(|a, b| {
@@ -202,22 +221,15 @@ pub fn list_listening_ports() -> Result<Vec<ProcessSocketRecord>, PalError> {
     Ok(records)
 }
 
-fn query_tcp_table(
-    get_tcp_table: GetExtendedTcpTableFn,
+fn query_iphlpapi_table(
+    query_fn: GetExtendedTcpTableFn,
     af: u32,
+    table_class: u32,
+    api_name: &str,
 ) -> Result<Option<Vec<u32>>, PalError> {
     let mut size: u32 = 0;
     // SAFETY: Null buffer queries required byte count.
-    let rc = unsafe {
-        get_tcp_table(
-            ptr::null_mut(),
-            &mut size,
-            0,
-            af,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        )
-    };
+    let rc = unsafe { query_fn(ptr::null_mut(), &mut size, 0, af, table_class, 0) };
     if rc == NO_ERROR || size == 0 {
         return Ok(None);
     }
@@ -226,7 +238,7 @@ fn query_tcp_table(
         if af == AF_INET6 {
             return Ok(None);
         }
-        return Err(map_win32_error(rc, None, "GetExtendedTcpTable"));
+        return Err(map_win32_error(rc, None, api_name));
     }
 
     for _ in 0..MAX_RETRIES {
@@ -238,12 +250,12 @@ fn query_tcp_table(
         let mut buf_bytes = (buf.len() * size_of::<u32>()) as u32;
         // SAFETY: `buf` is 4-byte aligned and writable for `buf_bytes`.
         let rc = unsafe {
-            get_tcp_table(
+            query_fn(
                 buf.as_mut_ptr().cast::<c_void>(),
                 &mut buf_bytes,
                 0,
                 af,
-                TCP_TABLE_OWNER_PID_ALL,
+                table_class,
                 0,
             )
         };
@@ -257,81 +269,29 @@ fn query_tcp_table(
         if af == AF_INET6 {
             return Ok(None);
         }
-        return Err(map_win32_error(rc, None, "GetExtendedTcpTable"));
+        return Err(map_win32_error(rc, None, api_name));
     }
 
     Ok(None)
 }
 
-fn query_udp_table(
-    get_udp_table: GetExtendedUdpTableFn,
-    af: u32,
-) -> Result<Option<Vec<u32>>, PalError> {
-    let mut size: u32 = 0;
-    // SAFETY: Null buffer queries required byte count.
-    let rc = unsafe { get_udp_table(ptr::null_mut(), &mut size, 0, af, UDP_TABLE_OWNER_PID, 0) };
-    if rc == NO_ERROR || size == 0 {
-        return Ok(None);
-    }
-    if rc != ERROR_INSUFFICIENT_BUFFER {
-        if af == AF_INET6 {
-            return Ok(None);
-        }
-        return Err(map_win32_error(rc, None, "GetExtendedUdpTable"));
-    }
-
-    for _ in 0..MAX_RETRIES {
-        let alloc_bytes = (size as usize).min(MAX_TABLE_BYTES);
-        if alloc_bytes < size_of::<u32>() {
-            return Ok(None);
-        }
-        let mut buf = vec![0u32; alloc_bytes.div_ceil(size_of::<u32>())];
-        let mut buf_bytes = (buf.len() * size_of::<u32>()) as u32;
-        // SAFETY: `buf` is 4-byte aligned and writable for `buf_bytes`.
-        let rc = unsafe {
-            get_udp_table(
-                buf.as_mut_ptr().cast::<c_void>(),
-                &mut buf_bytes,
-                0,
-                af,
-                UDP_TABLE_OWNER_PID,
-                0,
-            )
-        };
-        if rc == NO_ERROR {
-            return Ok(Some(buf));
-        }
-        if rc == ERROR_INSUFFICIENT_BUFFER && (buf_bytes as usize) <= MAX_TABLE_BYTES {
-            size = buf_bytes;
-            continue;
-        }
-        if af == AF_INET6 {
-            return Ok(None);
-        }
-        return Err(map_win32_error(rc, None, "GetExtendedUdpTable"));
-    }
-
-    Ok(None)
-}
-
-/// Decodes a `MIB_*TABLE_OWNER_PID` buffer (`dwNumEntries: u32` followed by `T` rows) safely.
-fn parse_table_rows<T: Copy>(buf: &[u32]) -> Vec<T> {
+/// Visits each `T` row in a `MIB_*TABLE_OWNER_PID` buffer (`dwNumEntries: u32` followed by `T` rows)
+/// without allocating an intermediate `Vec<T>`.
+fn for_each_table_row<T: Copy>(buf: &[u32], mut visit: impl FnMut(T)) {
     if buf.is_empty() {
-        return Vec::new();
+        return;
     }
     let count = buf[0] as usize;
     let payload_bytes = (buf.len() - 1) * size_of::<u32>();
     let max_fit = payload_bytes / size_of::<T>();
     let n = count.min(max_fit);
-    let mut rows = Vec::with_capacity(n);
     // SAFETY: `buf[1..]` is 4-byte aligned and has at least `n * size_of::<T>()` readable bytes.
     let base_ptr = unsafe { buf.as_ptr().add(1).cast::<T>() };
     for i in 0..n {
         // SAFETY: `i < n <= max_fit`, so reading `T` at `base_ptr.add(i)` is strictly in bounds.
         let row = unsafe { ptr::read_unaligned(base_ptr.add(i)) };
-        rows.push(row);
+        visit(row);
     }
-    rows
 }
 
 /// Decodes a Windows MIB port word (network byte order stored in the low 16 bits of a `u32`).

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_SUCCESS, FALSE, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0,
+    ERROR_ALREADY_EXISTS, ERROR_SUCCESS, FALSE, GetLastError, HANDLE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetSecurityInfo, NO_MULTIPLE_TRUSTEE,
@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Threading::{
     TerminateProcess, WaitForSingleObject,
 };
 
-use crate::handle::{OwnedHandle, to_wide_null};
+use crate::handle::{LocalAllocGuard, OwnedHandle, to_wide_null};
 use crate::taskmgr::launch;
 use crate::taskmgr::ready::{HANDSHAKE_ARG, OwnedSecurityDescriptor, generate_nonce, valid_nonce};
 
@@ -259,17 +259,7 @@ fn allow_owner_process_query(owner_sid: &str) -> Result<(), String> {
         let code = unsafe { GetLastError() };
         return Err(format!("ConvertStringSidToSidW failed (os error {code})"));
     }
-    struct LocalSid(*mut c_void);
-    impl Drop for LocalSid {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe {
-                    LocalFree(self.0);
-                }
-            }
-        }
-    }
-    let _sid_guard = LocalSid(psid);
+    let _sid_guard = LocalAllocGuard::new(psid);
 
     let mut old_dacl: *mut ACL = ptr::null_mut();
     let mut sd: *mut c_void = ptr::null_mut();
@@ -291,7 +281,7 @@ fn allow_owner_process_query(owner_sid: &str) -> Result<(), String> {
             "GetSecurityInfo(current process) failed (os error {rc})"
         ));
     }
-    let _sd_guard = LocalSid(sd);
+    let _sd_guard = LocalAllocGuard::new(sd);
 
     let ea = EXPLICIT_ACCESS_W {
         grfAccessPermissions: PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
@@ -312,7 +302,7 @@ fn allow_owner_process_query(owner_sid: &str) -> Result<(), String> {
     if rc != ERROR_SUCCESS || new_dacl.is_null() {
         return Err(format!("SetEntriesInAclW failed (os error {rc})"));
     }
-    let _dacl_guard = LocalSid(new_dacl.cast::<c_void>());
+    let _dacl_guard = LocalAllocGuard::new(new_dacl.cast::<c_void>());
 
     // SAFETY: Updates current process DACL to include owner query/wait rights.
     let rc = unsafe {

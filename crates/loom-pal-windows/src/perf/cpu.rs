@@ -16,8 +16,7 @@ use windows_sys::Win32::System::Power::{
     CallNtPowerInformation, PROCESSOR_POWER_INFORMATION, ProcessorInformation,
 };
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_DWORD, REG_SZ, RegCloseKey, RegOpenKeyExW,
-    RegQueryValueExW,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_DWORD, REG_SZ, RegOpenKeyExW, RegQueryValueExW,
 };
 use windows_sys::Win32::System::SystemInformation::{
     CACHE_RELATIONSHIP, GROUP_AFFINITY, GetLogicalProcessorInformationEx, GlobalMemoryStatusEx,
@@ -27,7 +26,7 @@ use windows_sys::Win32::System::SystemInformation::{
 use windows_sys::Win32::System::Threading::{IsProcessorFeaturePresent, PF_VIRT_FIRMWARE_ENABLED};
 
 use crate::fast_sampler::query_logical_cpu_count;
-use crate::handle::to_wide_null;
+use crate::handle::{OwnedRegKey, to_wide_null};
 use crate::perf::smbios::probe_memory_hardware_info;
 
 /// NT `SYSTEM_INFORMATION_CLASS::SystemMemoryListInformation` (`80`).
@@ -150,9 +149,8 @@ pub(crate) fn populate_memory_list_composition(
 pub fn probe_cpu_static_info() -> CpuStaticInfo {
     let logical_processors = query_logical_cpu_count();
     let (brand_name, reg_mhz) = read_cpu_registry_metadata();
-    let (sockets, physical_cores, l1_cache_bytes, l2_cache_bytes, l3_cache_bytes, _) =
+    let (sockets, physical_cores, l1_cache_bytes, l2_cache_bytes, l3_cache_bytes, hetero) =
         query_cpu_topology_and_caches();
-    let hetero = probe_heterogeneous_topology();
     tracing::debug!(
         p_cores = hetero.performance_cores,
         e_cores = hetero.efficiency_cores,
@@ -371,6 +369,7 @@ pub(crate) fn classify_heterogeneous_topology(
 
 /// Probes live heterogeneous core topology (`P` / `E` / `LP-E`) via
 /// `GetLogicalProcessorInformationEx(RelationAll, ...)`.
+#[cfg(test)]
 pub(crate) fn probe_heterogeneous_topology() -> HeterogeneousTopology {
     let (_, _, _, _, _, topo) = query_cpu_topology_and_caches();
     topo
@@ -526,17 +525,15 @@ fn read_cpu_registry_metadata() -> (String, u32) {
 
     // SAFETY: Standard read-only registry open under `HKEY_LOCAL_MACHINE`.
     let rc = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut hkey) };
-    if rc != ERROR_SUCCESS || hkey.is_null() {
+    if rc != ERROR_SUCCESS {
         return (String::new(), 0);
     }
+    let Some(key) = OwnedRegKey::from_raw(hkey) else {
+        return (String::new(), 0);
+    };
 
-    let brand = read_reg_string(hkey, "ProcessorNameString").unwrap_or_default();
-    let mhz = read_reg_dword(hkey, "~MHz").unwrap_or(0);
-
-    // SAFETY: `hkey` was successfully opened by `RegOpenKeyExW`.
-    unsafe {
-        RegCloseKey(hkey);
-    }
+    let brand = read_reg_string(key.as_raw(), "ProcessorNameString").unwrap_or_default();
+    let mhz = read_reg_dword(key.as_raw(), "~MHz").unwrap_or(0);
 
     (brand.trim().to_owned(), mhz)
 }

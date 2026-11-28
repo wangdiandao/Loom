@@ -199,16 +199,25 @@ fn complete_one(req: HandshakeRequest, expected_launcher: &Path) -> Result<Compl
         return Err("launcher creation time mismatch".into());
     }
 
-    let mut img_buf = [0u16; 32_768];
+    let mut img_buf = [0u16; 512];
     let mut img_len = img_buf.len() as u32;
     // SAFETY: Reads the Win32 executable path of the launcher process.
-    let ok = unsafe {
+    let parent_path = if unsafe {
         QueryFullProcessImageNameW(parent.as_raw(), 0, img_buf.as_mut_ptr(), &mut img_len)
+    } != 0
+    {
+        String::from_utf16_lossy(&img_buf[..(img_len as usize).min(img_buf.len())])
+    } else {
+        let mut wide_buf = vec![0u16; 32_768];
+        let mut wide_len = wide_buf.len() as u32;
+        if unsafe {
+            QueryFullProcessImageNameW(parent.as_raw(), 0, wide_buf.as_mut_ptr(), &mut wide_len)
+        } == 0
+        {
+            return Err("QueryFullProcessImageNameW failed".into());
+        }
+        String::from_utf16_lossy(&wide_buf[..(wide_len as usize).min(wide_buf.len())])
     };
-    if ok == 0 {
-        return Err("QueryFullProcessImageNameW failed".into());
-    }
-    let parent_path = String::from_utf16_lossy(&img_buf[..img_len as usize]);
     let expected_str = canonical_win32_path(expected_launcher);
     if !parent_path.eq_ignore_ascii_case(&expected_str) {
         return Err("unexpected launcher image path".into());
