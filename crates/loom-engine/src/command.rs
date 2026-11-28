@@ -7,9 +7,10 @@ use std::sync::atomic::AtomicBool;
 use crossbeam_channel::Sender;
 use loom_pal_api::PalError;
 use loom_types::{
-    CpuAffinityMask, DetailsSortColumn, DetailsViewMode, FileLockHolder, ProcessKey,
-    ProcessPriority, ProcessSortColumn, ProcessViewMode, RefreshSpeed, RunTaskRequest,
-    SortDirection, TreeKillReport, WaitChainNode,
+    AppHistorySortColumn, CpuAffinityMask, DetailsSortColumn, DetailsViewMode, FileLockHolder,
+    ProcessKey, ProcessPriority, ProcessSortColumn, ProcessViewMode, RefreshSpeed, RunTaskRequest,
+    ServicesSortColumn, SortDirection, StartupSortColumn, TreeKillReport, UsersSortColumn,
+    WaitChainNode,
 };
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -45,6 +46,38 @@ pub enum EngineCommand {
     },
     /// Toggles the expanded/collapsed state of a row in the Details tree view.
     ToggleDetailsExpanded(ProcessKey),
+    /// Updates the sort column and direction of the Services view.
+    SetServicesSort {
+        /// Column to sort by.
+        column: ServicesSortColumn,
+        /// Ascending or descending direction.
+        direction: SortDirection,
+    },
+    /// Updates or clears the optional hosting process ID filter of the Services view.
+    SetServicesFilterPid(Option<u32>),
+    /// Updates the sort column and direction of the Startup Applications view.
+    SetStartupSort {
+        /// Column to sort by.
+        column: StartupSortColumn,
+        /// Ascending or descending direction.
+        direction: SortDirection,
+    },
+    /// Updates the sort column and direction of the Users view.
+    SetUsersSort {
+        /// Column to sort by.
+        column: UsersSortColumn,
+        /// Ascending or descending direction.
+        direction: SortDirection,
+    },
+    /// Toggles the expanded/collapsed state of a user session row in the Users view.
+    ToggleUserSessionExpanded(u32),
+    /// Updates the sort column and direction of the App History view.
+    SetAppHistorySort {
+        /// Column to sort by.
+        column: AppHistorySortColumn,
+        /// Ascending or descending direction.
+        direction: SortDirection,
+    },
     /// Enters or exits window dormancy (minimized / closed to tray) to suspend fast-lane ticks.
     SetWindowDormant(bool),
     /// Freezes or unfreezes displayed [`ProcessKey`] row order in the Processes view while live metrics keep updating.
@@ -175,6 +208,18 @@ pub enum CommandKind {
     SetDetailsSort,
     /// [`EngineCommand::ToggleDetailsExpanded`]
     ToggleDetailsExpanded,
+    /// [`EngineCommand::SetServicesSort`]
+    SetServicesSort,
+    /// [`EngineCommand::SetServicesFilterPid`]
+    SetServicesFilterPid,
+    /// [`EngineCommand::SetStartupSort`]
+    SetStartupSort,
+    /// [`EngineCommand::SetUsersSort`]
+    SetUsersSort,
+    /// [`EngineCommand::ToggleUserSessionExpanded`]
+    ToggleUserSessionExpanded,
+    /// [`EngineCommand::SetAppHistorySort`]
+    SetAppHistorySort,
     /// [`EngineCommand::SetWindowDormant`]
     SetWindowDormant,
     /// [`EngineCommand::SetProcessOrderFreeze`]
@@ -264,6 +309,12 @@ impl EngineCommand {
             Self::SetDetailsViewMode(_) => CommandKind::SetDetailsViewMode,
             Self::SetDetailsSort { .. } => CommandKind::SetDetailsSort,
             Self::ToggleDetailsExpanded(_) => CommandKind::ToggleDetailsExpanded,
+            Self::SetServicesSort { .. } => CommandKind::SetServicesSort,
+            Self::SetServicesFilterPid(_) => CommandKind::SetServicesFilterPid,
+            Self::SetStartupSort { .. } => CommandKind::SetStartupSort,
+            Self::SetUsersSort { .. } => CommandKind::SetUsersSort,
+            Self::ToggleUserSessionExpanded(_) => CommandKind::ToggleUserSessionExpanded,
+            Self::SetAppHistorySort { .. } => CommandKind::SetAppHistorySort,
             Self::SetWindowDormant(_) => CommandKind::SetWindowDormant,
             Self::SetProcessOrderFreeze(_) => CommandKind::SetProcessOrderFreeze,
             Self::SetDetailsOrderFreeze(_) => CommandKind::SetDetailsOrderFreeze,

@@ -35,11 +35,14 @@ pub use command::{
 pub use coordinator::{EngineConfig, EngineCoordinator};
 pub use leaks::{LeakDetector, LeakDetectorConfig, LeakSampleInput};
 pub use lease::{MonitorLease, MonitorLeaseRegistry};
-pub use projection::{ProjectionEngine, ViewProjectionConfig};
+pub use projection::{
+    CPU_SORT_DEADBAND_PERMILLE, GPU_SORT_DEADBAND_PERMILLE, ProjectionEngine,
+    RATE_SORT_DEADBAND_BPS, ViewProjectionConfig,
+};
 pub use query::{
     CompareOp, ParsedQuery, QueryAtom, QueryClause, QueryMatchContext, QueryTerm, StatusFilter,
 };
-pub use slow_lane::{CircuitBreaker, ColdMetaCache, normalize_exe_path_key};
+pub use slow_lane::{CachedProcessMeta, CircuitBreaker, ColdMetaCache, normalize_exe_path_key};
 pub use tree::{ProcessTree, collect_bottom_up_kill_order};
 pub use wake::{NextSnapshotWake, SnapshotWakeSignal};
 pub use webview2::{WebView2Parsed, classify_webview2, is_webview2_image};

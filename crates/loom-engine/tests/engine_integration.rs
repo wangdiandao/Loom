@@ -18,16 +18,17 @@ use loom_pal_api::{
     SystemOperator,
 };
 use loom_types::{
-    AppHistoryRecord, CapabilityFlags, CpuAffinityMask, CpuCoreKind, CpuStaticInfo,
-    DetailsSortColumn, DetailsViewMode, DiskDeviceSample, DiskMediaType, ExeIconRgba,
-    ExeStaticAsset, FileLockHolder, GpuAdapterSample, GpuEngineSample, HardwareStaticInfo,
-    HistoryRing, LeakKind, MemoryHardwareInfo, MonitorDomain, NetAdapterSample, NetConnectionType,
-    PlatformProfile, ProcessArch, ProcessCategory, ProcessColdMeta, ProcessHotSample, ProcessKey,
-    ProcessPriority, ProcessRowKind, ProcessSocketRecord, ProcessSortColumn, ProcessStatusFlags,
-    ProcessViewMode, RefreshSpeed, RunTaskRequest, ServiceRecord, ServiceState, SocketProtocol,
-    SortDirection, StartupEntry, StartupImpact, SystemPerfSample, Timestamp100Ns, TreeKillItem,
-    TreeKillReport, UacVirtualization, UserSessionRecord, UserSessionState, WaitChainNode,
-    WebView2Role,
+    AppHistoryRecord, AppHistorySortColumn, CapabilityFlags, CpuAffinityMask, CpuCoreKind,
+    CpuStaticInfo, DetailsSortColumn, DetailsViewMode, DiskDeviceSample, DiskMediaType,
+    ExeIconRgba, ExeStaticAsset, FileLockHolder, GpuAdapterSample, GpuEngineSample,
+    HardwareStaticInfo, HistoryRing, LeakKind, MemoryHardwareInfo, MonitorDomain, NetAdapterSample,
+    NetConnectionType, PlatformProfile, ProcessArch, ProcessCategory, ProcessColdMeta,
+    ProcessHotSample, ProcessKey, ProcessPriority, ProcessRowKind, ProcessSocketRecord,
+    ProcessSortColumn, ProcessStatusFlags, ProcessViewMode, RefreshSpeed, RunTaskRequest,
+    ServiceRecord, ServiceState, ServicesSortColumn, SocketProtocol, SortDirection, StartupEntry,
+    StartupImpact, StartupSortColumn, SystemPerfSample, Timestamp100Ns, TreeKillItem,
+    TreeKillReport, UacVirtualization, UserSessionRecord, UserSessionState, UsersRowProjection,
+    UsersSortColumn, WaitChainNode, WebView2Role,
 };
 use parking_lot::Mutex;
 
@@ -3528,4 +3529,268 @@ fn new_process_controls_file_locks_etw_lease_and_app_history_save_work_end_to_en
         state.mgmt.save_history_calls.load(Ordering::Acquire) > saves_before_shutdown,
         "shutdown must flush remaining dirty AppHistory via save_history"
     );
+}
+
+#[test]
+fn offloaded_domain_sort_filter_expand_and_search_commands_are_lease_gated() {
+    let mut p_alice = MockProcSpec::new(101, 10, 0, "code.exe");
+    p_alice.session_id = 1;
+    p_alice.cpu_delta_per_tick = 1_000_000;
+    p_alice.private_mem_bytes = 256 * 1024 * 1024;
+    let mut p_bob = MockProcSpec::new(201, 20, 0, "notepad.exe");
+    p_bob.session_id = 2;
+    p_bob.cpu_delta_per_tick = 200_000;
+    p_bob.private_mem_bytes = 64 * 1024 * 1024;
+
+    let state = MockState::new(vec![p_alice, p_bob]);
+    *state.mgmt.services.lock() = vec![
+        ServiceRecord {
+            name: Arc::from("Spooler"),
+            display_name: Arc::from("Print Spooler"),
+            description: Some(Arc::from("打印后台处理程序")),
+            pid: Some(2040),
+            state: ServiceState::Running,
+            group: Some(Arc::from("SpoolerGroup")),
+        },
+        ServiceRecord {
+            name: Arc::from("Dhcp"),
+            display_name: Arc::from("DHCP Client"),
+            description: Some(Arc::from("网络配置服务")),
+            pid: Some(1200),
+            state: ServiceState::Stopped,
+            group: Some(Arc::from("netsvcs")),
+        },
+    ];
+    *state.mgmt.startup_entries.lock() = vec![
+        StartupEntry {
+            id: Arc::from("id:z"),
+            name: Arc::from("ZetaApp"),
+            publisher: Some(Arc::from("Beta Corp")),
+            command: None,
+            file_path: None,
+            enabled: false,
+            impact: StartupImpact::Low,
+        },
+        StartupEntry {
+            id: Arc::from("id:a"),
+            name: Arc::from("AlphaApp"),
+            publisher: Some(Arc::from("Acme Corp")),
+            command: None,
+            file_path: None,
+            enabled: true,
+            impact: StartupImpact::High,
+        },
+    ];
+    *state.mgmt.sessions.lock() = vec![
+        UserSessionRecord {
+            session_id: 1,
+            user_name: Arc::from("Alice"),
+            state: UserSessionState::Active,
+            process_count: 0,
+            cpu_permille: 0,
+            memory_bytes: 0,
+            disk_bytes_per_sec: 0,
+            net_bytes_per_sec: 0,
+            processes: Vec::new(),
+        },
+        UserSessionRecord {
+            session_id: 2,
+            user_name: Arc::from("Bob"),
+            state: UserSessionState::Disconnected,
+            process_count: 0,
+            cpu_permille: 0,
+            memory_bytes: 0,
+            disk_bytes_per_sec: 0,
+            net_bytes_per_sec: 0,
+            processes: Vec::new(),
+        },
+    ];
+    *state.mgmt.history_since.lock() = Some(1_700_000_000);
+    *state.mgmt.history_items.lock() = vec![
+        AppHistoryRecord {
+            app_id: Arc::from("app.one"),
+            name: Arc::from("AlphaBrowser"),
+            cpu_time_100ns: 100_000_000,
+            network_bytes: 5_000_000,
+            metered_network_bytes: 1_000,
+        },
+        AppHistoryRecord {
+            app_id: Arc::from("app.two"),
+            name: Arc::from("BetaEditor"),
+            cpu_time_100ns: 900_000_000,
+            network_bytes: 100_000,
+            metered_network_bytes: 50_000,
+        },
+    ];
+
+    let backend = MockBackend::from_state(Arc::clone(&state));
+    let settings = AppSettings {
+        refresh_speed: RefreshSpeed::Paused,
+        ..AppSettings::default()
+    };
+    let coord = EngineCoordinator::new(backend, settings).unwrap();
+    assert!(wait_until(Duration::from_secs(2), || {
+        coord.snapshot().revisions.processes >= 1
+    }));
+
+    // 1. Sending sort/filter/expand commands while domains are UNLEASED must NOT project or poll them.
+    for cmd in [
+        EngineCommand::SetServicesSort {
+            column: ServicesSortColumn::Pid,
+            direction: SortDirection::Descending,
+        },
+        EngineCommand::SetServicesFilterPid(None),
+        EngineCommand::SetStartupSort {
+            column: StartupSortColumn::Impact,
+            direction: SortDirection::Descending,
+        },
+        EngineCommand::SetUsersSort {
+            column: UsersSortColumn::User,
+            direction: SortDirection::Ascending,
+        },
+        EngineCommand::ToggleUserSessionExpanded(1),
+        EngineCommand::SetAppHistorySort {
+            column: AppHistorySortColumn::Network,
+            direction: SortDirection::Descending,
+        },
+    ] {
+        let ev = coord
+            .send_command_with_reply(cmd)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(ev.is_ok());
+    }
+
+    let snap_unleased = coord.snapshot();
+    assert_eq!(snap_unleased.revisions.services, 0);
+    assert_eq!(snap_unleased.revisions.startup, 0);
+    assert_eq!(snap_unleased.revisions.users, 0);
+    assert_eq!(snap_unleased.revisions.app_history, 0);
+    assert_eq!(state.mgmt.list_services_calls.load(Ordering::Acquire), 0);
+    assert_eq!(state.mgmt.list_startup_calls.load(Ordering::Acquire), 0);
+    assert_eq!(state.mgmt.list_sessions_calls.load(Ordering::Acquire), 0);
+    assert_eq!(state.mgmt.read_history_calls.load(Ordering::Acquire), 0);
+
+    // 2. Acquire all 4 leases -> initial projections immediately honor the configured sort & expand state!
+    let _svc_lease = coord.acquire_lease(MonitorDomain::Services);
+    let _st_lease = coord.acquire_lease(MonitorDomain::Startup);
+    let _usr_lease = coord.acquire_lease(MonitorDomain::Users);
+    let _hist_lease = coord.acquire_lease(MonitorDomain::AppHistory);
+
+    assert!(wait_until(Duration::from_secs(2), || {
+        let r = coord.snapshot().revisions;
+        r.services >= 1 && r.startup >= 1 && r.users >= 1 && r.app_history >= 1
+    }));
+
+    let snap = coord.snapshot();
+    assert_eq!(snap.services.sort_column, ServicesSortColumn::Pid);
+    assert_eq!(snap.services.visible_indices, vec![0, 1]);
+    assert_eq!(snap.startup.sort_column, StartupSortColumn::Impact);
+    assert_eq!(snap.startup.visible_indices, vec![1, 0]);
+    assert_eq!(snap.users.sort_column, UsersSortColumn::User);
+    assert_eq!(snap.users.rows.len(), 3); // Alice (expanded) + code.exe + Bob
+    assert!(matches!(
+        snap.users.rows[0],
+        UsersRowProjection::Session {
+            session_id: 1,
+            is_expanded: true,
+            ..
+        }
+    ));
+    assert_eq!(snap.app_history.sort_column, AppHistorySortColumn::Network);
+    assert_eq!(
+        snap.app_history.items[snap.app_history.visible_indices[0]]
+            .app_id
+            .as_ref(),
+        "app.one"
+    );
+
+    // 3. Record slow poll counts, then issue live sort/filter/search commands while leased (RefreshSpeed::Paused).
+    // All 4 domains MUST re-project immediately on the fast lane with ZERO additional slow polls!
+    let svc_polls = state.mgmt.list_services_calls.load(Ordering::Acquire);
+    let st_polls = state.mgmt.list_startup_calls.load(Ordering::Acquire);
+    let usr_polls = state.mgmt.list_sessions_calls.load(Ordering::Acquire);
+    let hist_polls = state.mgmt.read_history_calls.load(Ordering::Acquire);
+
+    let rev_before = coord.snapshot().revisions;
+    coord
+        .send_command_with_reply(EngineCommand::SetServicesFilterPid(Some(1200)))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let s_pid = coord.snapshot();
+    assert!(s_pid.revisions.services > rev_before.services);
+    assert_eq!(s_pid.services.filter_pid, Some(1200));
+    assert_eq!(s_pid.services.visible_indices, vec![1]);
+
+    // Clear PID filter, collapse session 1, then trigger SetSearchQuery across all leased domains!
+    coord
+        .send_command_with_reply(EngineCommand::SetServicesFilterPid(None))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    coord
+        .send_command_with_reply(EngineCommand::ToggleUserSessionExpanded(1))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(coord.snapshot().users.rows.len(), 2);
+
+    let rev_pre_search = coord.snapshot().revisions;
+    coord
+        .send_command_with_reply(EngineCommand::SetSearchQuery("alpha".to_owned()))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let s_search = coord.snapshot();
+    assert!(s_search.revisions.services > rev_pre_search.services);
+    assert!(s_search.revisions.startup > rev_pre_search.startup);
+    assert!(s_search.revisions.users > rev_pre_search.users);
+    assert!(s_search.revisions.app_history > rev_pre_search.app_history);
+    assert_eq!(s_search.startup.visible_indices, vec![1]); // AlphaApp
+    assert_eq!(s_search.app_history.visible_indices.len(), 1);
+    assert_eq!(
+        s_search.app_history.items[s_search.app_history.visible_indices[0]]
+            .app_id
+            .as_ref(),
+        "app.one"
+    );
+
+    // Search matching a child process auto-expands collapsed session 2 (Bob -> notepad.exe).
+    coord
+        .send_command_with_reply(EngineCommand::SetSearchQuery("notepad".to_owned()))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let s_note = coord.snapshot();
+    assert_eq!(s_note.users.rows.len(), 2);
+    assert!(matches!(
+        s_note.users.rows[0],
+        UsersRowProjection::Session {
+            session_id: 2,
+            is_expanded: true,
+            ..
+        }
+    ));
+
+    // Confirm zero extra slow-lane polls occurred during fast-lane sort/filter/search re-projections!
+    assert_eq!(
+        state.mgmt.list_services_calls.load(Ordering::Acquire),
+        svc_polls
+    );
+    assert_eq!(
+        state.mgmt.list_startup_calls.load(Ordering::Acquire),
+        st_polls
+    );
+    assert_eq!(
+        state.mgmt.list_sessions_calls.load(Ordering::Acquire),
+        usr_polls
+    );
+    assert_eq!(
+        state.mgmt.read_history_calls.load(Ordering::Acquire),
+        hist_polls
+    );
+
+    coord.shutdown();
 }

@@ -100,6 +100,7 @@ pub struct LeakDetector {
     last_eval_at: Option<Instant>,
     histories: HashMap<ProcessKey, ProcessLeakHistory, FastBuildHasher>,
     warnings: HashMap<ProcessKey, LeakWarning, FastBuildHasher>,
+    live_keys_scratch: HashSet<ProcessKey, FastBuildHasher>,
 }
 
 impl Default for LeakDetector {
@@ -121,6 +122,7 @@ impl LeakDetector {
             last_eval_at: None,
             histories: HashMap::with_hasher(FastBuildHasher),
             warnings: HashMap::with_hasher(FastBuildHasher),
+            live_keys_scratch: HashSet::with_hasher(FastBuildHasher),
         }
     }
 
@@ -128,6 +130,14 @@ impl LeakDetector {
     #[inline]
     pub const fn config(&self) -> LeakDetectorConfig {
         self.config
+    }
+
+    /// Returns `true` if `check_interval` has elapsed since the previous evaluation pass
+    /// (or if no pass has run yet).
+    #[inline]
+    pub fn should_evaluate(&self, now: Instant) -> bool {
+        self.last_eval_at
+            .is_none_or(|last| now.saturating_duration_since(last) >= self.config.check_interval)
     }
 
     /// Returns the active [`LeakWarning`] for `key`, respecting `show_warnings` and
@@ -154,25 +164,31 @@ impl LeakDetector {
     ///
     /// Returns `true` if an evaluation pass ran.
     pub fn update_at(&mut self, now: Instant, samples: &[LeakSampleInput<'_>]) -> bool {
-        if let Some(last) = self.last_eval_at
-            && now.saturating_duration_since(last) < self.config.check_interval
-        {
+        self.update_at_iter(now, samples.len(), samples.iter().copied())
+    }
+
+    /// Runs an evaluation pass at `now` over a borrowed iterator of [`LeakSampleInput`] values,
+    /// avoiding temporary `Vec` allocation on the fast-lane thread.
+    ///
+    /// Returns `true` if an evaluation pass ran.
+    pub fn update_at_iter<'a, I>(&mut self, now: Instant, len_hint: usize, samples: I) -> bool
+    where
+        I: IntoIterator<Item = LeakSampleInput<'a>>,
+    {
+        if !self.should_evaluate(now) {
             return false;
         }
         self.last_eval_at = Some(now);
 
-        let mut live_keys: HashSet<ProcessKey, FastBuildHasher> =
-            HashSet::with_capacity_and_hasher(samples.len(), FastBuildHasher);
-        for s in samples {
-            live_keys.insert(s.key);
-        }
-        self.histories.retain(|k, _| live_keys.contains(k));
+        self.live_keys_scratch.clear();
+        self.live_keys_scratch.reserve(len_hint);
         self.warnings.clear();
 
         let window = self.config.sustain_window;
         let mut stale_orphans_by_exe: HashMap<Arc<str>, Vec<ProcessKey>> = HashMap::new();
 
         for sample in samples {
+            self.live_keys_scratch.insert(sample.key);
             let is_kernel_or_system_core = sample.key.pid == 0
                 || sample.key.pid == 4
                 || sample
@@ -258,6 +274,9 @@ impl LeakDetector {
                 self.warnings.insert(sample.key, warning);
             }
         }
+
+        self.histories
+            .retain(|k, _| self.live_keys_scratch.contains(k));
 
         // Evaluate Orphans Leak heuristic across grouped stale orphans.
         for (_exe_key, keys) in stale_orphans_by_exe {
