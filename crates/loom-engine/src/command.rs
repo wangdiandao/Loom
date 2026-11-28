@@ -7,10 +7,10 @@ use std::sync::atomic::AtomicBool;
 use crossbeam_channel::Sender;
 use loom_pal_api::PalError;
 use loom_types::{
-    AppHistorySortColumn, CpuAffinityMask, DetailsSortColumn, DetailsViewMode, FileLockHolder,
-    ProcessKey, ProcessPriority, ProcessSortColumn, ProcessViewMode, RefreshSpeed, RunTaskRequest,
-    ServicesSortColumn, SortDirection, StartupSortColumn, TreeKillReport, UsersSortColumn,
-    WaitChainNode,
+    AdminStartupStatus, AppHistorySortColumn, CpuAffinityMask, DetailsSortColumn, DetailsViewMode,
+    FileLockHolder, ProcessKey, ProcessPriority, ProcessSortColumn, ProcessViewMode, RefreshSpeed,
+    RunTaskRequest, ServicesSortColumn, SortDirection, StartupSortColumn,
+    TaskManagerReplacementStatus, TreeKillReport, UsersSortColumn, WaitChainNode,
 };
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -185,6 +185,16 @@ pub enum EngineCommand {
     DisconnectSession(u32),
     /// Clears persisted and live in-memory cumulative application usage history.
     ClearAppHistory,
+    /// Queries the read-only status of OS-level system Task Manager replacement on the slow lane.
+    QueryTaskManagerReplacement,
+    /// Enables or restores OS-level system Task Manager replacement on the slow lane.
+    SetTaskManagerReplacement(bool),
+    /// Launches the built-in OS Task Manager directly (bypassing replacement) on the slow lane.
+    OpenNativeTaskManager,
+    /// Queries the read-only status of persistent administrator startup on the slow lane.
+    QueryAdminStartup,
+    /// Enables or disables persistent administrator startup on the slow lane.
+    SetAdminStartup(bool),
     /// Requests a clean shutdown of the engine coordinator threads.
     Shutdown,
 }
@@ -292,6 +302,16 @@ pub enum CommandKind {
     DisconnectSession,
     /// [`EngineCommand::ClearAppHistory`]
     ClearAppHistory,
+    /// [`EngineCommand::QueryTaskManagerReplacement`]
+    QueryTaskManagerReplacement,
+    /// [`EngineCommand::SetTaskManagerReplacement`]
+    SetTaskManagerReplacement,
+    /// [`EngineCommand::OpenNativeTaskManager`]
+    OpenNativeTaskManager,
+    /// [`EngineCommand::QueryAdminStartup`]
+    QueryAdminStartup,
+    /// [`EngineCommand::SetAdminStartup`]
+    SetAdminStartup,
     /// [`EngineCommand::Shutdown`]
     Shutdown,
 }
@@ -351,6 +371,11 @@ impl EngineCommand {
             Self::SetStartupEnabled { .. } => CommandKind::SetStartupEnabled,
             Self::DisconnectSession(_) => CommandKind::DisconnectSession,
             Self::ClearAppHistory => CommandKind::ClearAppHistory,
+            Self::QueryTaskManagerReplacement => CommandKind::QueryTaskManagerReplacement,
+            Self::SetTaskManagerReplacement(_) => CommandKind::SetTaskManagerReplacement,
+            Self::OpenNativeTaskManager => CommandKind::OpenNativeTaskManager,
+            Self::QueryAdminStartup => CommandKind::QueryAdminStartup,
+            Self::SetAdminStartup(_) => CommandKind::SetAdminStartup,
             Self::Shutdown => CommandKind::Shutdown,
         }
     }
@@ -378,6 +403,12 @@ pub enum CommandSuccess {
     FilePicked(Option<PathBuf>),
     /// [`EngineCommand::FindFileLocks`] returned all processes/services locking the queried path.
     FileLocks(Vec<FileLockHolder>),
+    /// [`EngineCommand::QueryTaskManagerReplacement`] or [`EngineCommand::SetTaskManagerReplacement`]
+    /// returned the verified OS Task Manager replacement status.
+    TaskManagerReplacementStatus(TaskManagerReplacementStatus),
+    /// [`EngineCommand::QueryAdminStartup`] or [`EngineCommand::SetAdminStartup`]
+    /// returned the verified persistent administrator startup status.
+    AdminStartupStatus(AdminStartupStatus),
 }
 
 /// Structured outcome of executing an [`EngineCommand`].

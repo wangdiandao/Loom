@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use loom_types::{
-    AppHistoryRecord, CapabilityFlags, CpuAffinityMask, DiskDeviceSample, ExeStaticAsset,
-    FileLockHolder, HardwareStaticInfo, PlatformProfile, ProcessColdMeta, ProcessKey,
-    ProcessPriority, ProcessSocketRecord, RunTaskRequest, ServiceRecord, StartupEntry,
-    Timestamp100Ns, TreeKillReport, UserSessionRecord, WaitChainNode,
+    AdminStartupStatus, AppHistoryRecord, CapabilityFlags, CpuAffinityMask, DiskDeviceSample,
+    ExeStaticAsset, FileLockHolder, HardwareStaticInfo, PlatformProfile, ProcessColdMeta,
+    ProcessKey, ProcessPriority, ProcessSocketRecord, RunTaskRequest, ServiceRecord, StartupEntry,
+    TaskManagerReplacementState, TaskManagerReplacementStatus, Timestamp100Ns, TreeKillReport,
+    UserSessionRecord, WaitChainNode,
 };
 
 use crate::{PalError, PerfSampleScratch, ProcessSampleScratch};
@@ -273,6 +274,46 @@ pub trait SystemOperator: Send + Sync {
     fn find_file_locks(&self, _path: &Path) -> Result<Vec<FileLockHolder>, PalError> {
         Err(PalError::Unsupported(
             "file lock finder is not supported on this platform",
+        ))
+    }
+
+    /// Queries the current read-only status of OS-level system Task Manager replacement.
+    fn task_manager_replacement_status(&self) -> Result<TaskManagerReplacementStatus, PalError> {
+        Ok(TaskManagerReplacementStatus {
+            state: TaskManagerReplacementState::Unsupported,
+            can_enable: false,
+            can_restore: false,
+            conflict_detail: None,
+            recovery_path: None,
+        })
+    }
+
+    /// Enables or restores OS-level system Task Manager replacement (e.g., Windows IFEO).
+    fn set_task_manager_replacement(
+        &self,
+        _enabled: bool,
+    ) -> Result<TaskManagerReplacementStatus, PalError> {
+        Err(PalError::Unsupported(
+            "system task manager replacement is not supported on this platform",
+        ))
+    }
+
+    /// Launches the OS built-in Task Manager directly, bypassing any active replacement entry.
+    fn open_native_task_manager(&self) -> Result<(), PalError> {
+        Err(PalError::Unsupported(
+            "opening native task manager is not supported on this platform",
+        ))
+    }
+
+    /// Queries the current read-only status of persistent administrator startup.
+    fn admin_startup_status(&self) -> Result<AdminStartupStatus, PalError> {
+        Ok(AdminStartupStatus::default())
+    }
+
+    /// Enables or disables persistent administrator startup (e.g., Windows Task Scheduler).
+    fn set_admin_startup(&self, _enabled: bool) -> Result<AdminStartupStatus, PalError> {
+        Err(PalError::Unsupported(
+            "persistent administrator startup is not supported on this platform",
         ))
     }
 

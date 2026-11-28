@@ -188,6 +188,74 @@ impl Future for NextHotkeyWake {
     }
 }
 
+#[derive(Default)]
+struct ActivationSignalState {
+    pending: Vec<Vec<String>>,
+    waker: Option<Waker>,
+    closed: bool,
+}
+
+/// Zero-polling waker-backed signal delivering single-instance activation payloads onto the GPUI loop.
+#[derive(Clone, Default)]
+struct ActivationWakeSignal {
+    inner: Arc<Mutex<ActivationSignalState>>,
+}
+
+impl ActivationWakeSignal {
+    fn push(&self, args: Vec<String>) {
+        let waker = {
+            let mut state = self.inner.lock();
+            if state.closed {
+                return;
+            }
+            if state.pending.len() < 16 {
+                state.pending.push(args);
+            }
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn close(&self) {
+        let waker = {
+            let mut state = self.inner.lock();
+            state.closed = true;
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn next(&self) -> NextActivationWake {
+        NextActivationWake {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+struct NextActivationWake {
+    inner: Arc<Mutex<ActivationSignalState>>,
+}
+
+impl Future for NextActivationWake {
+    type Output = Option<Vec<String>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let mut state = self.inner.lock();
+        if !state.pending.is_empty() {
+            return Poll::Ready(Some(state.pending.remove(0)));
+        }
+        if state.closed {
+            return Poll::Ready(None);
+        }
+        state.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
 /// Application-wide GPUI global managing the active windows, tray icon, global hotkey, and exit policy.
 struct AppRuntime {
     store: Entity<UiStore>,
@@ -202,6 +270,7 @@ struct AppRuntime {
     tray: Option<TrayController>,
     hotkey: Option<GlobalHotkeyController>,
     hotkey_signal: Option<HotkeyWakeSignal>,
+    activation_signal: Option<ActivationWakeSignal>,
     _window_closed_sub: Option<Subscription>,
     _single_instance: Option<SingleInstanceGuard>,
 }
@@ -209,15 +278,25 @@ struct AppRuntime {
 impl Global for AppRuntime {}
 
 /// Launches the Loom desktop application using the progressive startup pipeline.
-pub(crate) fn run(args: LaunchArgs) {
-    // 1. Optional single-instance lock (bypassed when `--allow-multiple` is set for testing).
+pub(crate) fn run(args: LaunchArgs, raw_args: Vec<String>) {
+    // 1. Optional cross-UIPI single-instance lock (bypassed when `--allow-multiple` is set for testing).
+    let activation_signal = ActivationWakeSignal::default();
     let single_instance = if args.allow_multiple {
         None
     } else {
-        match SingleInstanceGuard::acquire(SINGLE_INSTANCE_ID) {
+        let wake_signal = activation_signal.clone();
+        match SingleInstanceGuard::acquire_or_notify(
+            SINGLE_INSTANCE_ID,
+            &raw_args,
+            Some(Arc::new(move |forwarded_args| {
+                wake_signal.push(forwarded_args);
+            })),
+        ) {
             Ok(guard) if guard.is_single() => Some(guard),
             Ok(_) => {
-                tracing::info!("another Loom instance is already running; exiting");
+                tracing::info!(
+                    "another Loom instance is already running; forwarded activation and exiting"
+                );
                 return;
             }
             Err(err) => {
@@ -226,6 +305,17 @@ pub(crate) fn run(args: LaunchArgs) {
             }
         }
     };
+
+    // If this is a fresh cold start (no existing primary instance) and persistent administrator
+    // startup is enabled on this account, hand off to the elevated scheduled-task broker before
+    // initializing GPUI or the sampling engine.
+    if !args.allow_multiple && loom_pal::admin::route(&raw_args) {
+        drop(single_instance);
+        return;
+    }
+
+    // Queue any Task Manager replacement readiness handshake passed to this fresh primary instance.
+    let _ = loom_pal::taskmgr::queue_handshake_args(&raw_args);
 
     // 2. Synchronous, sub-millisecond settings load (< 1 ms).
     let config_store = match args.config_path {
@@ -282,6 +372,7 @@ pub(crate) fn run(args: LaunchArgs) {
                 tray: None,
                 hotkey: None,
                 hotkey_signal: None,
+                activation_signal: Some(activation_signal.clone()),
                 _window_closed_sub: None,
                 _single_instance: single_instance,
             });
@@ -301,6 +392,12 @@ pub(crate) fn run(args: LaunchArgs) {
                 return;
             }
 
+            // Complete any pending startup Task Manager readiness handshake and acknowledge any
+            // persistent administrator broker waiting for this window to appear.
+            complete_taskmgr_handshakes(false, cx);
+            loom_pal::admin::acknowledge(&raw_args);
+
+            let activation_signal_loop = activation_signal.clone();
             cx.defer(move |cx| {
                 if !cx.has_global::<AppRuntime>() || cx.global::<AppRuntime>().explicit_exit {
                     return;
@@ -336,6 +433,7 @@ pub(crate) fn run(args: LaunchArgs) {
                     spawn_tray_event_loop(signal, cx);
                 }
                 spawn_hotkey_event_loop(hotkey_signal, cx);
+                spawn_activation_event_loop(activation_signal_loop, cx);
             });
         });
 }
@@ -374,6 +472,36 @@ fn spawn_hotkey_event_loop(signal: HotkeyWakeSignal, cx: &mut App) {
         }
     })
     .detach();
+}
+
+fn spawn_activation_event_loop(signal: ActivationWakeSignal, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        while let Some(args) = signal.next().await {
+            cx.update(|cx| {
+                let is_taskmgr_handshake = loom_pal::taskmgr::queue_handshake_args(&args);
+                if is_taskmgr_handshake {
+                    complete_taskmgr_handshakes(true, cx);
+                } else {
+                    show_or_reopen_main_window(cx);
+                }
+            });
+        }
+    })
+    .detach();
+}
+
+fn complete_taskmgr_handshakes(wake_existing_window: bool, cx: &mut App) {
+    let completions = loom_pal::taskmgr::complete_pending_handshakes();
+    for completion in completions {
+        if completion.should_show() {
+            if wake_existing_window {
+                show_or_reopen_main_window(cx);
+            } else {
+                loom_pal::window::restore_and_focus_main_window();
+            }
+        }
+        completion.acknowledge();
+    }
 }
 
 fn build_window_options(settings: &AppSettings) -> WindowOptions {
@@ -651,6 +779,11 @@ fn handle_window_closed(cx: &mut App, closed_id: gpui_kit::WindowId) {
     }
 }
 
+/// Exits the current Loom instance cleanly so a prepared privilege-switch broker can take over.
+pub(crate) fn quit_for_privilege_switch(cx: &mut App) {
+    quit_application(cx);
+}
+
 fn quit_application(cx: &mut App) {
     if !cx.has_global::<AppRuntime>() {
         cx.quit();
@@ -661,6 +794,9 @@ fn quit_application(cx: &mut App) {
         let runtime = cx.global_mut::<AppRuntime>();
         runtime.explicit_exit = true;
         if let Some(signal) = runtime.hotkey_signal.take() {
+            signal.close();
+        }
+        if let Some(signal) = runtime.activation_signal.take() {
             signal.close();
         }
         runtime.hotkey = None;

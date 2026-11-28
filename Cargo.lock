@@ -4495,6 +4495,8 @@ dependencies = [
  "loom-pal-api",
  "loom-types",
  "parking_lot",
+ "serde",
+ "toml 1.2.3+spec-1.1.0",
  "tracing",
  "windows-sys 0.61.2",
 ]

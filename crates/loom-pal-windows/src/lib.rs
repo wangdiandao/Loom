@@ -13,6 +13,7 @@
 
 #![warn(missing_docs)]
 
+pub mod admin;
 pub mod app_history;
 pub mod circuit_breaker;
 pub mod diagnostics;
@@ -21,12 +22,14 @@ pub mod fast_sampler;
 pub mod filelock;
 pub(crate) mod handle;
 pub mod hotkey;
+pub mod instance;
 pub mod operator;
 pub mod perf;
 pub mod ports;
 pub mod services;
 pub mod slow_prober;
 pub mod startup;
+pub mod taskmgr;
 pub mod users;
 pub mod window;
 
@@ -34,6 +37,7 @@ pub use app_history::WindowsAppHistoryReader;
 pub use circuit_breaker::CircuitBreaker;
 pub use fast_sampler::WindowsFastSampler;
 pub use hotkey::{WindowsGlobalHotkeyController, parse_hotkey_spec};
+pub use instance::{ActivationCallback, WindowsSingleInstance};
 pub use operator::WindowsSystemOperator;
 pub use services::WindowsServiceManager;
 pub use slow_prober::WindowsSlowProber;
@@ -82,7 +86,9 @@ impl PlatformBackend for WindowsBackend {
         .union(CapabilityFlags::SUSPEND_RESUME)
         .union(CapabilityFlags::FILE_LOCKS)
         .union(CapabilityFlags::PROCESS_SOCKETS)
-        .union(CapabilityFlags::ELEVATED_PROCESS_NET);
+        .union(CapabilityFlags::ELEVATED_PROCESS_NET)
+        .union(CapabilityFlags::TASK_MANAGER_REPLACEMENT)
+        .union(CapabilityFlags::ADMIN_STARTUP);
 
     fn boost_self_priority() {
         fast_sampler::boost_self_priority();

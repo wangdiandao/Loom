@@ -488,6 +488,11 @@ pub(crate) enum SlowShellOp {
     AttachDebugger(ProcessKey),
     RestartExplorer,
     FindFileLocks(PathBuf),
+    QueryTaskManagerReplacement,
+    SetTaskManagerReplacement(bool),
+    OpenNativeTaskManager,
+    QueryAdminStartup,
+    SetAdminStartup(bool),
 }
 
 /// Blocking system management operations (Services, Startup, Users, App History)
@@ -895,6 +900,76 @@ fn execute_priority_job<B: PlatformBackend>(
                         CommandOutcome::err(err),
                     ),
                 },
+                SlowShellOp::QueryTaskManagerReplacement => {
+                    match operator.task_manager_replacement_status() {
+                        Ok(status) => CommandEvent::new(
+                            CommandKind::QueryTaskManagerReplacement,
+                            None,
+                            CommandOutcome::Ok(CommandSuccess::TaskManagerReplacementStatus(
+                                status,
+                            )),
+                        ),
+                        Err(err) => CommandEvent::new(
+                            CommandKind::QueryTaskManagerReplacement,
+                            None,
+                            CommandOutcome::err(err),
+                        ),
+                    }
+                }
+                SlowShellOp::SetTaskManagerReplacement(enabled) => {
+                    match operator.set_task_manager_replacement(enabled) {
+                        Ok(status) => CommandEvent::new(
+                            CommandKind::SetTaskManagerReplacement,
+                            None,
+                            CommandOutcome::Ok(CommandSuccess::TaskManagerReplacementStatus(
+                                status,
+                            )),
+                        ),
+                        Err(err) => CommandEvent::new(
+                            CommandKind::SetTaskManagerReplacement,
+                            None,
+                            CommandOutcome::err(err),
+                        ),
+                    }
+                }
+                SlowShellOp::OpenNativeTaskManager => match operator.open_native_task_manager() {
+                    Ok(()) => CommandEvent::new(
+                        CommandKind::OpenNativeTaskManager,
+                        None,
+                        CommandOutcome::Ok(CommandSuccess::Ack),
+                    ),
+                    Err(err) => CommandEvent::new(
+                        CommandKind::OpenNativeTaskManager,
+                        None,
+                        CommandOutcome::err(err),
+                    ),
+                },
+                SlowShellOp::QueryAdminStartup => match operator.admin_startup_status() {
+                    Ok(status) => CommandEvent::new(
+                        CommandKind::QueryAdminStartup,
+                        None,
+                        CommandOutcome::Ok(CommandSuccess::AdminStartupStatus(status)),
+                    ),
+                    Err(err) => CommandEvent::new(
+                        CommandKind::QueryAdminStartup,
+                        None,
+                        CommandOutcome::err(err),
+                    ),
+                },
+                SlowShellOp::SetAdminStartup(enabled) => {
+                    match operator.set_admin_startup(enabled) {
+                        Ok(status) => CommandEvent::new(
+                            CommandKind::SetAdminStartup,
+                            None,
+                            CommandOutcome::Ok(CommandSuccess::AdminStartupStatus(status)),
+                        ),
+                        Err(err) => CommandEvent::new(
+                            CommandKind::SetAdminStartup,
+                            None,
+                            CommandOutcome::err(err),
+                        ),
+                    }
+                }
             };
             events.emit(event, reply);
         }

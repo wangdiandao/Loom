@@ -1586,6 +1586,36 @@ impl<B: PlatformBackend> FastLaneRunner<B> {
             EngineCommand::FindFileLocks { path } => {
                 self.dispatch_slow_shell_op(kind, None, SlowShellOp::FindFileLocks(path), reply);
             }
+            EngineCommand::QueryTaskManagerReplacement => {
+                self.dispatch_slow_shell_op(
+                    kind,
+                    None,
+                    SlowShellOp::QueryTaskManagerReplacement,
+                    reply,
+                );
+            }
+            EngineCommand::SetTaskManagerReplacement(enabled) => {
+                self.dispatch_slow_shell_op(
+                    kind,
+                    None,
+                    SlowShellOp::SetTaskManagerReplacement(enabled),
+                    reply,
+                );
+            }
+            EngineCommand::OpenNativeTaskManager => {
+                self.dispatch_slow_shell_op(kind, None, SlowShellOp::OpenNativeTaskManager, reply);
+            }
+            EngineCommand::QueryAdminStartup => {
+                self.dispatch_slow_shell_op(kind, None, SlowShellOp::QueryAdminStartup, reply);
+            }
+            EngineCommand::SetAdminStartup(enabled) => {
+                self.dispatch_slow_shell_op(
+                    kind,
+                    None,
+                    SlowShellOp::SetAdminStartup(enabled),
+                    reply,
+                );
+            }
             EngineCommand::SetWebView2HostGrouping(enabled) => {
                 if self.view_config.webview2_host_grouping != enabled {
                     self.view_config.webview2_host_grouping = enabled;
