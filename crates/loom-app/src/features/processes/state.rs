@@ -70,7 +70,24 @@ pub(crate) fn find_selected_row(
     rows: &[ProcessRowProjection],
     selected_key: Option<ProcessKey>,
 ) -> Option<&ProcessRowProjection> {
+    find_selected_row_fast(rows, selected_key, None)
+}
+
+/// Fast-path variant of [`find_selected_row`] checking `hint_idx` in `O(1)` before scanning.
+#[inline]
+pub(crate) fn find_selected_row_fast(
+    rows: &[ProcessRowProjection],
+    selected_key: Option<ProcessKey>,
+    hint_idx: Option<usize>,
+) -> Option<&ProcessRowProjection> {
     let key = selected_key?;
+    if let Some(idx) = hint_idx
+        && let Some(row) = rows.get(idx)
+        && row.kind == ProcessRowKind::Process
+        && row.key == key
+    {
+        return Some(row);
+    }
     rows.iter()
         .find(|row| row.kind == ProcessRowKind::Process && row.key == key)
 }
@@ -300,8 +317,8 @@ mod tests {
         ];
 
         // Initially at index 2.
-        let found_initial = find_selected_row(&initial_rows, Some(target_key))
-            .expect("target should be found at initial position");
+        let found_initial = find_selected_row_fast(&initial_rows, Some(target_key), Some(2))
+            .expect("target should be found at initial position via O(1) hint");
         assert_eq!(found_initial.key, target_key);
         assert_eq!(found_initial.display_name.as_ref(), "Target App");
 
@@ -326,7 +343,8 @@ mod tests {
             ),
         ];
 
-        let found_reordered = find_selected_row(&reordered_rows, Some(target_key))
+        // Stale hint (index 2 now holds other_key) falls back cleanly to scanning by ProcessKey.
+        let found_reordered = find_selected_row_fast(&reordered_rows, Some(target_key), Some(2))
             .expect("target must stay anchored to ProcessKey after re-sort");
         assert_eq!(found_reordered.key, target_key);
         assert_eq!(found_reordered.display_name.as_ref(), "Target App");

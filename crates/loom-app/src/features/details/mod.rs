@@ -23,8 +23,8 @@ use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableEvent, TableState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _, Size,
-    StyledExt as _, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, ElementExt as _, Icon, IconName, Sizable as _, Size, StyledExt as _,
+    WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
     App, AppContext as _, Bounds, ClipboardItem, Context, Empty, Entity, EntityInputHandler,
@@ -49,14 +49,15 @@ use loom_ui_kit::{
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
 use crate::features::table_columns::{
-    ColumnKey, ColumnSpec, ColumnToggleItem, CopyRowFields, DataTablePane, FnvHasher64,
-    HeaderMenuAction, IconRenderCache, OrderFreezeState, ScrollBurstCoalescer, SortPausedBadge,
-    TableColumnLayout, TableInputBridge, TypeToSearchState, build_column_header_menu,
+    BudgetedIconLookup, ColumnKey, ColumnSpec, ColumnToggleItem, CopyRowFields, DataTablePane,
+    FnvHasher64, HeaderMenuAction, IconRenderCache, ListViewTelemetryKind, OrderFreezeState,
+    ScrollBurstCoalescer, SortPausedBadge, TableColumnLayout, TableInputBridge,
+    ToolbarActionButton, ToolbarActionStyle, TypeToSearchState, build_column_header_menu,
     build_copy_submenu, can_suspend_or_resume_process, dispatch_ignore_leak_path,
     dispatch_restart_explorer, dispatch_suspend_or_resume, expand_chevron_button,
     format_process_name_and_pid, is_explorer_image, leak_ignore_target, leak_warning_badge,
-    open_select_columns_dialog, should_attach_cell_tooltip, spawn_csv_export, webview2_role_badge,
-    webview2_role_label,
+    list_telemetry, open_select_columns_dialog, should_attach_cell_tooltip, spawn_csv_export,
+    webview2_role_badge, webview2_role_label,
 };
 use crate::i18n;
 use crate::shell::{ShellHandle, dialogs};
@@ -1081,6 +1082,7 @@ struct DetailsTableDelegate {
     total_ram_bytes: u64,
     last_rev: u64,
     selected_key: Option<ProcessKey>,
+    selected_row_hint: Option<usize>,
     reanchored_selection: Option<Option<usize>>,
     highlighted_key: Option<ProcessKey>,
     pending_scroll_key: Option<ProcessKey>,
@@ -1090,6 +1092,7 @@ struct DetailsTableDelegate {
     menu_focus_subs: Vec<Subscription>,
     column_layout: TableColumnLayout<DetailsColumn>,
     icon_cache: IconRenderCache,
+    icon_catchup_scheduled: bool,
     semantic_colors: CachedSemanticColors,
     row_cache: RowTextCache,
     user_name_cache: HashMap<String, SharedString>,
@@ -1141,6 +1144,7 @@ impl DetailsTableDelegate {
             total_ram_bytes,
             last_rev,
             selected_key: highlighted_key,
+            selected_row_hint: None,
             reanchored_selection: None,
             highlighted_key,
             pending_scroll_key: highlighted_key,
@@ -1150,6 +1154,7 @@ impl DetailsTableDelegate {
             menu_focus_subs: Vec::new(),
             column_layout,
             icon_cache: IconRenderCache::new(),
+            icon_catchup_scheduled: false,
             semantic_colors: CachedSemanticColors::new(),
             row_cache: RowTextCache::new(),
             user_name_cache: HashMap::new(),
@@ -1301,7 +1306,8 @@ impl DetailsTableDelegate {
 
     fn selected_row(&self) -> Option<&DetailsRowProjection> {
         let sel = self.selected_key?;
-        find_row_index_by_key(&self.details.rows, sel).and_then(|idx| self.details.rows.get(idx))
+        find_row_index_by_key_fast(&self.details.rows, sel, self.selected_row_hint)
+            .and_then(|idx| self.details.rows.get(idx))
     }
 
     fn selected_copy_short(&self) -> Option<String> {
@@ -1455,16 +1461,11 @@ impl DetailsTableDelegate {
     }
 
     fn selected_target(&self) -> Option<ProcessActionTarget> {
-        let sel = self.selected_key?;
-        find_row_index_by_key(&self.details.rows, sel)
-            .and_then(|idx| self.details.rows.get(idx))
-            .map(ProcessActionTarget::from_row)
+        self.selected_row().map(ProcessActionTarget::from_row)
     }
 
     fn has_valid_selection(&self) -> bool {
-        self.selected_key
-            .and_then(|sel| find_row_index_by_key(&self.details.rows, sel))
-            .is_some()
+        self.selected_row().is_some()
     }
 }
 
@@ -1570,6 +1571,7 @@ impl TableDelegate for DetailsTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        self.icon_cache.begin_frame();
         let table_weak = cx.entity().downgrade();
         let bg = cx.theme().secondary.opacity(0.45);
         div()
@@ -1670,9 +1672,10 @@ impl TableDelegate for DetailsTableDelegate {
         &mut self,
         row_ix: usize,
         col_ix: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        list_telemetry().record_render_td(ListViewTelemetryKind::Details);
         let Some(row) = self.details.rows.get(row_ix) else {
             return Empty.into_any_element();
         };
@@ -1699,10 +1702,32 @@ impl TableDelegate for DetailsTableDelegate {
                 };
                 let has_children = is_tree_mode && row.has_children;
                 let is_expanded = row.is_expanded;
-                let icon_image = row
-                    .icon
-                    .as_ref()
-                    .and_then(|icon| self.icon_cache.get_or_insert(icon));
+                let icon_image = row.icon.as_ref().and_then(|icon| {
+                    match self.icon_cache.get_or_insert_budgeted(icon) {
+                        BudgetedIconLookup::Hit(img) => Some(img),
+                        BudgetedIconLookup::Uploaded(img) => {
+                            list_telemetry().record_icon_upload(ListViewTelemetryKind::Details);
+                            Some(img)
+                        }
+                        BudgetedIconLookup::Deferred => {
+                            list_telemetry().record_icon_defer(ListViewTelemetryKind::Details);
+                            if !self.icon_catchup_scheduled {
+                                self.icon_catchup_scheduled = true;
+                                let table_weak = cx.entity().downgrade();
+                                window.on_next_frame(move |_window, cx| {
+                                    let _ = table_weak.update(cx, |table, cx| {
+                                        let d = table.delegate_mut();
+                                        d.icon_catchup_scheduled = false;
+                                        d.icon_cache.begin_frame();
+                                        cx.notify();
+                                    });
+                                });
+                            }
+                            None
+                        }
+                        BudgetedIconLookup::Invalid => None,
+                    }
+                });
                 let toggle_store = self.store.clone();
                 let name = SharedString::from(Arc::clone(&row.name));
                 let wv2_label = row
@@ -2192,6 +2217,7 @@ pub(crate) struct DetailsView {
     _details_lease: ScopedMonitorLease,
     table: Entity<TableState<DetailsTableDelegate>>,
     table_pane: Entity<DataTablePane<DetailsTableDelegate>>,
+    end_task_button: Entity<ToolbarActionButton>,
     table_left_x: Rc<Cell<Pixels>>,
     view_mode: DetailsViewMode,
     highlighted_key: Option<ProcessKey>,
@@ -2367,6 +2393,21 @@ impl DetailsView {
             )
         });
         let has_selection = table.read(cx).delegate().has_valid_selection();
+        let view_weak = cx.entity().downgrade();
+        let end_task_button = cx.new(|_| {
+            ToolbarActionButton::new(
+                "details-end-task",
+                IconName::CircleX,
+                i18n::tr("details.end_task"),
+                ToolbarActionStyle::DangerOutline,
+                has_selection,
+                Rc::new(move |window, cx| {
+                    let _ = view_weak.update(cx, |this, cx| {
+                        this.trigger_end_task_for_selected(window, cx);
+                    });
+                }),
+            )
+        });
 
         let mut subscriptions = Vec::with_capacity(2);
 
@@ -2407,6 +2448,7 @@ impl DetailsView {
                     });
 
                     if should_defer {
+                        list_telemetry().record_scroll_defer(ListViewTelemetryKind::Details);
                         this.pending_snapshot = Some(PendingDetailsSnapshot {
                             rev: revs.details,
                             details: next_details,
@@ -2450,6 +2492,9 @@ impl DetailsView {
                         this.table_pane.update(cx, |pane, cx| {
                             pane.set_accessibility_label(i18n::tr("details.title"), cx);
                         });
+                        this.end_task_button.update(cx, |btn, cx| {
+                            btn.set_label(i18n::tr("details.end_task"), cx);
+                        });
                         cx.notify();
                     }
                 }
@@ -2473,16 +2518,20 @@ impl DetailsView {
                         let d = table.delegate_mut();
                         if d.reanchored_selection == Some(Some(*row_ix)) {
                             d.reanchored_selection = None;
+                            d.selected_row_hint = Some(*row_ix);
                             return d.selected_key.is_some();
                         }
                         d.reanchored_selection = None;
                         d.selected_key = d.details.rows.get(*row_ix).map(|r| r.key);
+                        d.selected_row_hint = d.selected_key.map(|_| *row_ix);
                         d.invalidate_viewport_fingerprint();
                         d.selected_key.is_some()
                     });
                     if this.has_selection != next_has_sel {
                         this.has_selection = next_has_sel;
-                        cx.notify();
+                        this.end_task_button.update(cx, |btn, cx| {
+                            btn.set_enabled(next_has_sel, cx);
+                        });
                     }
                 }
                 TableEvent::RightClickedRow(Some(row_ix)) => {
@@ -2491,6 +2540,7 @@ impl DetailsView {
                         {
                             let d = table.delegate_mut();
                             d.selected_key = key_opt;
+                            d.selected_row_hint = key_opt.map(|_| *row_ix);
                             d.reanchored_selection = None;
                             d.invalidate_viewport_fingerprint();
                         }
@@ -2501,7 +2551,9 @@ impl DetailsView {
                     });
                     if this.has_selection != next_has_sel {
                         this.has_selection = next_has_sel;
-                        cx.notify();
+                        this.end_task_button.update(cx, |btn, cx| {
+                            btn.set_enabled(next_has_sel, cx);
+                        });
                     }
                 }
                 TableEvent::ClearSelection => {
@@ -2509,16 +2561,20 @@ impl DetailsView {
                         let d = table.delegate_mut();
                         if d.reanchored_selection == Some(None) {
                             d.reanchored_selection = None;
+                            d.selected_row_hint = None;
                             return true;
                         }
                         d.reanchored_selection = None;
                         d.selected_key = None;
+                        d.selected_row_hint = None;
                         d.invalidate_viewport_fingerprint();
                         false
                     });
                     if !was_reanchor && this.has_selection {
                         this.has_selection = false;
-                        cx.notify();
+                        this.end_task_button.update(cx, |btn, cx| {
+                            btn.set_enabled(false, cx);
+                        });
                     }
                 }
                 TableEvent::ColumnWidthsChanged(widths) => {
@@ -2546,6 +2602,7 @@ impl DetailsView {
             _details_lease: lease,
             table,
             table_pane,
+            end_task_button,
             table_left_x: Rc::new(Cell::new(px(0.0))),
             view_mode,
             highlighted_key,
@@ -2571,6 +2628,7 @@ impl DetailsView {
         next_ram: u64,
         cx: &mut Context<Self>,
     ) -> bool {
+        let commit_start = Instant::now();
         let (next_view_mode, next_has_sel, table_notified) = self.table.update(cx, |table, cx| {
             let prev_selected_row = table.selected_row();
             let (sort_changed, prev_fp, had_visible_rows, had_pending_scroll) = {
@@ -2598,10 +2656,15 @@ impl DetailsView {
             };
 
             let (view_mode, selected_idx) = {
-                let d = table.delegate();
+                let d = table.delegate_mut();
                 let selected_idx = d.selected_key.and_then(|sel| {
-                    find_row_index_by_key_fast(&d.details.rows, sel, prev_selected_row)
+                    find_row_index_by_key_fast(
+                        &d.details.rows,
+                        sel,
+                        d.selected_row_hint.or(prev_selected_row),
+                    )
                 });
+                d.selected_row_hint = selected_idx;
                 (d.details.view_mode, selected_idx)
             };
 
@@ -2649,9 +2712,20 @@ impl DetailsView {
             )
         });
 
-        if self.view_mode != next_view_mode || self.has_selection != next_has_sel {
-            self.view_mode = next_view_mode;
+        list_telemetry().record_commit(
+            ListViewTelemetryKind::Details,
+            commit_start.elapsed().as_micros() as u64,
+            table_notified,
+        );
+
+        if self.has_selection != next_has_sel {
             self.has_selection = next_has_sel;
+            self.end_task_button.update(cx, |btn, cx| {
+                btn.set_enabled(next_has_sel, cx);
+            });
+        }
+        if self.view_mode != next_view_mode {
+            self.view_mode = next_view_mode;
             cx.notify();
         }
 
@@ -2727,6 +2801,7 @@ impl DetailsView {
             {
                 let d = table.delegate_mut();
                 d.selected_key = Some(resolved_key);
+                d.selected_row_hint = Some(idx);
                 if d.highlighted_key == Some(target) {
                     d.highlighted_key = Some(resolved_key);
                 }
@@ -2755,7 +2830,12 @@ impl DetailsView {
             cx.notify();
             table.delegate().has_valid_selection()
         });
-        self.has_selection = next_has_sel;
+        if self.has_selection != next_has_sel {
+            self.has_selection = next_has_sel;
+            self.end_task_button.update(cx, |btn, cx| {
+                btn.set_enabled(next_has_sel, cx);
+            });
+        }
         cx.notify();
     }
 
@@ -2812,7 +2892,6 @@ impl Render for DetailsView {
 
         let view_mode = self.view_mode;
         let highlighted_key = self.highlighted_key;
-        let has_selection = self.has_selection;
         let preedit_badge: Option<String> = self
             .type_to_search
             .preedit_text()
@@ -2949,18 +3028,7 @@ impl Render for DetailsView {
                                 );
                             }),
                     )
-                    .child(
-                        Button::new("details-end-task")
-                            .small()
-                            .danger()
-                            .outline()
-                            .icon(IconName::CircleX)
-                            .label(i18n::tr("details.end_task"))
-                            .disabled(!has_selection)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.trigger_end_task_for_selected(window, cx);
-                            })),
-                    ),
+                    .child(self.end_task_button.clone()),
             );
 
         let highlight_banner = highlighted_key.map(|key| {

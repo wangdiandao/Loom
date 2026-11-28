@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,7 +18,8 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::table::{DataTable, TableDelegate, TableState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, Size, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, WindowExt as _, h_flex,
+    v_flex,
 };
 use gpui_kit::{
     App, AppContext as _, Bounds, ClickEvent, ClipboardItem, Context, Element, ElementId,
@@ -40,6 +42,27 @@ use crate::i18n;
 
 /// Maximum number of cached GPUI [`RenderImage`] icons retained by [`IconRenderCache`].
 pub(crate) const MAX_CACHED_ICONS: usize = 512;
+
+/// Maximum number of newly decoded icons converted into GPU [`RenderImage`] handles within
+/// a single UI frame before remaining uncached icons defer to the next frame.
+///
+/// Prevents frame-time spikes when rapidly scrolling past dozens of never-seen processes;
+/// cache hits consume zero budget.
+pub(crate) const MAX_ICON_UPLOADS_PER_FRAME: usize = 6;
+
+/// Outcome of a budgeted [`IconRenderCache::get_or_insert_budgeted`] lookup.
+#[derive(Clone)]
+pub(crate) enum BudgetedIconLookup {
+    /// Icon was already cached (consumed zero frame upload budget).
+    Hit(Arc<RenderImage>),
+    /// Icon was converted and uploaded within the current frame's budget.
+    Uploaded(Arc<RenderImage>),
+    /// Per-frame upload budget was exhausted; caller should render a lightweight placeholder
+    /// and schedule a next-frame catch-up pass.
+    Deferred,
+    /// Underlying RGBA payload was invalid and could not be converted.
+    Invalid,
+}
 
 /// Unique key identifying an [`ExeIconRgba`] buffer by pointer address and dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -68,30 +91,64 @@ struct IconCacheEntry {
     image: Arc<RenderImage>,
 }
 
-/// Bounded local cache mapping unique [`ExeIconRgba`] buffers to GPUI [`RenderImage`] handles.
+/// Bounded local cache mapping unique [`ExeIconRgba`] buffers to GPUI [`RenderImage`] handles
+/// with optional per-frame upload budgeting to avoid GPU texture upload spikes during fast scrolling.
 ///
 /// Prevents re-swapping RGBA -> BGRA pixels and re-uploading textures on every frame.
-#[derive(Default)]
 pub(crate) struct IconRenderCache {
     entries: HashMap<IconCacheKey, IconCacheEntry>,
     max_entries: usize,
+    max_uploads_per_frame: usize,
+    uploads_this_frame: usize,
+    deferred_this_frame: bool,
+}
+
+impl Default for IconRenderCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IconRenderCache {
-    /// Creates a new bounded [`IconRenderCache`] capped at [`MAX_CACHED_ICONS`].
+    /// Creates a new bounded [`IconRenderCache`] capped at [`MAX_CACHED_ICONS`] and
+    /// [`MAX_ICON_UPLOADS_PER_FRAME`] new uploads per frame.
     pub(crate) fn new() -> Self {
-        Self::with_capacity(MAX_CACHED_ICONS)
+        Self::with_limits(MAX_CACHED_ICONS, MAX_ICON_UPLOADS_PER_FRAME)
     }
 
     /// Creates a new bounded [`IconRenderCache`] with a custom capacity ceiling.
+    #[cfg(test)]
     pub(crate) fn with_capacity(max_entries: usize) -> Self {
+        Self::with_limits(max_entries, MAX_ICON_UPLOADS_PER_FRAME)
+    }
+
+    /// Creates a new bounded [`IconRenderCache`] with custom capacity and per-frame upload budget.
+    pub(crate) fn with_limits(max_entries: usize, max_uploads_per_frame: usize) -> Self {
         Self {
             entries: HashMap::new(),
             max_entries: max_entries.max(1),
+            max_uploads_per_frame: max_uploads_per_frame.max(1),
+            uploads_this_frame: 0,
+            deferred_this_frame: false,
         }
     }
 
-    /// Returns a cached [`Arc<RenderImage>`] for `icon`, converting it once on cache miss.
+    /// Resets the per-frame GPU icon upload budget at the start of a new frame.
+    #[inline]
+    pub(crate) fn begin_frame(&mut self) {
+        self.uploads_this_frame = 0;
+        self.deferred_this_frame = false;
+    }
+
+    /// Returns whether at least one uncached icon was deferred during the current frame.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) const fn has_deferred_uploads(&self) -> bool {
+        self.deferred_this_frame
+    }
+
+    /// Returns a cached [`Arc<RenderImage>`] for `icon`, converting it unconditionally on miss.
+    #[cfg(test)]
     pub(crate) fn get_or_insert(&mut self, icon: &ExeIconRgba) -> Option<Arc<RenderImage>> {
         let key = IconCacheKey::from_icon(icon);
         if let Some(entry) = self.entries.get(&key)
@@ -117,6 +174,46 @@ impl IconRenderCache {
             },
         );
         Some(rendered)
+    }
+
+    /// Returns a cached [`Arc<RenderImage>`] for `icon` while enforcing the per-frame upload budget.
+    ///
+    /// Cache hits always return [`BudgetedIconLookup::Hit`] without consuming budget. Cache misses
+    /// beyond `max_uploads_per_frame` return [`BudgetedIconLookup::Deferred`] so the caller can
+    /// render a lightweight placeholder icon and schedule a next-frame catch-up pass.
+    pub(crate) fn get_or_insert_budgeted(&mut self, icon: &ExeIconRgba) -> BudgetedIconLookup {
+        let key = IconCacheKey::from_icon(icon);
+        if let Some(entry) = self.entries.get(&key)
+            && entry
+                .source
+                .upgrade()
+                .is_some_and(|existing| Arc::ptr_eq(&existing, &icon.rgba))
+        {
+            return BudgetedIconLookup::Hit(Arc::clone(&entry.image));
+        }
+
+        if self.uploads_this_frame >= self.max_uploads_per_frame {
+            self.deferred_this_frame = true;
+            return BudgetedIconLookup::Deferred;
+        }
+
+        let Some(rendered) = rgba_icon_to_render_image(icon) else {
+            return BudgetedIconLookup::Invalid;
+        };
+
+        if self.entries.len() >= self.max_entries {
+            self.prune();
+        }
+
+        self.entries.insert(
+            key,
+            IconCacheEntry {
+                source: Arc::downgrade(&icon.rgba),
+                image: Arc::clone(&rendered),
+            },
+        );
+        self.uploads_this_frame += 1;
+        BudgetedIconLookup::Uploaded(rendered)
     }
 
     /// Reclaims entries whose underlying `ExeIconRgba` buffer was dropped, or clears
@@ -894,6 +991,318 @@ impl Render for SortPausedBadge {
         let color = self.semantic_colors.get_copy(cx.theme()).sort_paused;
         sort_paused_indicator((self.id_prefix, self.col_ix), color, self.tooltip.clone())
             .into_any_element()
+    }
+}
+
+/// Visual styling mode for an isolated [`ToolbarActionButton`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolbarActionStyle {
+    /// Solid danger button when enabled, outline when disabled (Processes toolbar).
+    DangerWhenEnabled,
+    /// Outlined danger button in both states (Details toolbar).
+    DangerOutline,
+}
+
+/// Callback triggered when an isolated [`ToolbarActionButton`] is clicked.
+pub(crate) type ToolbarActionClick = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// Isolated GPUI Entity rendering a single selection-sensitive toolbar button
+/// (such as **End task** in `ProcessesView` and `DetailsView`).
+///
+/// Hosting selection-dependent enablement in its own small entity mirrors Zed's
+/// fine-grained status/action views: moving selection up/down or clicking a row
+/// notifies only this button instead of re-rendering the enclosing page toolbar.
+pub(crate) struct ToolbarActionButton {
+    id: SharedString,
+    icon: IconName,
+    label: SharedString,
+    style: ToolbarActionStyle,
+    enabled: bool,
+    on_click: ToolbarActionClick,
+}
+
+impl ToolbarActionButton {
+    /// Creates a new [`ToolbarActionButton`] with initial enablement and click handler.
+    pub(crate) fn new(
+        id: impl Into<SharedString>,
+        icon: IconName,
+        label: impl Into<SharedString>,
+        style: ToolbarActionStyle,
+        enabled: bool,
+        on_click: ToolbarActionClick,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            icon,
+            label: label.into(),
+            style,
+            enabled,
+            on_click,
+        }
+    }
+
+    /// Updates enablement, notifying GPUI only when state actually changes.
+    pub(crate) fn set_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.enabled != enabled {
+            self.enabled = enabled;
+            cx.notify();
+        }
+    }
+
+    /// Updates the localized button label (e.g. after a live language switch).
+    pub(crate) fn set_label(&mut self, label: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let next = label.into();
+        if self.label != next {
+            self.label = next;
+            cx.notify();
+        }
+    }
+
+    /// Returns whether this action button is currently enabled.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+impl Render for ToolbarActionButton {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let on_click = Rc::clone(&self.on_click);
+        let button = Button::new(self.id.clone()).small();
+        let styled = match self.style {
+            ToolbarActionStyle::DangerWhenEnabled => {
+                if self.enabled {
+                    button.danger()
+                } else {
+                    button.outline()
+                }
+            }
+            ToolbarActionStyle::DangerOutline => button.danger().outline(),
+        };
+        styled
+            .icon(self.icon.clone())
+            .label(self.label.clone())
+            .disabled(!self.enabled)
+            .on_click(move |_, window, cx| {
+                on_click(window, cx);
+            })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Zero-allocation atomic list-rendering telemetry (120Hz frame-budget diagnostics)
+// ---------------------------------------------------------------------------
+
+/// High-frequency virtualized table views tracked by [`ListTelemetryRegistry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub(crate) enum ListViewTelemetryKind {
+    Processes = 0,
+    Details = 1,
+}
+
+impl ListViewTelemetryKind {
+    #[inline]
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    #[inline]
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Processes => "Processes",
+            Self::Details => "Details",
+        }
+    }
+}
+
+/// Immutable point-in-time snapshot of one table's rendering telemetry counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ListTelemetrySnapshot {
+    pub(crate) commits: u64,
+    pub(crate) viewport_fp_skips: u64,
+    pub(crate) scroll_defers: u64,
+    pub(crate) icon_uploads: u64,
+    pub(crate) icon_defers: u64,
+    pub(crate) last_commit_us: u64,
+    pub(crate) max_commit_us: u64,
+    pub(crate) render_td_calls: u64,
+}
+
+struct ListViewTelemetryCounters {
+    commits: AtomicU64,
+    viewport_fp_skips: AtomicU64,
+    scroll_defers: AtomicU64,
+    icon_uploads: AtomicU64,
+    icon_defers: AtomicU64,
+    last_commit_us: AtomicU64,
+    max_commit_us: AtomicU64,
+    render_td_calls: AtomicU64,
+}
+
+impl ListViewTelemetryCounters {
+    const fn new() -> Self {
+        Self {
+            commits: AtomicU64::new(0),
+            viewport_fp_skips: AtomicU64::new(0),
+            scroll_defers: AtomicU64::new(0),
+            icon_uploads: AtomicU64::new(0),
+            icon_defers: AtomicU64::new(0),
+            last_commit_us: AtomicU64::new(0),
+            max_commit_us: AtomicU64::new(0),
+            render_td_calls: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn snapshot(&self) -> ListTelemetrySnapshot {
+        ListTelemetrySnapshot {
+            commits: self.commits.load(Ordering::Relaxed),
+            viewport_fp_skips: self.viewport_fp_skips.load(Ordering::Relaxed),
+            scroll_defers: self.scroll_defers.load(Ordering::Relaxed),
+            icon_uploads: self.icon_uploads.load(Ordering::Relaxed),
+            icon_defers: self.icon_defers.load(Ordering::Relaxed),
+            last_commit_us: self.last_commit_us.load(Ordering::Relaxed),
+            max_commit_us: self.max_commit_us.load(Ordering::Relaxed),
+            render_td_calls: self.render_td_calls.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Lock-free, zero-allocation atomic counter registry tracking UI frame-budget efficiency
+/// for high-frequency virtualized tables.
+///
+/// Contains strictly aggregate numeric counters (no PIDs, names, or paths) and is safe to
+/// surface in `tracing::debug!` logs and the privacy-safe Diagnostic Summary.
+pub(crate) struct ListTelemetryRegistry {
+    views: [ListViewTelemetryCounters; 2],
+}
+
+static LIST_TELEMETRY: ListTelemetryRegistry = ListTelemetryRegistry::new();
+
+/// Returns the process-wide [`ListTelemetryRegistry`].
+#[inline]
+pub(crate) fn list_telemetry() -> &'static ListTelemetryRegistry {
+    &LIST_TELEMETRY
+}
+
+impl ListTelemetryRegistry {
+    /// Creates a zeroed [`ListTelemetryRegistry`].
+    pub(crate) const fn new() -> Self {
+        Self {
+            views: [
+                ListViewTelemetryCounters::new(),
+                ListViewTelemetryCounters::new(),
+            ],
+        }
+    }
+
+    /// Records a `commit_snapshot` completion, its wall duration in microseconds, and
+    /// whether the viewport fingerprint check triggered a repaint (`table_notified`).
+    #[inline]
+    pub(crate) fn record_commit(
+        &self,
+        kind: ListViewTelemetryKind,
+        duration_us: u64,
+        table_notified: bool,
+    ) {
+        let c = &self.views[kind.index()];
+        let commits = c.commits.fetch_add(1, Ordering::Relaxed) + 1;
+        if !table_notified {
+            c.viewport_fp_skips.fetch_add(1, Ordering::Relaxed);
+        }
+        c.last_commit_us.store(duration_us, Ordering::Relaxed);
+        c.max_commit_us.fetch_max(duration_us, Ordering::Relaxed);
+
+        if commits.is_multiple_of(64) {
+            let snap = c.snapshot();
+            tracing::debug!(
+                view = kind.label(),
+                commits = snap.commits,
+                fp_skips = snap.viewport_fp_skips,
+                scroll_defers = snap.scroll_defers,
+                icon_uploads = snap.icon_uploads,
+                icon_defers = snap.icon_defers,
+                last_commit_us = snap.last_commit_us,
+                max_commit_us = snap.max_commit_us,
+                render_td_calls = snap.render_td_calls,
+                "list render telemetry sample"
+            );
+        }
+    }
+
+    /// Records a snapshot deferred during an active scroll burst.
+    #[inline]
+    pub(crate) fn record_scroll_defer(&self, kind: ListViewTelemetryKind) {
+        self.views[kind.index()]
+            .scroll_defers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a newly converted GPU `RenderImage` icon upload.
+    #[inline]
+    pub(crate) fn record_icon_upload(&self, kind: ListViewTelemetryKind) {
+        self.views[kind.index()]
+            .icon_uploads
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records an uncached icon deferred to the next frame by the per-frame upload cap.
+    #[inline]
+    pub(crate) fn record_icon_defer(&self, kind: ListViewTelemetryKind) {
+        self.views[kind.index()]
+            .icon_defers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a single `TableDelegate::render_td` cell evaluation.
+    #[inline]
+    pub(crate) fn record_render_td(&self, kind: ListViewTelemetryKind) {
+        self.views[kind.index()]
+            .render_td_calls
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reads an atomic snapshot of counters for `kind`.
+    #[inline]
+    pub(crate) fn snapshot(&self, kind: ListViewTelemetryKind) -> ListTelemetrySnapshot {
+        self.views[kind.index()].snapshot()
+    }
+
+    /// Formats a privacy-safe single-line diagnostic summary across views that recorded
+    /// at least one snapshot commit, or `None` if no list commits have occurred yet.
+    pub(crate) fn format_diagnostic_line(&self) -> Option<String> {
+        use std::fmt::Write as _;
+
+        let mut parts: Vec<String> = Vec::with_capacity(2);
+        for kind in [
+            ListViewTelemetryKind::Processes,
+            ListViewTelemetryKind::Details,
+        ] {
+            let s = self.snapshot(kind);
+            if s.commits == 0 {
+                continue;
+            }
+            let mut seg = String::with_capacity(96);
+            let _ = write!(
+                seg,
+                "{}(commits={}, fp_skips={}, scroll_defers={}, icon_uploads={}, icon_defers={}, max_commit={}us)",
+                kind.label(),
+                s.commits,
+                s.viewport_fp_skips,
+                s.scroll_defers,
+                s.icon_uploads,
+                s.icon_defers,
+                s.max_commit_us,
+            );
+            parts.push(seg);
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("; "))
+        }
     }
 }
 
@@ -2403,5 +2812,89 @@ mod tests {
         // Texts exceeding DEFAULT_CELL_PREVIEW_CHARS always attach tooltip regardless of width.
         let huge = "a".repeat(DEFAULT_CELL_PREVIEW_CHARS + 10);
         assert!(should_attach_cell_tooltip(&huge, 5000.0));
+    }
+
+    #[test]
+    fn icon_render_cache_enforces_per_frame_upload_budget_and_zero_cost_hits() {
+        let mut cache = IconRenderCache::with_limits(16, 2);
+        let mk_icon = |seed: u8| ExeIconRgba {
+            width: 2,
+            height: 2,
+            rgba: Arc::from([seed; 16]),
+        };
+
+        let icon1 = mk_icon(1);
+        let icon2 = mk_icon(2);
+        let icon3 = mk_icon(3);
+
+        // Frame 1: first two uncached icons upload, cache hits consume zero budget,
+        // third uncached icon defers.
+        cache.begin_frame();
+        assert!(matches!(
+            cache.get_or_insert_budgeted(&icon1),
+            BudgetedIconLookup::Uploaded(_)
+        ));
+        assert!(matches!(
+            cache.get_or_insert_budgeted(&icon1),
+            BudgetedIconLookup::Hit(_)
+        ));
+        assert!(matches!(
+            cache.get_or_insert_budgeted(&icon2),
+            BudgetedIconLookup::Uploaded(_)
+        ));
+        assert!(!cache.has_deferred_uploads());
+        assert!(matches!(
+            cache.get_or_insert_budgeted(&icon3),
+            BudgetedIconLookup::Deferred
+        ));
+        assert!(cache.has_deferred_uploads());
+        assert_eq!(cache.len(), 2);
+
+        // Frame 2: budget resets, icon1/icon2 hit cache, icon3 uploads cleanly with no defer.
+        cache.begin_frame();
+        assert!(!cache.has_deferred_uploads());
+        assert!(matches!(
+            cache.get_or_insert_budgeted(&icon1),
+            BudgetedIconLookup::Hit(_)
+        ));
+        assert!(matches!(
+            cache.get_or_insert_budgeted(&icon2),
+            BudgetedIconLookup::Hit(_)
+        ));
+        assert!(matches!(
+            cache.get_or_insert_budgeted(&icon3),
+            BudgetedIconLookup::Uploaded(_)
+        ));
+        assert!(!cache.has_deferred_uploads());
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn list_telemetry_registry_records_counters_and_formats_privacy_safe_line() {
+        let reg = ListTelemetryRegistry::new();
+        assert!(reg.format_diagnostic_line().is_none());
+
+        reg.record_commit(ListViewTelemetryKind::Processes, 180, true);
+        reg.record_commit(ListViewTelemetryKind::Processes, 95, false);
+        reg.record_scroll_defer(ListViewTelemetryKind::Processes);
+        reg.record_icon_upload(ListViewTelemetryKind::Processes);
+        reg.record_icon_defer(ListViewTelemetryKind::Processes);
+        reg.record_render_td(ListViewTelemetryKind::Processes);
+
+        let snap = reg.snapshot(ListViewTelemetryKind::Processes);
+        assert_eq!(snap.commits, 2);
+        assert_eq!(snap.viewport_fp_skips, 1);
+        assert_eq!(snap.scroll_defers, 1);
+        assert_eq!(snap.icon_uploads, 1);
+        assert_eq!(snap.icon_defers, 1);
+        assert_eq!(snap.last_commit_us, 95);
+        assert_eq!(snap.max_commit_us, 180);
+        assert_eq!(snap.render_td_calls, 1);
+
+        let line = reg
+            .format_diagnostic_line()
+            .expect("non-zero commits produce telemetry line");
+        assert!(line.contains("Processes(commits=2, fp_skips=1, scroll_defers=1, icon_uploads=1, icon_defers=1, max_commit=180us)"));
+        assert!(!line.contains("Details("));
     }
 }

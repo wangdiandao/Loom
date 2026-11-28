@@ -10,6 +10,8 @@ use loom_config::AppSettings;
 use loom_types::{AppSnapshot, LanguagePreference, RefreshSpeed, ThemePreference};
 use loom_ui_kit::format_bytes;
 
+use crate::features::table_columns::{ListTelemetryRegistry, list_telemetry};
+
 /// Builds a concise, privacy-safe plain-text system and configuration summary
 /// suitable for pasting into GitHub issues or bug reports.
 ///
@@ -22,6 +24,14 @@ use loom_ui_kit::format_bytes;
 /// - IPv4/IPv6 addresses, DNS suffixes, and network interface LUIDs
 /// - PCI bus locations, GPU LUIDs, and hardware serial numbers
 pub(crate) fn build_diagnostic_summary(snapshot: &AppSnapshot, settings: &AppSettings) -> String {
+    build_diagnostic_summary_with_telemetry(snapshot, settings, list_telemetry())
+}
+
+fn build_diagnostic_summary_with_telemetry(
+    snapshot: &AppSnapshot,
+    settings: &AppSettings,
+    telemetry: &ListTelemetryRegistry,
+) -> String {
     let version = env!("CARGO_PKG_VERSION");
     let os_name = if snapshot.platform.os_name.is_empty() {
         std::env::consts::OS
@@ -108,6 +118,9 @@ pub(crate) fn build_diagnostic_summary(snapshot: &AppSnapshot, settings: &AppSet
     let _ = writeln!(out, "Refresh Speed: {refresh_label}");
     let _ = writeln!(out, "Theme: {theme_label} (Accent: {accent_label})");
     let _ = write!(out, "Language: {language_label}");
+    if let Some(telemetry_line) = telemetry.format_diagnostic_line() {
+        let _ = write!(out, "\nList Render Telemetry: {telemetry_line}");
+    }
     out
 }
 
@@ -273,6 +286,19 @@ mod tests {
         assert!(summary.contains("Refresh Speed: High (0.5s)"));
         assert!(summary.contains("Theme: Dark"));
         assert!(summary.contains("Language: zh-CN"));
+
+        // Non-empty list telemetry appends strictly aggregate privacy-safe counters.
+        let telemetry = crate::features::table_columns::ListTelemetryRegistry::new();
+        telemetry.record_commit(
+            crate::features::table_columns::ListViewTelemetryKind::Processes,
+            240,
+            false,
+        );
+        let summary_with_tel =
+            super::build_diagnostic_summary_with_telemetry(&snapshot, &settings, &telemetry);
+        assert!(summary_with_tel.contains(
+            "List Render Telemetry: Processes(commits=1, fp_skips=1, scroll_defers=0, icon_uploads=0, icon_defers=0, max_commit=240us)"
+        ));
 
         // Sensitive fields must NEVER appear anywhere in the summary.
         let forbidden = [

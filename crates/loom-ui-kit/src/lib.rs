@@ -20,19 +20,19 @@ pub mod theme;
 
 pub use format::{
     CHILD_COUNT_TABLE_MAX, DEFAULT_CELL_PREVIEW_CHARS, HeatmapLevel, MetricDisplay,
-    SMALL_U32_TABLE_MAX, UNAVAILABLE_LABEL, adaptive_network_scale, adaptive_throughput_scale,
-    cap_single_line_preview, display_preview_shared, format_bits_per_sec, format_bytes,
-    format_bytes_metric, format_bytes_shared, format_child_count_shared, format_cpu_time,
-    format_cpu_time_shared, format_disk_cell, format_disk_cell_metric, format_disk_cell_shared,
-    format_freq_ghz, format_latency_us, format_memory_cell, format_memory_cell_metric,
-    format_memory_cell_shared, format_network_cell, format_network_cell_metric,
-    format_network_cell_shared, format_network_rate_mbps, format_network_rate_mbps_metric,
-    format_network_rate_mbps_shared, format_opt_percent_permille, format_opt_temp_celsius,
-    format_permille, format_permille_metric, format_permille_shared, format_rate_bytes_per_sec,
-    format_rate_bytes_per_sec_metric, format_rate_bytes_per_sec_shared, format_signed_bytes,
-    format_signed_bytes_metric, format_u32_shared, format_uptime, quantize_bytes_display,
-    quantize_cpu_time_secs, quantize_net_bps_display, quantize_rate_bps_display,
-    quantize_signed_bytes_display,
+    SMALL_U32_TABLE_MAX, TENTHS_TABLE_MAX, UNAVAILABLE_LABEL, adaptive_network_scale,
+    adaptive_throughput_scale, cap_single_line_preview, display_preview_shared,
+    format_bits_per_sec, format_bytes, format_bytes_metric, format_bytes_shared,
+    format_child_count_shared, format_cpu_time, format_cpu_time_shared, format_disk_cell,
+    format_disk_cell_metric, format_disk_cell_shared, format_freq_ghz, format_latency_us,
+    format_memory_cell, format_memory_cell_metric, format_memory_cell_shared, format_network_cell,
+    format_network_cell_metric, format_network_cell_shared, format_network_rate_mbps,
+    format_network_rate_mbps_metric, format_network_rate_mbps_shared, format_opt_percent_permille,
+    format_opt_temp_celsius, format_permille, format_permille_metric, format_permille_shared,
+    format_rate_bytes_per_sec, format_rate_bytes_per_sec_metric, format_rate_bytes_per_sec_shared,
+    format_signed_bytes, format_signed_bytes_metric, format_tenths_shared, format_u32_shared,
+    format_uptime, quantize_bytes_display, quantize_cpu_time_secs, quantize_net_bps_display,
+    quantize_rate_bps_display, quantize_signed_bytes_display,
 };
 pub use heatmap::{heatmap_cell, heatmap_cell_metric, heatmap_cell_mono};
 pub use icon::rgba_icon_to_render_image;
@@ -968,7 +968,10 @@ mod tests {
             assert_eq!(a.as_ref(), n.to_string());
             assert_eq!(a, b);
         }
-        assert_eq!(format_u32_shared(SMALL_U32_TABLE_MAX + 1).as_ref(), "513");
+        assert_eq!(
+            format_u32_shared(SMALL_U32_TABLE_MAX + 1).as_ref(),
+            (SMALL_U32_TABLE_MAX + 1).to_string()
+        );
         assert_eq!(format_u32_shared(u32::MAX).as_ref(), u32::MAX.to_string());
 
         for c in 0..=CHILD_COUNT_TABLE_MAX {
@@ -1537,5 +1540,47 @@ mod tests {
                 let _ = before_primary;
             }
         }
+    }
+
+    #[test]
+    fn chunked_tenths_and_signed_delta_tables_cover_ranges_and_fallbacks() {
+        // Extended small u32 LUT covers up to 1024 (all B/KB/Bps integer ranges).
+        let u1 = format_u32_shared(1024);
+        let u2 = format_u32_shared(1024);
+        assert_eq!(u1.as_ref(), "1024");
+        assert_eq!(u1, u2);
+
+        // Chunked tenths LUT covers 0.0..=1029.9 accurately across chunk boundaries.
+        for sample in [0u64, 9, 10, 99, 100, 124, 3670, 9999, TENTHS_TABLE_MAX] {
+            let expected = format!("{}.{}", sample / 10, sample % 10);
+            let a = format_tenths_shared(sample);
+            let b = format_tenths_shared(sample);
+            assert_eq!(a.as_ref(), expected);
+            assert_eq!(a, b);
+        }
+
+        // Values above TENTHS_TABLE_MAX fall back cleanly.
+        assert_eq!(
+            format_tenths_shared(TENTHS_TABLE_MAX + 1).as_ref(),
+            "1030.0"
+        );
+
+        // Signed byte deltas cover both integer B/KB and tenths MB/GB/TB ranges.
+        let p_kb1 = format_signed_bytes_metric(512 * 1024);
+        let p_kb2 = format_signed_bytes_metric(512 * 1024);
+        assert_eq!(p_kb1.value.as_ref(), "+512");
+        assert_eq!(p_kb1.unit, " KB");
+        assert_eq!(p_kb1, p_kb2);
+
+        let n_mb1 = format_signed_bytes_metric(-(15 * 1024 * 1024) / 10);
+        let n_mb2 = format_signed_bytes_metric(-(15 * 1024 * 1024) / 10);
+        assert_eq!(n_mb1.value.as_ref(), "-1.5");
+        assert_eq!(n_mb1.unit, " MB");
+        assert_eq!(n_mb1, n_mb2);
+
+        // Large signed deltas beyond table bounds still format accurately.
+        let huge = format_signed_bytes_metric(250 * 1024 * 1024);
+        assert_eq!(huge.value.as_ref(), "+250.0");
+        assert_eq!(huge.unit, " MB");
     }
 }

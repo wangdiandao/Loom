@@ -20,8 +20,8 @@ use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableEvent, TableState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _, Size,
-    StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, ElementExt as _, Icon, IconName, Sizable as _, Size, StyledExt as _, h_flex,
+    v_flex,
 };
 use gpui_kit::{
     App, AppContext as _, Bounds, ClipboardItem, Context, Empty, Entity, EntityInputHandler,
@@ -47,23 +47,24 @@ use loom_ui_kit::{
 
 use crate::bridge::{ScopedMonitorLease, UiCommands, UiStore, UiStoreEvent};
 use crate::features::table_columns::{
-    ColumnKey, ColumnSpec, ColumnToggleItem, CopyRowFields, DataTablePane, FnvHasher64,
-    HeaderMenuAction, IconRenderCache, OrderFreezeState, ScrollBurstCoalescer, SortPausedBadge,
-    TableColumnLayout, TableInputBridge, TypeToSearchState, build_column_header_menu,
+    BudgetedIconLookup, ColumnKey, ColumnSpec, ColumnToggleItem, CopyRowFields, DataTablePane,
+    FnvHasher64, HeaderMenuAction, IconRenderCache, ListViewTelemetryKind, OrderFreezeState,
+    ScrollBurstCoalescer, SortPausedBadge, TableColumnLayout, TableInputBridge,
+    ToolbarActionButton, ToolbarActionStyle, TypeToSearchState, build_column_header_menu,
     build_copy_submenu, can_suspend_or_resume_process, dispatch_hide_system_processes,
     dispatch_ignore_leak_path, dispatch_restart_explorer, dispatch_suspend_or_resume,
     expand_chevron_button, is_explorer_image, leak_ignore_target, leak_warning_badge,
-    open_select_columns_dialog, should_attach_cell_tooltip, spawn_csv_export, webview2_role_badge,
-    webview2_role_label,
+    list_telemetry, open_select_columns_dialog, should_attach_cell_tooltip, spawn_csv_export,
+    webview2_role_badge, webview2_role_label,
 };
 use crate::i18n;
 use crate::shell::{ShellHandle, dialogs};
 
 use self::state::{
     ResourceColumn, apply_resource_display_mode, can_terminate_process, find_selected_row,
-    format_process_copy_short, format_process_row_summary, format_process_status_text,
-    is_efficiency_mode_eligible, next_sort_direction, requires_end_task_confirmation,
-    search_online_query, stable_row_id,
+    find_selected_row_fast, format_process_copy_short, format_process_row_summary,
+    format_process_status_text, is_efficiency_mode_eligible, next_sort_direction,
+    requires_end_task_confirmation, search_online_query, stable_row_id,
 };
 
 const PROCESS_HEADER_HEIGHT: f32 = 32.0;
@@ -484,12 +485,14 @@ struct ProcessesTableDelegate {
     net_mode: ResourceDisplayMode,
     column_layout: TableColumnLayout<ProcessColumn>,
     selected_key: Option<ProcessKey>,
+    selected_row_hint: Option<usize>,
     reanchored_selection: Option<Option<usize>>,
     last_right_clicked_col: Option<usize>,
     order_freeze: OrderFreezeState,
     sort_paused_badge: Entity<SortPausedBadge>,
     menu_focus_subs: Vec<Subscription>,
     icon_cache: IconRenderCache,
+    icon_catchup_scheduled: bool,
     semantic_colors: CachedSemanticColors,
     row_cache: RowTextCache,
     section_header_cache: [Option<(usize, SharedString)>; 3],
@@ -540,12 +543,14 @@ impl ProcessesTableDelegate {
             net_mode,
             column_layout,
             selected_key: None,
+            selected_row_hint: None,
             reanchored_selection: None,
             last_right_clicked_col: None,
             order_freeze: OrderFreezeState::default(),
             sort_paused_badge,
             menu_focus_subs: Vec::new(),
             icon_cache: IconRenderCache::new(),
+            icon_catchup_scheduled: false,
             semantic_colors: CachedSemanticColors::new(),
             row_cache: RowTextCache::new(),
             section_header_cache: [None, None, None],
@@ -693,12 +698,14 @@ impl ProcessesTableDelegate {
     }
 
     fn selected_copy_short(&self) -> Option<String> {
-        let row = find_selected_row(&self.slice.rows, self.selected_key)?;
+        let row =
+            find_selected_row_fast(&self.slice.rows, self.selected_key, self.selected_row_hint)?;
         Some(format_process_copy_short(row))
     }
 
     fn selected_copy_summary(&self) -> Option<String> {
-        let row = find_selected_row(&self.slice.rows, self.selected_key)?;
+        let row =
+            find_selected_row_fast(&self.slice.rows, self.selected_key, self.selected_row_hint)?;
         Some(self.format_row_summary(row))
     }
 
@@ -947,6 +954,7 @@ impl TableDelegate for ProcessesTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        self.icon_cache.begin_frame();
         let store = self.store.clone();
         let table_weak = cx.entity().downgrade();
         let bg = cx.theme().secondary.opacity(0.45);
@@ -1055,6 +1063,7 @@ impl TableDelegate for ProcessesTableDelegate {
         window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        list_telemetry().record_render_td(ListViewTelemetryKind::Processes);
         let Some(row) = self.slice.rows.get(row_ix) else {
             return Empty.into_any_element();
         };
@@ -1095,10 +1104,34 @@ impl TableDelegate for ProcessesTableDelegate {
                         let has_children = row.has_children;
                         let is_expanded = row.is_expanded;
                         let is_selected = self.selected_key == Some(key);
-                        let rendered_icon = row
-                            .icon
-                            .as_ref()
-                            .and_then(|icon| self.icon_cache.get_or_insert(icon));
+                        let rendered_icon = row.icon.as_ref().and_then(|icon| {
+                            match self.icon_cache.get_or_insert_budgeted(icon) {
+                                BudgetedIconLookup::Hit(img) => Some(img),
+                                BudgetedIconLookup::Uploaded(img) => {
+                                    list_telemetry()
+                                        .record_icon_upload(ListViewTelemetryKind::Processes);
+                                    Some(img)
+                                }
+                                BudgetedIconLookup::Deferred => {
+                                    list_telemetry()
+                                        .record_icon_defer(ListViewTelemetryKind::Processes);
+                                    if !self.icon_catchup_scheduled {
+                                        self.icon_catchup_scheduled = true;
+                                        let table_weak = cx.entity().downgrade();
+                                        window.on_next_frame(move |_window, cx| {
+                                            let _ = table_weak.update(cx, |table, cx| {
+                                                let d = table.delegate_mut();
+                                                d.icon_catchup_scheduled = false;
+                                                d.icon_cache.begin_frame();
+                                                cx.notify();
+                                            });
+                                        });
+                                    }
+                                    None
+                                }
+                                BudgetedIconLookup::Invalid => None,
+                            }
+                        });
                         let display_name = SharedString::from(Arc::clone(&row.display_name));
                         let child_badge: Option<SharedString> = (row.child_count > 0)
                             .then(|| format_child_count_shared(row.child_count));
@@ -1482,6 +1515,7 @@ pub(crate) struct ProcessesView {
     _processes_lease: ScopedMonitorLease,
     table: Entity<TableState<ProcessesTableDelegate>>,
     table_pane: Entity<DataTablePane<ProcessesTableDelegate>>,
+    end_task_button: Entity<ToolbarActionButton>,
     table_left_x: Rc<Cell<Pixels>>,
     process_net_lease: Option<ScopedMonitorLease>,
     view_mode: ProcessViewMode,
@@ -1661,6 +1695,21 @@ impl ProcessesView {
                 i18n::tr("processes.title"),
             )
         });
+        let view_weak = cx.entity().downgrade();
+        let end_task_button = cx.new(|_| {
+            ToolbarActionButton::new(
+                "processes-end-task",
+                IconName::CircleX,
+                i18n::tr("processes.end_task"),
+                ToolbarActionStyle::DangerWhenEnabled,
+                false,
+                Rc::new(move |window, cx| {
+                    let _ = view_weak.update(cx, |this, cx| {
+                        this.trigger_end_task_for_selected(window, cx);
+                    });
+                }),
+            )
+        });
 
         let mut subscriptions = Vec::with_capacity(2);
 
@@ -1697,6 +1746,7 @@ impl ProcessesView {
                     });
 
                     if should_defer {
+                        list_telemetry().record_scroll_defer(ListViewTelemetryKind::Processes);
                         this.pending_snapshot = Some(PendingProcessesSnapshot {
                             rev: revs.processes,
                             slice: next_slice,
@@ -1759,6 +1809,9 @@ impl ProcessesView {
                         this.table_pane.update(cx, |pane, cx| {
                             pane.set_accessibility_label(i18n::tr("processes.title"), cx);
                         });
+                        this.end_task_button.update(cx, |btn, cx| {
+                            btn.set_label(i18n::tr("processes.end_task"), cx);
+                        });
                     }
                     if locale_changed || hide_sys_changed {
                         cx.notify();
@@ -1784,6 +1837,7 @@ impl ProcessesView {
                         let d = table.delegate_mut();
                         if d.reanchored_selection == Some(Some(*row_ix)) {
                             d.reanchored_selection = None;
+                            d.selected_row_hint = Some(*row_ix);
                             return d.slice.rows.get(*row_ix).is_some_and(can_terminate_process);
                         }
                         d.reanchored_selection = None;
@@ -1791,17 +1845,21 @@ impl ProcessesView {
                         match d.slice.rows.get(*row_ix) {
                             Some(row) if row.kind == ProcessRowKind::Process => {
                                 d.selected_key = Some(row.key);
+                                d.selected_row_hint = Some(*row_ix);
                                 can_terminate_process(row)
                             }
                             _ => {
                                 d.selected_key = None;
+                                d.selected_row_hint = None;
                                 false
                             }
                         }
                     });
                     if this.end_task_enabled != next_end_enabled {
                         this.end_task_enabled = next_end_enabled;
-                        cx.notify();
+                        this.end_task_button.update(cx, |btn, cx| {
+                            btn.set_enabled(next_end_enabled, cx);
+                        });
                     }
                 }
                 TableEvent::RightClickedRow(Some(row_ix)) => {
@@ -1816,6 +1874,7 @@ impl ProcessesView {
                         {
                             let d = table.delegate_mut();
                             d.selected_key = key_opt;
+                            d.selected_row_hint = key_opt.map(|_| *row_ix);
                             d.reanchored_selection = None;
                             d.invalidate_viewport_fingerprint();
                         }
@@ -1826,7 +1885,9 @@ impl ProcessesView {
                     });
                     if this.end_task_enabled != next_end_enabled {
                         this.end_task_enabled = next_end_enabled;
-                        cx.notify();
+                        this.end_task_button.update(cx, |btn, cx| {
+                            btn.set_enabled(next_end_enabled, cx);
+                        });
                     }
                 }
                 TableEvent::ClearSelection => {
@@ -1834,16 +1895,20 @@ impl ProcessesView {
                         let d = table.delegate_mut();
                         if d.reanchored_selection == Some(None) {
                             d.reanchored_selection = None;
+                            d.selected_row_hint = None;
                             return true;
                         }
                         d.reanchored_selection = None;
                         d.selected_key = None;
+                        d.selected_row_hint = None;
                         d.invalidate_viewport_fingerprint();
                         false
                     });
                     if !was_reanchor && this.end_task_enabled {
                         this.end_task_enabled = false;
-                        cx.notify();
+                        this.end_task_button.update(cx, |btn, cx| {
+                            btn.set_enabled(false, cx);
+                        });
                     }
                 }
                 TableEvent::ColumnWidthsChanged(widths) => {
@@ -1871,6 +1936,7 @@ impl ProcessesView {
             _processes_lease: processes_lease,
             table,
             table_pane,
+            end_task_button,
             table_left_x: Rc::new(Cell::new(px(0.0))),
             process_net_lease: None,
             view_mode,
@@ -1897,6 +1963,7 @@ impl ProcessesView {
         next_platform: PlatformProfile,
         cx: &mut Context<Self>,
     ) -> bool {
+        let commit_start = Instant::now();
         let (next_view_mode, next_end_enabled, table_notified) =
             self.table.update(cx, |table, cx| {
                 let prev_selected_row = table.selected_row();
@@ -1918,9 +1985,13 @@ impl ProcessesView {
                 };
 
                 let (view_mode, selected_idx, end_enabled) = {
-                    let d = table.delegate();
-                    let selected_idx =
-                        find_row_index_fast(&d.slice.rows, d.selected_key, prev_selected_row);
+                    let d = table.delegate_mut();
+                    let selected_idx = find_row_index_fast(
+                        &d.slice.rows,
+                        d.selected_key,
+                        d.selected_row_hint.or(prev_selected_row),
+                    );
+                    d.selected_row_hint = selected_idx;
                     let end_enabled = selected_idx
                         .and_then(|idx| d.slice.rows.get(idx))
                         .is_some_and(can_terminate_process);
@@ -1960,9 +2031,20 @@ impl ProcessesView {
                 (view_mode, end_enabled, should_notify)
             });
 
-        if self.view_mode != next_view_mode || self.end_task_enabled != next_end_enabled {
-            self.view_mode = next_view_mode;
+        list_telemetry().record_commit(
+            ListViewTelemetryKind::Processes,
+            commit_start.elapsed().as_micros() as u64,
+            table_notified,
+        );
+
+        if self.end_task_enabled != next_end_enabled {
             self.end_task_enabled = next_end_enabled;
+            self.end_task_button.update(cx, |btn, cx| {
+                btn.set_enabled(next_end_enabled, cx);
+            });
+        }
+        if self.view_mode != next_view_mode {
+            self.view_mode = next_view_mode;
             cx.notify();
         }
 
@@ -2036,9 +2118,11 @@ impl ProcessesView {
     }
 
     fn trigger_end_task_for_selected(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let selected_key = self.table.read(cx).delegate().selected_key;
-        let slice = Arc::clone(&self.table.read(cx).delegate().slice);
-        let Some(row) = find_selected_row(&slice.rows, selected_key) else {
+        let (selected_key, selected_hint, slice) = {
+            let d = self.table.read(cx).delegate();
+            (d.selected_key, d.selected_row_hint, Arc::clone(&d.slice))
+        };
+        let Some(row) = find_selected_row_fast(&slice.rows, selected_key, selected_hint) else {
             return;
         };
         trigger_end_task_for_row(&self.store, row, window, cx);
@@ -2433,7 +2517,6 @@ impl Render for ProcessesView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view_mode = self.view_mode;
         let hide_system = self.hide_system_processes;
-        let end_task_enabled = self.end_task_enabled;
         let preedit_badge: Option<String> = self
             .type_to_search
             .preedit_text()
@@ -2589,23 +2672,7 @@ impl Render for ProcessesView {
                                 );
                             }),
                     )
-                    .child(
-                        Button::new("processes-end-task")
-                            .small()
-                            .map(|btn| {
-                                if end_task_enabled {
-                                    btn.danger()
-                                } else {
-                                    btn.outline()
-                                }
-                            })
-                            .icon(IconName::CircleX)
-                            .label(i18n::tr("processes.end_task"))
-                            .disabled(!end_task_enabled)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.trigger_end_task_for_selected(window, cx);
-                            })),
-                    ),
+                    .child(self.end_task_button.clone()),
             );
 
         let table_focus = self.table.focus_handle(cx);
@@ -3588,6 +3655,47 @@ mod tests {
                 .is_active(loom_types::MonitorDomain::Processes),
             "mounted ProcessesView must hold MonitorDomain::Processes lease"
         );
+
+        // 7. Selection enablement transitions notify only the isolated ToolbarActionButton
+        //    entity without re-rendering the outer ProcessesView toolbar, and telemetry records
+        //    both commits and viewport fingerprint skips.
+        let outer_notifies = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outer_notifies_clone = Arc::clone(&outer_notifies);
+        let _obs = vcx.update(|_, cx| {
+            cx.observe(&view, move |_, _| {
+                outer_notifies_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
+        let end_btn = view.read_with(&vcx, |this, _| this.end_task_button.clone());
+        assert!(
+            end_btn.read_with(&vcx, |b, _| b.is_enabled()),
+            "end task button should be enabled while row 3 is selected"
+        );
+        table.update(&mut vcx, |t, cx| t.clear_selection(cx));
+        vcx.run_until_parked();
+        assert!(
+            !end_btn.read_with(&vcx, |b, _| b.is_enabled()),
+            "clearing selection must disable isolated end task button"
+        );
+        table.update(&mut vcx, |t, cx| t.set_selected_row(1, cx));
+        vcx.run_until_parked();
+        assert!(
+            end_btn.read_with(&vcx, |b, _| b.is_enabled()),
+            "selecting a terminable row must re-enable isolated end task button"
+        );
+        assert_eq!(
+            table.read_with(&vcx, |t, _| t.delegate().selected_row_hint),
+            Some(1),
+            "selected_row_hint must stay synced with TableEvent::SelectRow"
+        );
+        assert_eq!(
+            outer_notifies.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "selection transitions must not notify the enclosing ProcessesView toolbar"
+        );
+        let tel = super::list_telemetry().snapshot(super::ListViewTelemetryKind::Processes);
+        assert!(tel.commits >= 4);
+        assert!(tel.viewport_fp_skips >= 1);
 
         coordinator_for_shutdown.shutdown();
     }
