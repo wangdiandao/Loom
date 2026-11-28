@@ -1,32 +1,80 @@
-//! CPU detail pane for the Performance view (overall vs logical processors + kernel time overlay).
+//! CPU detail pane for the Performance view (overall vs adaptive logical-core grid + P/E/LP-E colors + kernel time overlay).
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::{
-    Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
-    div, prelude::FluentBuilder as _, px,
+    Context, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    Styled as _, div, prelude::FluentBuilder as _, px,
 };
-use loom_types::PerformanceSlice;
+use loom_types::{CpuCoreKind, HistoryRing, PerformanceSlice};
 use loom_ui_kit::{
-    LoomSemanticColors, format_bytes, format_freq_ghz, format_permille, format_uptime,
+    CoreCardHeaderMode, CoreGridLayout, LoomSemanticColors, format_bytes, format_freq_ghz,
+    format_opt_percent_permille, format_permille, format_uptime,
 };
 
 use crate::features::performance::PerformanceView;
 use crate::features::performance::charts::{
-    MetricStat, SpecRow, build_dual_percent_area_chart, build_percent_area_chart, chart_frame,
-    device_header, dual_history_rings_to_points, history_ring_to_points, legend_swatch,
-    metrics_two_column_panel,
+    HISTORY_WINDOW, MetricStat, SpecRow, build_dual_percent_area_chart, build_percent_area_chart,
+    chart_frame, device_header, dual_history_rings_to_points, history_ring_to_points,
+    legend_swatch, metrics_two_column_panel,
 };
-use crate::features::performance::state::{CpuGraphMode, logical_cpu_grid_columns};
+use crate::features::performance::state::CpuGraphMode;
 use crate::i18n;
+
+/// Returns `true` when `core_kinds` describes a heterogeneous hybrid CPU topology
+/// (at least two distinct non-`Unknown` core classes such as `P` + `E` or `P` + `E` + `LP-E`).
+pub(crate) fn is_hybrid_cpu_topology(core_kinds: &[CpuCoreKind]) -> bool {
+    let mut has_p = false;
+    let mut has_e = false;
+    let mut has_lpe = false;
+    for &kind in core_kinds {
+        match kind {
+            CpuCoreKind::Performance => has_p = true,
+            CpuCoreKind::Efficiency => has_e = true,
+            CpuCoreKind::LowPowerEfficiency => has_lpe = true,
+            CpuCoreKind::Unknown => {}
+        }
+    }
+    usize::from(has_p) + usize::from(has_e) + usize::from(has_lpe) >= 2
+}
+
+/// Maps a logical core's [`CpuCoreKind`] to its semantic accent color when a
+/// hybrid CPU topology is active, or falls back to `colors.chart_cpu` on uniform CPUs.
+#[inline]
+pub(crate) fn core_kind_accent(
+    kind: CpuCoreKind,
+    is_hybrid: bool,
+    colors: &LoomSemanticColors,
+) -> Hsla {
+    if !is_hybrid {
+        return colors.chart_cpu;
+    }
+    match kind {
+        CpuCoreKind::Performance => colors.cpu_core_p,
+        CpuCoreKind::Efficiency => colors.cpu_core_e,
+        CpuCoreKind::LowPowerEfficiency => colors.cpu_core_lp_e,
+        CpuCoreKind::Unknown => colors.chart_cpu,
+    }
+}
+
+/// Returns the compact badge text (`"P"`, `"E"`, `"LP-E"`) for a classified core kind.
+pub(crate) fn core_kind_badge_label(kind: CpuCoreKind) -> Option<String> {
+    match kind {
+        CpuCoreKind::Performance => Some(i18n::tr("perf.perf_polish_core_p")),
+        CpuCoreKind::Efficiency => Some(i18n::tr("perf.perf_polish_core_e")),
+        CpuCoreKind::LowPowerEfficiency => Some(i18n::tr("perf.perf_polish_core_lp_e")),
+        CpuCoreKind::Unknown => None,
+    }
+}
 
 /// Renders the CPU hardware detail pane.
 pub(crate) fn render_cpu_detail(
     perf: &PerformanceSlice,
     mode: CpuGraphMode,
     show_kernel_times: bool,
+    core_grid_layout: CoreGridLayout,
     colors: &LoomSemanticColors,
     cx: &mut Context<PerformanceView>,
 ) -> impl IntoElement {
@@ -91,7 +139,6 @@ pub(crate) fn render_cpu_detail(
         )
         .child(kernel_checkbox);
 
-    let weak_ctx = cx.entity().downgrade();
     let chart_area = div()
         .id("perf-cpu-chart-surface")
         .w_full()
@@ -100,41 +147,8 @@ pub(crate) fn render_cpu_detail(
                 render_overall_cpu_chart(perf, show_kernel_times, colors).into_any_element()
             }
             CpuGraphMode::LogicalProcessors => {
-                render_logical_cpu_grid(perf, colors).into_any_element()
+                render_logical_cpu_grid(perf, core_grid_layout, colors).into_any_element()
             }
-        })
-        .context_menu(move |menu, _window, _cx| {
-            let weak_overall = weak_ctx.clone();
-            let weak_logical = weak_ctx.clone();
-            let weak_kernel = weak_ctx.clone();
-            menu.item(
-                PopupMenuItem::new(i18n::tr("perf.cpu_overall"))
-                    .checked(mode == CpuGraphMode::Overall)
-                    .on_click(move |_, _, cx| {
-                        let _ = weak_overall.update(cx, |view, cx| {
-                            view.set_cpu_graph_mode(CpuGraphMode::Overall, cx);
-                        });
-                    }),
-            )
-            .item(
-                PopupMenuItem::new(i18n::tr("perf.cpu_logical"))
-                    .checked(mode == CpuGraphMode::LogicalProcessors)
-                    .on_click(move |_, _, cx| {
-                        let _ = weak_logical.update(cx, |view, cx| {
-                            view.set_cpu_graph_mode(CpuGraphMode::LogicalProcessors, cx);
-                        });
-                    }),
-            )
-            .separator()
-            .item(
-                PopupMenuItem::new(i18n::tr("perf.cpu_show_kernel"))
-                    .checked(show_kernel_times)
-                    .on_click(move |_, _, cx| {
-                        let _ = weak_kernel.update(cx, |view, cx| {
-                            view.set_show_kernel_times(!show_kernel_times, cx);
-                        });
-                    }),
-            )
         });
 
     let speed_text = if latest.cpu_freq_mhz > 0 {
@@ -240,13 +254,59 @@ pub(crate) fn render_cpu_detail(
         ),
     ];
 
+    let weak_ctx = cx.entity().downgrade();
     v_flex()
+        .id("perf-cpu-detail")
         .w_full()
         .gap_4()
         .child(device_header(i18n::tr("perf.cpu"), brand, None, colors))
         .child(controls_bar)
         .child(chart_area)
         .child(metrics_two_column_panel(left_stats, right_specs, colors))
+        .context_menu(move |menu, _window, _cx| {
+            let weak_overall = weak_ctx.clone();
+            let weak_logical = weak_ctx.clone();
+            let weak_kernel = weak_ctx.clone();
+            let weak_copy = weak_ctx.clone();
+            menu.item(
+                PopupMenuItem::new(i18n::tr("perf.cpu_overall"))
+                    .checked(mode == CpuGraphMode::Overall)
+                    .on_click(move |_, _, cx| {
+                        let _ = weak_overall.update(cx, |view, cx| {
+                            view.set_cpu_graph_mode(CpuGraphMode::Overall, cx);
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(i18n::tr("perf.cpu_logical"))
+                    .checked(mode == CpuGraphMode::LogicalProcessors)
+                    .on_click(move |_, _, cx| {
+                        let _ = weak_logical.update(cx, |view, cx| {
+                            view.set_cpu_graph_mode(CpuGraphMode::LogicalProcessors, cx);
+                        });
+                    }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(i18n::tr("perf.cpu_show_kernel"))
+                    .checked(show_kernel_times)
+                    .on_click(move |_, _, cx| {
+                        let _ = weak_kernel.update(cx, |view, cx| {
+                            view.set_show_kernel_times(!show_kernel_times, cx);
+                        });
+                    }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(i18n::tr("perf.perf_polish_copy_summary")).on_click(
+                    move |_, window, cx| {
+                        let _ = weak_copy.update(cx, |view, cx| {
+                            view.copy_selected_summary(window, cx);
+                        });
+                    },
+                ),
+            )
+        })
 }
 
 fn render_overall_cpu_chart(
@@ -300,8 +360,9 @@ fn render_overall_cpu_chart(
     }
 }
 
-fn render_logical_cpu_grid(
+pub(crate) fn render_logical_cpu_grid(
     perf: &PerformanceSlice,
+    layout: CoreGridLayout,
     colors: &LoomSemanticColors,
 ) -> impl IntoElement {
     let core_count = perf.per_core_history.len();
@@ -323,51 +384,129 @@ fn render_logical_cpu_grid(
             );
     }
 
-    let cols = logical_cpu_grid_columns(core_count);
-    let cell_height = if core_count <= 4 {
-        118.0
-    } else if core_count <= 16 {
-        86.0
-    } else {
-        66.0
+    let cols = layout.columns.max(1);
+    let header_mode = layout.header_mode;
+    let is_hybrid = is_hybrid_cpu_topology(&perf.cpu_info.core_kinds);
+
+    let plot_height = match header_mode {
+        CoreCardHeaderMode::Full => (layout.card_height_px - 32.0).max(32.0),
+        CoreCardHeaderMode::Short => (layout.card_height_px - 22.0).max(28.0),
+        CoreCardHeaderMode::Hidden => (layout.card_height_px - 4.0).max(28.0),
     };
 
     let mut grid = v_flex().w_full().gap_2();
+
+    // When a heterogeneous P/E/LP-E topology is detected, show a compact color legend.
+    if is_hybrid {
+        let has_p = perf.cpu_info.core_kinds.contains(&CpuCoreKind::Performance);
+        let has_e = perf.cpu_info.core_kinds.contains(&CpuCoreKind::Efficiency);
+        let has_lpe = perf
+            .cpu_info
+            .core_kinds
+            .contains(&CpuCoreKind::LowPowerEfficiency);
+        let mut legend_row = h_flex().w_full().flex_wrap().items_center().gap_3();
+        if has_p {
+            legend_row = legend_row.child(legend_swatch(
+                i18n::tr("perf.perf_polish_core_p_legend"),
+                colors.cpu_core_p,
+                colors,
+            ));
+        }
+        if has_e {
+            legend_row = legend_row.child(legend_swatch(
+                i18n::tr("perf.perf_polish_core_e_legend"),
+                colors.cpu_core_e,
+                colors,
+            ));
+        }
+        if has_lpe {
+            legend_row = legend_row.child(legend_swatch(
+                i18n::tr("perf.perf_polish_core_lp_e_legend"),
+                colors.cpu_core_lp_e,
+                colors,
+            ));
+        }
+        grid = grid.child(legend_row);
+    }
+
     for (row_ix, chunk) in perf.per_core_history.chunks(cols).enumerate() {
         let mut row = h_flex().w_full().gap_2();
         for (col_ix, ring) in chunk.iter().enumerate() {
             let core_ix = row_ix * cols + col_ix;
+            let core_kind = perf
+                .cpu_info
+                .core_kinds
+                .get(core_ix)
+                .copied()
+                .unwrap_or(CpuCoreKind::Unknown);
+            let accent = core_kind_accent(core_kind, is_hybrid, colors);
+            let badge_label = is_hybrid
+                .then(|| core_kind_badge_label(core_kind))
+                .flatten();
+
             let live_permille = perf
                 .per_core_permille
                 .get(core_ix)
                 .copied()
-                .or_else(|| ring.latest())
-                .unwrap_or(0);
-            let label = i18n::perf_cpu_core_label(core_ix);
-            let pct_label = if cols >= 8 {
-                format!("{:.0}%", f32::from(live_permille) / 10.0)
-            } else {
-                format_permille(live_permille)
+                .filter(|&v| !HistoryRing::<HISTORY_WINDOW>::is_gap(v))
+                .or_else(|| {
+                    ring.latest()
+                        .filter(|&v| !HistoryRing::<HISTORY_WINDOW>::is_gap(v))
+                });
+
+            let full_label = i18n::perf_cpu_core_label(core_ix);
+            let series_name = match &badge_label {
+                Some(tag) => format!("{full_label} ({tag})"),
+                None => full_label.clone(),
             };
+            let pct_label: SharedString = match (header_mode, live_permille) {
+                (CoreCardHeaderMode::Short, Some(p)) => {
+                    format!("{:.0}%", f32::from(p) / 10.0).into()
+                }
+                (_, opt) => format_opt_percent_permille(opt),
+            };
+
             let points = history_ring_to_points(ring);
             let chart = build_percent_area_chart(
                 SharedString::from(format!("perf-cpu-core-{core_ix}")),
                 points,
-                label.clone(),
-                colors.chart_cpu,
+                series_name,
+                accent,
                 true,
             );
 
-            row = row.child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(colors.chart_cpu.opacity(0.4))
-                    .bg(colors.card_bg)
-                    .overflow_hidden()
-                    .child(
+            let mut card = v_flex()
+                .flex_1()
+                .min_w_0()
+                .rounded_md()
+                .border_1()
+                .border_color(accent.opacity(0.45))
+                .bg(colors.card_bg)
+                .overflow_hidden();
+
+            match header_mode {
+                CoreCardHeaderMode::Full => {
+                    let mut left = h_flex().items_center().gap_1().min_w_0().child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .font_medium()
+                            .text_color(colors.text_muted)
+                            .child(full_label),
+                    );
+                    if let Some(tag) = badge_label {
+                        left = left.child(
+                            div()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(accent.opacity(0.16))
+                                .text_size(px(9.5))
+                                .font_semibold()
+                                .text_color(accent)
+                                .child(tag),
+                        );
+                    }
+                    card = card.child(
                         h_flex()
                             .w_full()
                             .px_1p5()
@@ -375,26 +514,60 @@ fn render_logical_cpu_grid(
                             .items_center()
                             .justify_between()
                             .gap_1()
+                            .child(left)
                             .child(
                                 div()
                                     .flex_shrink_0()
-                                    .text_size(px(if cols >= 8 { 10. } else { 11. }))
-                                    .font_medium()
-                                    .text_color(colors.text_muted)
-                                    .child(label),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(px(if cols >= 8 { 10. } else { 11. }))
+                                    .text_size(px(11.))
                                     .font_semibold()
                                     .text_color(colors.text_primary)
                                     .child(pct_label),
                             ),
-                    )
-                    .child(div().w_full().h(px(cell_height)).child(chart)),
-            );
+                    );
+                }
+                CoreCardHeaderMode::Short => {
+                    let mut left = h_flex().items_center().gap_1().min_w_0().child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(10.))
+                            .font_medium()
+                            .text_color(colors.text_muted)
+                            .child(format!("{core_ix}")),
+                    );
+                    if let Some(tag) = badge_label {
+                        left = left.child(
+                            div()
+                                .text_size(px(9.))
+                                .font_semibold()
+                                .text_color(accent)
+                                .child(tag),
+                        );
+                    }
+                    card = card.child(
+                        h_flex()
+                            .w_full()
+                            .px_1()
+                            .items_center()
+                            .justify_between()
+                            .gap_1()
+                            .child(left)
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(10.))
+                                    .font_semibold()
+                                    .text_color(colors.text_primary)
+                                    .child(pct_label),
+                            ),
+                    );
+                }
+                CoreCardHeaderMode::Hidden => {}
+            }
+
+            card = card.child(div().w_full().h(px(plot_height)).child(chart));
+            row = row.child(card);
         }
+
         // Pad incomplete trailing row so cell widths remain uniform.
         for _ in chunk.len()..cols {
             row = row.child(div().flex_1().min_w_0());
@@ -403,4 +576,54 @@ fn render_logical_cpu_grid(
     }
 
     grid
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::component::{Theme, ThemeColor, ThemeMode};
+    use loom_types::CpuCoreKind;
+    use loom_ui_kit::LoomSemanticColors;
+
+    use super::*;
+
+    #[test]
+    fn hybrid_topology_detection_and_core_kind_colors() {
+        let mut theme = Theme::from(ThemeColor::dark().as_ref());
+        theme.mode = ThemeMode::Dark;
+        let colors = LoomSemanticColors::from_theme(&theme);
+
+        // Uniform / empty topologies are not hybrid.
+        assert!(!is_hybrid_cpu_topology(&[]));
+        assert!(!is_hybrid_cpu_topology(&[CpuCoreKind::Unknown; 8]));
+        assert!(!is_hybrid_cpu_topology(&[CpuCoreKind::Performance; 8]));
+
+        // Hybrid P+E and P+E+LP-E topologies are detected.
+        assert!(is_hybrid_cpu_topology(&[
+            CpuCoreKind::Performance,
+            CpuCoreKind::Efficiency,
+        ]));
+        assert!(is_hybrid_cpu_topology(&[
+            CpuCoreKind::Performance,
+            CpuCoreKind::Efficiency,
+            CpuCoreKind::LowPowerEfficiency,
+        ]));
+
+        // Color mapping distinguishes P, E, and LP-E on hybrid CPUs and falls back on uniform CPUs.
+        assert_eq!(
+            core_kind_accent(CpuCoreKind::Performance, true, &colors),
+            colors.cpu_core_p
+        );
+        assert_eq!(
+            core_kind_accent(CpuCoreKind::Efficiency, true, &colors),
+            colors.cpu_core_e
+        );
+        assert_eq!(
+            core_kind_accent(CpuCoreKind::LowPowerEfficiency, true, &colors),
+            colors.cpu_core_lp_e
+        );
+        assert_eq!(
+            core_kind_accent(CpuCoreKind::Performance, false, &colors),
+            colors.chart_cpu
+        );
+    }
 }

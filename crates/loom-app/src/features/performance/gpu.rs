@@ -1,4 +1,4 @@
-//! GPU detail pane for the Performance view (`2×2` multi-engine / single-engine, VRAM charts, specs).
+//! GPU detail pane for the Performance view (`2×2` multi-engine / single-engine, VRAM charts, honest D3 sleep & specs).
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
@@ -9,7 +9,9 @@ use gpui_kit::{
     Styled as _, div, prelude::FluentBuilder as _, px,
 };
 use loom_types::GpuAdapterSlice;
-use loom_ui_kit::{LoomSemanticColors, format_bytes, format_permille};
+use loom_ui_kit::{
+    LoomSemanticColors, format_bytes, format_opt_percent_permille, format_opt_temp_celsius,
+};
 
 use crate::features::performance::PerformanceView;
 use crate::features::performance::charts::{
@@ -58,6 +60,19 @@ pub(crate) fn render_gpu_detail(
         SharedString::from(gpu.name.as_ref().to_owned())
     };
 
+    let sleep_badge = gpu.d3_asleep.then(|| {
+        div()
+            .px_2()
+            .py_0p5()
+            .rounded_sm()
+            .bg(colors.status_suspended_bg)
+            .text_xs()
+            .font_medium()
+            .text_color(colors.status_suspended_fg)
+            .child(i18n::tr("perf.perf_polish_gpu_sleeping"))
+            .into_any_element()
+    });
+
     let grid_btn = Button::new("perf-gpu-mode-grid")
         .small()
         .label(i18n::tr("perf.gpu_view_grid"))
@@ -93,7 +108,6 @@ pub(crate) fn render_gpu_detail(
         .child(grid_btn)
         .child(single_btn);
 
-    let weak_ctx = cx.entity().downgrade();
     let engine_charts_area = div()
         .id(SharedString::from(format!("perf-gpu-engines-{}", gpu.luid)))
         .w_full()
@@ -126,28 +140,6 @@ pub(crate) fn render_gpu_detail(
                         .into_any_element()
                 }
             }
-        })
-        .context_menu(move |menu, _window, _cx| {
-            let weak_grid = weak_ctx.clone();
-            let weak_single = weak_ctx.clone();
-            menu.item(
-                PopupMenuItem::new(i18n::tr("perf.gpu_view_grid"))
-                    .checked(view_mode == GpuViewMode::Grid2x2)
-                    .on_click(move |_, _, cx| {
-                        let _ = weak_grid.update(cx, |view, cx| {
-                            view.set_gpu_view_mode(GpuViewMode::Grid2x2, cx);
-                        });
-                    }),
-            )
-            .item(
-                PopupMenuItem::new(i18n::tr("perf.gpu_view_single"))
-                    .checked(view_mode == GpuViewMode::SingleEngine)
-                    .on_click(move |_, _, cx| {
-                        let _ = weak_single.update(cx, |view, cx| {
-                            view.set_gpu_view_mode(GpuViewMode::SingleEngine, cx);
-                        });
-                    }),
-            )
         });
 
     // Dedicated & Shared VRAM 60s charts side by side.
@@ -212,10 +204,8 @@ pub(crate) fn render_gpu_detail(
         format_bytes(gpu.shared_used_bytes),
         format_bytes(gpu.shared_total_bytes)
     );
-    let temp_metric = match gpu.temperature_celsius {
-        Some(temp) => format!("{temp} °C"),
-        None => unavailable.clone(),
-    };
+    let util_metric = format_opt_percent_permille((!gpu.d3_asleep).then_some(gpu.util_permille));
+    let temp_metric = format_opt_temp_celsius(gpu.temperature_celsius, gpu.d3_asleep);
 
     let opt_str = |opt: &Option<std::sync::Arc<str>>| {
         opt.as_deref()
@@ -225,10 +215,7 @@ pub(crate) fn render_gpu_detail(
     };
 
     let left_stats = vec![
-        MetricStat::new(
-            i18n::tr("perf.gpu_utilization"),
-            format_permille(gpu.util_permille),
-        ),
+        MetricStat::new(i18n::tr("perf.gpu_utilization"), util_metric),
         MetricStat::new(ded_title, ded_metric),
         MetricStat::new(shared_title, shared_metric),
         MetricStat::new(i18n::tr("perf.gpu_temperature"), temp_metric),
@@ -249,14 +236,49 @@ pub(crate) fn render_gpu_detail(
         ),
     ];
 
+    let weak_ctx = cx.entity().downgrade();
     v_flex()
+        .id(SharedString::from(format!("perf-gpu-detail-{}", gpu.luid)))
         .w_full()
         .gap_4()
-        .child(device_header(title, name, None, colors))
+        .child(device_header(title, name, sleep_badge, colors))
         .child(controls_bar)
         .child(engine_charts_area)
         .child(vram_row)
         .child(metrics_two_column_panel(left_stats, right_specs, colors))
+        .context_menu(move |menu, _window, _cx| {
+            let weak_grid = weak_ctx.clone();
+            let weak_single = weak_ctx.clone();
+            let weak_copy = weak_ctx.clone();
+            menu.item(
+                PopupMenuItem::new(i18n::tr("perf.gpu_view_grid"))
+                    .checked(view_mode == GpuViewMode::Grid2x2)
+                    .on_click(move |_, _, cx| {
+                        let _ = weak_grid.update(cx, |view, cx| {
+                            view.set_gpu_view_mode(GpuViewMode::Grid2x2, cx);
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(i18n::tr("perf.gpu_view_single"))
+                    .checked(view_mode == GpuViewMode::SingleEngine)
+                    .on_click(move |_, _, cx| {
+                        let _ = weak_single.update(cx, |view, cx| {
+                            view.set_gpu_view_mode(GpuViewMode::SingleEngine, cx);
+                        });
+                    }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(i18n::tr("perf.perf_polish_copy_summary")).on_click(
+                    move |_, window, cx| {
+                        let _ = weak_copy.update(cx, |view, cx| {
+                            view.copy_selected_summary(window, cx);
+                        });
+                    },
+                ),
+            )
+        })
 }
 
 fn render_gpu_2x2_grid(
@@ -276,6 +298,8 @@ fn render_gpu_2x2_grid(
             colors.chart_gpu,
             true,
         );
+        let util_label =
+            format_opt_percent_permille((!gpu.d3_asleep).then_some(engine.util_permille));
 
         v_flex()
             .flex_1()
@@ -300,7 +324,7 @@ fn render_gpu_2x2_grid(
                             .text_xs()
                             .font_semibold()
                             .text_color(colors.text_primary)
-                            .child(format_permille(engine.util_permille)),
+                            .child(util_label),
                     ),
             )
             .child(
@@ -350,6 +374,7 @@ fn render_gpu_single_engine(
         colors.chart_gpu,
         true,
     );
+    let util_label = format_opt_percent_permille((!gpu.d3_asleep).then_some(engine.util_permille));
 
     v_flex()
         .w_full()
@@ -372,7 +397,7 @@ fn render_gpu_single_engine(
                         .text_xs()
                         .font_semibold()
                         .text_color(colors.text_primary)
-                        .child(format!("{} · 100%", format_permille(engine.util_permille))),
+                        .child(format!("{util_label} · 100%")),
                 ),
         )
         .child(

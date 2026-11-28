@@ -1,12 +1,17 @@
 //! Memory detail pane for the Performance view (60s usage chart, 4-segment composition bar, SMBIOS specs).
 
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
-use gpui_kit::{IntoElement, ParentElement as _, SharedString, Styled as _, div};
+use gpui_kit::{
+    Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
+    div,
+};
 use loom_types::PerformanceSlice;
 use loom_ui_kit::{
     LoomSemanticColors, MemoryBarLabels, MemoryBarSegments, format_bytes, memory_composition_bar,
 };
 
+use crate::features::performance::PerformanceView;
 use crate::features::performance::charts::{
     MetricStat, SpecRow, build_percent_area_chart, chart_frame, device_header,
     history_ring_to_points, legend_swatch, metrics_two_column_panel,
@@ -17,6 +22,7 @@ use crate::i18n;
 pub(crate) fn render_memory_detail(
     perf: &PerformanceSlice,
     colors: &LoomSemanticColors,
+    cx: &mut Context<PerformanceView>,
 ) -> impl IntoElement {
     let latest = &perf.latest;
     let info = &perf.memory_info;
@@ -180,7 +186,9 @@ pub(crate) fn render_memory_detail(
         ),
     ];
 
+    let weak_ctx = cx.entity().downgrade();
     v_flex()
+        .id("perf-memory-detail")
         .w_full()
         .gap_4()
         .child(device_header(
@@ -200,4 +208,16 @@ pub(crate) fn render_memory_detail(
         ))
         .child(composition_section)
         .child(metrics_two_column_panel(left_stats, right_specs, colors))
+        .context_menu(move |menu, _window, _cx| {
+            let weak_copy = weak_ctx.clone();
+            menu.item(
+                PopupMenuItem::new(i18n::tr("perf.perf_polish_copy_summary")).on_click(
+                    move |_, window, cx| {
+                        let _ = weak_copy.update(cx, |view, cx| {
+                            view.copy_selected_summary(window, cx);
+                        });
+                    },
+                ),
+            )
+        })
 }

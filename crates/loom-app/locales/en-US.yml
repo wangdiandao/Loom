@@ -214,6 +214,10 @@ settings:
   privilege_admin: "Administrator"
   restart_as_admin: "Restart as Administrator"
   config_path_label: "Configuration file"
+  settings_diag_section: "Processes & diagnostics"
+  settings_diag_webview2_grouping: "Group WebView2 helpers under host app"
+  settings_diag_leak_warnings: "Show resource leak warnings"
+  settings_diag_hide_system: "Hide Windows system processes by default"
 
 uac:
   title: "Administrator privileges required"
@@ -322,6 +326,15 @@ perf:
   gpu_directx_version: "DirectX version"
   gpu_pci_location: "PCI location"
   gpu_select_engine: "Select GPU engine"
+  perf_polish_core_p: "P"
+  perf_polish_core_e: "E"
+  perf_polish_core_lp_e: "LP-E"
+  perf_polish_core_p_legend: "P-core"
+  perf_polish_core_e_legend: "E-core"
+  perf_polish_core_lp_e_legend: "LP-E core"
+  perf_polish_gpu_sleeping: "Sleeping (D3)"
+  perf_polish_copy_summary: "Copy summary"
+  perf_polish_copied_summary: "Performance summary copied to clipboard."
 
 services:
   title: "Services"

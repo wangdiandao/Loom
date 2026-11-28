@@ -214,6 +214,10 @@ settings:
   privilege_admin: "管理员"
   restart_as_admin: "以管理员身份重启"
   config_path_label: "配置文件路径"
+  settings_diag_section: "进程与诊断"
+  settings_diag_webview2_grouping: "将 WebView2 辅助进程归入宿主应用"
+  settings_diag_leak_warnings: "显示资源泄漏预警"
+  settings_diag_hide_system: "默认隐藏 Windows 系统进程"
 
 uac:
   title: "需要管理员权限"
@@ -322,6 +326,15 @@ perf:
   gpu_directx_version: "DirectX 版本"
   gpu_pci_location: "PCI 位置"
   gpu_select_engine: "选择 GPU 引擎"
+  perf_polish_core_p: "P"
+  perf_polish_core_e: "E"
+  perf_polish_core_lp_e: "LP-E"
+  perf_polish_core_p_legend: "性能核 (P)"
+  perf_polish_core_e_legend: "能效核 (E)"
+  perf_polish_core_lp_e_legend: "低功耗能效核 (LP-E)"
+  perf_polish_gpu_sleeping: "休眠 (D3)"
+  perf_polish_copy_summary: "复制摘要"
+  perf_polish_copied_summary: "性能摘要已复制到剪贴板。"
 
 services:
   title: "服务"

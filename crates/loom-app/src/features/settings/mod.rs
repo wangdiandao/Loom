@@ -1,7 +1,7 @@
 //! Complete inline Settings vertical feature slice (zero modals required).
 //!
 //! All controls apply live to the running engine, native window, theme, and locale
-//! and persist atomically to `settings.toml` via [`UiCommands`].
+//! and persist atomically to `settings.toml` via [`UiCommands`] / [`UiStore`].
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
@@ -16,6 +16,7 @@ use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
     Render, SharedString, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
+use loom_engine::EngineCommand;
 use loom_types::{CapabilityFlags, LanguagePreference, RefreshSpeed, StartupPage, ThemePreference};
 
 use crate::bridge::{UiCommands, UiStore, UiStoreEvent};
@@ -323,6 +324,33 @@ impl SettingsView {
         }
     }
 
+    /// Toggles grouping `msedgewebview2.exe` helpers under their host app,
+    /// dispatching [`EngineCommand::SetWebView2HostGrouping`] and persisting to `settings.toml`.
+    pub(crate) fn set_webview2_host_grouping(&self, enabled: bool, cx: &mut Context<Self>) {
+        self.store.update(cx, |store, cx| {
+            let _ = store.dispatch_command(EngineCommand::SetWebView2HostGrouping(enabled));
+            let _ = store.update_settings(|s| s.webview2_host_grouping = enabled, cx);
+        });
+    }
+
+    /// Toggles advisory resource leak warnings, dispatching
+    /// [`EngineCommand::SetShowLeakWarnings`] and persisting to `settings.toml`.
+    pub(crate) fn set_show_leak_warnings(&self, enabled: bool, cx: &mut Context<Self>) {
+        self.store.update(cx, |store, cx| {
+            let _ = store.dispatch_command(EngineCommand::SetShowLeakWarnings(enabled));
+            let _ = store.update_settings(|s| s.show_leak_warnings = enabled, cx);
+        });
+    }
+
+    /// Toggles hiding core Windows system processes by default, dispatching
+    /// [`EngineCommand::SetHideSystemProcesses`] and persisting to `settings.toml`.
+    pub(crate) fn set_hide_system_processes(&self, hidden: bool, cx: &mut Context<Self>) {
+        self.store.update(cx, |store, cx| {
+            let _ = store.dispatch_command(EngineCommand::SetHideSystemProcesses(hidden));
+            let _ = store.update_settings(|s| s.hide_windows_system_processes = hidden, cx);
+        });
+    }
+
     fn refresh_select_labels(&self, window: &mut Window, cx: &mut Context<Self>) {
         let current_hotkey = self.store.read(cx).settings().global_hotkey.clone();
         self.startup_page_select.update(cx, |state, cx| {
@@ -382,6 +410,9 @@ impl Render for SettingsView {
 
         let startup_label = i18n::tr("settings.startup_page_label");
         let speed_label = i18n::tr("settings.refresh_speed_label");
+        let wv2_label = i18n::tr("settings.settings_diag_webview2_grouping");
+        let leak_label = i18n::tr("settings.settings_diag_leak_warnings");
+        let hide_sys_label = i18n::tr("settings.settings_diag_hide_system");
         let always_on_top_label = i18n::tr("settings.always_on_top_label");
         let min_tray_label = i18n::tr("settings.minimize_to_tray_label");
         let close_tray_label = i18n::tr("settings.close_to_tray_label");
@@ -439,7 +470,54 @@ impl Render for SettingsView {
                             ),
                         )),
                     )
-                    // 2. Window Management
+                    // 2. Processes & Diagnostics
+                    .child(
+                        settings_section(
+                            i18n::tr("settings.settings_diag_section"),
+                            IconName::Settings2,
+                            card_bg,
+                            border,
+                            fg,
+                            radius_lg,
+                        )
+                        .child(setting_row(
+                            wv2_label.clone(),
+                            fg,
+                            border,
+                            false,
+                            Switch::new("setting-webview2-host-grouping")
+                                .checked(settings.webview2_host_grouping)
+                                .accessibility_label(wv2_label)
+                                .on_change(cx.listener(|view, checked, _, cx| {
+                                    view.set_webview2_host_grouping(*checked, cx);
+                                })),
+                        ))
+                        .child(setting_row(
+                            leak_label.clone(),
+                            fg,
+                            border,
+                            true,
+                            Switch::new("setting-show-leak-warnings")
+                                .checked(settings.show_leak_warnings)
+                                .accessibility_label(leak_label)
+                                .on_change(cx.listener(|view, checked, _, cx| {
+                                    view.set_show_leak_warnings(*checked, cx);
+                                })),
+                        ))
+                        .child(setting_row(
+                            hide_sys_label.clone(),
+                            fg,
+                            border,
+                            true,
+                            Switch::new("setting-hide-system-processes")
+                                .checked(settings.hide_windows_system_processes)
+                                .accessibility_label(hide_sys_label)
+                                .on_change(cx.listener(|view, checked, _, cx| {
+                                    view.set_hide_system_processes(*checked, cx);
+                                })),
+                        )),
+                    )
+                    // 3. Window Management
                     .child(
                         settings_section(
                             i18n::tr("settings.section_window"),
@@ -501,7 +579,7 @@ impl Render for SettingsView {
                             ))
                         }),
                     )
-                    // 3. Appearance & Language
+                    // 4. Appearance & Language
                     .child(
                         settings_section(
                             i18n::tr("settings.section_appearance"),
@@ -534,7 +612,7 @@ impl Render for SettingsView {
                             ),
                         )),
                     )
-                    // 4. Privileges & Storage
+                    // 5. Privileges & Storage
                     .child(
                         settings_section(
                             i18n::tr("settings.section_privileges"),
@@ -658,4 +736,80 @@ fn setting_row(
                 .child(title),
         )
         .child(div().flex_shrink_0().child(control))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui_kit::{AppContext as _, TestAppContext, VisualTestContext};
+    use loom_config::{AppSettings, ConfigStore};
+    use loom_engine::EngineCoordinator;
+    use loom_pal::{NativeBackend, PlatformBackend};
+
+    use crate::bridge::UiStore;
+
+    use super::SettingsView;
+
+    #[gpui_kit::test]
+    fn settings_view_diagnostic_toggles_persist_and_reload_cleanly(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let dir = tempfile::tempdir().expect("create temp config dir");
+        let config_path = dir.path().join("settings.toml");
+        let config_store = ConfigStore::new(config_path.clone());
+        let settings = AppSettings::default();
+        assert!(settings.webview2_host_grouping);
+        assert!(settings.show_leak_warnings);
+        assert!(!settings.hide_windows_system_processes);
+
+        let backend = NativeBackend::initialize().expect("initialize native backend");
+        let coordinator =
+            Arc::new(EngineCoordinator::new(backend, settings.clone()).expect("start coordinator"));
+        let store = cx.new(|cx| UiStore::new(coordinator.clone(), config_store, settings, cx));
+
+        let mut settings_view_handle = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| SettingsView::new(store.clone(), window, cx));
+                settings_view_handle = Some(view.clone());
+                cx.new(|cx| gpui_kit::base::Root::new(view, window, cx))
+            })
+            .expect("open settings test window")
+        });
+        let settings_view = settings_view_handle.expect("SettingsView constructed");
+
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // Flip all 3 additive v1 toggles via SettingsView.
+        vcx.update(|_window, cx| {
+            settings_view.update(cx, |view, cx| {
+                view.set_webview2_host_grouping(false, cx);
+                view.set_show_leak_warnings(false, cx);
+                view.set_hide_system_processes(true, cx);
+            });
+        });
+
+        // Verify in-memory UiStore state updated immediately.
+        vcx.update(|_window, cx| {
+            let s = store.read(cx).settings();
+            assert!(!s.webview2_host_grouping);
+            assert!(!s.show_leak_warnings);
+            assert!(s.hide_windows_system_processes);
+        });
+
+        // Verify persisted settings.toml reloads identically.
+        let reloaded = ConfigStore::new(config_path)
+            .load()
+            .expect("reload persisted settings.toml");
+        assert!(!reloaded.webview2_host_grouping);
+        assert!(!reloaded.show_leak_warnings);
+        assert!(reloaded.hide_windows_system_processes);
+
+        drop(settings_view);
+        vcx.update(|window, _| window.remove_window());
+        vcx.run_until_parked();
+        coordinator.shutdown();
+    }
 }

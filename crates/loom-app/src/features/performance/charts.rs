@@ -1,6 +1,8 @@
 //! Shared stateless `gpui-kit` chart builders and metric layout helpers for the Performance view.
 //!
-//! All plots compose `gpui-kit`'s [`AreaChart`] directly without custom `Canvas` or GPU shaders.
+//! All plots compose `gpui-kit`'s [`AreaChart`] directly without custom `Canvas` or GPU shaders,
+//! using gap-aware point conversion so paused/sleep sentinels never fabricate spikes or flat
+//! baseline artifacts.
 
 use gpui_kit::component::chart::AreaChart;
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
@@ -9,109 +11,184 @@ use gpui_kit::{
     linear_color_stop, linear_gradient, px,
 };
 use loom_types::{HistoryRing, ThroughputRing};
-use loom_ui_kit::LoomSemanticColors;
+use loom_ui_kit::{LoomSemanticColors, PERMILLE_GAP_SENTINEL, SparklinePoint, UNAVAILABLE_LABEL};
 
 use crate::i18n;
 
 /// Fixed 60-sample horizontal window matching Windows Task Manager's 60-second history.
 pub(crate) const HISTORY_WINDOW: usize = 60;
 
-/// Single-series data point for 60-second [`AreaChart`] plots.
+/// Single-series gap-aware data point for 60-second [`AreaChart`] plots.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SinglePoint {
     pub(crate) index: usize,
-    pub(crate) value: f32,
+    pub(crate) value: Option<f32>,
 }
 
-/// Dual-series data point for overlaid 60-second [`AreaChart`] plots (e.g. Total + Kernel CPU,
-/// Read + Write Disk, Receive + Send Network).
+/// Dual-series gap-aware data point for overlaid 60-second [`AreaChart`] plots
+/// (e.g. Total + Kernel CPU, Read + Write Disk, Receive + Send Network).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct DualPoint {
     pub(crate) index: usize,
-    pub(crate) primary: f32,
-    pub(crate) secondary: f32,
+    pub(crate) primary: Option<f32>,
+    pub(crate) secondary: Option<f32>,
 }
 
-/// Converts a [`HistoryRing<60>`] (permille `0..=1000`) into a right-aligned 60-point
-/// percentage (`0.0..=100.0`) series, left-padded with `0.0`.
+/// Formats a stepped ceiling label from `(y_max, unit)` returned by
+/// [`loom_ui_kit::stepped_throughput_ceiling`] or [`loom_ui_kit::stepped_network_ceiling`].
+pub(crate) fn format_stepped_ceiling_label(y_max: f64, unit: &str) -> SharedString {
+    if y_max.fract().abs() < 1e-6 {
+        SharedString::from(format!("{} {unit}", y_max as u64))
+    } else {
+        SharedString::from(format!("{y_max:.1} {unit}"))
+    }
+}
+
+/// Converts a [`HistoryRing<60>`] (permille `0..=1000` + [`HistoryRing::GAP_SENTINEL`])
+/// into a right-aligned 60-point gap-aware percentage (`0.0..=100.0`) series.
+///
+/// Leading unfilled slots and `GAP_SENTINEL` (`PERMILLE_GAP_SENTINEL`) entries map to `None`
+/// rather than fabricating spikes or misleading zero baselines.
 pub(crate) fn history_ring_to_points(ring: &HistoryRing<HISTORY_WINDOW>) -> Vec<SinglePoint> {
-    let len = ring.len();
-    let pad = HISTORY_WINDOW.saturating_sub(len);
-    let mut points = Vec::with_capacity(HISTORY_WINDOW);
-    for index in 0..pad {
-        points.push(SinglePoint { index, value: 0.0 });
-    }
-    for (offset, permille) in ring.iter_ordered().enumerate() {
-        points.push(SinglePoint {
-            index: pad + offset,
-            value: f32::from(permille) / 10.0,
-        });
-    }
-    points
+    let window = SparklinePoint::from_opt_f32_window(ring.to_vec_opt_f32(), HISTORY_WINDOW);
+    window
+        .into_iter()
+        .map(|slot| SinglePoint {
+            index: slot.index,
+            value: slot.value,
+        })
+        .collect()
 }
 
-/// Converts two [`HistoryRing<60>`] buffers (permille `0..=1000`) into a right-aligned
-/// 60-point dual percentage series.
+/// Converts a [`HistoryRing<60>`] into gap-safe [`SparklinePoint`] entries for sidebar cards.
+///
+/// Uses [`SparklinePoint::from_permille_sentinel_segments`] so `PERMILLE_GAP_SENTINEL`
+/// entries never create `6553.5%` spikes, and returns an empty vector when no valid samples
+/// exist (e.g., while a discrete GPU is sleeping in D3).
+pub(crate) fn history_ring_to_sparkline_points(
+    ring: &HistoryRing<HISTORY_WINDOW>,
+) -> Vec<SparklinePoint> {
+    let segments = SparklinePoint::from_permille_sentinel_segments(
+        ring.iter_ordered().map(|raw| {
+            if HistoryRing::<HISTORY_WINDOW>::is_gap(raw) {
+                PERMILLE_GAP_SENTINEL
+            } else {
+                raw
+            }
+        }),
+        HISTORY_WINDOW,
+    );
+    if segments.is_empty() {
+        return Vec::new();
+    }
+    let window = SparklinePoint::from_opt_f32_window(ring.to_vec_opt_f32(), HISTORY_WINDOW);
+    window
+        .into_iter()
+        .map(|slot| SparklinePoint::new(slot.index, slot.value.unwrap_or(0.0)))
+        .collect()
+}
+
+/// Converts two [`ThroughputRing<60>`] buffers (bytes/sec) into gap-safe combined
+/// [`SparklinePoint`] entries scaled by `divisor` (matching [`loom_ui_kit::stepped_network_ceiling`]).
+pub(crate) fn throughput_pair_to_sparkline_points(
+    recv: &ThroughputRing<HISTORY_WINDOW>,
+    sent: &ThroughputRing<HISTORY_WINDOW>,
+    divisor: f64,
+) -> Vec<SparklinePoint> {
+    let safe_div = if divisor.is_finite() && divisor > 0.0 {
+        divisor
+    } else {
+        1.0
+    };
+    let r_vals = recv.to_vec_opt();
+    let s_vals = sent.to_vec_opt();
+    let len = r_vals.len().max(s_vals.len());
+    let mut combined: Vec<Option<f32>> = Vec::with_capacity(len);
+    for idx in 0..len {
+        let r = r_vals.get(idx).copied().flatten();
+        let s = s_vals.get(idx).copied().flatten();
+        let entry = match (r, s) {
+            (Some(rv), Some(sv)) => Some((rv.saturating_add(sv) as f64 / safe_div) as f32),
+            (Some(rv), None) => Some((rv as f64 / safe_div) as f32),
+            (None, Some(sv)) => Some((sv as f64 / safe_div) as f32),
+            (None, None) => None,
+        };
+        combined.push(entry);
+    }
+
+    let window = SparklinePoint::from_opt_f32_window(combined, HISTORY_WINDOW);
+    if window.iter().all(|slot| slot.is_gap()) {
+        return Vec::new();
+    }
+    window
+        .into_iter()
+        .map(|slot| SparklinePoint::new(slot.index, slot.value.unwrap_or(0.0)))
+        .collect()
+}
+
+/// Converts two [`HistoryRing<60>`] buffers (permille `0..=1000` + `GAP_SENTINEL`)
+/// into a right-aligned 60-point gap-aware dual percentage series.
 pub(crate) fn dual_history_rings_to_points(
     primary: &HistoryRing<HISTORY_WINDOW>,
     secondary: &HistoryRing<HISTORY_WINDOW>,
 ) -> Vec<DualPoint> {
-    let p_vals: Vec<u16> = primary.iter_ordered().collect();
-    let s_vals: Vec<u16> = secondary.iter_ordered().collect();
-    let p_pad = HISTORY_WINDOW.saturating_sub(p_vals.len());
-    let s_pad = HISTORY_WINDOW.saturating_sub(s_vals.len());
+    let p_win = SparklinePoint::from_opt_f32_window(primary.to_vec_opt_f32(), HISTORY_WINDOW);
+    let s_win = SparklinePoint::from_opt_f32_window(secondary.to_vec_opt_f32(), HISTORY_WINDOW);
 
-    let mut points = Vec::with_capacity(HISTORY_WINDOW);
-    for index in 0..HISTORY_WINDOW {
-        let p = index
-            .checked_sub(p_pad)
-            .and_then(|i| p_vals.get(i).copied())
-            .unwrap_or(0);
-        let s = index
-            .checked_sub(s_pad)
-            .and_then(|i| s_vals.get(i).copied())
-            .unwrap_or(0);
-        points.push(DualPoint {
-            index,
-            primary: f32::from(p) / 10.0,
-            secondary: f32::from(s) / 10.0,
-        });
-    }
-    points
+    p_win
+        .into_iter()
+        .zip(s_win)
+        .map(|(p, s)| DualPoint {
+            index: p.index,
+            primary: p.value,
+            secondary: s.value,
+        })
+        .collect()
 }
 
-/// Converts two [`ThroughputRing<60>`] buffers (bytes/sec) into a right-aligned 60-point
-/// dual series scaled by `multiplier` (use `1.0` for bytes/sec or `8.0` for bits/sec).
+/// Converts two [`ThroughputRing<60>`] buffers (bytes/sec + `GAP_SENTINEL`) into a
+/// right-aligned 60-point gap-aware dual series divided by `divisor` so values map
+/// cleanly onto a stepped ceiling's unit domain.
 pub(crate) fn dual_throughput_rings_to_points(
     primary: &ThroughputRing<HISTORY_WINDOW>,
     secondary: &ThroughputRing<HISTORY_WINDOW>,
-    multiplier: f32,
+    divisor: f64,
 ) -> Vec<DualPoint> {
-    let p_vals: Vec<u64> = primary.iter().collect();
-    let s_vals: Vec<u64> = secondary.iter().collect();
-    let p_pad = HISTORY_WINDOW.saturating_sub(p_vals.len());
-    let s_pad = HISTORY_WINDOW.saturating_sub(s_vals.len());
+    let safe_div = if divisor.is_finite() && divisor > 0.0 {
+        divisor
+    } else {
+        1.0
+    };
+    let p_win = SparklinePoint::from_opt_f32_window(
+        primary
+            .to_vec_opt()
+            .into_iter()
+            .map(|opt| opt.map(|v| (v as f64 / safe_div) as f32)),
+        HISTORY_WINDOW,
+    );
+    let s_win = SparklinePoint::from_opt_f32_window(
+        secondary
+            .to_vec_opt()
+            .into_iter()
+            .map(|opt| opt.map(|v| (v as f64 / safe_div) as f32)),
+        HISTORY_WINDOW,
+    );
 
-    let mut points = Vec::with_capacity(HISTORY_WINDOW);
-    for index in 0..HISTORY_WINDOW {
-        let p = index
-            .checked_sub(p_pad)
-            .and_then(|i| p_vals.get(i).copied())
-            .unwrap_or(0);
-        let s = index
-            .checked_sub(s_pad)
-            .and_then(|i| s_vals.get(i).copied())
-            .unwrap_or(0);
-        points.push(DualPoint {
-            index,
-            primary: p as f32 * multiplier,
-            secondary: s as f32 * multiplier,
-        });
-    }
-    points
+    p_win
+        .into_iter()
+        .zip(s_win)
+        .map(|(p, s)| DualPoint {
+            index: p.index,
+            primary: p.value,
+            secondary: s.value,
+        })
+        .collect()
 }
 
 /// Builds a 60-second single-series percentage (`0..100%`) [`AreaChart`].
+///
+/// When all points are gaps (`None`), passes an empty dataset so the chart renders
+/// an honest empty grid instead of fabricating a flat `0%` baseline.
 pub(crate) fn build_percent_area_chart(
     id: impl Into<SharedString>,
     points: Vec<SinglePoint>,
@@ -119,10 +196,16 @@ pub(crate) fn build_percent_area_chart(
     color: Hsla,
     interactive: bool,
 ) -> AreaChart<SinglePoint, SharedString, f32> {
-    AreaChart::new(points)
+    let data = if points.iter().all(|p| p.value.is_none()) {
+        Vec::new()
+    } else {
+        points
+    };
+
+    AreaChart::new(data)
         .id(id.into())
         .x(|p: &SinglePoint| SharedString::from(p.index.to_string()))
-        .y(|p: &SinglePoint| p.value)
+        .y(|p: &SinglePoint| p.value.unwrap_or(0.0))
         .name(series_name)
         .linear()
         .stroke(color)
@@ -145,7 +228,13 @@ pub(crate) fn build_percent_area_chart(
             let secs_ago = HISTORY_WINDOW.saturating_sub(1).saturating_sub(p.index);
             i18n::perf_time_offset_label(secs_ago).into()
         })
-        .tooltip_value(|_p, _series_ix, val| SharedString::from(format!("{val:.1}%")))
+        .tooltip_value(|p, _series_ix, val| {
+            if p.value.is_none() {
+                SharedString::new_static(UNAVAILABLE_LABEL)
+            } else {
+                SharedString::from(format!("{val:.1}%"))
+            }
+        })
 }
 
 /// Builds a 60-second dual-series percentage (`0..100%`) [`AreaChart`] (e.g. CPU Total + Kernel).
@@ -157,10 +246,19 @@ pub(crate) fn build_dual_percent_area_chart(
     secondary_name: impl Into<SharedString>,
     secondary_color: Hsla,
 ) -> AreaChart<DualPoint, SharedString, f32> {
-    AreaChart::new(points)
+    let data = if points
+        .iter()
+        .all(|p| p.primary.is_none() && p.secondary.is_none())
+    {
+        Vec::new()
+    } else {
+        points
+    };
+
+    AreaChart::new(data)
         .id(id.into())
         .x(|p: &DualPoint| SharedString::from(p.index.to_string()))
-        .y(|p: &DualPoint| p.primary)
+        .y(|p: &DualPoint| p.primary.unwrap_or(0.0))
         .name(primary_name)
         .linear()
         .stroke(primary_color)
@@ -169,7 +267,7 @@ pub(crate) fn build_dual_percent_area_chart(
             linear_color_stop(primary_color.opacity(0.28), 1.0),
             linear_color_stop(primary_color.opacity(0.04), 0.0),
         ))
-        .y(|p: &DualPoint| p.secondary)
+        .y(|p: &DualPoint| p.secondary.unwrap_or(0.0))
         .name(secondary_name)
         .linear()
         .stroke(secondary_color)
@@ -192,10 +290,21 @@ pub(crate) fn build_dual_percent_area_chart(
             let secs_ago = HISTORY_WINDOW.saturating_sub(1).saturating_sub(p.index);
             i18n::perf_time_offset_label(secs_ago).into()
         })
-        .tooltip_value(|_p, _series_ix, val| SharedString::from(format!("{val:.1}%")))
+        .tooltip_value(|p, series_ix, val| {
+            let is_gap = if series_ix == 0 {
+                p.primary.is_none()
+            } else {
+                p.secondary.is_none()
+            };
+            if is_gap {
+                SharedString::new_static(UNAVAILABLE_LABEL)
+            } else {
+                SharedString::from(format!("{val:.1}%"))
+            }
+        })
 }
 
-/// Builds a 60-second adaptive-scale dual-series throughput [`AreaChart`] (Disk Read/Write or
+/// Builds a 60-second stepped-ceiling dual-series throughput [`AreaChart`] (Disk Read/Write or
 /// Network Receive/Send).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_dual_throughput_area_chart(
@@ -213,10 +322,19 @@ pub(crate) fn build_dual_throughput_area_chart(
     } else {
         1.0
     };
-    AreaChart::new(points)
+    let data = if points
+        .iter()
+        .all(|p| p.primary.is_none() && p.secondary.is_none())
+    {
+        Vec::new()
+    } else {
+        points
+    };
+
+    AreaChart::new(data)
         .id(id.into())
         .x(|p: &DualPoint| SharedString::from(p.index.to_string()))
-        .y(|p: &DualPoint| p.primary)
+        .y(|p: &DualPoint| p.primary.unwrap_or(0.0))
         .name(primary_name)
         .linear()
         .stroke(primary_color)
@@ -225,7 +343,7 @@ pub(crate) fn build_dual_throughput_area_chart(
             linear_color_stop(primary_color.opacity(0.28), 1.0),
             linear_color_stop(primary_color.opacity(0.04), 0.0),
         ))
-        .y(|p: &DualPoint| p.secondary)
+        .y(|p: &DualPoint| p.secondary.unwrap_or(0.0))
         .name(secondary_name)
         .linear()
         .stroke(secondary_color)
@@ -248,7 +366,18 @@ pub(crate) fn build_dual_throughput_area_chart(
             let secs_ago = HISTORY_WINDOW.saturating_sub(1).saturating_sub(p.index);
             i18n::perf_time_offset_label(secs_ago).into()
         })
-        .tooltip_value(move |_p, _series_ix, val| SharedString::from(format_value(val)))
+        .tooltip_value(move |p, series_ix, val| {
+            let is_gap = if series_ix == 0 {
+                p.primary.is_none()
+            } else {
+                p.secondary.is_none()
+            };
+            if is_gap {
+                SharedString::new_static(UNAVAILABLE_LABEL)
+            } else {
+                SharedString::from(format_value(val))
+            }
+        })
 }
 
 /// Renders a compact color swatch + series label for chart headers.
@@ -474,4 +603,67 @@ pub(crate) fn metrics_two_column_panel(
         .border_color(colors.card_border)
         .child(left_grid)
         .child(right_table)
+}
+
+#[cfg(test)]
+mod tests {
+    use loom_types::{HistoryRing, ThroughputRing};
+
+    use super::*;
+
+    #[test]
+    fn gap_sentinels_never_fabricate_spikes_in_history_or_throughput_points() {
+        let mut h = HistoryRing::<HISTORY_WINDOW>::new();
+        h.push(250);
+        h.push_gap();
+        h.push(500);
+
+        let pts = history_ring_to_points(&h);
+        assert_eq!(pts.len(), HISTORY_WINDOW);
+        assert_eq!(pts[HISTORY_WINDOW - 3].value, Some(25.0));
+        assert_eq!(pts[HISTORY_WINDOW - 2].value, None);
+        assert_eq!(pts[HISTORY_WINDOW - 1].value, Some(50.0));
+        assert!(pts[0].value.is_none());
+
+        let spark = history_ring_to_sparkline_points(&h);
+        assert_eq!(spark.len(), HISTORY_WINDOW);
+        assert!(spark.iter().all(|p| p.value <= 100.0 && p.value >= 0.0));
+
+        // Gap-only ring produces empty sparkline (no fabricated flat baseline).
+        let mut gap_only = HistoryRing::<HISTORY_WINDOW>::new();
+        gap_only.push_gap();
+        assert!(history_ring_to_sparkline_points(&gap_only).is_empty());
+
+        // Throughput gap sentinel never produces u64::MAX spike.
+        let mut r = ThroughputRing::<HISTORY_WINDOW>::new();
+        let mut w = ThroughputRing::<HISTORY_WINDOW>::new();
+        r.push(1024 * 1024);
+        r.push_gap();
+        w.push(512 * 1024);
+        w.push_gap();
+
+        let dual = dual_throughput_rings_to_points(&r, &w, 1024.0 * 1024.0);
+        assert_eq!(dual.len(), HISTORY_WINDOW);
+        assert_eq!(dual[HISTORY_WINDOW - 2].primary, Some(1.0));
+        assert_eq!(dual[HISTORY_WINDOW - 2].secondary, Some(0.5));
+        assert_eq!(dual[HISTORY_WINDOW - 1].primary, None);
+        assert_eq!(dual[HISTORY_WINDOW - 1].secondary, None);
+    }
+
+    #[test]
+    fn format_stepped_ceiling_label_formats_integers_and_decimals_cleanly() {
+        assert_eq!(
+            format_stepped_ceiling_label(100.0, "KB/s").as_ref(),
+            "100 KB/s"
+        );
+        assert_eq!(format_stepped_ceiling_label(1.0, "MB/s").as_ref(), "1 MB/s");
+        assert_eq!(
+            format_stepped_ceiling_label(2.5, "Gbps").as_ref(),
+            "2.5 Gbps"
+        );
+        assert_eq!(
+            format_stepped_ceiling_label(100.0, "Mbps").as_ref(),
+            "100 Mbps"
+        );
+    }
 }
