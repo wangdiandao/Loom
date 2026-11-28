@@ -337,8 +337,8 @@ impl RowTextCache {
     /// Returns a formatted `u32` cell string for a numbered column `slot`
     /// (e.g., Handles, Threads, Session ID).
     ///
-    /// Values `<= 512` return directly from the static zero-allocation lookup
-    /// table; larger values are cached per `(key, slot)`.
+    /// Values `<= 1024` ([`SMALL_U32_TABLE_MAX`]) return directly from the static
+    /// zero-allocation lookup table; larger values are cached per `(key, slot)`.
     pub fn u32_slot(&mut self, key: ProcessKey, slot: u8, val: u32) -> SharedString {
         if val <= SMALL_U32_TABLE_MAX {
             if let Some(entry) = self.entries.get_mut(&key) {
@@ -399,5 +399,119 @@ impl RowTextCache {
             preview: preview.clone(),
         });
         preview
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use loom_types::{ProcessKey, ResourceDisplayMode};
+
+    use crate::format::MetricDisplay;
+
+    use super::RowTextCache;
+
+    #[test]
+    fn row_text_cache_hits_reuses_invalidates_and_evicts_oldest_epochs() {
+        const MIB: u64 = 1024 * 1024;
+        let p1 = ProcessKey::new(4096, 100);
+        let p1_recycled = ProcessKey::new(4096, 200);
+        let p2 = ProcessKey::new(8192, 150);
+        let p3 = ProcessKey::new(9999, 250);
+
+        let mut cache = RowTextCache::with_capacity(2);
+        assert!(cache.is_empty());
+        assert_eq!(cache.capacity(), 2);
+
+        cache.begin_epoch();
+        assert_eq!(cache.epoch(), 1);
+
+        let pid_a = cache.pid_text(p1);
+        let pid_b = cache.pid_text(p1);
+        assert_eq!(pid_a.as_ref(), "4096");
+        assert_eq!(pid_a, pid_b);
+
+        let mem1 = cache.memory_metric(p1, 128 * MIB, 42, ResourceDisplayMode::Values);
+        let mem2 = cache.memory_metric(p1, 128 * MIB + 64, 42, ResourceDisplayMode::Values);
+        assert_eq!(mem1, MetricDisplay::new("128.0", " MB"));
+        assert_eq!(mem1, mem2);
+
+        let mem_pct = cache.memory_metric(p1, 128 * MIB + 64, 42, ResourceDisplayMode::Percent);
+        assert_eq!(mem_pct, MetricDisplay::new("4.2%", ""));
+
+        let d1 = cache.disk_metric(p1, 2 * MIB, 10, ResourceDisplayMode::Values);
+        let d2 = cache.disk_metric(p1, 2 * MIB + 16, 10, ResourceDisplayMode::Values);
+        assert_eq!(d1, MetricDisplay::new("2.0", " MB/s"));
+        assert_eq!(d1, d2);
+
+        let n1 = cache.network_metric(p1, 1_550_000, 124, ResourceDisplayMode::Values);
+        let n2 = cache.network_metric(p1, 1_550_050, 124, ResourceDisplayMode::Values);
+        assert_eq!(n1, MetricDisplay::new("12.4", " Mbps"));
+        assert_eq!(n1, n2);
+
+        let ws1 = cache.bytes_metric_slot(p1, 0, 64 * MIB);
+        let commit1 = cache.bytes_metric_slot(p1, 1, 256 * MIB);
+        let ws2 = cache.bytes_metric_slot(p1, 0, 64 * MIB + 10);
+        assert_eq!(ws1, MetricDisplay::new("64.0", " MB"));
+        assert_eq!(commit1, MetricDisplay::new("256.0", " MB"));
+        assert_eq!(ws1, ws2);
+
+        let d0 = cache.signed_bytes_metric_slot(p1, 0, 0);
+        let d_pos1 = cache.signed_bytes_metric_slot(p1, 0, (4 * MIB) as i64);
+        let d_pos2 = cache.signed_bytes_metric_slot(p1, 0, (4 * MIB) as i64 + 16);
+        let d_neg = cache.signed_bytes_metric_slot(p1, 0, -((4 * MIB) as i64));
+        assert_eq!(d0, MetricDisplay::from_static("0", " B"));
+        assert_eq!(d_pos1, MetricDisplay::new("+4.0", " MB"));
+        assert_eq!(d_pos1, d_pos2);
+        assert_eq!(d_neg, MetricDisplay::new("-4.0", " MB"));
+
+        let t1 = cache.cpu_time_text(p1, 10_000_000);
+        let t2 = cache.cpu_time_text(p1, 19_999_999);
+        let t3 = cache.cpu_time_text(p1, 20_000_000);
+        assert_eq!(t1.as_ref(), "00:00:01");
+        assert_eq!(t1, t2);
+        assert_eq!(t3.as_ref(), "00:00:02");
+
+        let small = cache.u32_slot(p1, 0, 42);
+        assert_eq!(small.as_ref(), "42");
+        let big1 = cache.u32_slot(p1, 0, 12_345);
+        let big2 = cache.u32_slot(p1, 0, 12_345);
+        let big3 = cache.u32_slot(p1, 0, 12_346);
+        assert_eq!(big1.as_ref(), "12345");
+        assert_eq!(big1, big2);
+        assert_eq!(big3.as_ref(), "12346");
+
+        let long_cmd: Arc<str> = Arc::from(format!("cmd.exe --arg={}", "a".repeat(300)));
+        let prev1 = cache.preview_slot(p1, 0, &long_cmd, 48);
+        let prev2 = cache.preview_slot(p1, 0, &long_cmd, 48);
+        assert_eq!(prev1.chars().count(), 49);
+        assert!(prev1.ends_with('…'));
+        assert_eq!(prev1.as_ptr(), prev2.as_ptr());
+
+        let prev_longer = cache.preview_slot(p1, 0, &long_cmd, 64);
+        assert_eq!(prev_longer.chars().count(), 65);
+        let short_cmd: Arc<str> = Arc::from("C:\\Windows\\System32\\notepad.exe --launch");
+        let prev_short = cache.preview_slot(p1, 0, &short_cmd, 64);
+        assert_eq!(prev_short.as_ptr(), short_cmd.as_ptr());
+
+        cache.begin_epoch();
+        let _ = cache.pid_text(p2);
+        let _ = cache.pid_text(p1_recycled);
+
+        cache.begin_epoch();
+        let _ = cache.pid_text(p3);
+        let _ = cache.pid_text(p1_recycled);
+
+        assert_eq!(cache.len(), 4);
+        cache.prune_if_needed();
+        assert_eq!(cache.len(), 2);
+
+        let p3_again = cache.pid_text(p3);
+        assert_eq!(p3_again.as_ref(), "9999");
+        assert_eq!(cache.len(), 2);
+
+        cache.clear();
+        assert!(cache.is_empty());
     }
 }

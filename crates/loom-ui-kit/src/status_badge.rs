@@ -150,3 +150,63 @@ pub fn status_badges(
 ) -> impl IntoElement {
     status_badges_with_a11y(row_id, status, labels, colors, true)
 }
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::component::{Theme, ThemeColor, ThemeMode};
+    use loom_types::ProcessStatusFlags;
+
+    use crate::theme::LoomSemanticColors;
+
+    use super::{StatusLabels, has_visible_status_badges, status_badges, status_badges_with_a11y};
+
+    #[test]
+    fn status_badge_fast_check_and_construction() {
+        assert!(!has_visible_status_badges(ProcessStatusFlags::empty()));
+        assert!(!has_visible_status_badges(
+            ProcessStatusFlags::ELEVATED
+                | ProcessStatusFlags::PROTECTED
+                | ProcessStatusFlags::CRITICAL
+                | ProcessStatusFlags::SYSTEM_IDLE
+                | ProcessStatusFlags::KERNEL
+        ));
+        assert!(has_visible_status_badges(
+            ProcessStatusFlags::NOT_RESPONDING
+        ));
+        assert!(has_visible_status_badges(ProcessStatusFlags::SUSPENDED));
+        assert!(has_visible_status_badges(
+            ProcessStatusFlags::EFFICIENCY_MODE
+        ));
+        assert!(has_visible_status_badges(
+            ProcessStatusFlags::ELEVATED | ProcessStatusFlags::EFFICIENCY_MODE
+        ));
+
+        let mut theme = Theme::from(ThemeColor::dark().as_ref());
+        theme.mode = ThemeMode::Dark;
+        let colors = LoomSemanticColors::from_theme(&theme);
+        let labels = StatusLabels::new("Efficiency mode", "Suspended", "Not responding");
+
+        let _all = status_badges(
+            42,
+            ProcessStatusFlags::EFFICIENCY_MODE
+                | ProcessStatusFlags::SUSPENDED
+                | ProcessStatusFlags::NOT_RESPONDING,
+            &labels,
+            &colors,
+        );
+        let _no_a11y = status_badges_with_a11y(
+            7,
+            ProcessStatusFlags::EFFICIENCY_MODE,
+            &labels,
+            &colors,
+            false,
+        );
+        let _with_a11y = status_badges_with_a11y(
+            7,
+            ProcessStatusFlags::SUSPENDED | ProcessStatusFlags::NOT_RESPONDING,
+            &labels,
+            &colors,
+            true,
+        );
+    }
+}

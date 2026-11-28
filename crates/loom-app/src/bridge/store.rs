@@ -513,6 +513,15 @@ mod tests {
             "UiStore must wake up from SnapshotWakeSignal when a CommandEvent is emitted"
         );
 
+        // Redundant sync_from_coordinator with unchanged revisions must not emit SnapshotUpdated.
+        let before_noop = snapshot_events.load(Ordering::Acquire);
+        store.update(cx, |s, cx| s.sync_from_coordinator(cx));
+        assert_eq!(
+            snapshot_events.load(Ordering::Acquire),
+            before_noop,
+            "sync_from_coordinator must suppress SnapshotUpdated when revisions did not change"
+        );
+
         // Entering dormancy cancels the wake task cleanly; waking restarts it.
         store.update(cx, |s, cx| s.set_window_dormant(true, cx));
         assert!(store.read_with(cx, |s, _| s.is_dormant() && !s.has_active_wake_task()));
