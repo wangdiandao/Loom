@@ -51,33 +51,34 @@ impl<const N: usize> HistoryRing<N> {
         raw == Self::GAP_SENTINEL
     }
 
+    #[inline]
+    fn push_raw(&mut self, raw: u16) {
+        if N == 0 {
+            return;
+        }
+        self.buf[self.head] = raw;
+        self.head += 1;
+        if self.head == N {
+            self.head = 0;
+        }
+        if self.len < N {
+            self.len += 1;
+        }
+    }
+
     /// Pushes a quantized permille value (`0..=1000`), clamping values above `1000`.
     ///
     /// When the buffer is already full, the oldest entry is overwritten.
     #[inline]
     pub fn push(&mut self, value_permille: u16) {
-        if N == 0 {
-            return;
-        }
-        self.buf[self.head] = value_permille.min(Self::MAX_PERMILLE);
-        self.head = (self.head + 1) % N;
-        if self.len < N {
-            self.len += 1;
-        }
+        self.push_raw(value_permille.min(Self::MAX_PERMILLE));
     }
 
     /// Pushes a [`Self::GAP_SENTINEL`] marker recording a sampling discontinuity
     /// (such as system suspend/resume or paused collection).
     #[inline]
     pub fn push_gap(&mut self) {
-        if N == 0 {
-            return;
-        }
-        self.buf[self.head] = Self::GAP_SENTINEL;
-        self.head = (self.head + 1) % N;
-        if self.len < N {
-            self.len += 1;
-        }
+        self.push_raw(Self::GAP_SENTINEL);
     }
 
     /// Returns the number of samples currently stored (`0..=N`).
@@ -112,11 +113,10 @@ impl<const N: usize> HistoryRing<N> {
     /// Returns an iterator yielding stored values from oldest to newest.
     #[inline]
     pub fn iter_ordered(&self) -> HistoryRingIter<'_, N> {
-        let start = if self.len == N && N > 0 { self.head } else { 0 };
+        let cursor = if self.len == N && N > 0 { self.head } else { 0 };
         HistoryRingIter {
             ring: self,
-            start,
-            offset: 0,
+            cursor,
             remaining: self.len,
         }
     }
@@ -150,8 +150,7 @@ impl<const N: usize> HistoryRing<N> {
 #[derive(Debug, Clone)]
 pub struct HistoryRingIter<'a, const N: usize> {
     ring: &'a HistoryRing<N>,
-    start: usize,
-    offset: usize,
+    cursor: usize,
     remaining: usize,
 }
 
@@ -163,10 +162,13 @@ impl<const N: usize> Iterator for HistoryRingIter<'_, N> {
         if self.remaining == 0 || N == 0 {
             return None;
         }
-        let idx = (self.start + self.offset) % N;
-        self.offset += 1;
+        let val = self.ring.buf[self.cursor];
+        self.cursor += 1;
+        if self.cursor == N {
+            self.cursor = 0;
+        }
         self.remaining -= 1;
-        Some(self.ring.buf[idx])
+        Some(val)
     }
 
     #[inline]
@@ -181,6 +183,8 @@ impl<const N: usize> ExactSizeIterator for HistoryRingIter<'_, N> {
         self.remaining
     }
 }
+
+impl<const N: usize> std::iter::FusedIterator for HistoryRingIter<'_, N> {}
 
 /// A fixed-size `Copy` ring buffer storing raw `u64` throughput values (e.g., bytes/sec).
 ///
@@ -229,33 +233,34 @@ impl<const N: usize> ThroughputRing<N> {
         raw == Self::GAP_SENTINEL
     }
 
+    #[inline]
+    fn push_raw(&mut self, raw: u64) {
+        if N == 0 {
+            return;
+        }
+        self.buf[self.head] = raw;
+        self.head += 1;
+        if self.head == N {
+            self.head = 0;
+        }
+        if self.len < N {
+            self.len += 1;
+        }
+    }
+
     /// Pushes a `u64` throughput sample, overwriting the oldest entry when full.
     ///
     /// Values equal to [`Self::GAP_SENTINEL`] (`u64::MAX`) are clamped to `u64::MAX - 1`
     /// so real throughput samples never collide with the gap marker.
     #[inline]
     pub fn push(&mut self, value: u64) {
-        if N == 0 {
-            return;
-        }
-        self.buf[self.head] = value.min(Self::GAP_SENTINEL - 1);
-        self.head = (self.head + 1) % N;
-        if self.len < N {
-            self.len += 1;
-        }
+        self.push_raw(value.min(Self::GAP_SENTINEL - 1));
     }
 
     /// Pushes a [`Self::GAP_SENTINEL`] marker recording a sampling discontinuity.
     #[inline]
     pub fn push_gap(&mut self) {
-        if N == 0 {
-            return;
-        }
-        self.buf[self.head] = Self::GAP_SENTINEL;
-        self.head = (self.head + 1) % N;
-        if self.len < N {
-            self.len += 1;
-        }
+        self.push_raw(Self::GAP_SENTINEL);
     }
 
     /// Returns the number of samples currently stored (`0..=N`).
@@ -290,11 +295,10 @@ impl<const N: usize> ThroughputRing<N> {
     /// Returns an ordered iterator yielding stored values from oldest to newest.
     #[inline]
     pub fn iter(&self) -> ThroughputRingIter<'_, N> {
-        let start = if self.len == N && N > 0 { self.head } else { 0 };
+        let cursor = if self.len == N && N > 0 { self.head } else { 0 };
         ThroughputRingIter {
             ring: self,
-            start,
-            offset: 0,
+            cursor,
             remaining: self.len,
         }
     }
@@ -324,8 +328,7 @@ impl<const N: usize> ThroughputRing<N> {
 #[derive(Debug, Clone)]
 pub struct ThroughputRingIter<'a, const N: usize> {
     ring: &'a ThroughputRing<N>,
-    start: usize,
-    offset: usize,
+    cursor: usize,
     remaining: usize,
 }
 
@@ -337,10 +340,13 @@ impl<const N: usize> Iterator for ThroughputRingIter<'_, N> {
         if self.remaining == 0 || N == 0 {
             return None;
         }
-        let idx = (self.start + self.offset) % N;
-        self.offset += 1;
+        let val = self.ring.buf[self.cursor];
+        self.cursor += 1;
+        if self.cursor == N {
+            self.cursor = 0;
+        }
         self.remaining -= 1;
-        Some(self.ring.buf[idx])
+        Some(val)
     }
 
     #[inline]
@@ -355,3 +361,5 @@ impl<const N: usize> ExactSizeIterator for ThroughputRingIter<'_, N> {
         self.remaining
     }
 }
+
+impl<const N: usize> std::iter::FusedIterator for ThroughputRingIter<'_, N> {}

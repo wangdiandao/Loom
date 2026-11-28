@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true, features = ["png"] }
 loom-pal-api.workspace = true
 loom-types.workspace = true
 parking_lot.workspace = true
@@ -36,7 +36,6 @@ windows-sys = { workspace = true, features = [
     "Win32_System_IO",
     "Win32_System_Ioctl",
     "Win32_System_LibraryLoader",
-    "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Pipes",
     "Win32_System_Power",

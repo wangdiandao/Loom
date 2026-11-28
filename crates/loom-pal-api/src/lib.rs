@@ -65,6 +65,15 @@ mod tests {
         assert!(scratch.samples.is_empty());
         assert!(scratch.string_buf.is_empty());
         assert_eq!(scratch.string_buf.capacity(), prev_cap);
+
+        // Multi-byte UTF-8 strings exceeding u16::MAX truncate cleanly on a char boundary.
+        let oversized = "汉".repeat(25_000); // 75_000 bytes (> u16::MAX = 65_535)
+        let (off_big, len_big) = scratch.push_str(&oversized);
+        let slice = scratch.str_slice(off_big, len_big);
+        assert_eq!(usize::from(len_big), slice.len());
+        assert!(slice.len() <= usize::from(u16::MAX));
+        assert_eq!(slice.len() % 3, 0);
+        assert!(slice.chars().all(|ch| ch == '汉'));
     }
 
     #[test]

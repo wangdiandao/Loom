@@ -39,9 +39,10 @@ bitflags = { version = "2", features = ["serde"] }
 smallvec = { version = "1", features = ["serde"] }
 arc-swap = "1"
 crossbeam-channel = "0.5"
-parking_lot = "0.12"
+parking_lot = "0.13"
 tempfile = "3"
 directories = "6"
+image = { version = "0.25", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 windows-sys = "0.61"

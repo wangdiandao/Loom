@@ -452,4 +452,19 @@ mod tests {
         window::set_main_window_always_on_top(false);
         window::restore_and_focus_main_window();
     }
+
+    #[test]
+    fn global_hotkey_controller_disabled_state_is_safe_and_idempotent() {
+        let mut controller = GlobalHotkeyController::new(Arc::new(|| {}));
+        assert_eq!(controller.active_hotkey(), None);
+        controller
+            .set_hotkey(None)
+            .expect("clearing unset hotkey succeeds");
+        controller
+            .set_hotkey(Some("   "))
+            .expect("blank hotkey disables cleanly");
+        assert_eq!(controller.active_hotkey(), None);
+        controller.clear();
+        assert_eq!(controller.active_hotkey(), None);
+    }
 }

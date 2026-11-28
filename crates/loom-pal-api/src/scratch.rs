@@ -66,11 +66,7 @@ impl<Ext> ProcessSampleScratch<Ext> {
         let truncated = if s.len() <= usize::from(u16::MAX) {
             s
         } else {
-            let mut end = usize::from(u16::MAX);
-            while end > 0 && !s.is_char_boundary(end) {
-                end -= 1;
-            }
-            &s[..end]
+            &s[..s.floor_char_boundary(usize::from(u16::MAX))]
         };
         self.string_buf.push_str(truncated);
         (offset, truncated.len() as u16)
