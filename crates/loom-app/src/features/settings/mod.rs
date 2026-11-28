@@ -9,16 +9,21 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, IndexPath, Sizable as _, StyledExt as _, WindowExt as _,
-    h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Sizable as _, StyledExt as _,
+    WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
+    Render, SharedString, Styled as _, Subscription, Task, Window, div,
+    prelude::FluentBuilder as _, px,
 };
-use loom_engine::EngineCommand;
-use loom_types::{CapabilityFlags, LanguagePreference, RefreshSpeed, StartupPage, ThemePreference};
+use loom_engine::{CommandOutcome, CommandSuccess, EngineCommand};
+use loom_types::{
+    AdminStartupStatus, CapabilityFlags, LanguagePreference, RefreshSpeed, StartupPage,
+    TaskManagerReplacementState, TaskManagerReplacementStatus, ThemePreference,
+};
 
+use crate::bootstrap;
 use crate::bridge::{UiCommands, UiStore, UiStoreEvent};
 use crate::i18n;
 use crate::shell::Route;
@@ -177,6 +182,12 @@ pub(crate) struct SettingsView {
     global_hotkey_select: Entity<SelectState<Vec<SelectOption<Option<String>>>>>,
     theme_select: Entity<SelectState<Vec<SelectOption<ThemePreference>>>>,
     language_select: Entity<SelectState<Vec<SelectOption<LanguagePreference>>>>,
+    taskmgr_status: Option<TaskManagerReplacementStatus>,
+    taskmgr_busy: bool,
+    _taskmgr_task: Option<Task<()>>,
+    admin_status: Option<AdminStartupStatus>,
+    admin_busy: bool,
+    _admin_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -312,7 +323,7 @@ impl SettingsView {
             }),
         );
 
-        Self {
+        let mut view = Self {
             store,
             last_locale: settings.language,
             startup_page_select,
@@ -320,8 +331,220 @@ impl SettingsView {
             global_hotkey_select,
             theme_select,
             language_select,
+            taskmgr_status: None,
+            taskmgr_busy: false,
+            _taskmgr_task: None,
+            admin_status: None,
+            admin_busy: false,
+            _admin_task: None,
             _subscriptions: subscriptions,
+        };
+        let caps = view.store.read(cx).snapshot().capabilities;
+        if caps.contains(CapabilityFlags::TASK_MANAGER_REPLACEMENT) {
+            view.refresh_task_manager_status(window, cx);
         }
+        if caps.contains(CapabilityFlags::ADMIN_STARTUP) {
+            view.refresh_admin_startup_status(window, cx);
+        }
+        view
+    }
+
+    /// Queries the read-only OS Task Manager replacement status once on the slow lane.
+    pub(crate) fn refresh_task_manager_status(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(rx) = UiCommands::query_task_manager_replacement_async(&self.store, cx) else {
+            return;
+        };
+        self._taskmgr_task = Some(cx.spawn_in(window, async move |weak, cx| {
+            let reply = cx
+                .background_executor()
+                .spawn(async move { rx.recv().ok() })
+                .await;
+            let _ =
+                weak.update_in(cx, |this, _window, cx| {
+                    this.taskmgr_busy = false;
+                    if let Some(event) = reply
+                        && let CommandOutcome::Ok(CommandSuccess::TaskManagerReplacementStatus(
+                            status,
+                        )) = event.outcome
+                    {
+                        this.taskmgr_status = Some(status);
+                    }
+                    cx.notify();
+                });
+        }));
+    }
+
+    /// Toggles OS-level Task Manager replacement on the slow lane (triggering UAC if needed).
+    pub(crate) fn set_task_manager_replacement(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.taskmgr_busy {
+            return;
+        }
+        let Ok(rx) = UiCommands::set_task_manager_replacement_async(&self.store, enabled, cx)
+        else {
+            return;
+        };
+        self.taskmgr_busy = true;
+        cx.notify();
+
+        self._taskmgr_task = Some(cx.spawn_in(window, async move |weak, cx| {
+            let reply = cx
+                .background_executor()
+                .spawn(async move { rx.recv().ok() })
+                .await;
+            let _ = weak.update_in(cx, |this, window, cx| {
+                this.taskmgr_busy = false;
+                if let Some(event) = reply {
+                    match event.outcome {
+                        CommandOutcome::Ok(CommandSuccess::TaskManagerReplacementStatus(
+                            status,
+                        )) => {
+                            let msg = if status.state == TaskManagerReplacementState::Enabled {
+                                i18n::tr("settings.taskmgr_replace_enabled_toast")
+                            } else {
+                                i18n::tr("settings.taskmgr_replace_restored_toast")
+                            };
+                            this.taskmgr_status = Some(status);
+                            window.push_notification(Notification::success(msg), cx);
+                        }
+                        CommandOutcome::Err(_) => {
+                            // Refresh authoritative OS status so the toggle stays accurate
+                            // (including when the user cancels UAC).
+                            this.refresh_task_manager_status(window, cx);
+                        }
+                        CommandOutcome::Ok(_) => {}
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Queries the read-only persistent administrator startup status once on the slow lane.
+    pub(crate) fn refresh_admin_startup_status(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(rx) = UiCommands::query_admin_startup_async(&self.store, cx) else {
+            return;
+        };
+        self._admin_task = Some(cx.spawn_in(window, async move |weak, cx| {
+            let reply = cx
+                .background_executor()
+                .spawn(async move { rx.recv().ok() })
+                .await;
+            let _ = weak.update_in(cx, |this, _window, cx| {
+                this.admin_busy = false;
+                if let Some(event) = reply
+                    && let CommandOutcome::Ok(CommandSuccess::AdminStartupStatus(status)) =
+                        event.outcome
+                {
+                    this.admin_status = Some(status);
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Enables or disables persistent administrator startup on the slow lane and seamlessly
+    /// transitions privilege level when needed.
+    pub(crate) fn set_admin_startup(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.admin_busy {
+            return;
+        }
+        let Ok(rx) = UiCommands::set_admin_startup_async(&self.store, enabled, cx) else {
+            return;
+        };
+        self.admin_busy = true;
+        cx.notify();
+
+        self._admin_task = Some(cx.spawn_in(window, async move |weak, cx| {
+            let reply = cx
+                .background_executor()
+                .spawn(async move { rx.recv().ok() })
+                .await;
+            let Some(event) = reply else {
+                let _ = weak.update_in(cx, |this, _window, cx| {
+                    this.admin_busy = false;
+                    cx.notify();
+                });
+                return;
+            };
+
+            let status = match event.outcome {
+                CommandOutcome::Ok(CommandSuccess::AdminStartupStatus(status)) => status,
+                CommandOutcome::Err(_) => {
+                    let _ = weak.update_in(cx, |this, window, cx| {
+                        this.admin_busy = false;
+                        this.refresh_admin_startup_status(window, cx);
+                        cx.notify();
+                    });
+                    return;
+                }
+                CommandOutcome::Ok(_) => {
+                    let _ = weak.update_in(cx, |this, _window, cx| {
+                        this.admin_busy = false;
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+
+            // Decide whether to perform a seamless privilege switch after updating the task.
+            let switch_target = if status.enabled && status.ready && !status.elevated {
+                Some(true)
+            } else if !status.enabled && status.elevated && status.can_drop_elevation {
+                Some(false)
+            } else {
+                None
+            };
+
+            if let Some(target_elevated) = switch_target {
+                let prepared = cx
+                    .background_executor()
+                    .spawn(async move {
+                        loom_pal::admin::prepare_privilege_switch(
+                            Route::Settings.as_str(),
+                            target_elevated,
+                        )
+                    })
+                    .await;
+                if let Ok(switch) = prepared
+                    && switch.commit().is_ok()
+                {
+                    let _ = cx.update(|_window, cx| {
+                        bootstrap::quit_for_privilege_switch(cx);
+                    });
+                    return;
+                }
+            }
+
+            let _ = weak.update_in(cx, |this, window, cx| {
+                this.admin_busy = false;
+                let msg = if status.enabled {
+                    i18n::tr("settings.admin_startup_enabled_toast")
+                } else {
+                    i18n::tr("settings.admin_startup_disabled_toast")
+                };
+                this.admin_status = Some(status);
+                window.push_notification(Notification::success(msg), cx);
+                cx.notify();
+            });
+        }));
     }
 
     /// Toggles grouping `msedgewebview2.exe` helpers under their host app,
@@ -378,15 +601,21 @@ impl Render for SettingsView {
         let snapshot = store_ref.snapshot();
         let is_elevated = snapshot.is_elevated;
         let capabilities = snapshot.capabilities;
-        let supports_always_on_top = capabilities.contains(CapabilityFlags::ALWAYS_ON_TOP);
         let supports_global_hotkey = capabilities.contains(CapabilityFlags::GLOBAL_HOTKEY);
         let supports_elevation_relaunch =
             capabilities.contains(CapabilityFlags::ELEVATION_RELAUNCH);
+        let supports_admin_startup = capabilities.contains(CapabilityFlags::ADMIN_STARTUP);
+        let supports_taskmgr_replacement =
+            capabilities.contains(CapabilityFlags::TASK_MANAGER_REPLACEMENT);
         let config_path = store_ref.config_path().display().to_string();
 
         let theme = cx.theme();
         let fg = theme.foreground;
         let muted_fg = theme.muted_foreground;
+        let warn_fg = theme.warning;
+        let warn_bg = theme.warning.opacity(0.16);
+        let danger_fg = theme.danger;
+        let danger_bg = theme.danger.opacity(0.16);
         let border = theme.border;
         let card_bg = theme.secondary.opacity(0.28);
         let badge_bg = if is_elevated {
@@ -403,22 +632,120 @@ impl Render for SettingsView {
         let radius_lg = theme.radius_lg;
         let mono_font = theme.mono_font_family.clone();
 
-        let store_top = self.store.clone();
         let store_min = self.store.clone();
         let store_close = self.store.clone();
         let store_elevate = self.store.clone();
+        let store_native_taskmgr = self.store.clone();
 
         let startup_label = i18n::tr("settings.startup_page_label");
         let speed_label = i18n::tr("settings.refresh_speed_label");
         let wv2_label = i18n::tr("settings.settings_diag_webview2_grouping");
         let leak_label = i18n::tr("settings.settings_diag_leak_warnings");
         let hide_sys_label = i18n::tr("settings.settings_diag_hide_system");
-        let always_on_top_label = i18n::tr("settings.always_on_top_label");
         let min_tray_label = i18n::tr("settings.minimize_to_tray_label");
         let close_tray_label = i18n::tr("settings.close_to_tray_label");
         let global_hotkey_label = i18n::tr("settings.global_hotkey_label");
         let theme_label = i18n::tr("settings.theme_label");
         let language_label = i18n::tr("settings.language_label");
+        let taskmgr_replace_label = i18n::tr("settings.taskmgr_replace_label");
+        let taskmgr_open_native_label = i18n::tr("settings.taskmgr_open_native_label");
+        let admin_startup_label = i18n::tr("settings.admin_startup_label");
+
+        let admin_status = self.admin_status.clone();
+        let admin_busy = self.admin_busy;
+        let admin_checked = admin_status.as_ref().is_some_and(|s| s.enabled);
+        let admin_needs_repair = admin_status.as_ref().is_some_and(|s| s.enabled && !s.ready);
+        let admin_switch_disabled = admin_busy
+            || match admin_status.as_ref() {
+                None => true,
+                Some(s) if s.enabled => false,
+                Some(s) => !s.supported || !s.eligible,
+            };
+        let (admin_desc, admin_desc_color, admin_badge) = match admin_status.as_ref() {
+            None => (None, muted_fg, None),
+            Some(s) if !s.eligible => (
+                Some(i18n::tr("settings.admin_startup_ineligible_desc")),
+                muted_fg,
+                None,
+            ),
+            Some(s) if s.enabled && !s.ready => (
+                Some(i18n::tr("settings.admin_startup_repair_desc")),
+                warn_fg,
+                Some((
+                    i18n::tr("settings.admin_startup_badge_repair"),
+                    warn_bg,
+                    warn_fg,
+                )),
+            ),
+            Some(_) => (None, muted_fg, None),
+        };
+
+        let taskmgr_status = self.taskmgr_status.clone();
+        let taskmgr_busy = self.taskmgr_busy;
+        let taskmgr_checked = taskmgr_status
+            .as_ref()
+            .is_some_and(|s| s.state == TaskManagerReplacementState::Enabled);
+        let taskmgr_switch_disabled = taskmgr_busy
+            || match taskmgr_status.as_ref() {
+                None => true,
+                Some(s) if s.state == TaskManagerReplacementState::Enabled => !s.can_restore,
+                Some(s) => !s.can_enable,
+            };
+        let taskmgr_show_restore = taskmgr_status.as_ref().is_some_and(|s| {
+            s.can_restore
+                && matches!(
+                    s.state,
+                    TaskManagerReplacementState::Revoked
+                        | TaskManagerReplacementState::RecoveryNeeded
+                )
+        });
+        let (taskmgr_desc, taskmgr_desc_color, taskmgr_badge) = match taskmgr_status.as_ref() {
+            None => (None, muted_fg, None),
+            Some(s) => match s.state {
+                TaskManagerReplacementState::Disabled
+                | TaskManagerReplacementState::Enabled
+                | TaskManagerReplacementState::Unsupported => (None, muted_fg, None),
+                TaskManagerReplacementState::Conflict => {
+                    let detail = s
+                        .conflict_detail
+                        .as_deref()
+                        .unwrap_or(&i18n::tr("settings.taskmgr_replace_conflict_unknown"))
+                        .to_owned();
+                    let msg = rust_i18n::t!(
+                        "settings.taskmgr_replace_conflict_desc",
+                        detail = detail.as_str()
+                    )
+                    .into_owned();
+                    (
+                        Some(msg),
+                        danger_fg,
+                        Some((
+                            i18n::tr("settings.taskmgr_replace_badge_conflict"),
+                            danger_bg,
+                            danger_fg,
+                        )),
+                    )
+                }
+                TaskManagerReplacementState::Revoked => (
+                    Some(i18n::tr("settings.taskmgr_replace_revoked_desc")),
+                    warn_fg,
+                    Some((
+                        i18n::tr("settings.taskmgr_replace_badge_revoked"),
+                        warn_bg,
+                        warn_fg,
+                    )),
+                ),
+                TaskManagerReplacementState::RecoveryNeeded => (
+                    Some(i18n::tr("settings.taskmgr_replace_recovery_desc")),
+                    warn_fg,
+                    Some((
+                        i18n::tr("settings.taskmgr_replace_badge_recovery"),
+                        warn_bg,
+                        warn_fg,
+                    )),
+                ),
+            },
+        };
 
         v_flex()
             .id("settings-scroll-container")
@@ -527,25 +854,11 @@ impl Render for SettingsView {
                             fg,
                             radius_lg,
                         )
-                        .when(supports_always_on_top, |section| {
-                            section.child(setting_row(
-                                always_on_top_label.clone(),
-                                fg,
-                                border,
-                                false,
-                                Switch::new("setting-always-on-top")
-                                    .checked(settings.always_on_top)
-                                    .accessibility_label(always_on_top_label.clone())
-                                    .on_change(move |checked, _, cx| {
-                                        UiCommands::set_always_on_top(&store_top, *checked, cx);
-                                    }),
-                            ))
-                        })
                         .child(setting_row(
                             min_tray_label.clone(),
                             fg,
                             border,
-                            supports_always_on_top,
+                            false,
                             Switch::new("setting-minimize-to-tray")
                                 .checked(settings.minimize_to_tray)
                                 .accessibility_label(min_tray_label)
@@ -661,6 +974,126 @@ impl Render for SettingsView {
                                     )
                                 }),
                         ))
+                        .when(supports_admin_startup, |section| {
+                            section.child(setting_row_with_description(
+                                admin_startup_label.clone(),
+                                admin_desc,
+                                fg,
+                                admin_desc_color,
+                                border,
+                                true,
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .when_some(admin_badge, |this, (label, bg, color)| {
+                                        this.child(
+                                            div()
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded(radius)
+                                                .bg(bg)
+                                                .text_xs()
+                                                .font_medium()
+                                                .text_color(color)
+                                                .child(label),
+                                        )
+                                    })
+                                    .when(admin_needs_repair, |this| {
+                                        this.child(
+                                            Button::new("settings-repair-admin-startup")
+                                                .small()
+                                                .disabled(admin_busy)
+                                                .label(i18n::tr(
+                                                    "settings.admin_startup_repair_btn",
+                                                ))
+                                                .on_click(cx.listener(|view, _, window, cx| {
+                                                    view.set_admin_startup(true, window, cx);
+                                                })),
+                                        )
+                                    })
+                                    .child(
+                                        Switch::new("setting-admin-startup")
+                                            .checked(admin_checked)
+                                            .disabled(admin_switch_disabled)
+                                            .accessibility_label(admin_startup_label.clone())
+                                            .on_change(cx.listener(|view, checked, window, cx| {
+                                                view.set_admin_startup(*checked, window, cx);
+                                            })),
+                                    ),
+                            ))
+                        })
+                        .when(supports_taskmgr_replacement, |section| {
+                            section
+                                .child(setting_row_with_description(
+                                    taskmgr_replace_label.clone(),
+                                    taskmgr_desc,
+                                    fg,
+                                    taskmgr_desc_color,
+                                    border,
+                                    true,
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .when_some(taskmgr_badge, |this, (label, bg, color)| {
+                                            this.child(
+                                                div()
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded(radius)
+                                                    .bg(bg)
+                                                    .text_xs()
+                                                    .font_medium()
+                                                    .text_color(color)
+                                                    .child(label),
+                                            )
+                                        })
+                                        .when(taskmgr_show_restore, |this| {
+                                            this.child(
+                                                Button::new("settings-restore-task-manager")
+                                                    .small()
+                                                    .disabled(taskmgr_busy)
+                                                    .label(i18n::tr(
+                                                        "settings.taskmgr_replace_restore_btn",
+                                                    ))
+                                                    .on_click(cx.listener(
+                                                        |view, _, window, cx| {
+                                                            view.set_task_manager_replacement(
+                                                                false, window, cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            )
+                                        })
+                                        .child(
+                                            Switch::new("setting-replace-task-manager")
+                                                .checked(taskmgr_checked)
+                                                .disabled(taskmgr_switch_disabled)
+                                                .accessibility_label(taskmgr_replace_label.clone())
+                                                .on_change(cx.listener(
+                                                    |view, checked, window, cx| {
+                                                        view.set_task_manager_replacement(
+                                                            *checked, window, cx,
+                                                        );
+                                                    },
+                                                )),
+                                        ),
+                                ))
+                                .child(setting_row(
+                                    taskmgr_open_native_label,
+                                    fg,
+                                    border,
+                                    true,
+                                    Button::new("settings-open-native-taskmgr")
+                                        .small()
+                                        .label(i18n::tr("settings.taskmgr_open_native_btn"))
+                                        .on_click(move |_, _, cx| {
+                                            UiCommands::open_native_task_manager(
+                                                &store_native_taskmgr,
+                                                cx,
+                                            );
+                                        }),
+                                ))
+                        })
                         .child(setting_row(
                             i18n::tr("settings.config_path_label"),
                             fg,
@@ -738,6 +1171,36 @@ fn setting_row(
         .child(div().flex_shrink_0().child(control))
 }
 
+fn setting_row_with_description(
+    title: String,
+    description: Option<String>,
+    fg: gpui_kit::Hsla,
+    desc_fg: gpui_kit::Hsla,
+    border: gpui_kit::Hsla,
+    top_divider: bool,
+    control: impl IntoElement,
+) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .px_4()
+        .py_3()
+        .when(top_divider, |this| this.border_t_1().border_color(border))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(div().text_sm().font_medium().text_color(fg).child(title))
+                .when_some(description, |this, text| {
+                    this.child(div().text_xs().text_color(desc_fg).child(text))
+                }),
+        )
+        .child(div().flex_shrink_0().child(control))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -806,6 +1269,44 @@ mod tests {
         assert!(!reloaded.webview2_host_grouping);
         assert!(!reloaded.show_leak_warnings);
         assert!(reloaded.hide_windows_system_processes);
+
+        // On platforms advertising TASK_MANAGER_REPLACEMENT / ADMIN_STARTUP (Windows),
+        // SettingsView must query read-only status asynchronously on mount without panicking.
+        let caps = NativeBackend::CAPABILITIES;
+        if caps.contains(loom_types::CapabilityFlags::TASK_MANAGER_REPLACEMENT)
+            || caps.contains(loom_types::CapabilityFlags::ADMIN_STARTUP)
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                vcx.run_until_parked();
+                let ready = vcx.update(|_, cx| {
+                    let v = settings_view.read(cx);
+                    (!caps.contains(loom_types::CapabilityFlags::TASK_MANAGER_REPLACEMENT)
+                        || v.taskmgr_status.is_some())
+                        && (!caps.contains(loom_types::CapabilityFlags::ADMIN_STARTUP)
+                            || v.admin_status.is_some())
+                });
+                if ready {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if caps.contains(loom_types::CapabilityFlags::TASK_MANAGER_REPLACEMENT) {
+                let status = vcx.update(|_, cx| settings_view.read(cx).taskmgr_status.clone());
+                assert!(
+                    status.is_some(),
+                    "SettingsView should resolve read-only TaskManagerReplacementStatus on mount"
+                );
+            }
+            if caps.contains(loom_types::CapabilityFlags::ADMIN_STARTUP) {
+                let status = vcx.update(|_, cx| settings_view.read(cx).admin_status.clone());
+                assert!(
+                    status.is_some(),
+                    "SettingsView should resolve read-only AdminStartupStatus on mount"
+                );
+            }
+            vcx.update(|window, cx| window.draw(cx).clear(cx));
+        }
 
         drop(settings_view);
         vcx.update(|window, _| window.remove_window());

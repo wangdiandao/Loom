@@ -15,8 +15,9 @@ pub mod snapshot;
 pub mod time;
 
 pub use control::{
-    CapabilityFlags, FileLockHolder, ProcessSocketRecord, RunTaskRequest, SocketProtocol,
-    TreeKillItem, TreeKillReport, WaitChainNode,
+    AdminStartupStatus, CapabilityFlags, FileLockHolder, ProcessSocketRecord, RunTaskRequest,
+    SocketProtocol, TaskManagerReplacementState, TaskManagerReplacementStatus, TreeKillItem,
+    TreeKillReport, WaitChainNode,
 };
 pub use history::{HistoryRing, HistoryRingIter, ThroughputRing, ThroughputRingIter};
 pub use performance::{

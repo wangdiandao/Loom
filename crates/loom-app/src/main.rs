@@ -13,6 +13,17 @@ use loom_pal::{NativeBackend, PlatformBackend};
 rust_i18n::i18n!("locales", fallback = "en-US");
 
 fn main() {
+    // 0. Fast-path early CLI dispatch for Windows persistent administrator startup brokers,
+    //    IFEO Task Manager launcher, probes, and elevated maintenance helpers before initializing
+    //    GPUI or the sampling engine.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(exit_code) = loom_pal::admin::try_handle_cli_mode(&raw_args) {
+        std::process::exit(exit_code);
+    }
+    if let Some(exit_code) = loom_pal::taskmgr::try_handle_cli_mode(&raw_args) {
+        std::process::exit(exit_code);
+    }
+
     // 1. Boost process scheduling priority immediately to stay responsive under 100% CPU load.
     NativeBackend::boost_self_priority();
 
@@ -22,6 +33,6 @@ fn main() {
         .try_init();
 
     // 3. Parse optional CLI flags (`--restore-route`, `--config`, `--allow-multiple`) and run.
-    let args = bootstrap::LaunchArgs::parse_from(std::env::args().skip(1));
-    bootstrap::run(args);
+    let args = bootstrap::LaunchArgs::parse_from(&raw_args);
+    bootstrap::run(args, raw_args);
 }

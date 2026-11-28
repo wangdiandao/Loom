@@ -116,6 +116,7 @@ impl UiCommands {
     }
 
     /// Updates, persists, and live-applies the native window Always-on-Top state.
+    #[allow(dead_code)]
     pub(crate) fn set_always_on_top(store: &Entity<UiStore>, enabled: bool, cx: &mut App) {
         store.update(cx, |store, cx| {
             let _ = store.update_settings(|s| s.always_on_top = enabled, cx);
@@ -632,5 +633,54 @@ impl UiCommands {
         let _ = store
             .read(cx)
             .dispatch_command(EngineCommand::SetAppHistorySort { column, direction });
+    }
+
+    /// Queries the current OS Task Manager replacement status on the slow lane.
+    pub(crate) fn query_task_manager_replacement_async(
+        store: &Entity<UiStore>,
+        cx: &App,
+    ) -> Result<Receiver<CommandEvent>, EngineCommandError> {
+        store
+            .read(cx)
+            .dispatch_command_with_reply(EngineCommand::QueryTaskManagerReplacement)
+    }
+
+    /// Enables or restores OS Task Manager replacement on the slow lane.
+    pub(crate) fn set_task_manager_replacement_async(
+        store: &Entity<UiStore>,
+        enabled: bool,
+        cx: &App,
+    ) -> Result<Receiver<CommandEvent>, EngineCommandError> {
+        store
+            .read(cx)
+            .dispatch_command_with_reply(EngineCommand::SetTaskManagerReplacement(enabled))
+    }
+
+    /// Launches the built-in OS Task Manager directly (bypassing any active IFEO entry).
+    pub(crate) fn open_native_task_manager(store: &Entity<UiStore>, cx: &mut App) {
+        let _ = store
+            .read(cx)
+            .dispatch_command(EngineCommand::OpenNativeTaskManager);
+    }
+
+    /// Queries the current persistent administrator startup status on the slow lane.
+    pub(crate) fn query_admin_startup_async(
+        store: &Entity<UiStore>,
+        cx: &App,
+    ) -> Result<Receiver<CommandEvent>, EngineCommandError> {
+        store
+            .read(cx)
+            .dispatch_command_with_reply(EngineCommand::QueryAdminStartup)
+    }
+
+    /// Enables or disables persistent administrator startup on the slow lane.
+    pub(crate) fn set_admin_startup_async(
+        store: &Entity<UiStore>,
+        enabled: bool,
+        cx: &App,
+    ) -> Result<Receiver<CommandEvent>, EngineCommandError> {
+        store
+            .read(cx)
+            .dispatch_command_with_reply(EngineCommand::SetAdminStartup(enabled))
     }
 }

@@ -50,6 +50,10 @@ bitflags! {
         const PROCESS_SOCKETS = 1 << 16;
         /// Supports elevated per-process network byte attribution (e.g., real-time ETW).
         const ELEVATED_PROCESS_NET = 1 << 17;
+        /// Supports replacing the OS built-in Task Manager (e.g., Windows IFEO `taskmgr.exe`).
+        const TASK_MANAGER_REPLACEMENT = 1 << 18;
+        /// Supports persistent UAC-free administrator startup (e.g., Windows Task Scheduler).
+        const ADMIN_STARTUP = 1 << 19;
     }
 }
 
@@ -168,4 +172,56 @@ pub struct FileLockHolder {
     pub app_type: Arc<str>,
     /// Whether the OS indicates the lock holder can be safely restarted automatically.
     pub restartable: bool,
+}
+
+/// Lifecycle state of OS-level system Task Manager replacement (e.g., Windows IFEO).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TaskManagerReplacementState {
+    /// Replacement is not enabled and no conflicting entry is present.
+    #[default]
+    Disabled,
+    /// Replacement is active and verified against Loom's registered launcher command.
+    Enabled,
+    /// Another program's `Debugger`, `UseFilter`, or IFEO subkey is present; Loom refuses to overwrite.
+    Conflict,
+    /// Loom's recovery journal is active, but the OS entry was externally removed/restored.
+    Revoked,
+    /// An interrupted enable or restore left an unfinished recovery journal.
+    RecoveryNeeded,
+    /// Platform does not support system Task Manager replacement.
+    Unsupported,
+}
+
+/// Read-only status snapshot for system Task Manager replacement.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskManagerReplacementStatus {
+    /// Current verified replacement state.
+    pub state: TaskManagerReplacementState,
+    /// Whether enabling replacement is currently permitted (no conflict and supported).
+    pub can_enable: bool,
+    /// Whether restoring/cleaning up replacement is currently permitted.
+    pub can_restore: bool,
+    /// Optional human-readable conflict summary (e.g., third-party Debugger or IFEO subkeys).
+    pub conflict_detail: Option<String>,
+    /// Optional path to the recovery journal / instructions for troubleshooting.
+    pub recovery_path: Option<String>,
+}
+
+/// Read-only status snapshot for persistent administrator startup (e.g., Windows Task Scheduler).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminStartupStatus {
+    /// Whether the platform supports persistent administrator startup.
+    pub supported: bool,
+    /// Whether a persistent administrator startup task/grant is currently registered.
+    pub enabled: bool,
+    /// Whether the registered task is verified and ready to elevate the current executable.
+    pub ready: bool,
+    /// Whether the current process is already running elevated.
+    pub elevated: bool,
+    /// Whether the current user account is eligible for elevation (administrator or split-token admin).
+    pub eligible: bool,
+    /// Whether the current elevated session can cleanly drop back to standard privileges (split token).
+    pub can_drop_elevation: bool,
+    /// Optional diagnostic detail when an existing grant is missing, stale, or invalid.
+    pub error: Option<String>,
 }

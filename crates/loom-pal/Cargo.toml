@@ -8,6 +8,8 @@ repository.workspace = true
 
 [dependencies]
 loom-pal-api.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
 single-instance.workspace = true
 
 [target.'cfg(windows)'.dependencies]

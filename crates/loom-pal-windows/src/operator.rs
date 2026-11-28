@@ -633,6 +633,31 @@ impl SystemOperator for WindowsSystemOperator {
         crate::filelock::find_file_locks(path)
     }
 
+    fn task_manager_replacement_status(
+        &self,
+    ) -> Result<loom_types::TaskManagerReplacementStatus, PalError> {
+        crate::taskmgr::status()
+    }
+
+    fn set_task_manager_replacement(
+        &self,
+        enabled: bool,
+    ) -> Result<loom_types::TaskManagerReplacementStatus, PalError> {
+        crate::taskmgr::set_replacement(enabled)
+    }
+
+    fn open_native_task_manager(&self) -> Result<(), PalError> {
+        crate::taskmgr::open_native()
+    }
+
+    fn admin_startup_status(&self) -> Result<loom_types::AdminStartupStatus, PalError> {
+        crate::admin::status()
+    }
+
+    fn set_admin_startup(&self, enabled: bool) -> Result<loom_types::AdminStartupStatus, PalError> {
+        crate::admin::set_enabled(enabled)
+    }
+
     fn relaunch_self_elevated(&self, restore_route: &str) -> Result<(), PalError> {
         ensure_com_initialized();
 
